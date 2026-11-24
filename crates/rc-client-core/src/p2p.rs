@@ -19,7 +19,7 @@
 #![deny(missing_docs)]
 
 use std::collections::HashSet;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -529,100 +529,25 @@ fn punch_udp_pair_with_lease(
             last_send = Some(Instant::now());
         }
 
-        let mut err_clears = 0usize;
-        loop {
-            match socket.peek_from(&mut recv_buf) {
-                Ok((n, raw_from)) => {
-                    let from_addr = normalize_addr_for_socket(raw_from, socket_is_ipv6);
-                    let from_canon = canonicalize_socket_addr(from_addr);
-                    if let Some(pkt) = decode_punch_packet(&recv_buf[..n]) {
-                        // 合法 RCP2 打洞包：先从内核接收队列消费掉再处理。
-                        let _ = socket.recv_from(&mut recv_buf);
-                        if pkt.session_hash != session_hash || pkt.role != expected_role {
-                            continue;
-                        }
-                        for _ in 0..IMMEDIATE_ACK_BURST {
-                            let _ = socket.send_to(&ack_pkt, from_addr);
-                        }
-                        if pkt.ack {
-                            return Ok(PunchedSocket {
-                                socket,
-                                peer_addr: from_addr,
-                                elapsed: start.elapsed(),
-                                port_lease,
-                            });
-                        }
-                        if confirmed_peer.is_none() {
-                            confirmed_peer = Some(from_addr);
-                        }
-                    } else {
-                        let from_confirmed = confirmed_peer
-                            .is_some_and(|p| canonicalize_socket_addr(p) == from_canon);
-                        let from_target = target_canons.contains(&from_canon);
-                        if from_confirmed
-                            || (from_target && (role == P2pRole::Host || confirmed_peer.is_some()))
-                        {
-                            // 对端已切入 QUIC 并发出 Initial 等非 RCP2 报文：绝不消费该包，
-                            // 直接保留在内核接收缓冲中移交给 QuicEndpoint::from_socket。
-                            return Ok(PunchedSocket {
-                                socket,
-                                peer_addr: from_addr,
-                                elapsed: start.elapsed(),
-                                port_lease,
-                            });
-                        }
-                        // 未知来源的杂散非 RCP2 报文：消费丢弃，防止 peek_from 空转。
-                        let _ = socket.recv_from(&mut recv_buf);
-                    }
-                }
-                Err(err)
-                    if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
-                {
-                    break;
-                }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    // Windows Winsock 发送探测包至未监听端口后会异步锁存 ICMP Port Unreachable
-                    // (WSAECONNRESET=10054)；MSG_PEEK 不会清除该锁存错误，必须用非 peek 的 recv_from
-                    // 清掉错误状态后再继续 peek，避免后续对端真实打洞包被永久遮蔽。
-                    if err_clears >= 16 {
-                        break;
-                    }
-                    err_clears += 1;
-                    match socket.recv_from(&mut recv_buf) {
-                        Ok((n, raw_from)) => {
-                            let from_addr = normalize_addr_for_socket(raw_from, socket_is_ipv6);
-                            if let Some(pkt) = decode_punch_packet(&recv_buf[..n]) {
-                                if pkt.session_hash == session_hash && pkt.role == expected_role {
-                                    for _ in 0..IMMEDIATE_ACK_BURST {
-                                        let _ = socket.send_to(&ack_pkt, from_addr);
-                                    }
-                                    if pkt.ack {
-                                        return Ok(PunchedSocket {
-                                            socket,
-                                            peer_addr: from_addr,
-                                            elapsed: start.elapsed(),
-                                            port_lease,
-                                        });
-                                    }
-                                    if confirmed_peer.is_none() {
-                                        confirmed_peer = Some(from_addr);
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Err(_) => continue,
-                    }
-                }
-                Err(err) => {
-                    return Err(format!("P2P UDP 打洞读取失败：{err}"));
-                }
-            }
+        let mut socket_ref = &socket;
+        let drain_outcome = drain_punch_rx(
+            &mut recv_buf,
+            socket_is_ipv6,
+            session_hash,
+            expected_role,
+            role,
+            &target_canons,
+            &ack_pkt,
+            &mut confirmed_peer,
+            &mut socket_ref,
+        )?;
+        if let DrainOutcome::Ready(peer_addr) = drain_outcome {
+            return Ok(PunchedSocket {
+                socket,
+                peer_addr,
+                elapsed: start.elapsed(),
+                port_lease,
+            });
         }
 
         let now = Instant::now();
@@ -633,6 +558,206 @@ fn punch_udp_pair_with_lease(
         let sleep_budget = POLL_STEP.min(deadline - now);
         thread::sleep(sleep_budget);
     }
+}
+
+/// 单次接收队列排空迭代允许连续吞吐的瞬态错误上限（防止死循环饿死超时与取消检查）。
+const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    Continue,
+    Ready(SocketAddr),
+}
+
+trait PunchSocketOps {
+    fn peek_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+    fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+    fn send_to(&mut self, buf: &[u8], addr: SocketAddr);
+}
+
+impl PunchSocketOps for &UdpSocket {
+    fn peek_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        UdpSocket::peek_from(self, buf)
+    }
+
+    fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        UdpSocket::recv_from(self, buf)
+    }
+
+    fn send_to(&mut self, buf: &[u8], addr: SocketAddr) {
+        let _ = UdpSocket::send_to(self, buf, addr);
+    }
+}
+
+fn handle_decoded_punch_packet(
+    pkt: PunchPacket,
+    from_addr: SocketAddr,
+    session_hash: [u8; 16],
+    expected_role: P2pRole,
+    ack_pkt: &[u8],
+    confirmed_peer: &mut Option<SocketAddr>,
+    ops: &mut dyn PunchSocketOps,
+) -> Option<SocketAddr> {
+    if pkt.session_hash != session_hash || pkt.role != expected_role {
+        return None;
+    }
+    for _ in 0..IMMEDIATE_ACK_BURST {
+        ops.send_to(ack_pkt, from_addr);
+    }
+    if pkt.ack {
+        return Some(from_addr);
+    }
+    if confirmed_peer.is_none() {
+        *confirmed_peer = Some(from_addr);
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_punch_datagram(
+    recv_buf: &mut [u8],
+    n: usize,
+    from_addr: SocketAddr,
+    already_consumed: bool,
+    session_hash: [u8; 16],
+    expected_role: P2pRole,
+    role: P2pRole,
+    target_canons: &HashSet<SocketAddr>,
+    ack_pkt: &[u8],
+    confirmed_peer: &mut Option<SocketAddr>,
+    ops: &mut dyn PunchSocketOps,
+) -> Option<SocketAddr> {
+    if let Some(pkt) = decode_punch_packet(&recv_buf[..n]) {
+        if !already_consumed {
+            // 合法 RCP2 打洞包：先从内核接收队列消费掉再处理。
+            let _ = ops.recv_from(recv_buf);
+        }
+        return handle_decoded_punch_packet(
+            pkt,
+            from_addr,
+            session_hash,
+            expected_role,
+            ack_pkt,
+            confirmed_peer,
+            ops,
+        );
+    }
+
+    let from_canon = canonicalize_socket_addr(from_addr);
+    let from_confirmed = confirmed_peer.is_some_and(|p| canonicalize_socket_addr(p) == from_canon);
+    let from_target = target_canons.contains(&from_canon);
+    if from_confirmed || (from_target && (role == P2pRole::Host || confirmed_peer.is_some())) {
+        // 对端已切入 QUIC 并发出 Initial 等非 RCP2 报文：未消费时保留在内核接收缓冲中移交给 QuicEndpoint::from_socket。
+        return Some(from_addr);
+    }
+
+    if !already_consumed {
+        // 未知来源的杂散非 RCP2 报文：消费丢弃，防止 peek_from 空转。
+        let _ = ops.recv_from(recv_buf);
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_punch_rx(
+    recv_buf: &mut [u8],
+    socket_is_ipv6: bool,
+    session_hash: [u8; 16],
+    expected_role: P2pRole,
+    role: P2pRole,
+    target_canons: &HashSet<SocketAddr>,
+    ack_pkt: &[u8],
+    confirmed_peer: &mut Option<SocketAddr>,
+    ops: &mut dyn PunchSocketOps,
+) -> Result<DrainOutcome, String> {
+    let mut consecutive_transient_errors = 0usize;
+    loop {
+        match ops.peek_from(recv_buf) {
+            Ok((n, raw_from)) => {
+                consecutive_transient_errors = 0;
+                let from_addr = normalize_addr_for_socket(raw_from, socket_is_ipv6);
+                if let Some(peer) = classify_punch_datagram(
+                    recv_buf,
+                    n,
+                    from_addr,
+                    false,
+                    session_hash,
+                    expected_role,
+                    role,
+                    target_canons,
+                    ack_pkt,
+                    confirmed_peer,
+                    ops,
+                ) {
+                    return Ok(DrainOutcome::Ready(peer));
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                break;
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::Interrupted
+                        | ErrorKind::ConnectionRefused
+                        | ErrorKind::ConnectionReset
+                ) =>
+            {
+                consecutive_transient_errors += 1;
+                if consecutive_transient_errors > MAX_CONSECUTIVE_TRANSIENT_ERRORS {
+                    break;
+                }
+                if matches!(
+                    err.kind(),
+                    ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
+                ) {
+                    // Windows Winsock 发送探测包至未监听端口后会异步锁存 ICMP Port Unreachable
+                    // (WSAECONNRESET=10054)；MSG_PEEK 不会清除该锁存错误，必须用非 peek 的 recv_from
+                    // 清掉错误状态后再继续 peek，避免后续对端真实打洞包被永久遮蔽。
+                    match ops.recv_from(recv_buf) {
+                        Ok((n, raw_from)) => {
+                            consecutive_transient_errors = 0;
+                            let from_addr = normalize_addr_for_socket(raw_from, socket_is_ipv6);
+                            if let Some(peer) = classify_punch_datagram(
+                                recv_buf,
+                                n,
+                                from_addr,
+                                true,
+                                session_hash,
+                                expected_role,
+                                role,
+                                target_canons,
+                                ack_pkt,
+                                confirmed_peer,
+                                ops,
+                            ) {
+                                return Ok(DrainOutcome::Ready(peer));
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                ErrorKind::Interrupted
+                                    | ErrorKind::ConnectionRefused
+                                    | ErrorKind::ConnectionReset
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(format!("P2P UDP 打洞读取失败：{e}"));
+                        }
+                    }
+                }
+                continue;
+            }
+            Err(err) => {
+                return Err(format!("P2P UDP 打洞读取失败：{err}"));
+            }
+        }
+    }
+    Ok(DrainOutcome::Continue)
 }
 
 /// 作为被控端（Host）尝试 UDP 打洞并在打通的 socket 上完成 QUIC 服务端握手。
@@ -1620,5 +1745,197 @@ mod tests {
         );
         assert!(c_res.is_err(), "wrong expected_peer_device_id must fail");
         let _ = h_jh2.join();
+    }
+
+    #[test]
+    fn drain_punch_rx_continues_across_transient_errors_and_caps_spin() {
+        struct FakePunchSocket {
+            peek_results: std::collections::VecDeque<io::Result<(Vec<u8>, SocketAddr)>>,
+            recv_results: std::collections::VecDeque<io::Result<(Vec<u8>, SocketAddr)>>,
+            sent: usize,
+            peeks: usize,
+        }
+
+        impl PunchSocketOps for FakePunchSocket {
+            fn peek_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+                self.peeks += 1;
+                match self.peek_results.pop_front() {
+                    Some(Ok((pkt, addr))) => {
+                        buf[..pkt.len()].copy_from_slice(&pkt);
+                        Ok((pkt.len(), addr))
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => Err(io::Error::from(ErrorKind::WouldBlock)),
+                }
+            }
+
+            fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+                match self.recv_results.pop_front() {
+                    Some(Ok((pkt, addr))) => {
+                        buf[..pkt.len()].copy_from_slice(&pkt);
+                        Ok((pkt.len(), addr))
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => Err(io::Error::from(ErrorKind::WouldBlock)),
+                }
+            }
+
+            fn send_to(&mut self, _buf: &[u8], _addr: SocketAddr) {
+                self.sent += 1;
+            }
+        }
+
+        let session_hash = derive_session_hash("sess-transient");
+        let peer_addr: SocketAddr = "198.51.100.77:55555".parse().unwrap();
+        let target_canons: HashSet<SocketAddr> = [peer_addr].into_iter().collect();
+        let peer_ack = encode_punch_packet(&PunchPacket {
+            version: PUNCH_VERSION,
+            role: P2pRole::Client,
+            ack: true,
+            session_hash,
+            nonce: [7u8; 6],
+        });
+        let local_ack = encode_punch_packet(&PunchPacket {
+            version: PUNCH_VERSION,
+            role: P2pRole::Host,
+            ack: true,
+            session_hash,
+            nonce: [8u8; 6],
+        });
+
+        // 1) Interrupted + ConnectionReset + ConnectionRefused (< 64) 后立即继续排空并命中对端 ACK 包
+        let mut recv_buf = [0u8; 128];
+        let mut confirmed_peer = None;
+        let mut fake1 = FakePunchSocket {
+            peek_results: std::collections::VecDeque::from([
+                Err(io::Error::from(ErrorKind::Interrupted)),
+                Err(io::Error::from(ErrorKind::ConnectionReset)),
+                Err(io::Error::from(ErrorKind::ConnectionRefused)),
+                Ok((peer_ack.to_vec(), peer_addr)),
+            ]),
+            recv_results: std::collections::VecDeque::from([
+                Err(io::Error::from(ErrorKind::ConnectionReset)),
+                Err(io::Error::from(ErrorKind::Interrupted)),
+                Ok((peer_ack.to_vec(), peer_addr)),
+            ]),
+            sent: 0,
+            peeks: 0,
+        };
+        let res = drain_punch_rx(
+            &mut recv_buf,
+            false,
+            session_hash,
+            P2pRole::Client,
+            P2pRole::Host,
+            &target_canons,
+            &local_ack,
+            &mut confirmed_peer,
+            &mut fake1,
+        )
+        .expect("transient errors followed by ACK must succeed");
+        assert_eq!(res, DrainOutcome::Ready(peer_addr));
+        assert_eq!(fake1.sent, IMMEDIATE_ACK_BURST);
+
+        // 2) 连续超过 MAX_CONSECUTIVE_TRANSIENT_ERRORS (64) 次瞬态错误时必须主动 break，避免饿死超时/取消
+        let mut confirmed_peer2 = None;
+        let mut fake2 = FakePunchSocket {
+            peek_results: (0..100)
+                .map(|_| Err(io::Error::from(ErrorKind::Interrupted)))
+                .collect(),
+            recv_results: std::collections::VecDeque::new(),
+            sent: 0,
+            peeks: 0,
+        };
+        let res2 = drain_punch_rx(
+            &mut recv_buf,
+            false,
+            session_hash,
+            P2pRole::Client,
+            P2pRole::Host,
+            &target_canons,
+            &local_ack,
+            &mut confirmed_peer2,
+            &mut fake2,
+        )
+        .expect("capped transient errors must break cleanly");
+        assert_eq!(res2, DrainOutcome::Continue);
+        assert_eq!(fake2.peeks, MAX_CONSECUTIVE_TRANSIENT_ERRORS + 1);
+
+        // 3) 非瞬态硬错误立即向上返回 Err
+        let mut confirmed_peer3 = None;
+        let mut fake3 = FakePunchSocket {
+            peek_results: std::collections::VecDeque::from([Err(io::Error::from(
+                ErrorKind::InvalidInput,
+            ))]),
+            recv_results: std::collections::VecDeque::new(),
+            sent: 0,
+            peeks: 0,
+        };
+        let err = drain_punch_rx(
+            &mut recv_buf,
+            false,
+            session_hash,
+            P2pRole::Client,
+            P2pRole::Host,
+            &target_canons,
+            &local_ack,
+            &mut confirmed_peer3,
+            &mut fake3,
+        )
+        .unwrap_err();
+        assert!(err.contains("P2P UDP 打洞读取失败"));
+
+        // 4) ConnectionReset 后由 recv_from 返回来自已知对端的非 RCP2（如 QUIC Initial）报文也必须返回 Ready
+        let mut confirmed_peer4 = None;
+        let quic_initial_like = b"\xc0\x00\x00\x00\x01QUIC-INITIAL".to_vec();
+        let mut fake4 = FakePunchSocket {
+            peek_results: std::collections::VecDeque::from([Err(io::Error::from(
+                ErrorKind::ConnectionReset,
+            ))]),
+            recv_results: std::collections::VecDeque::from([Ok((quic_initial_like, peer_addr))]),
+            sent: 0,
+            peeks: 0,
+        };
+        let res4 = drain_punch_rx(
+            &mut recv_buf,
+            false,
+            session_hash,
+            P2pRole::Client,
+            P2pRole::Host,
+            &target_canons,
+            &local_ack,
+            &mut confirmed_peer4,
+            &mut fake4,
+        )
+        .expect(
+            "non-RCP2 packet from target peer via recv_from after ConnectionReset must succeed",
+        );
+        assert_eq!(res4, DrainOutcome::Ready(peer_addr));
+
+        // 5) ConnectionReset 清错路径中若 recv_from 返回非瞬态硬错误，不得吞错而应立即向上返回 Err
+        let mut confirmed_peer5 = None;
+        let mut fake5 = FakePunchSocket {
+            peek_results: std::collections::VecDeque::from([Err(io::Error::from(
+                ErrorKind::ConnectionReset,
+            ))]),
+            recv_results: std::collections::VecDeque::from([Err(io::Error::from(
+                ErrorKind::InvalidInput,
+            ))]),
+            sent: 0,
+            peeks: 0,
+        };
+        let err5 = drain_punch_rx(
+            &mut recv_buf,
+            false,
+            session_hash,
+            P2pRole::Client,
+            P2pRole::Host,
+            &target_canons,
+            &local_ack,
+            &mut confirmed_peer5,
+            &mut fake5,
+        )
+        .unwrap_err();
+        assert!(err5.contains("P2P UDP 打洞读取失败"));
     }
 }

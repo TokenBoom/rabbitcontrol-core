@@ -154,7 +154,7 @@ pub struct DeviceStatusEvent {
 /// 动态 Access Token 提供器类型（由上层接入 `AuthSessionManager::ensure_valid_access_token`）。
 pub type TokenProvider = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
 
-/// 信令客户端启动扩展参数（注入动态 Token 提供器、设备公钥与远程协助初始开关）。
+/// 信令客户端启动扩展参数（注入动态 Token 提供器、设备公钥、远程协助与动态局域网探测开关）。
 #[derive(Clone, Default)]
 pub struct SignalClientOptions {
     /// 可选动态 Access Token 提供器；每次建连与断线重连注册时自动拉取最新（必要时已轮换的）令牌。
@@ -163,6 +163,8 @@ pub struct SignalClientOptions {
     pub device_pubkey: Option<String>,
     /// 初始是否允许他人远程协助（默认 `false`）。
     pub allow_remote_assist: bool,
+    /// 是否按信令出向路由动态探测本机局域网 IPv4 候选并前置于静态 `lan_addrs`（默认 `false`）。
+    pub dynamic_lan_discovery: bool,
 }
 
 impl fmt::Debug for SignalClientOptions {
@@ -171,6 +173,7 @@ impl fmt::Debug for SignalClientOptions {
             .field("has_token_provider", &self.token_provider.is_some())
             .field("device_pubkey", &self.device_pubkey)
             .field("allow_remote_assist", &self.allow_remote_assist)
+            .field("dynamic_lan_discovery", &self.dynamic_lan_discovery)
             .finish()
     }
 }
@@ -365,6 +368,12 @@ struct SharedState {
     local_udp_port: AtomicU16,
     /// 持久化 UDP `RCSP` 探测套接字是否绑定在 IPv6 地址族（仅在 `local_udp_port != 0` 时有效）。
     local_udp_is_ipv6: AtomicBool,
+    /// 是否在已连接状态下启用按路由动态局域网 IPv4 探测。
+    dynamic_lan_discovery: bool,
+    /// 当前信令连接对应的 UDP 探测与 TCP 对端目标列表（用于动态局域网出向网卡路由探测）。
+    connected_probe_targets: Mutex<Vec<SocketAddr>>,
+    /// 当前信令 TCP 对端是否位于回环地址（仅在同机联调时允许上报回环候选）。
+    server_is_loopback: AtomicBool,
     lan_addrs: Vec<String>,
     enabled: bool,
     token_provider: Option<TokenProvider>,
@@ -479,6 +488,11 @@ impl SharedState {
     fn clear_active_writer(&self) {
         self.local_udp_port.store(0, Ordering::Release);
         self.local_udp_is_ipv6.store(false, Ordering::Release);
+        self.server_is_loopback.store(false, Ordering::Release);
+        self.connected_probe_targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.shutdown_active_socket();
         let writer = self
             .active_writer
@@ -488,6 +502,43 @@ impl SharedState {
         if let Some(w) = writer {
             w.shutdown_and_close();
         }
+    }
+
+    fn current_effective_lan_addrs(
+        &self,
+        static_lan_addrs: &[String],
+        local_udp_port: u16,
+        local_udp_is_ipv6: bool,
+    ) -> Vec<String> {
+        if local_udp_port == 0 {
+            return Vec::new();
+        }
+        let allow_loopback = self.server_is_loopback.load(Ordering::Acquire);
+        if self.dynamic_lan_discovery && !local_udp_is_ipv6 {
+            let targets = self
+                .connected_probe_targets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let discovered = crate::lan_discovery::discover_local_lan_ipv4s(&targets);
+            if !discovered.is_empty() {
+                let mut combined: Vec<String> =
+                    discovered.into_iter().map(|ip| ip.to_string()).collect();
+                combined.extend(static_lan_addrs.iter().cloned());
+                return effective_lan_addrs(
+                    &combined,
+                    local_udp_port,
+                    local_udp_is_ipv6,
+                    allow_loopback,
+                );
+            }
+        }
+        effective_lan_addrs(
+            static_lan_addrs,
+            local_udp_port,
+            local_udp_is_ipv6,
+            allow_loopback,
+        )
     }
 
     fn send_msg(&self, msg: &OutgoingSignalMsg) -> Result<(), String> {
@@ -639,7 +690,7 @@ impl SignalClientHandle {
             cfg.disabled_snapshot()
         };
 
-        let (token_provider, device_pubkey, initial_assist) = match options {
+        let (token_provider, device_pubkey, initial_assist, dynamic_lan_discovery) = match options {
             Some(opts) => {
                 let pubkey = opts
                     .device_pubkey
@@ -650,9 +701,14 @@ impl SignalClientHandle {
                 } else {
                     ASSIST_FALSE
                 };
-                (opts.token_provider, pubkey, assist)
+                (
+                    opts.token_provider,
+                    pubkey,
+                    assist,
+                    opts.dynamic_lan_discovery,
+                )
             }
-            None => (None, None, ASSIST_UNSET),
+            None => (None, None, ASSIST_UNSET, false),
         };
 
         let shared = Arc::new(SharedState {
@@ -669,6 +725,9 @@ impl SignalClientHandle {
             stop_cv: Condvar::new(),
             local_udp_port: AtomicU16::new(0),
             local_udp_is_ipv6: AtomicBool::new(false),
+            dynamic_lan_discovery,
+            connected_probe_targets: Mutex::new(Vec::new()),
+            server_is_loopback: AtomicBool::new(false),
             lan_addrs: clean_lan_addrs.clone(),
             enabled: active,
             token_provider,
@@ -741,7 +800,7 @@ impl SignalClientHandle {
         let msg = OutgoingSignalMsg::ConnectRequest {
             target_id: normalized,
             session_id: session_id.clone(),
-            lan_addrs: effective_lan_addrs(
+            lan_addrs: self.shared.current_effective_lan_addrs(
                 &self.shared.lan_addrs,
                 local_udp_port,
                 local_udp_is_ipv6,
@@ -896,15 +955,40 @@ fn sanitize_lan_addrs(addrs: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// 将清洗后的 `lan_addrs` 端口改写为持久化 UDP 探测端口，并按探测套接字地址族过滤：
+/// 判断候选 IP 是否允许上报给信令作为打洞候选地址：
+/// - 拒绝未指定、多播、IPv4 广播、IPv4 链路本地 (`169.254.0.0/16`) 与 IPv6 单播链路本地 (`fe80::/10`)；
+/// - 仅当 `allow_loopback == true`（连接回环信令服务器做同机联调）时允许回环地址 (`127.0.0.0/8` / `::1`)。
+fn is_usable_candidate_ip(ip: IpAddr, allow_loopback: bool) -> bool {
+    match canonicalize_ip(ip) {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                allow_loopback
+            } else {
+                crate::lan_discovery::is_usable_lan_ipv4(v4)
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_unspecified() || v6.is_multicast() || (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            if v6.is_loopback() {
+                return allow_loopback;
+            }
+            true
+        }
+    }
+}
+
+/// 将清洗后的 `lan_addrs` 端口改写为持久化 UDP 探测端口，并按探测套接字地址族与可用性过滤：
 /// - 当 `local_udp_port == 0`（初始注册尚未绑定探测端口，或探测绑定失败）时返回空列表，
 ///   绝不泄漏 Host QUIC 直连端口（如 `:9901`）作为 P2P 打洞候选；
-/// - 当 `local_udp_port != 0` 时，仅改写并上报与 `local_udp_is_ipv6` 同地址族的局域网地址，
-///   跳过地址族不匹配的候选。
+/// - 当 `local_udp_port != 0` 时，仅改写并上报与 `local_udp_is_ipv6` 同地址族且通过 [`is_usable_candidate_ip`] 校验的局域网地址，
+///   跳过地址族不匹配或不可达/无效候选。
 fn effective_lan_addrs(
     lan_addrs: &[String],
     local_udp_port: u16,
     local_udp_is_ipv6: bool,
+    allow_loopback: bool,
 ) -> Vec<String> {
     if local_udp_port == 0 {
         return Vec::new();
@@ -915,7 +999,7 @@ fn effective_lan_addrs(
         let Some(ip) = extract_canonical_lan_ip(&raw, local_udp_port) else {
             continue;
         };
-        if ip.is_ipv6() != local_udp_is_ipv6 {
+        if ip.is_ipv6() != local_udp_is_ipv6 || !is_usable_candidate_ip(ip, allow_loopback) {
             continue;
         }
         let rewritten = format_host_port(&ip.to_string(), local_udp_port);
@@ -1556,6 +1640,22 @@ fn run_single_connection(
     let mut last_server_activity = connected_at;
     // 在 Registered 时一次性解析 UDP 探测目标（优先匹配 TCP 对端地址族），避免每 30s 阻塞 DNS。
     let udp_probe_target = resolve_udp_probe_target(&effective_udp_probe_addr, peer_addr);
+    let server_is_loopback = peer_addr.is_some_and(|addr| canonicalize_ip(addr.ip()).is_loopback());
+    shared
+        .server_is_loopback
+        .store(server_is_loopback, Ordering::Release);
+    {
+        let mut targets = shared
+            .connected_probe_targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        targets.clear();
+        for cand in [udp_probe_target, peer_addr].into_iter().flatten() {
+            if !targets.contains(&cand) {
+                targets.push(cand);
+            }
+        }
+    }
 
     // 注册成功后绑定持久化 UDP 探测套接字（SO_REUSEADDR + SO_REUSEPORT 且已 connect 至信令端口），
     // 记录本地端口并立即发送一次 `RCSP` 探测包与携带改写后 `lan_addrs` 的 `Heartbeat`，
@@ -1573,7 +1673,7 @@ fn run_single_connection(
         probe.send_probe(&assigned_id);
         if let Err(err) = send_heartbeat_frame(
             shared,
-            effective_lan_addrs(&clean_lan_addrs, bound_udp_port, bound_udp_is_ipv6),
+            shared.current_effective_lan_addrs(&clean_lan_addrs, bound_udp_port, bound_udp_is_ipv6),
         ) {
             shared.shutdown_active_socket();
             if shared.stop_flag.load(Ordering::Acquire) {
@@ -1628,7 +1728,11 @@ fn run_single_connection(
             let current_udp_is_ipv6 = shared.local_udp_is_ipv6.load(Ordering::Acquire);
             if let Err(err) = send_heartbeat_frame(
                 shared,
-                effective_lan_addrs(&clean_lan_addrs, current_udp_port, current_udp_is_ipv6),
+                shared.current_effective_lan_addrs(
+                    &clean_lan_addrs,
+                    current_udp_port,
+                    current_udp_is_ipv6,
+                ),
             ) {
                 shared.shutdown_active_socket();
                 if shared.stop_flag.load(Ordering::Acquire) {
@@ -3007,6 +3111,9 @@ mod tests {
             stop_cv: Condvar::new(),
             local_udp_port: AtomicU16::new(45678),
             local_udp_is_ipv6: AtomicBool::new(false),
+            dynamic_lan_discovery: false,
+            connected_probe_targets: Mutex::new(Vec::new()),
+            server_is_loopback: AtomicBool::new(false),
             lan_addrs: Vec::new(),
             enabled: true,
             token_provider: None,
@@ -3381,6 +3488,9 @@ mod tests {
             stop_cv: Condvar::new(),
             local_udp_port: AtomicU16::new(0),
             local_udp_is_ipv6: AtomicBool::new(false),
+            dynamic_lan_discovery: false,
+            connected_probe_targets: Mutex::new(Vec::new()),
+            server_is_loopback: AtomicBool::new(false),
             lan_addrs: Vec::new(),
             enabled: true,
             token_provider: None,
@@ -3481,16 +3591,16 @@ mod tests {
         ];
         // H4: local_udp_port == 0 时必须返回空列表，绝不泄漏 :9901 作为打洞候选
         assert!(
-            effective_lan_addrs(&raw, 0, false).is_empty(),
+            effective_lan_addrs(&raw, 0, false, false).is_empty(),
             "local_udp_port == 0 must return empty lan_addrs (IPv4)"
         );
         assert!(
-            effective_lan_addrs(&raw, 0, true).is_empty(),
+            effective_lan_addrs(&raw, 0, true, false).is_empty(),
             "local_udp_port == 0 must return empty lan_addrs (IPv6)"
         );
         // H3: IPv4 探测套接字仅改写并上报 IPv4 LAN 地址（自动去重 ::ffff: 并跳过 IPv6）
         assert_eq!(
-            effective_lan_addrs(&raw, 54321, false),
+            effective_lan_addrs(&raw, 54321, false, false),
             vec![
                 "192.168.1.10:54321".to_string(),
                 "10.0.0.5:54321".to_string(),
@@ -3498,8 +3608,137 @@ mod tests {
         );
         // H3: IPv6 探测套接字仅改写并上报 IPv6 LAN 地址（跳过 IPv4）
         assert_eq!(
-            effective_lan_addrs(&raw, 54321, true),
+            effective_lan_addrs(&raw, 54321, true, false),
             vec!["[fd00::1]:54321".to_string()]
+        );
+    }
+
+    #[test]
+    fn effective_lan_addrs_filters_unusable_and_gates_loopback() {
+        let raw_v4 = vec![
+            "0.0.0.0:9901".to_string(),
+            "127.0.0.1:9901".to_string(),
+            "[::ffff:127.0.0.1]:9901".to_string(),
+            "169.254.10.20:9901".to_string(),
+            "224.0.0.1:9901".to_string(),
+            "255.255.255.255:9901".to_string(),
+            "192.168.1.10:9901".to_string(),
+        ];
+        assert_eq!(
+            effective_lan_addrs(&raw_v4, 41000, false, false),
+            vec!["192.168.1.10:41000".to_string()]
+        );
+        assert_eq!(
+            effective_lan_addrs(&raw_v4, 41000, false, true),
+            vec![
+                "127.0.0.1:41000".to_string(),
+                "192.168.1.10:41000".to_string(),
+            ]
+        );
+
+        let raw_v6 = vec![
+            "[::]:9901".to_string(),
+            "[::1]:9901".to_string(),
+            "[fe80::1]:9901".to_string(),
+            "[ff02::1]:9901".to_string(),
+            "[fd00::2]:9901".to_string(),
+        ];
+        assert_eq!(
+            effective_lan_addrs(&raw_v6, 41000, true, false),
+            vec!["[fd00::2]:41000".to_string()]
+        );
+        assert_eq!(
+            effective_lan_addrs(&raw_v6, 41000, true, true),
+            vec!["[::1]:41000".to_string(), "[fd00::2]:41000".to_string(),]
+        );
+    }
+
+    #[test]
+    fn shared_state_current_effective_lan_addrs_and_clear_active_writer() {
+        let opts = SignalClientOptions::default();
+        assert!(!opts.dynamic_lan_discovery);
+        assert!(format!("{opts:?}").contains("dynamic_lan_discovery: false"));
+
+        let cfg = ServerConfig::default();
+        let make_shared = |dynamic_lan_discovery: bool| SharedState {
+            status: Mutex::new(cfg.disabled_snapshot()),
+            status_updates: Mutex::new(VecDeque::new()),
+            incoming: Mutex::new(VecDeque::new()),
+            device_status_events: Mutex::new(VecDeque::new()),
+            kicked_reasons: Mutex::new(VecDeque::new()),
+            pending_connects: Mutex::new(HashMap::new()),
+            active_writer: Mutex::new(None),
+            shutdown_stream: Mutex::new(None),
+            stop_flag: AtomicBool::new(false),
+            stop_lock: Mutex::new(false),
+            stop_cv: Condvar::new(),
+            local_udp_port: AtomicU16::new(50000),
+            local_udp_is_ipv6: AtomicBool::new(false),
+            dynamic_lan_discovery,
+            connected_probe_targets: Mutex::new(vec!["192.0.2.10:21116".parse().unwrap()]),
+            server_is_loopback: AtomicBool::new(true),
+            lan_addrs: Vec::new(),
+            enabled: true,
+            token_provider: None,
+            device_pubkey: None,
+            allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
+        };
+
+        let static_addrs = vec![
+            "127.0.0.1:9901".to_string(),
+            "203.0.113.50:9901".to_string(),
+            "[fd00::5]:9901".to_string(),
+        ];
+
+        // dynamic_lan_discovery == false 时仅返回静态筛选结果；server_is_loopback == true 时放行 127.0.0.1
+        let static_only = make_shared(false);
+        assert!(static_only
+            .current_effective_lan_addrs(&static_addrs, 0, false)
+            .is_empty());
+        assert_eq!(
+            static_only.current_effective_lan_addrs(&static_addrs, 50000, false),
+            vec![
+                "127.0.0.1:50000".to_string(),
+                "203.0.113.50:50000".to_string(),
+            ]
+        );
+
+        // clear_active_writer 必须重置 local_udp_port / local_udp_is_ipv6 / server_is_loopback 与 connected_probe_targets
+        static_only.clear_active_writer();
+        assert_eq!(static_only.local_udp_port.load(Ordering::Acquire), 0);
+        assert!(!static_only.local_udp_is_ipv6.load(Ordering::Acquire));
+        assert!(!static_only.server_is_loopback.load(Ordering::Acquire));
+        assert!(static_only
+            .connected_probe_targets
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            static_only.current_effective_lan_addrs(&static_addrs, 50000, false),
+            vec!["203.0.113.50:50000".to_string()]
+        );
+
+        // dynamic_lan_discovery == true 时，IPv4 会将动态探测 IP 前置于静态地址（若有可用路由），IPv6 则不前置 IPv4
+        let dynamic = make_shared(true);
+        let probe_targets = dynamic.connected_probe_targets.lock().unwrap().clone();
+        let discovered: Vec<String> =
+            crate::lan_discovery::discover_local_lan_ipv4s(&probe_targets)
+                .into_iter()
+                .map(|ip| format!("{ip}:50000"))
+                .collect();
+        let got_v4 = dynamic.current_effective_lan_addrs(&static_addrs, 50000, false);
+        assert!(got_v4.ends_with(&["203.0.113.50:50000".to_string()]));
+        let loopback_pos = got_v4
+            .iter()
+            .position(|a| a == "127.0.0.1:50000")
+            .expect("loopback static entry must remain when server_is_loopback == true");
+        for (idx, d) in discovered.iter().enumerate() {
+            assert_eq!(got_v4.get(idx), Some(d));
+            assert!(idx < loopback_pos);
+        }
+        assert_eq!(
+            dynamic.current_effective_lan_addrs(&static_addrs, 50000, true),
+            vec!["[fd00::5]:50000".to_string()]
         );
     }
 
@@ -3536,6 +3775,9 @@ mod tests {
             stop_cv: Condvar::new(),
             local_udp_port: AtomicU16::new(45678),
             local_udp_is_ipv6: AtomicBool::new(false),
+            dynamic_lan_discovery: false,
+            connected_probe_targets: Mutex::new(Vec::new()),
+            server_is_loopback: AtomicBool::new(false),
             lan_addrs: Vec::new(),
             enabled: true,
             token_provider: None,
@@ -3789,6 +4031,7 @@ mod tests {
             })),
             device_pubkey: Some("A".repeat(64)),
             allow_remote_assist: false,
+            dynamic_lan_discovery: false,
         };
         let fast_timing = SignalTiming {
             heartbeat_interval: Duration::from_secs(30),

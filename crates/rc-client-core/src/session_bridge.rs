@@ -2002,25 +2002,35 @@ fn prepare_peer_mtls_bundle(
 
 fn collect_lan_candidate_addrs(cfg: &UiSessionConfig, grant: &ConnectGrant) -> Vec<SocketAddr> {
     let mut out = Vec::new();
+    let mut probe_targets = Vec::new();
     if let Some(addr) = cfg.lan_direct_addr {
         out.push(addr);
+        probe_targets.push(addr);
     }
-    let local_v4 = lan_discovery::detect_local_lan_ipv4();
+    if let Ok(relay_addr) = grant.relay_addr.parse::<SocketAddr>() {
+        if !probe_targets.contains(&relay_addr) {
+            probe_targets.push(relay_addr);
+        }
+    }
+    let local_v4s = lan_discovery::discover_local_lan_ipv4s(&probe_targets);
     for raw in &grant.peer_lan_addrs {
         let Ok(addr) = raw.parse::<SocketAddr>() else {
             continue;
         };
-        if addr.ip().is_loopback() {
+        let std::net::IpAddr::V4(peer_ip) = addr.ip().to_canonical() else {
+            continue;
+        };
+        if !lan_discovery::is_usable_lan_ipv4(peer_ip) {
             continue;
         }
-        let same_subnet = match (addr.ip(), local_v4) {
-            (std::net::IpAddr::V4(peer_ip), Some(local_ip)) => {
-                peer_ip.octets()[..3] == local_ip.octets()[..3]
-            }
-            _ => false,
-        };
+        let same_subnet = local_v4s
+            .iter()
+            .any(|local_ip| peer_ip.octets()[..3] == local_ip.octets()[..3]);
         if same_subnet {
-            let candidate = SocketAddr::new(addr.ip(), crate::host_bridge::DEFAULT_HOST_PORT);
+            let candidate = SocketAddr::new(
+                std::net::IpAddr::V4(peer_ip),
+                crate::host_bridge::DEFAULT_HOST_PORT,
+            );
             if !out.contains(&candidate) {
                 out.push(candidate);
             }
@@ -4088,5 +4098,58 @@ mod tests {
         assert!(!cfg.force_relay);
         assert!(cfg.clipboard_enabled);
         assert!(cfg.audio_enabled);
+    }
+
+    #[test]
+    fn collect_lan_candidate_addrs_filters_unusable_and_matches_local_subnets() {
+        let direct: SocketAddr = "192.168.77.88:9901".parse().unwrap();
+        let cfg = UiSessionConfig {
+            lan_direct_addr: Some(direct),
+            ..UiSessionConfig::default()
+        };
+        let mut peer_lan_addrs = vec![
+            "127.0.0.1:40000".to_string(),
+            "[::ffff:127.0.0.1]:40000".to_string(),
+            "0.0.0.0:40000".to_string(),
+            "169.254.12.34:40000".to_string(),
+            "224.0.0.1:40000".to_string(),
+            "255.255.255.255:40000".to_string(),
+            "[fd00::10]:40000".to_string(),
+        ];
+        let probe_targets = vec![direct, "192.0.2.10:21116".parse().unwrap()];
+        let local_v4s = lan_discovery::discover_local_lan_ipv4s(&probe_targets);
+        let expected_same_subnet = local_v4s.first().map(|local_ip| {
+            let octets = local_ip.octets();
+            let sibling = std::net::Ipv4Addr::new(
+                octets[0],
+                octets[1],
+                octets[2],
+                if octets[3] == 200 { 201 } else { 200 },
+            );
+            peer_lan_addrs.push(format!("{sibling}:51234"));
+            SocketAddr::new(
+                std::net::IpAddr::V4(sibling),
+                crate::host_bridge::DEFAULT_HOST_PORT,
+            )
+        });
+
+        let grant = ConnectGrant {
+            session_id: "sess-lan".to_string(),
+            target_id: "111222333".to_string(),
+            relay_addr: "192.0.2.10:21117".to_string(),
+            relay_token: "tok".to_string(),
+            peer_lan_addrs,
+            ..ConnectGrant::default()
+        };
+        let candidates = collect_lan_candidate_addrs(&cfg, &grant);
+        assert_eq!(candidates.first().copied(), Some(direct));
+        for addr in &candidates[1..] {
+            if let std::net::IpAddr::V4(v4) = addr.ip() {
+                assert!(lan_discovery::is_usable_lan_ipv4(v4));
+            }
+        }
+        if let Some(expected) = expected_same_subnet {
+            assert!(candidates.contains(&expected));
+        }
     }
 }

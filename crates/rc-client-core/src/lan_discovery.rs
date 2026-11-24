@@ -272,14 +272,73 @@ impl PeerTable {
     }
 }
 
-/// 探测本机出向局域网 IPv4 地址（纯标准库 UDP `connect` 路由表查询，发送 0 个报文）。
-pub fn detect_local_lan_ipv4() -> Option<Ipv4Addr> {
+/// 默认路由探测目标（RFC 5737 TEST-NET-1 与公共路由），用于兜底探测本机出向局域网 IPv4。
+const DEFAULT_ROUTE_PROBE_TARGETS: [SocketAddrV4; 2] = [
+    SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 9),
+    SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 80),
+];
+
+/// 判断 IPv4 地址是否为可向对端通告的本机局域网候选地址（排除未指定、回环、多播、链路本地与广播）。
+pub fn is_usable_lan_ipv4(ip: Ipv4Addr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_link_local()
+        && !ip.is_broadcast()
+}
+
+fn probe_route_local_ipv4(target: SocketAddrV4) -> Option<Ipv4Addr> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("8.8.8.8:80").ok()?;
-    match sock.local_addr().ok()?.ip() {
-        IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+    sock.connect(target).ok()?;
+    match sock.local_addr().ok()?.ip().to_canonical() {
+        IpAddr::V4(ip) if is_usable_lan_ipv4(ip) => Some(ip),
         _ => None,
     }
+}
+
+/// 探测本机出向局域网 IPv4 地址列表（纯标准库 UDP `connect` 路由表查询，发送 0 个报文）。
+///
+/// 先按顺序探测 `preferred_targets`（将 IPv4-mapped IPv6 规范化为 IPv4，跳过未指定/回环/多播/纯 IPv6 目标），
+/// 再探测默认路由目标 `192.0.2.1:9`（RFC 5737 TEST-NET-1）与 `8.8.8.8:80`；
+/// 返回经 [`is_usable_lan_ipv4`] 过滤并按探测顺序去重后的本机源 IPv4 列表。
+pub fn discover_local_lan_ipv4s(preferred_targets: &[SocketAddr]) -> Vec<Ipv4Addr> {
+    let mut out = Vec::new();
+    let mut push_unique = |target: SocketAddrV4| {
+        if let Some(ip) = probe_route_local_ipv4(target) {
+            if is_usable_lan_ipv4(ip) && !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    };
+
+    for target in preferred_targets {
+        let v4_target = match target.ip().to_canonical() {
+            IpAddr::V4(v4) if !v4.is_unspecified() && !v4.is_loopback() && !v4.is_multicast() => {
+                let port = if target.port() == 0 { 9 } else { target.port() };
+                SocketAddrV4::new(v4, port)
+            }
+            _ => continue,
+        };
+        push_unique(v4_target);
+    }
+
+    for default_target in DEFAULT_ROUTE_PROBE_TARGETS {
+        push_unique(default_target);
+    }
+
+    out
+}
+
+/// 按给定目标列表探测首选本机出向局域网 IPv4 地址（纯标准库 UDP `connect` 路由表查询，发送 0 个报文）。
+pub fn detect_local_lan_ipv4_for_targets(preferred_targets: &[SocketAddr]) -> Option<Ipv4Addr> {
+    discover_local_lan_ipv4s(preferred_targets)
+        .into_iter()
+        .next()
+}
+
+/// 探测本机出向局域网 IPv4 地址（纯标准库 UDP `connect` 路由表查询，发送 0 个报文）。
+pub fn detect_local_lan_ipv4() -> Option<Ipv4Addr> {
+    detect_local_lan_ipv4_for_targets(&[])
 }
 
 /// 获取本机可读设备名（优先 macOS `scutil`，次选 `HOSTNAME` 环境变量，兜底 `"本机 Mac"`）。
@@ -802,5 +861,63 @@ mod tests {
         );
         assert_eq!(table.lookup_addr("999999999"), None);
         assert_eq!(table.lookup_addr("bad"), None);
+    }
+
+    #[test]
+    fn is_usable_lan_ipv4_filters_non_routable_ranges() {
+        assert!(!is_usable_lan_ipv4(Ipv4Addr::UNSPECIFIED));
+        assert!(!is_usable_lan_ipv4(Ipv4Addr::LOCALHOST));
+        assert!(!is_usable_lan_ipv4(Ipv4Addr::new(127, 1, 2, 3)));
+        assert!(!is_usable_lan_ipv4(Ipv4Addr::new(224, 0, 0, 1)));
+        assert!(!is_usable_lan_ipv4(MULTICAST_ADDR));
+        assert!(!is_usable_lan_ipv4(Ipv4Addr::new(169, 254, 1, 1)));
+        assert!(!is_usable_lan_ipv4(Ipv4Addr::BROADCAST));
+
+        assert!(is_usable_lan_ipv4(Ipv4Addr::new(192, 168, 1, 10)));
+        assert!(is_usable_lan_ipv4(Ipv4Addr::new(10, 0, 0, 2)));
+        assert!(is_usable_lan_ipv4(Ipv4Addr::new(172, 16, 0, 5)));
+        assert!(is_usable_lan_ipv4(Ipv4Addr::new(198, 51, 100, 10)));
+    }
+
+    #[test]
+    fn discover_local_lan_ipv4s_filters_targets_and_deduplicates_usable_ips() {
+        let skipped_targets: Vec<SocketAddr> = vec![
+            "0.0.0.0:9".parse().unwrap(),
+            "127.0.0.1:21116".parse().unwrap(),
+            "[::ffff:127.0.0.1]:21116".parse().unwrap(),
+            "224.0.0.1:9".parse().unwrap(),
+            "[::1]:21116".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+        ];
+        let baseline = discover_local_lan_ipv4s(&[]);
+        let with_skipped = discover_local_lan_ipv4s(&skipped_targets);
+        assert_eq!(with_skipped, baseline);
+
+        for ip in &with_skipped {
+            assert!(is_usable_lan_ipv4(*ip));
+        }
+        let mut unique = with_skipped.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), with_skipped.len());
+
+        let mapped_targets: Vec<SocketAddr> = vec![
+            "[::ffff:192.0.2.10]:21116".parse().unwrap(),
+            "192.0.2.10:21116".parse().unwrap(),
+        ];
+        let mapped_res = discover_local_lan_ipv4s(&mapped_targets);
+        for ip in &mapped_res {
+            assert!(is_usable_lan_ipv4(*ip));
+        }
+        let mut mapped_unique = mapped_res.clone();
+        mapped_unique.sort_unstable();
+        mapped_unique.dedup();
+        assert_eq!(mapped_unique.len(), mapped_res.len());
+
+        assert_eq!(
+            detect_local_lan_ipv4(),
+            detect_local_lan_ipv4_for_targets(&[])
+        );
+        assert_eq!(detect_local_lan_ipv4(), baseline.into_iter().next());
     }
 }
