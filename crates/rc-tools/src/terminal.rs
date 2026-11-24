@@ -641,6 +641,7 @@ pub enum TerminalEvent {
     },
 }
 
+#[cfg(any(unix, test))]
 fn append_scrollback(scrollback: &mut VecDeque<u8>, data: &[u8]) {
     if data.is_empty() {
         return;
@@ -725,7 +726,9 @@ fn current_unix_secs() -> u64 {
 pub struct TerminalHostEngine {
     outgoing: VecDeque<Vec<u8>>,
     deferred_ctrl: VecDeque<Vec<u8>>,
+    #[cfg(unix)]
     next_term_id: u32,
+    #[cfg(unix)]
     next_session_seq: u32,
     #[cfg(unix)]
     sessions: BTreeMap<u32, HostPtySession>,
@@ -745,7 +748,9 @@ impl TerminalHostEngine {
         Self {
             outgoing: VecDeque::new(),
             deferred_ctrl: VecDeque::new(),
+            #[cfg(unix)]
             next_term_id: 1,
+            #[cfg(unix)]
             next_session_seq: 1,
             sessions: BTreeMap::new(),
         }
@@ -1006,6 +1011,7 @@ impl TerminalHostEngine {
             }
             TerminalWireMsg::Close { term_id } => {
                 if self.sessions.remove(&term_id).is_some() {
+                    #[cfg(unix)]
                     if self.sessions.is_empty() {
                         self.next_session_seq = 1;
                     }

@@ -61,6 +61,22 @@ fn validate_target_addr(addr: &str) -> bool {
     !addr.is_empty() && !addr.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+fn atomic_try_update(
+    atom: &AtomicUsize,
+    mut f: impl FnMut(usize) -> Option<usize>,
+) -> Result<usize, usize> {
+    let mut cur = atom.load(Ordering::Acquire);
+    loop {
+        let Some(next) = f(cur) else {
+            return Err(cur);
+        };
+        match atom.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(prev) => return Ok(prev),
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
 struct SendWindow {
     available: AtomicUsize,
     wait_lock: Mutex<()>,
@@ -81,11 +97,9 @@ impl SendWindow {
             return;
         }
         let _guard = self.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = self
-            .available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                Some(cur.saturating_add(delta as usize))
-            });
+        let _ = atomic_try_update(&self.available, |cur| {
+            Some(cur.saturating_add(delta as usize))
+        });
         self.cvar.notify_all();
     }
 
@@ -120,11 +134,7 @@ impl SendWindow {
         if bytes == 0 {
             return;
         }
-        let _ = self
-            .available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                Some(cur.saturating_sub(bytes))
-            });
+        let _ = atomic_try_update(&self.available, |cur| Some(cur.saturating_sub(bytes)));
     }
 }
 
@@ -712,15 +722,13 @@ impl PortMapHostEngine {
             });
             return;
         }
-        let reserved = self
-            .live_workers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                if cur < MAX_HOST_PROXY_CONNS {
-                    Some(cur + 1)
-                } else {
-                    None
-                }
-            });
+        let reserved = atomic_try_update(&self.live_workers, |cur| {
+            if cur < MAX_HOST_PROXY_CONNS {
+                Some(cur + 1)
+            } else {
+                None
+            }
+        });
         if reserved.is_err() {
             self.enqueue(&PortMapWireMsg::ConnError {
                 conn_id,
