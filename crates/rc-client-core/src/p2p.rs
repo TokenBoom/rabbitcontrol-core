@@ -529,6 +529,7 @@ fn punch_udp_pair_with_lease(
             last_send = Some(Instant::now());
         }
 
+        let mut err_clears = 0usize;
         loop {
             match socket.peek_from(&mut recv_buf) {
                 Ok((n, raw_from)) => {
@@ -575,15 +576,48 @@ fn punch_udp_pair_with_lease(
                     }
                 }
                 Err(err)
-                    if matches!(
-                        err.kind(),
-                        ErrorKind::WouldBlock
-                            | ErrorKind::Interrupted
-                            | ErrorKind::ConnectionRefused
-                            | ErrorKind::ConnectionReset
-                    ) =>
+                    if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
                 {
                     break;
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    // Windows Winsock 发送探测包至未监听端口后会异步锁存 ICMP Port Unreachable
+                    // (WSAECONNRESET=10054)；MSG_PEEK 不会清除该锁存错误，必须用非 peek 的 recv_from
+                    // 清掉错误状态后再继续 peek，避免后续对端真实打洞包被永久遮蔽。
+                    if err_clears >= 16 {
+                        break;
+                    }
+                    err_clears += 1;
+                    match socket.recv_from(&mut recv_buf) {
+                        Ok((n, raw_from)) => {
+                            let from_addr = normalize_addr_for_socket(raw_from, socket_is_ipv6);
+                            if let Some(pkt) = decode_punch_packet(&recv_buf[..n]) {
+                                if pkt.session_hash == session_hash && pkt.role == expected_role {
+                                    for _ in 0..IMMEDIATE_ACK_BURST {
+                                        let _ = socket.send_to(&ack_pkt, from_addr);
+                                    }
+                                    if pkt.ack {
+                                        return Ok(PunchedSocket {
+                                            socket,
+                                            peer_addr: from_addr,
+                                            elapsed: start.elapsed(),
+                                            port_lease,
+                                        });
+                                    }
+                                    if confirmed_peer.is_none() {
+                                        confirmed_peer = Some(from_addr);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(_) => continue,
+                    }
                 }
                 Err(err) => {
                     return Err(format!("P2P UDP 打洞读取失败：{err}"));

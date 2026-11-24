@@ -1030,11 +1030,42 @@ fn quic_localhost_owner_ticket_streams_frames_without_password_or_approval() {
     )
     .expect("host new");
 
+    struct WallCapture {
+        inner: FakeBackend,
+        origin: Instant,
+    }
+
+    impl rc_capture::CaptureBackend for WallCapture {
+        fn next_frame(&mut self, timeout: Duration) -> Result<Option<rc_capture::CapturedFrame>> {
+            match self.inner.next_frame(timeout) {
+                Ok(Some(mut frame)) => {
+                    let us = u32::try_from(self.origin.elapsed().as_micros()).unwrap_or(u32::MAX);
+                    frame.timestamp = rc_types::Timestamp(us);
+                    Ok(Some(frame))
+                }
+                other => other,
+            }
+        }
+
+        fn poll_invalidation(&mut self) -> Option<rc_capture::InvalidationReason> {
+            self.inner.poll_invalidation()
+        }
+
+        fn rebuild(&mut self) -> Result<()> {
+            self.inner.rebuild()
+        }
+
+        fn display_info(&self) -> DisplayInfo {
+            self.inner.display_info()
+        }
+    }
+
     let host_built_c = Arc::clone(&host_built);
     let origin_c = Arc::clone(&origin);
     host.set_pipeline_factory_for(Box::new(move |pcfg| {
         host_built_c.fetch_add(1, Ordering::SeqCst);
-        *origin_c.lock().expect("origin") = Some(Instant::now());
+        let t0 = Instant::now();
+        *origin_c.lock().expect("origin") = Some(t0);
         let capture = FakeBackend::new(FakeBackendConfig {
             display: DisplayInfo {
                 id: rc_types::DisplayId(0),
@@ -1058,7 +1089,10 @@ fn quic_localhost_owner_ticket_streams_frames_without_password_or_approval() {
         )?;
         rc_pipeline::HostPipeline::with_backends_paced(
             pcfg.clone(),
-            Box::new(capture),
+            Box::new(WallCapture {
+                inner: capture,
+                origin: t0,
+            }),
             Box::new(encoder),
             true,
         )

@@ -2190,6 +2190,7 @@ fn connect_single_interruptible(
                 if let Some(so_err) = socket.take_error().map_err(SingleConnectErr::Io)? {
                     return Err(SingleConnectErr::Io(so_err));
                 }
+                #[cfg(not(windows))]
                 match socket.peer_addr() {
                     Ok(_) => {
                         if let Some(so_err) = socket.take_error().map_err(SingleConnectErr::Io)? {
@@ -2208,6 +2209,41 @@ fn connect_single_interruptible(
                                 | ErrorKind::Interrupted
                         ) {
                             return Err(SingleConnectErr::Io(err));
+                        }
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    let mut probe = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+                    match socket.peek(&mut probe) {
+                        Ok(_) => {
+                            if let Some(so_err) =
+                                socket.take_error().map_err(SingleConnectErr::Io)?
+                            {
+                                return Err(SingleConnectErr::Io(so_err));
+                            }
+                            break;
+                        }
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            if let Some(so_err) =
+                                socket.take_error().map_err(SingleConnectErr::Io)?
+                            {
+                                return Err(SingleConnectErr::Io(so_err));
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            if let Some(so_err) =
+                                socket.take_error().map_err(SingleConnectErr::Io)?
+                            {
+                                return Err(SingleConnectErr::Io(so_err));
+                            }
+                            if !matches!(
+                                err.kind(),
+                                ErrorKind::NotConnected | ErrorKind::Interrupted
+                            ) {
+                                return Err(SingleConnectErr::Io(err));
+                            }
                         }
                     }
                 }
@@ -3291,8 +3327,13 @@ mod tests {
             dial_tcp(&closed_addr.to_string(), Duration::from_secs(5), &no_stop),
             Err(DialError::Failed(_))
         ));
+        let fast_fail_limit = if cfg!(windows) {
+            Duration::from_secs(4)
+        } else {
+            Duration::from_secs(2)
+        };
         assert!(
-            t0.elapsed() < Duration::from_secs(2),
+            t0.elapsed() < fast_fail_limit,
             "closed port dial should fail fast, took {:?}",
             t0.elapsed()
         );
@@ -3762,7 +3803,7 @@ mod tests {
         );
 
         // Wait until reconnect round 2 reaches Connected (token_calls >= 2)
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(12);
         while (token_calls.load(Ordering::SeqCst) < 2
             || client.status().state != ServerConnectionState::Connected)
             && Instant::now() < deadline

@@ -71,6 +71,8 @@ const RELAY_TX_DATAGRAM_MAX_BYTES: usize = 4 * 1024 * 1024;
 const RELAY_TX_RELIABLE_CAP: usize = 512;
 /// 后台写线程单次 TCP 写超时（防止对端黑洞永久卡住写线程）。
 const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 后台读线程轮询 `cancel` 标志的读取超时（兼容 Windows 上 `TcpStream::shutdown` 不立即唤醒阻塞读的情况）。
+const RELAY_READ_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 /// 握手期间轮询取消标志的切片上限（<= 100ms）。
 const HANDSHAKE_POLL_SLICE: Duration = Duration::from_millis(50);
 /// 多候选地址拨号时的单地址最小超时预算。
@@ -222,6 +224,7 @@ pub struct RelayShutdownHandle {
     cancel: Arc<AtomicBool>,
     stream: Arc<Mutex<Option<TcpStream>>>,
     tx: Option<Arc<TxQueue>>,
+    rx: Option<Arc<RxQueue>>,
 }
 
 impl RelayShutdownHandle {
@@ -230,6 +233,9 @@ impl RelayShutdownHandle {
         self.cancel.store(true, Ordering::Release);
         if let Some(tx) = &self.tx {
             tx.mark_closed();
+        }
+        if let Some(rx) = &self.rx {
+            rx.push_disconnected("relay shutdown requested".to_string());
         }
         let stream = self.stream.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(s) = stream {
@@ -415,6 +421,7 @@ impl TxQueue {
     }
 }
 
+#[derive(Debug)]
 struct RxQueueInner {
     events: VecDeque<NetEvent>,
     total_bytes: usize,
@@ -422,6 +429,7 @@ struct RxQueueInner {
     shutdown: bool,
 }
 
+#[derive(Debug)]
 struct RxQueue {
     inner: Mutex<RxQueueInner>,
     cv: Condvar,
@@ -1804,8 +1812,9 @@ fn connect_relay_internal(
         }
     };
 
-    // 握手成功：读端不设超时（由 shutdown_handle 中断），写端设有限超时防黑洞卡死。
-    stream.set_read_timeout(None)?;
+    // 握手成功：读端设置短读超时以按切片响应 cancel（Windows 下 shutdown 不一定唤醒阻塞 read），
+    // 写端设有限超时防黑洞卡死。
+    stream.set_read_timeout(Some(RELAY_READ_POLL_TIMEOUT))?;
     stream.set_write_timeout(Some(RELAY_WRITE_TIMEOUT))?;
 
     if cancel.load(Ordering::Acquire) {
@@ -1827,6 +1836,7 @@ fn connect_relay_internal(
         cancel,
         stream: Arc::new(Mutex::new(Some(shutdown_stream))),
         tx: Some(Arc::clone(&tx)),
+        rx: Some(Arc::clone(&rx)),
     };
 
     let tls_stack = if outer_conn.is_some() || inner_conn.is_some() {
@@ -1845,6 +1855,7 @@ fn connect_relay_internal(
     let tx_for_reader = Arc::clone(&tx);
     let recv_counter = Arc::clone(&bytes_recv);
     let tls_for_reader = tls_stack.clone();
+    let cancel_for_reader = Arc::clone(&shutdown_handle.cancel);
     let reader_thread = thread::Builder::new()
         .name("rc-relay-rx".to_string())
         .spawn(move || {
@@ -1856,9 +1867,16 @@ fn connect_relay_internal(
                     tx_for_reader,
                     rx_for_reader,
                     recv_counter,
+                    cancel_for_reader,
                 );
             } else {
-                reader_loop_plain(read_stream, initial_plaintext, rx_for_reader, recv_counter);
+                reader_loop_plain(
+                    read_stream,
+                    initial_plaintext,
+                    rx_for_reader,
+                    recv_counter,
+                    cancel_for_reader,
+                );
             }
         })
         .map_err(|e| Error::Network(format!("spawn relay reader thread failed: {e}")))?;
@@ -1976,23 +1994,21 @@ fn writer_loop(
 #[derive(Debug)]
 enum FrameReadError {
     Eof,
+    Cancelled,
     Io(io::Error),
     Protocol(String),
 }
 
-/// 从字节流读取一条完整的中继复用帧 `[ch: u8][len: u32 BE][payload]`。
+/// 从字节流读取一条完整的中继复用帧 `[ch: u8][len: u32 BE][payload]`，并按 `cancel` 可中断。
 ///
 /// 使用 `stream.take(len as u64)` 渐进式读入负载，初始容量封顶 64 KiB，
 /// 防止恶意或损坏的大长度头在未收到实际数据时一次性分配 4 MiB。
-fn read_exact_frame(stream: &mut impl Read) -> std::result::Result<(u8, Vec<u8>), FrameReadError> {
+fn read_exact_frame_cancellable(
+    stream: &mut impl Read,
+    cancel: &AtomicBool,
+) -> std::result::Result<(u8, Vec<u8>), FrameReadError> {
     let mut header = [0u8; 5];
-    if let Err(err) = read_exact_retry(stream, &mut header) {
-        return if err.kind() == ErrorKind::UnexpectedEof {
-            Err(FrameReadError::Eof)
-        } else {
-            Err(FrameReadError::Io(err))
-        };
-    }
+    read_exact_retry_cancellable(stream, &mut header, cancel)?;
 
     let ch = header[0];
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
@@ -2012,6 +2028,9 @@ fn read_exact_frame(stream: &mut impl Read) -> std::result::Result<(u8, Vec<u8>)
         let mut limited = stream.take(len as u64);
         let mut chunk = [0u8; 16 * 1024];
         while payload.len() < len {
+            if cancel.load(Ordering::Acquire) {
+                return Err(FrameReadError::Cancelled);
+            }
             match limited.read(&mut chunk) {
                 Ok(0) => {
                     return Err(FrameReadError::Io(io::Error::new(
@@ -2021,6 +2040,12 @@ fn read_exact_frame(stream: &mut impl Read) -> std::result::Result<(u8, Vec<u8>)
                 }
                 Ok(n) => payload.extend_from_slice(&chunk[..n]),
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(FrameReadError::Cancelled);
+                    }
+                    continue;
+                }
                 Err(e) => return Err(FrameReadError::Io(e)),
             }
         }
@@ -2029,21 +2054,31 @@ fn read_exact_frame(stream: &mut impl Read) -> std::result::Result<(u8, Vec<u8>)
     Ok((ch, payload))
 }
 
+#[cfg(test)]
+fn read_exact_frame(stream: &mut impl Read) -> std::result::Result<(u8, Vec<u8>), FrameReadError> {
+    read_exact_frame_cancellable(stream, &AtomicBool::new(false))
+}
+
 fn reader_loop_plain(
     stream: TcpStream,
     initial_plaintext: Vec<u8>,
     rx: Arc<RxQueue>,
     bytes_recv: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
 ) {
     if initial_plaintext.is_empty() {
         let mut stream = stream;
         loop {
-            match read_exact_frame(&mut stream) {
+            match read_exact_frame_cancellable(&mut stream, &cancel) {
                 Ok((ch, payload)) => {
                     dispatch_decoded_frame(ch, payload, &rx, &bytes_recv);
                 }
                 Err(FrameReadError::Eof) => {
                     rx.push_disconnected("relay stream closed by peer".to_string());
+                    return;
+                }
+                Err(FrameReadError::Cancelled) => {
+                    rx.push_disconnected("relay shutdown requested".to_string());
                     return;
                 }
                 Err(FrameReadError::Protocol(reason)) => {
@@ -2059,12 +2094,16 @@ fn reader_loop_plain(
     } else {
         let mut chained = io::Cursor::new(initial_plaintext).chain(stream);
         loop {
-            match read_exact_frame(&mut chained) {
+            match read_exact_frame_cancellable(&mut chained, &cancel) {
                 Ok((ch, payload)) => {
                     dispatch_decoded_frame(ch, payload, &rx, &bytes_recv);
                 }
                 Err(FrameReadError::Eof) => {
                     rx.push_disconnected("relay stream closed by peer".to_string());
+                    return;
+                }
+                Err(FrameReadError::Cancelled) => {
+                    rx.push_disconnected("relay shutdown requested".to_string());
                     return;
                 }
                 Err(FrameReadError::Protocol(reason)) => {
@@ -2138,6 +2177,7 @@ fn reader_loop_tls(
     tx: Arc<TxQueue>,
     rx: Arc<RxQueue>,
     bytes_recv: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
 ) {
     let mut plain_buf = initial_plaintext;
     let mut read_pos = 0usize;
@@ -2176,6 +2216,10 @@ fn reader_loop_tls(
     }
 
     loop {
+        if cancel.load(Ordering::Acquire) {
+            rx.push_disconnected("relay shutdown requested".to_string());
+            return;
+        }
         // 绝不持有 tls 锁阻塞在 TcpStream::read() 上，保证写线程零阻塞全双工转发。
         let n = match stream.read(&mut net_buf) {
             Ok(0) => {
@@ -2190,6 +2234,13 @@ fn reader_loop_tls(
             }
             Ok(n) => n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if cancel.load(Ordering::Acquire) {
+                    rx.push_disconnected("relay shutdown requested".to_string());
+                    return;
+                }
+                continue;
+            }
             Err(e) => {
                 rx.push_disconnected(format!("relay read error: {e}"));
                 return;
@@ -2297,6 +2348,7 @@ fn connect_single_cancellable(
                 if let Some(so_err) = socket.take_error().map_err(SingleConnectErr::Io)? {
                     return Err(SingleConnectErr::Io(so_err));
                 }
+                #[cfg(not(windows))]
                 match socket.peer_addr() {
                     Ok(_) => {
                         if let Some(so_err) = socket.take_error().map_err(SingleConnectErr::Io)? {
@@ -2315,6 +2367,41 @@ fn connect_single_cancellable(
                                 | ErrorKind::Interrupted
                         ) {
                             return Err(SingleConnectErr::Io(err));
+                        }
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    let mut probe = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+                    match socket.peek(&mut probe) {
+                        Ok(_) => {
+                            if let Some(so_err) =
+                                socket.take_error().map_err(SingleConnectErr::Io)?
+                            {
+                                return Err(SingleConnectErr::Io(so_err));
+                            }
+                            break;
+                        }
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            if let Some(so_err) =
+                                socket.take_error().map_err(SingleConnectErr::Io)?
+                            {
+                                return Err(SingleConnectErr::Io(so_err));
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            if let Some(so_err) =
+                                socket.take_error().map_err(SingleConnectErr::Io)?
+                            {
+                                return Err(SingleConnectErr::Io(so_err));
+                            }
+                            if !matches!(
+                                err.kind(),
+                                ErrorKind::NotConnected | ErrorKind::Interrupted
+                            ) {
+                                return Err(SingleConnectErr::Io(err));
+                            }
                         }
                     }
                 }
@@ -2405,18 +2492,27 @@ fn write_all_retry(stream: &mut TcpStream, mut buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn read_exact_retry(stream: &mut impl Read, mut buf: &mut [u8]) -> io::Result<()> {
+fn read_exact_retry_cancellable(
+    stream: &mut impl Read,
+    mut buf: &mut [u8],
+    cancel: &AtomicBool,
+) -> std::result::Result<(), FrameReadError> {
     while !buf.is_empty() {
+        if cancel.load(Ordering::Acquire) {
+            return Err(FrameReadError::Cancelled);
+        }
         match stream.read(buf) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "relay stream hit EOF before completing frame",
-                ));
-            }
+            Ok(0) => return Err(FrameReadError::Eof),
             Ok(n) => buf = &mut buf[n..],
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(FrameReadError::Cancelled);
+                }
+                continue;
+            }
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(FrameReadError::Eof),
+            Err(e) => return Err(FrameReadError::Io(e)),
         }
     }
     Ok(())

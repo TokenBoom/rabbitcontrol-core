@@ -658,16 +658,41 @@ mod tests {
             "master_fd must have FD_CLOEXEC"
         );
 
-        // Pre-fill pending_write leaving only 2 bytes of room, then attempt to write a 3-byte UTF-8 char.
-        // First fill the kernel buffer or directly pre-seed pending_write so try_flush cannot drain all
-        // when flow-control is paused, OR verify atomic rejection when remaining > avail.
-        let _ = pty.write_input(&[0x13]); // Ctrl+S pause
-        let fill = vec![b'x'; 16 * 1024];
-        while pty.pending_write_len() == 0 {
+        // Freeze the child shell process so it cannot drain the slave PTY concurrently,
+        // ensuring the kernel PTY buffer fills deterministically on both Linux and macOS.
+        let pid = pty.child.id() as libc::pid_t;
+        // SAFETY: `pid` belongs to the live child process owned by `pty` and has not been reaped;
+        // stopping it freezes slave-side PTY reads so the kernel input buffer stays saturated.
+        unsafe {
+            let _ = libc::kill(-pid, libc::SIGSTOP);
+            let _ = libc::kill(pid, libc::SIGSTOP);
+        }
+        let stop_deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < stop_deadline {
+            let mut status: libc::c_int = 0;
+            // SAFETY: `pid` is owned by `pty`; `WUNTRACED | WNOHANG` observes stopped state without reaping.
+            let rc = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if rc == pid && libc::WIFSTOPPED(status) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Fill the kernel buffer with newline-delimited 4 KiB blocks (works in both ICANON & raw modes)
+        // until writes spill into `pending_write`, then top up leaving only 2 bytes of room.
+        let fill = b"xxxxxxxxxxxxxxx\n".repeat(256);
+        for _ in 0..1024 {
+            if pty.pending_write_len() > 0 {
+                break;
+            }
             if pty.write_input(&fill).is_err() {
                 break;
             }
         }
+        assert!(
+            pty.pending_write_len() > 0,
+            "kernel PTY buffer must saturate while child is stopped"
+        );
         // Top up pending_write to leave exactly 2 bytes free.
         let cur = pty.pending_write_len();
         if cur < PTY_PENDING_WRITE_CAP - 2 {

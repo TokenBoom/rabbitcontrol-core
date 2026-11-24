@@ -501,11 +501,26 @@ impl HostPipeline {
                             }
                             if pace {
                                 next_emit += interval;
-                                let n = std::time::Instant::now();
-                                if next_emit > n {
-                                    std::thread::sleep(next_emit - n);
-                                } else {
-                                    next_emit = n;
+                                let mut now = std::time::Instant::now();
+                                if next_emit + interval * 2 < now {
+                                    // 仅在极端调度卡顿落后超 2 帧时重锚，避免单次微抖动拖垮长时均帧率。
+                                    next_emit = now;
+                                }
+                                while next_emit > now && !stop_flag.load(Ordering::Acquire) {
+                                    let rem = next_emit - now;
+                                    if rem > Duration::from_millis(2) {
+                                        // 分片短睡（≤2ms）规避 macOS XNU 定时器合并把 16.7ms 拉长至 ~40ms，
+                                        // 同时使 stop_capture() 能在 ≤2ms 内及时退出。
+                                        std::thread::sleep(
+                                            (rem - Duration::from_millis(1))
+                                                .min(Duration::from_millis(2)),
+                                        );
+                                    } else if rem > Duration::from_micros(300) {
+                                        std::thread::sleep(Duration::from_micros(200));
+                                    } else {
+                                        std::thread::yield_now();
+                                    }
+                                    now = std::time::Instant::now();
                                 }
                             }
                         }

@@ -417,6 +417,41 @@ mod quic_session_auth {
 
     type OriginSlot = Arc<Mutex<Option<Instant>>>;
 
+    /// 将 FakeBackend 的帧时间戳改写为相对管线创建时刻 `origin` 的墙钟微秒，
+    /// 与 `origin_clock` 对齐（避免 macOS/Windows CI 虚机睡眠抖动触发 Stale 丢帧）。
+    struct WallCapture {
+        inner: rc_capture::FakeBackend,
+        origin: Instant,
+    }
+
+    impl rc_capture::CaptureBackend for WallCapture {
+        fn next_frame(
+            &mut self,
+            timeout: Duration,
+        ) -> rc_types::Result<Option<rc_capture::CapturedFrame>> {
+            match self.inner.next_frame(timeout) {
+                Ok(Some(mut frame)) => {
+                    let us = u32::try_from(self.origin.elapsed().as_micros()).unwrap_or(u32::MAX);
+                    frame.timestamp = rc_types::Timestamp(us);
+                    Ok(Some(frame))
+                }
+                other => other,
+            }
+        }
+
+        fn poll_invalidation(&mut self) -> Option<rc_capture::InvalidationReason> {
+            self.inner.poll_invalidation()
+        }
+
+        fn rebuild(&mut self) -> rc_types::Result<()> {
+            self.inner.rebuild()
+        }
+
+        fn display_info(&self) -> rc_capture::DisplayInfo {
+            self.inner.display_info()
+        }
+    }
+
     fn origin_clock(origin: OriginSlot) -> SessionClock {
         Arc::new(move || match *origin.lock().expect("origin lock") {
             Some(o) => u32::try_from(o.elapsed().as_micros()).unwrap_or(u32::MAX),
@@ -452,7 +487,8 @@ mod quic_session_auth {
         let factory_origin = Arc::clone(&origin);
         host.set_pipeline_factory_for(Box::new(move |pcfg| {
             pipelines_built.fetch_add(1, Ordering::SeqCst);
-            *factory_origin.lock().expect("origin lock") = Some(Instant::now());
+            let t0 = Instant::now();
+            *factory_origin.lock().expect("origin lock") = Some(t0);
             let capture = rc_capture::FakeBackend::new(rc_capture::FakeBackendConfig {
                 display: rc_capture::DisplayInfo {
                     id: rc_types::DisplayId(0),
@@ -476,7 +512,10 @@ mod quic_session_auth {
             )?;
             rc_pipeline::HostPipeline::with_backends_paced(
                 pcfg.clone(),
-                Box::new(capture),
+                Box::new(WallCapture {
+                    inner: capture,
+                    origin: t0,
+                }),
                 Box::new(encoder),
                 true,
             )
@@ -940,12 +979,18 @@ mod quic_session_auth {
 
         // 阶段 3：重连后持续流帧
         let post_deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < post_deadline && client.pipeline().displayed() < 2 {
+        while Instant::now() < post_deadline
+            && client.state() == SessionState::Streaming
+            && client.pipeline().displayed() < 2
+        {
             let now_us = u64::from((client_clock)());
             client.pump_probes(now_us).expect("pump_probes");
-            client
+            let r = client
                 .tick(Duration::from_millis(2), Instant::now())
                 .expect("post-reconnect tick");
+            if r.closed.is_some() {
+                break;
+            }
         }
         assert!(
             client.pipeline().displayed() >= 2,
