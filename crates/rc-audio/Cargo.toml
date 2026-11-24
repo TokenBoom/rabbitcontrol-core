@@ -1,0 +1,10 @@
+[package]
+name = "rc-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl 音频子系统：纯 Rust IMA-ADPCM 编解码 + 跨平台低延迟采集与播放抽象。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }

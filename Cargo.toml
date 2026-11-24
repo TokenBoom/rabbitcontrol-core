@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rc-types",
+    "crates/rc-diff",
+    "crates/rc-sched",
+    "crates/rc-fec",
+    "crates/rc-proto",
+    "crates/rc-trace",
+    "crates/rc-loopback",
+    "crates/rc-capture",
+    "crates/rc-encode",
+    "crates/rc-input",
+    "crates/rc-decode",
+    "crates/rc-render",
+    "crates/rc-pipeline",
+    "crates/rc-net",
+    "crates/rc-session",
+    "crates/rc-audio",
+    "crates/rc-tools",
+    "crates/rc-client-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "AGPL-3.0-only"
+
+[profile.dev]
+opt-level = 0
+debug = 1
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 0
+debug = 1
+
+[profile.dev-debug]
+inherits = "dev"
+debug = 2
+
+[profile.bench]
+inherits = "release"
+debug = 1
+lto = "thin"
+codegen-units = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
