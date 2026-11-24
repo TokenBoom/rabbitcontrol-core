@@ -2096,9 +2096,9 @@ mod tests {
 
     #[test]
     fn part_file_path_includes_unique_entropy_and_short_length() {
-        let dir = Path::new("/tmp");
-        let p1 = part_file_path(dir, 7);
-        let p2 = part_file_path(dir, 7);
+        let dir = std::env::temp_dir();
+        let p1 = part_file_path(&dir, 7);
+        let p2 = part_file_path(&dir, 7);
         assert_ne!(p1, p2);
         let name1 = p1.file_name().unwrap().to_str().unwrap();
         assert!(name1.starts_with(".rcpart.7."));

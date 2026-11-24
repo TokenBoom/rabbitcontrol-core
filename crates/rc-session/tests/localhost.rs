@@ -374,9 +374,43 @@ fn localhost_input_flows_to_injector() {
 // T22 审批集成测试（进程内双端、真 QUIC over 127.0.0.1:0、免权限）
 // ─────────────────────────────────────────────────────────────────
 
-/// 给假后端 `HostSession` 挂上与 `host_session()` 同款的假采集/编码管线工厂。
-fn attach_fake_host_pipeline(host: &mut HostSession) {
-    host.set_pipeline_factory_for(Box::new(|pcfg| {
+/// 将 FakeBackend 的帧时间戳对齐到宿主注入的 `SessionClock`，避免握手耗时超过
+/// `target_latency_us` 时逻辑时间戳 `0` 被调度器判定为 Stale 丢弃。
+struct ClockCapture {
+    inner: rc_capture::FakeBackend,
+    clock: SessionClock,
+}
+
+impl rc_capture::CaptureBackend for ClockCapture {
+    fn next_frame(
+        &mut self,
+        timeout: Duration,
+    ) -> rc_types::Result<Option<rc_capture::CapturedFrame>> {
+        match self.inner.next_frame(timeout) {
+            Ok(Some(mut frame)) => {
+                frame.timestamp = rc_types::Timestamp((self.clock)());
+                Ok(Some(frame))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_invalidation(&mut self) -> Option<rc_capture::InvalidationReason> {
+        self.inner.poll_invalidation()
+    }
+
+    fn rebuild(&mut self) -> rc_types::Result<()> {
+        self.inner.rebuild()
+    }
+
+    fn display_info(&self) -> rc_capture::DisplayInfo {
+        self.inner.display_info()
+    }
+}
+
+/// 给假后端 `HostSession` 挂上与 `host_session()` 同款的假采集/编码管线工厂，并将帧时间戳对齐到 `clock`。
+fn attach_fake_host_pipeline(host: &mut HostSession, clock: SessionClock) {
+    host.set_pipeline_factory_for(Box::new(move |pcfg| {
         let capture = rc_capture::FakeBackend::new(rc_capture::FakeBackendConfig {
             display: rc_capture::DisplayInfo {
                 id: rc_types::DisplayId(0),
@@ -400,7 +434,10 @@ fn attach_fake_host_pipeline(host: &mut HostSession) {
         )?;
         rc_pipeline::HostPipeline::with_backends_paced(
             pcfg.clone(),
-            Box::new(capture),
+            Box::new(ClockCapture {
+                inner: capture,
+                clock: Arc::clone(&clock),
+            }),
             Box::new(encoder),
             true,
         )
@@ -427,10 +464,10 @@ fn host_session_with(
         },
         SERVER_CERT_PEM,
         SERVER_KEY_PEM,
-        clock,
+        Arc::clone(&clock),
     )
     .expect("host session");
-    attach_fake_host_pipeline(&mut host);
+    attach_fake_host_pipeline(&mut host, clock);
     host
 }
 
@@ -950,9 +987,10 @@ fn headless_default_keeps_t18_handshake_shape() {
         hcfg.mtu = rc_session::DEFAULT_SESSION_MTU;
         hcfg.pipeline = pcfg();
         hcfg.pace_capture = true;
-        let mut host =
-            HostSession::new(hcfg, SERVER_CERT_PEM, SERVER_KEY_PEM, wall_clock()).expect("host");
-        attach_fake_host_pipeline(&mut host);
+        let clock = wall_clock();
+        let mut host = HostSession::new(hcfg, SERVER_CERT_PEM, SERVER_KEY_PEM, Arc::clone(&clock))
+            .expect("host");
+        attach_fake_host_pipeline(&mut host, clock);
         let host_addr = host.local_addr().expect("host addr");
         let host_thread = thread::spawn(move || {
             host.accept_and_handshake(CONNECT_TIMEOUT)
@@ -1008,9 +1046,10 @@ fn headless_default_keeps_t18_handshake_shape() {
         hcfg.mtu = rc_session::DEFAULT_SESSION_MTU;
         hcfg.pipeline = pcfg();
         hcfg.pace_capture = true;
-        let mut host =
-            HostSession::new(hcfg, SERVER_CERT_PEM, SERVER_KEY_PEM, wall_clock()).expect("host");
-        attach_fake_host_pipeline(&mut host);
+        let clock = wall_clock();
+        let mut host = HostSession::new(hcfg, SERVER_CERT_PEM, SERVER_KEY_PEM, Arc::clone(&clock))
+            .expect("host");
+        attach_fake_host_pipeline(&mut host, clock);
         let host_addr = host.local_addr().expect("host addr");
         let host_thread = spawn_host(host, Duration::from_secs(2));
 
