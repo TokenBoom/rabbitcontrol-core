@@ -31,12 +31,50 @@ fn cfg() -> PipelineConfig {
 fn fake_capture(content: FakeContent, fps: u32) -> Box<dyn CaptureBackend> {
     Box::new(
         FakeBackend::new(FakeBackendConfig {
+            display: rc_capture::DisplayInfo {
+                id: rc_types::DisplayId(0),
+                resolution: Resolution::new(64, 64),
+                scale: 1.0,
+                hdr: false,
+            },
             fps,
             content,
             ..FakeBackendConfig::default()
         })
         .expect("fake backend config valid"),
     )
+}
+
+/// 墙钟包装假采集：与 `session_clock()` 同零点，防止慢速 CI 虚机上调度/启动暂停后
+/// `FakeBackend` 合成零基时间戳落到 `target_latency_us` 之前引发 `Stale` 假阳性。
+struct WallCapture {
+    inner: Box<dyn CaptureBackend>,
+    anchor: std::time::Instant,
+}
+
+impl CaptureBackend for WallCapture {
+    fn next_frame(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<rc_capture::CapturedFrame>> {
+        match self.inner.next_frame(timeout)? {
+            Some(mut frame) => {
+                frame.timestamp =
+                    Timestamp(u32::try_from(self.anchor.elapsed().as_micros()).unwrap_or(u32::MAX));
+                Ok(Some(frame))
+            }
+            None => Ok(None),
+        }
+    }
+    fn poll_invalidation(&mut self) -> Option<rc_capture::InvalidationReason> {
+        self.inner.poll_invalidation()
+    }
+    fn rebuild(&mut self) -> Result<()> {
+        self.inner.rebuild()
+    }
+    fn display_info(&self) -> rc_capture::DisplayInfo {
+        self.inner.display_info()
+    }
 }
 
 fn fake_encoder() -> Box<dyn Encoder> {
@@ -209,7 +247,11 @@ fn host_controller(
 ) {
     // 节流模式：假采集按 60fps 墙钟供帧——异步采集线程下的确定性前提
     //（不节流会瞬时洪灌通道，帧数变成竞态）。
-    let (clock, _start) = session_clock();
+    let (clock, start) = session_clock();
+    let capture = Box::new(WallCapture {
+        inner: capture,
+        anchor: start,
+    });
     let mut host =
         HostPipeline::with_backends_paced(cfg(), capture, encoder, true).expect("host ok");
     host.set_clock(std::sync::Arc::clone(&clock));
@@ -339,12 +381,12 @@ fn on_encoded_called_on_all_paths() {
 fn reassembly_waits_for_all_packets() {
     // 输出 3000 字节 → 1200+1200+600 三包。
     let encoder = Box::new(FakeEncoder::with_tuning(encoder_cfg(), 5_000, 3_000).expect("valid"));
-    let (mut host, mut controller, _clock) =
+    let (mut host, mut controller, clock) =
         host_controller(fake_capture(FakeContent::Dynamic, 60), encoder);
     let mut datagrams = Vec::new();
     // 异步编码：多 tick 几轮让完成到达。
-    for i in 0..12u32 {
-        if let Some(d) = host.tick(i * 5_000).expect("tick") {
+    for _ in 0..12u32 {
+        if let Some(d) = host.tick(clock()).expect("tick") {
             datagrams.extend(d);
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -383,12 +425,15 @@ fn keyframe_request_propagates_to_encoder() {
         })
         .expect("valid"),
     );
-    let (clock, _) = session_clock();
+    let (clock, start) = session_clock();
     let mut controller =
         ControllerPipeline::with_backends(cfg(), decoder, fake_renderer()).expect("ctl ok");
     let mut host = HostPipeline::with_backends_paced(
         cfg(),
-        fake_capture(FakeContent::Dynamic, 60),
+        Box::new(WallCapture {
+            inner: fake_capture(FakeContent::Dynamic, 60),
+            anchor: start,
+        }),
         fake_encoder(),
         true,
     )

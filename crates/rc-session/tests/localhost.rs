@@ -69,6 +69,37 @@ fn origin_clock(origin: OriginSlot) -> SessionClock {
     })
 }
 
+struct WallCapture {
+    inner: rc_capture::FakeBackend,
+    anchor: Instant,
+}
+
+impl rc_capture::CaptureBackend for WallCapture {
+    fn next_frame(
+        &mut self,
+        timeout: Duration,
+    ) -> rc_types::Result<Option<rc_capture::CapturedFrame>> {
+        match self.inner.next_frame(timeout)? {
+            Some(mut frame) => {
+                frame.timestamp = rc_types::Timestamp(
+                    u32::try_from(self.anchor.elapsed().as_micros()).unwrap_or(u32::MAX),
+                );
+                Ok(Some(frame))
+            }
+            None => Ok(None),
+        }
+    }
+    fn poll_invalidation(&mut self) -> Option<rc_capture::InvalidationReason> {
+        self.inner.poll_invalidation()
+    }
+    fn rebuild(&mut self) -> rc_types::Result<()> {
+        self.inner.rebuild()
+    }
+    fn display_info(&self) -> rc_capture::DisplayInfo {
+        self.inner.display_info()
+    }
+}
+
 /// host 会话（真网络端点 + 假后端工厂 + 记录注入器）。
 /// 返回会话与注入器克隆（断言已注入事件用）。
 fn host_session(injector: RecordingInjector) -> (HostSession, OriginSlot) {
@@ -91,10 +122,11 @@ fn host_session(injector: RecordingInjector) -> (HostSession, OriginSlot) {
         clock,
     )
     .expect("host session");
-    // 工厂：锚定会话零点于假后端构造同刻，再建假栈（带节流，坑 4）。
+    // 工厂：锚定会话零点于假后端构造同刻，再建假栈（带节流，坑 4 + WallCapture 防 VM 暂停漂移）。
     let factory_origin = Arc::clone(&origin);
     host.set_pipeline_factory_for(Box::new(move |pcfg| {
-        *factory_origin.lock().expect("origin lock") = Some(Instant::now());
+        let anchor = Instant::now();
+        *factory_origin.lock().expect("origin lock") = Some(anchor);
         let capture = rc_capture::FakeBackend::new(rc_capture::FakeBackendConfig {
             display: rc_capture::DisplayInfo {
                 id: rc_types::DisplayId(0),
@@ -118,7 +150,10 @@ fn host_session(injector: RecordingInjector) -> (HostSession, OriginSlot) {
         )?;
         rc_pipeline::HostPipeline::with_backends_paced(
             pcfg.clone(),
-            Box::new(capture),
+            Box::new(WallCapture {
+                inner: capture,
+                anchor,
+            }),
             Box::new(encoder),
             true,
         )

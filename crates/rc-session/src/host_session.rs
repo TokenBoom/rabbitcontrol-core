@@ -681,11 +681,16 @@ impl HostSession {
             });
         }
         let mut report = HostTickReport::default();
+        let effective_budget = if self.pipeline.as_ref().is_some_and(|p| p.has_pending_work()) {
+            Duration::ZERO
+        } else {
+            poll_budget
+        };
         let events = self
             .transport
             .as_mut()
             .expect("Streaming implies transport")
-            .poll(poll_budget)?;
+            .poll(effective_budget)?;
 
         let mut bye: Option<ByeReason> = None;
         let mut disconnected = false;

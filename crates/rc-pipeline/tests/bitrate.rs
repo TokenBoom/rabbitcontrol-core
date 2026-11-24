@@ -30,6 +30,12 @@ fn cfg() -> PipelineConfig {
 fn capture(content: FakeContent) -> Box<dyn CaptureBackend> {
     Box::new(
         FakeBackend::new(FakeBackendConfig {
+            display: rc_capture::DisplayInfo {
+                id: rc_types::DisplayId(0),
+                resolution: rc_types::Resolution::new(64, 64),
+                scale: 1.0,
+                hdr: false,
+            },
             content,
             ..FakeBackendConfig::default()
         })

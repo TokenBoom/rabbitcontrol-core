@@ -2155,7 +2155,7 @@ fn is_connect_in_progress(err: &io::Error) -> bool {
         }
         #[cfg(windows)]
         {
-            matches!(err.raw_os_error(), Some(10035 | 10036 | 10037))
+            matches!(err.raw_os_error(), Some(10035..=10037))
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
@@ -3664,12 +3664,26 @@ mod tests {
                 }),
             );
 
-            // Read UpdateAssistState + ConnectRequest (order: UpdateAssistState then ConnectRequest)
-            let upd = read_tls_json(&mut tls);
+            // Read UpdateAssistState + ConnectRequest (order: UpdateAssistState then ConnectRequest),
+            // skipping any background periodic heartbeat ticks that may interleave.
+            let read_non_heartbeat = |s: &mut rustls::StreamOwned<
+                rustls::ServerConnection,
+                TcpStream,
+            >|
+             -> serde_json::Value {
+                for _ in 0..16 {
+                    let msg = read_tls_json(s);
+                    if msg["type"] != "heartbeat" {
+                        return msg;
+                    }
+                }
+                panic!("too many heartbeats without expected signaling message");
+            };
+            let upd = read_non_heartbeat(&mut tls);
             assert_eq!(upd["type"], "update_assist_state");
             assert_eq!(upd["allow_remote_assist"], true);
 
-            let req = read_tls_json(&mut tls);
+            let req = read_non_heartbeat(&mut tls);
             assert_eq!(req["type"], "connect_request");
             let sid = req["session_id"].as_str().unwrap().to_string();
             write_tls_json(

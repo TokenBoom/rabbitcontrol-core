@@ -46,6 +46,12 @@ fn cfg(max_packet_payload: usize) -> PipelineConfig {
 fn fake_capture() -> Box<dyn CaptureBackend> {
     Box::new(
         FakeBackend::new(FakeBackendConfig {
+            display: rc_capture::DisplayInfo {
+                id: rc_types::DisplayId(0),
+                resolution: Resolution::new(64, 64),
+                scale: 1.0,
+                hdr: false,
+            },
             fps: 60,
             content: FakeContent::Dynamic,
             ..FakeBackendConfig::default()

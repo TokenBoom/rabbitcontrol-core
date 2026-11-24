@@ -2262,7 +2262,7 @@ fn is_connect_in_progress(err: &io::Error) -> bool {
         }
         #[cfg(windows)]
         {
-            matches!(err.raw_os_error(), Some(10035 | 10036 | 10037))
+            matches!(err.raw_os_error(), Some(10035..=10037))
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
