@@ -55,16 +55,15 @@ pub fn service_managed_marker_path() -> PathBuf {
 
 /// 判断当前环境是否启用了系统后台服务托管模式。
 pub fn is_service_managed() -> bool {
-    if std::env::var_os(ENV_DAEMON_MODE).is_some_and(|v| !v.to_string_lossy().trim().is_empty()) {
-        return true;
-    }
+    let daemon_env =
+        std::env::var_os(ENV_DAEMON_MODE).is_some_and(|v| !v.to_string_lossy().trim().is_empty());
     #[cfg(target_os = "macos")]
     {
-        service_managed_marker_path().exists()
+        daemon_env || service_managed_marker_path().exists()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        false
+        daemon_env
     }
 }
 

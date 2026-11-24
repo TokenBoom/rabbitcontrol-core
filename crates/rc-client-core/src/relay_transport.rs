@@ -2251,18 +2251,24 @@ enum SingleConnectErr {
 }
 
 fn is_connect_in_progress(err: &io::Error) -> bool {
-    if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) {
-        return true;
+    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) || {
+        #[cfg(target_os = "macos")]
+        {
+            matches!(err.raw_os_error(), Some(36 | 37))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            matches!(err.raw_os_error(), Some(115 | 114))
+        }
+        #[cfg(windows)]
+        {
+            matches!(err.raw_os_error(), Some(10035 | 10036 | 10037))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        {
+            false
+        }
     }
-    #[cfg(target_os = "macos")]
-    if matches!(err.raw_os_error(), Some(36 | 37)) {
-        return true;
-    }
-    #[cfg(target_os = "linux")]
-    if matches!(err.raw_os_error(), Some(115 | 114)) {
-        return true;
-    }
-    false
 }
 
 fn connect_single_cancellable(

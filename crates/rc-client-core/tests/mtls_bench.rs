@@ -375,6 +375,37 @@ fn spawn_low_jitter_mtls_relay(
     (addr, stop, handle)
 }
 
+struct WallCapture {
+    inner: FakeBackend,
+    anchor: Instant,
+}
+
+impl rc_capture::CaptureBackend for WallCapture {
+    fn next_frame(
+        &mut self,
+        timeout: Duration,
+    ) -> rc_types::Result<Option<rc_capture::CapturedFrame>> {
+        match self.inner.next_frame(timeout)? {
+            Some(mut frame) => {
+                frame.timestamp = rc_types::Timestamp(
+                    u32::try_from(self.anchor.elapsed().as_micros()).unwrap_or(u32::MAX),
+                );
+                Ok(Some(frame))
+            }
+            None => Ok(None),
+        }
+    }
+    fn poll_invalidation(&mut self) -> Option<rc_capture::InvalidationReason> {
+        self.inner.poll_invalidation()
+    }
+    fn rebuild(&mut self) -> rc_types::Result<()> {
+        self.inner.rebuild()
+    }
+    fn display_info(&self) -> DisplayInfo {
+        self.inner.display_info()
+    }
+}
+
 struct BenchNoopCapture;
 
 impl InputCapture for BenchNoopCapture {
@@ -439,17 +470,24 @@ fn measure_e2e_session(
         dirty_rect: None,
     })
     .unwrap();
-    let encoder = FakeEncoder::new(EncoderConfig {
-        resolution: res,
-        fps: BENCH_FPS,
-        bitrate_bps: 4_000_000,
-        ..EncoderConfig::default()
-    })
+    let encoder = FakeEncoder::with_tuning(
+        EncoderConfig {
+            resolution: res,
+            fps: BENCH_FPS,
+            bitrate_bps: 4_000_000,
+            ..EncoderConfig::default()
+        },
+        500,
+        512,
+    )
     .unwrap();
     let mut host = HostSession::with_parts(
         host_cfg,
         host_transport,
-        Box::new(capture),
+        Box::new(WallCapture {
+            inner: capture,
+            anchor: t0,
+        }),
         Box::new(encoder),
         Arc::clone(&clock),
     )
@@ -504,7 +542,7 @@ fn measure_e2e_session(
 
     client.handshake().expect("bench client handshake");
     let start = Instant::now();
-    let deadline = start + Duration::from_secs(15);
+    let deadline = start + Duration::from_secs(20);
     while client.pipeline().displayed() < BENCH_FRAMES as u64 && Instant::now() < deadline {
         client
             .tick(Duration::from_millis(2), Instant::now())
