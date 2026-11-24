@@ -658,66 +658,92 @@ mod tests {
             "master_fd must have FD_CLOEXEC"
         );
 
-        // Freeze the child shell process so it cannot drain the slave PTY concurrently,
-        // ensuring the kernel PTY buffer fills deterministically on both Linux and macOS.
-        let pid = pty.child.id() as libc::pid_t;
-        // SAFETY: `pid` belongs to the live child process owned by `pty` and has not been reaped;
-        // stopping it freezes slave-side PTY reads so the kernel input buffer stays saturated.
-        unsafe {
-            let _ = libc::kill(-pid, libc::SIGSTOP);
-            let _ = libc::kill(pid, libc::SIGSTOP);
+        // Use an RAII pipe swap so the write end has zero asynchronous kernel draining
+        // (unlike Linux n_tty's `flush_to_ldisc` workqueue), letting us verify `write_input`'s
+        // atomic UTF-8 overflow guard deterministically while restoring `master_fd` before Drop.
+        struct PipeSwapGuard<'a> {
+            pty: &'a mut PtyProcess,
+            orig_master_fd: RawFd,
+            pipe_rd: RawFd,
+            pipe_wr: RawFd,
         }
-        let stop_deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < stop_deadline {
-            let mut status: libc::c_int = 0;
-            // SAFETY: `pid` is owned by `pty`; `WUNTRACED | WNOHANG` observes stopped state without reaping.
-            let rc = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
-            if rc == pid && libc::WIFSTOPPED(status) {
-                break;
+        impl Drop for PipeSwapGuard<'_> {
+            fn drop(&mut self) {
+                self.pty.master_fd = self.orig_master_fd;
+                // SAFETY: `pipe_rd` and `pipe_wr` were created by `libc::pipe` and owned exclusively by this guard.
+                unsafe {
+                    libc::close(self.pipe_wr);
+                    libc::close(self.pipe_rd);
+                }
             }
-            thread::sleep(Duration::from_millis(5));
         }
 
-        // Fill the kernel buffer with newline-delimited 4 KiB blocks (works in both ICANON & raw modes)
-        // until writes spill into `pending_write`, then top up leaving only 2 bytes of room.
-        let fill = b"xxxxxxxxxxxxxxx\n".repeat(256);
+        let mut pipe_fds = [-1 as libc::c_int; 2];
+        // SAFETY: `pipe_fds` is a valid mutable 2-element `c_int` array.
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0, "pipe");
+        let pipe_rd = pipe_fds[0];
+        let pipe_wr = pipe_fds[1];
+        // SAFETY: `pipe_wr` is a valid open write-end pipe descriptor owned by this test.
+        unsafe {
+            let flags = libc::fcntl(pipe_wr, libc::F_GETFL);
+            assert!(flags >= 0, "F_GETFL on pipe_wr");
+            assert!(
+                libc::fcntl(pipe_wr, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0,
+                "F_SETFL O_NONBLOCK on pipe_wr"
+            );
+        }
+
+        let orig_master_fd = pty.master_fd;
+        pty.master_fd = pipe_wr;
+        let guard = PipeSwapGuard {
+            pty: &mut pty,
+            orig_master_fd,
+            pipe_rd,
+            pipe_wr,
+        };
+
+        // Fill `pipe_wr` until writes spill into `pending_write` (`pipe_rd` is never read).
+        let fill = vec![b'x'; 4096];
         for _ in 0..1024 {
-            if pty.pending_write_len() > 0 {
+            if guard.pty.pending_write_len() > 0 {
                 break;
             }
-            if pty.write_input(&fill).is_err() {
+            if guard.pty.write_input(&fill).is_err() {
                 break;
             }
         }
         assert!(
-            pty.pending_write_len() > 0,
-            "kernel PTY buffer must saturate while child is stopped"
+            guard.pty.pending_write_len() > 0,
+            "non-blocking pipe buffer must saturate"
         );
         // Top up pending_write to leave exactly 2 bytes free.
-        let cur = pty.pending_write_len();
+        let cur = guard.pty.pending_write_len();
         if cur < PTY_PENDING_WRITE_CAP - 2 {
-            pty.pending_write
+            guard
+                .pty
+                .pending_write
                 .extend(std::iter::repeat(b'y').take(PTY_PENDING_WRITE_CAP - 2 - cur));
         } else if cur > PTY_PENDING_WRITE_CAP - 2 {
-            pty.pending_write.truncate(PTY_PENDING_WRITE_CAP - 2);
+            guard.pty.pending_write.truncate(PTY_PENDING_WRITE_CAP - 2);
         }
-        let before_len = pty.pending_write_len();
+        let before_len = guard.pty.pending_write_len();
         assert_eq!(before_len, PTY_PENDING_WRITE_CAP - 2);
 
         // Attempt to write 3-byte UTF-8 "中" ([0xE4, 0xB8, 0xAD]): must fail atomically without pushing partial bytes!
         let cjk = "中".as_bytes();
         assert_eq!(cjk.len(), 3);
-        let res = pty.write_input(cjk);
+        let res = guard.pty.write_input(cjk);
         assert!(res.is_err(), "expected atomic overflow rejection");
         assert_eq!(
-            pty.pending_write_len(),
+            guard.pty.pending_write_len(),
             before_len,
             "pending_write must not be partially mutated on overflow"
         );
         assert_ne!(
-            pty.pending_write.back().copied(),
+            guard.pty.pending_write.back().copied(),
             Some(0xE4),
             "must not slice leading UTF-8 byte into pending_write"
         );
+        drop(guard);
     }
 }

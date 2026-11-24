@@ -261,9 +261,15 @@ pub fn select_capture_labeled(
         }
     }
     let fake = FakeBackend::new(FakeBackendConfig {
+        display: rc_capture::DisplayInfo {
+            id: rc_types::DisplayId(0),
+            resolution: cfg.resolution,
+            scale: 1.0,
+            hdr: false,
+        },
         fps: cfg.fps,
         content: FakeContent::Dynamic,
-        ..FakeBackendConfig::default()
+        dirty_rect: None,
     })?;
     Ok((Box::new(fake), "fake"))
 }

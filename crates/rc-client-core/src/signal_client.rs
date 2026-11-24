@@ -3597,6 +3597,7 @@ mod tests {
             // Round 1: initial connection -> accept TLS, verify Register fields, drop with server_shutdown kick
             {
                 let (tcp, _) = listener.accept().unwrap();
+                let _ = tcp.set_read_timeout(Some(Duration::from_secs(2)));
                 let conn = rustls::ServerConnection::new(Arc::clone(&tls_server_cfg)).unwrap();
                 let mut tls = rustls::StreamOwned::new(conn, tcp);
 
@@ -3633,7 +3634,8 @@ mod tests {
                     }),
                 );
 
-                // Expect server_shutdown kick to trigger reconnect with rotated token
+                // Expect server_shutdown kick to trigger reconnect with rotated token; send close_notify
+                // and drain until client closes so Windows does not RST away unread TLS data.
                 write_tls_json(
                     &mut tls,
                     &serde_json::json!({
@@ -3641,6 +3643,10 @@ mod tests {
                         "reason": "server_shutdown",
                     }),
                 );
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+                let mut sink = [0u8; 256];
+                while matches!(tls.read(&mut sink), Ok(n) if n > 0) {}
             }
 
             // Round 2: reconnect -> must fetch rotated token "tok-round-2", handle UpdateAssistState,
@@ -3759,8 +3765,10 @@ mod tests {
                     "reason": "account_disabled",
                 }),
             );
-            let mut sink = [0u8; 8];
-            let _ = tls.read(&mut sink);
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+            let mut sink = [0u8; 256];
+            while matches!(tls.read(&mut sink), Ok(n) if n > 0) {}
         });
 
         let token_calls = Arc::new(AtomicUsize::new(0));

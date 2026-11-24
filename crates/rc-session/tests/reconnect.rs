@@ -101,9 +101,41 @@ fn origin_clock(origin: OriginSlot) -> SessionClock {
     })
 }
 
-/// 建一个真网络 host（127.0.0.1:0，auto 假后端）。
-fn new_host(clock: &SessionClock) -> HostSession {
-    HostSession::new(
+/// 将 FakeBackend 的帧时间戳改写为相对管线创建时刻 `origin` 的墙钟微秒，
+/// 与共享 `OriginSlot` 对齐，避免 macOS/Windows CI 虚机睡眠抖动触发 Stale 丢帧。
+struct WallCapture {
+    inner: rc_capture::FakeBackend,
+    origin: Instant,
+}
+
+impl rc_capture::CaptureBackend for WallCapture {
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<rc_capture::CapturedFrame>> {
+        match self.inner.next_frame(timeout) {
+            Ok(Some(mut frame)) => {
+                let us = u32::try_from(self.origin.elapsed().as_micros()).unwrap_or(u32::MAX);
+                frame.timestamp = rc_types::Timestamp(us);
+                Ok(Some(frame))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_invalidation(&mut self) -> Option<rc_capture::InvalidationReason> {
+        self.inner.poll_invalidation()
+    }
+
+    fn rebuild(&mut self) -> Result<()> {
+        self.inner.rebuild()
+    }
+
+    fn display_info(&self) -> rc_capture::DisplayInfo {
+        self.inner.display_info()
+    }
+}
+
+/// 建一个真网络 host（127.0.0.1:0，WallCapture + 假编码，随重建重锚 origin）。
+fn new_host(clock: &SessionClock, origin: OriginSlot) -> HostSession {
+    let mut host = HostSession::new(
         HostSessionConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             mtu: DEFAULT_MTU,
@@ -119,7 +151,43 @@ fn new_host(clock: &SessionClock) -> HostSession {
         SERVER_KEY_PEM,
         Arc::clone(clock),
     )
-    .expect("host endpoint")
+    .expect("host endpoint");
+
+    host.set_pipeline_factory_for(Box::new(move |pcfg| {
+        let t0 = Instant::now();
+        *origin.lock().expect("origin lock") = Some(t0);
+        let capture = rc_capture::FakeBackend::new(rc_capture::FakeBackendConfig {
+            display: rc_capture::DisplayInfo {
+                id: rc_types::DisplayId(0),
+                resolution: pcfg.resolution,
+                scale: 1.0,
+                hdr: false,
+            },
+            fps: pcfg.fps,
+            content: rc_capture::FakeContent::Dynamic,
+            dirty_rect: None,
+        })?;
+        let encoder = rc_encode::FakeEncoder::with_tuning(
+            rc_encode::EncoderConfig {
+                resolution: pcfg.resolution,
+                fps: pcfg.fps,
+                bitrate_bps: pcfg.bitrate_bps,
+                ..rc_encode::EncoderConfig::default()
+            },
+            500,
+            512,
+        )?;
+        rc_pipeline::HostPipeline::with_backends_paced(
+            pcfg.clone(),
+            Box::new(WallCapture {
+                inner: capture,
+                origin: t0,
+            }),
+            Box::new(encoder),
+            true,
+        )
+    }));
+    host
 }
 
 /// 建一个真网络 client（端点由会话内建并留存；rebind 测试经 `endpoint()` 拿）。
@@ -324,7 +392,7 @@ fn media_datagrams(recorder: &Recorder) -> Vec<Vec<u8>> {
 fn reconnect_over_real_quic_resumes_with_idr() {
     let origin: OriginSlot = Arc::new(Mutex::new(None));
     let clock = origin_clock(Arc::clone(&origin));
-    let host = new_host(&clock);
+    let host = new_host(&clock, Arc::clone(&origin));
     let host_addr = host.local_addr().expect("host addr");
     let mut client = new_client(host_addr, 42, &clock);
     // 连接来源走记录工厂（同端点复用 + 到达数据报可观测）。
@@ -454,7 +522,7 @@ fn reconnect_over_real_quic_resumes_with_idr() {
 fn rebind_migration_does_not_interrupt_session() {
     let origin: OriginSlot = Arc::new(Mutex::new(None));
     let clock = origin_clock(Arc::clone(&origin));
-    let host = new_host(&clock);
+    let host = new_host(&clock, Arc::clone(&origin));
     let host_addr = host.local_addr().expect("host addr");
     let client = new_client(host_addr, 7, &clock);
     let (host, mut client) = handshake_pair(host, client);
@@ -540,7 +608,7 @@ fn rebind_migration_does_not_interrupt_session() {
 fn refresh_guard_rebuilds_session_end_to_end() {
     let origin: OriginSlot = Arc::new(Mutex::new(None));
     let clock = origin_clock(Arc::clone(&origin));
-    let mut host = new_host(&clock);
+    let mut host = new_host(&clock, Arc::clone(&origin));
     let host_addr = host.local_addr().expect("host addr");
     // 注入 3s 守卫线（不真等 70 分钟，坑 5）。
     let rcfg = ReconnectConfig {
