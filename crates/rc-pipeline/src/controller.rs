@@ -515,6 +515,9 @@ impl ControllerPipeline {
                 let received_ts = Timestamp(now_us);
                 if kind == FrameKind::Idr {
                     self.async_chain_broken = false;
+                    // 若刚抵达的是完整 IDR，覆盖本次 evict_stale 因旧残帧而置位的关键帧请求，
+                    // 避免在 IDR 刚入槽时发出多余关键帧请求。
+                    self.need_keyframe = false;
                 } else if self.async_chain_broken {
                     let f = self.trace.begin(seq);
                     f.mark(Mark::Captured, capture_ts);

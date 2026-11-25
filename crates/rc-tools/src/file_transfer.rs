@@ -836,6 +836,11 @@ pub fn create_local_dir(parent: &str, name: &str) -> Result<String, String> {
     Ok(target.to_string_lossy().into_owned())
 }
 
+fn is_protected_local_dir(canon: &Path) -> bool {
+    let canon_home = fs::canonicalize(default_home_dir()).unwrap_or_else(|_| default_home_dir());
+    canon.parent().is_none() || canon == canon_home
+}
+
 /// 安全删除本地指定文件或目录：
 /// - 拒绝空路径、主目录根目录 `~` 及文件系统根目录（`/` 或盘符根目录）；
 /// - 使用 `symlink_metadata` 识别符号链接，仅删除链接本身而不递归删除其指向的外部目录。
@@ -845,8 +850,8 @@ pub fn delete_local_path(path: &str) -> Result<(), String> {
         return Err("删除路径不能为空或根目录".to_string());
     }
     let target = expand_tilde(trimmed);
-    if target.parent().is_none() || target.file_name().is_none() {
-        return Err("禁止删除文件系统根目录".to_string());
+    if target.parent().is_none() || target.file_name().is_none() || target == default_home_dir() {
+        return Err("禁止删除文件系统根目录或当前用户主目录".to_string());
     }
     let meta = fs::symlink_metadata(&target)
         .map_err(|e| format!("无法访问目标 '{}': {e}", target.display()))?;
@@ -855,7 +860,7 @@ pub fn delete_local_path(path: &str) -> Result<(), String> {
     } else {
         let canon = fs::canonicalize(&target)
             .map_err(|e| format!("解析目录 '{}' 失败：{e}", target.display()))?;
-        if canon.parent().is_none() || canon == default_home_dir() {
+        if is_protected_local_dir(&canon) {
             return Err("禁止删除根目录或当前用户主目录".to_string());
         }
         fs::remove_dir_all(&target)
@@ -871,8 +876,18 @@ pub fn rename_local_path(path: &str, new_name: &str) -> Result<String, String> {
     }
     let valid_name = validate_single_name(new_name)?;
     let target = expand_tilde(trimmed);
-    let _meta = fs::symlink_metadata(&target)
+    if target.parent().is_none() || target.file_name().is_none() || target == default_home_dir() {
+        return Err("禁止重命名根目录或当前用户主目录".to_string());
+    }
+    let meta = fs::symlink_metadata(&target)
         .map_err(|e| format!("无法访问目标 '{}': {e}", target.display()))?;
+    if !meta.file_type().is_symlink() && meta.is_dir() {
+        let canon = fs::canonicalize(&target)
+            .map_err(|e| format!("解析目录 '{}' 失败：{e}", target.display()))?;
+        if is_protected_local_dir(&canon) {
+            return Err("禁止重命名根目录或当前用户主目录".to_string());
+        }
+    }
     let parent = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -2549,8 +2564,11 @@ mod tests {
             assert!(outside_file.exists());
         }
 
-        // Root & traversal rejection
+        // Root, home-dir & traversal rejection
         assert!(delete_local_path("/").is_err());
+        assert!(delete_local_path("~/").is_err());
+        assert!(rename_local_path("/", "root").is_err());
+        assert!(rename_local_path("~/", "home").is_err());
         assert!(rename_local_path(file_a.to_str().unwrap(), "../escape").is_err());
 
         // Remote client <-> host roundtrip for rename + delete

@@ -795,7 +795,7 @@ fn async_decode_gates_broken_p_frames_until_idr() {
         Some(Outcome::DroppedStale)
     );
 
-    // 再发一个 IDR（seq=3）重置参考链并正常解码上屏。
+    // 再发一个 IDR（seq=3）重置参考链并正常解码上屏；同时再验证未凑齐 P 帧被紧随的完整 IDR 淘汰时不产生多余关键帧请求。
     for p in make_pkts(3, true, rc_proto::MAX_PAYLOAD) {
         let _ = controller.push_datagram(&p, 4_200).expect("seq 3 idr");
     }
@@ -806,6 +806,19 @@ fn async_decode_gates_broken_p_frames_until_idr() {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let _ = controller.take_keyframe_request();
     }
+    let _ = controller.take_keyframe_request();
+    let p4 = make_pkts(4, false, 16);
+    assert!(p4.len() >= 2);
+    let _ = controller
+        .push_datagram(&p4[0], 4_500)
+        .expect("seq 4 part 0");
+    for p in make_pkts(5, true, rc_proto::MAX_PAYLOAD) {
+        let _ = controller.push_datagram(&p, 5_000).expect("seq 5 idr");
+    }
+    assert!(
+        !controller.take_keyframe_request(),
+        "完整 IDR 抵达触发旧残帧淘汰时不应产生多余关键帧请求"
+    );
     controller.shutdown();
     let s = controller.trace().summary();
     assert_eq!(
