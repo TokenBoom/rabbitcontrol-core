@@ -728,6 +728,7 @@ name = "rc-mobile-ffi"
 version = "0.1.0"
 dependencies = [
  "rc-client-core",
+ "serde",
  "serde_json",
  "socket2",
 ]

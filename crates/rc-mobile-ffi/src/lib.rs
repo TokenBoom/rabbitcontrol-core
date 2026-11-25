@@ -14,6 +14,8 @@ use std::sync::{Mutex, OnceLock};
 
 use rc_client_core::lan_discovery::LanDiscoveryHandle;
 
+pub mod auth;
+
 /// 返回核心库版本字符串(调用方负责用 `rc_string_free` 释放)。
 #[no_mangle]
 pub extern "C" fn rc_core_version() -> *mut c_char {
