@@ -98,6 +98,11 @@ pub fn daemon_socket_path() -> PathBuf {
     run_dir().join("daemon.sock")
 }
 
+/// 返回前台控制端 GUI（`rc-ui`）暴露给后台状态栏唤醒用的 IPC Unix Socket 路径。
+pub fn gui_socket_path() -> PathBuf {
+    run_dir().join("gui.sock")
+}
+
 /// 返回「整体退出」防拉起标记文件路径（由 launchd `KeepAlive.PathState` 监控）。
 pub fn manual_stop_path() -> PathBuf {
     run_dir().join("manual-stop")

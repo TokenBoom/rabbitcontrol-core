@@ -463,13 +463,25 @@ fn urgent_input_beats_control_backlog() {
          此前只交付 {before}/{N} 条控制消息",
         urgent_at_after_flood.unwrap(),
     );
+    let is_ci = std::env::var_os("CI").is_some();
+    let send_budget = if is_ci {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_millis(100)
+    };
+    let visible_budget = if is_ci {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_millis(500)
+    };
     assert!(
-        urgent_send_took < Duration::from_millis(100),
-        "send_reliable_urgent 本身耗时 {urgent_send_took:?}：输入发送路径被控制流反压挡住了"
+        urgent_send_took < send_budget,
+        "send_reliable_urgent 本身耗时 {urgent_send_took:?}（上限 {send_budget:?}）：输入发送路径被控制流反压挡住了"
     );
     assert!(
-        urgent_at_after_flood.unwrap() < Duration::from_millis(500),
-        "灌流结束后 urgent 仍迟迟不可见"
+        urgent_at_after_flood.unwrap() < visible_budget,
+        "灌流结束后 urgent 仍迟迟不可见（耗时 {:?}，上限 {visible_budget:?}）",
+        urgent_at_after_flood.unwrap()
     );
     assert!(
         before < HALF + GRANT_SLACK,

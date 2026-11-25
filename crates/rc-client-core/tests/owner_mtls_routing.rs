@@ -941,7 +941,7 @@ fn awaiting_mtls_cert_never_downgrades_to_plain_and_recovers_once_cert_installed
         }),
         true,
     );
-    std::thread::sleep(Duration::from_millis(250));
+    std::thread::sleep(Duration::from_millis(450));
 
     let s_mtls = SessionHandle::spawn(UiSessionConfig {
         connect_addr: host.listen_addr(),
@@ -1129,11 +1129,26 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
         .expect("input to background pty");
     thread::sleep(Duration::from_millis(180));
 
+    // 排空历史更新，便于每次断连后精确等待被控端回到 HostUpdate::Listening 再发起下一次建连。
+    let drain_host_updates = |h: &HostHandle| {
+        while h.try_recv_update().is_some() {}
+    };
+    let wait_host_ready_again = |h: &HostHandle| {
+        let ready = collect_host_until(h, Duration::from_secs(8), |us| {
+            us.iter().any(|u| matches!(u, HostUpdate::Listening { .. }))
+        });
+        assert!(
+            ready
+                .iter()
+                .any(|u| matches!(u, HostUpdate::Listening { .. })),
+            "host must return to Listening after client disconnect, got: {ready:?}"
+        );
+    };
+
+    drain_host_updates(&host);
     owner1.send(SessionCommand::Disconnect);
     owner1.join();
-
-    // Wait briefly for host to return to listening state while owner PTY keeps draining in background.
-    thread::sleep(Duration::from_millis(150));
+    wait_host_ready_again(&host);
 
     // 2) Non-owner guest connects with password: must see ZERO owner background terminals!
     let guest = SessionHandle::spawn(UiSessionConfig {
@@ -1149,18 +1164,21 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
         encrypt_connection: false,
         ..UiSessionConfig::default()
     });
-    let guest_neg = collect_client_until(&guest, Duration::from_secs(6), |us| {
+    let guest_neg = collect_client_until(&guest, Duration::from_secs(12), |us| {
         us.iter()
             .any(|u| matches!(u, SessionUpdate::Negotiated { .. }))
     });
-    assert!(guest_neg
-        .iter()
-        .any(|u| matches!(u, SessionUpdate::Negotiated { .. })));
+    assert!(
+        guest_neg
+            .iter()
+            .any(|u| matches!(u, SessionUpdate::Negotiated { .. })),
+        "guest negotiate failed: {guest_neg:?}"
+    );
 
     let guest_tools = guest.tools();
     guest_tools.terminal_list().expect("guest list");
     let mut guest_listed = None;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline && guest_listed.is_none() {
         while let Some(ev) = guest.try_recv_terminal_event() {
             if let TerminalEvent::SessionList { sessions } = ev {
@@ -1177,7 +1195,7 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
     // Guest opens a session-scoped terminal, then disconnects (guest terminal must not leak to owner).
     let guest_tid = guest_tools.terminal_open(80, 24).expect("guest open");
     let mut guest_opened = false;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline && !guest_opened {
         while let Some(ev) = guest.try_recv_terminal_event() {
             if matches!(
@@ -1190,24 +1208,27 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(guest_opened);
+    drain_host_updates(&host);
     guest.send(SessionCommand::Disconnect);
     guest.join();
-    thread::sleep(Duration::from_millis(150));
+    wait_host_ready_again(&host);
 
     // 3) Owner reconnects: must still see ONLY `persist-job`, attach & replay scrollback, then close cleanly.
     let owner2 = SessionHandle::spawn(make_owner_cfg(&"22".repeat(16)));
-    let neg2 = collect_client_until(&owner2, Duration::from_secs(6), |us| {
+    let neg2 = collect_client_until(&owner2, Duration::from_secs(12), |us| {
         us.iter()
             .any(|u| matches!(u, SessionUpdate::Negotiated { .. }))
     });
-    assert!(neg2
-        .iter()
-        .any(|u| matches!(u, SessionUpdate::Negotiated { .. })));
+    assert!(
+        neg2.iter()
+            .any(|u| matches!(u, SessionUpdate::Negotiated { .. })),
+        "owner2 negotiate failed: {neg2:?}"
+    );
 
     let tools2 = owner2.tools();
     tools2.terminal_list().expect("owner2 list");
     let mut owner2_listed = None;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline && owner2_listed.is_none() {
         while let Some(ev) = owner2.try_recv_terminal_event() {
             if let TerminalEvent::SessionList { sessions } = ev {
@@ -1226,7 +1247,7 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
         .expect("attach");
     let mut attached_ok = false;
     let mut replayed = String::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline && (!attached_ok || !replayed.contains("PERSIST_OWNER_OK")) {
         while let Some(ev) = owner2.try_recv_terminal_event() {
             match ev {
@@ -1257,7 +1278,7 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
         .terminal_close(owner_term_id)
         .expect("explicit terminate");
     let mut closed = false;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline && !closed {
         while let Some(ev) = owner2.try_recv_terminal_event() {
             if matches!(ev, TerminalEvent::Exited { term_id, .. } if term_id == owner_term_id) {
@@ -1276,7 +1297,7 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
         0
     );
     let mut opened2 = false;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline && !opened2 {
         while let Some(ev) = owner2.try_recv_terminal_event() {
             if matches!(
@@ -1289,9 +1310,10 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(opened2);
+    drain_host_updates(&host);
     owner2.send(SessionCommand::Disconnect);
     owner2.join();
-    thread::sleep(Duration::from_millis(120));
+    wait_host_ready_again(&host);
 
     // Refresh same-user verifier (e.g. token refresh / prefs reload): background PTY must stay alive.
     let same_user_refreshed = Arc::new(
@@ -1302,20 +1324,23 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
         )
         .unwrap(),
     );
+    drain_host_updates(&host);
     host.set_owner_verifier(Some(same_user_refreshed));
-    thread::sleep(Duration::from_millis(200));
+    wait_host_ready_again(&host);
 
     let owner3 = SessionHandle::spawn(make_owner_cfg(&"33".repeat(16)));
-    let neg3 = collect_client_until(&owner3, Duration::from_secs(6), |us| {
+    let neg3 = collect_client_until(&owner3, Duration::from_secs(12), |us| {
         us.iter()
             .any(|u| matches!(u, SessionUpdate::Negotiated { .. }))
     });
-    assert!(neg3
-        .iter()
-        .any(|u| matches!(u, SessionUpdate::Negotiated { .. })));
+    assert!(
+        neg3.iter()
+            .any(|u| matches!(u, SessionUpdate::Negotiated { .. })),
+        "owner3 negotiate failed: {neg3:?}"
+    );
     owner3.tools().terminal_list().expect("owner3 list");
     let mut owner3_listed = None;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline && owner3_listed.is_none() {
         while let Some(ev) = owner3.try_recv_terminal_event() {
             if let TerminalEvent::SessionList { sessions } = ev {
@@ -1327,9 +1352,10 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
     let owner3_sessions = owner3_listed.expect("owner3 SessionList");
     assert_eq!(owner3_sessions.len(), 1);
     assert_eq!(owner3_sessions[0].name, "reauth-keep");
+    drain_host_updates(&host);
     owner3.send(SessionCommand::Disconnect);
     owner3.join();
-    thread::sleep(Duration::from_millis(120));
+    wait_host_ready_again(&host);
 
     // Switching to another user verifier immediately clears previous owner's PTYs.
     let other_user_verifier = Arc::new(
@@ -1340,19 +1366,23 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
         )
         .unwrap(),
     );
+    drain_host_updates(&host);
     host.set_owner_verifier(Some(other_user_verifier));
-    thread::sleep(Duration::from_millis(250));
+    wait_host_ready_again(&host);
+    drain_host_updates(&host);
     host.set_owner_verifier(Some(verifier));
-    thread::sleep(Duration::from_millis(150));
+    wait_host_ready_again(&host);
 
     let owner4 = SessionHandle::spawn(make_owner_cfg(&"44".repeat(16)));
-    let neg4 = collect_client_until(&owner4, Duration::from_secs(6), |us| {
+    let neg4 = collect_client_until(&owner4, Duration::from_secs(12), |us| {
         us.iter()
             .any(|u| matches!(u, SessionUpdate::Negotiated { .. }))
     });
-    assert!(neg4
-        .iter()
-        .any(|u| matches!(u, SessionUpdate::Negotiated { .. })));
+    assert!(
+        neg4.iter()
+            .any(|u| matches!(u, SessionUpdate::Negotiated { .. })),
+        "owner4 negotiate failed: {neg4:?}"
+    );
     owner4.tools().terminal_list().expect("owner4 list");
     let mut owner4_listed = None;
     let deadline = Instant::now() + Duration::from_secs(4);

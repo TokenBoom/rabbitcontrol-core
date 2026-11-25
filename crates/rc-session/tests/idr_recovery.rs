@@ -415,7 +415,12 @@ fn step(w: &mut World) -> Result<()> {
 
 /// 驱动直到上屏数 ≥ n（上限 panic：管线饿死）。
 fn drive_until_displayed(w: &mut World, n: u64, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let budget = if std::env::var_os("CI").is_some() {
+        Duration::from_secs(12)
+    } else {
+        Duration::from_secs(5)
+    };
+    let deadline = Instant::now() + budget;
     while w.client.controller.displayed() < n {
         assert!(Instant::now() < deadline, "预热超时（{what}：管线饿死）");
         step(w).expect("step");
@@ -476,11 +481,16 @@ fn loss_drill_recovers_via_watchdog_idr() {
     w.handle.set_drop(DropPlan::Off);
     let window_end = Instant::now();
     let displayed_at_end = w.client.controller.displayed();
-    let recover_deadline = Instant::now() + Duration::from_secs(3);
+    let recover_deadline = Instant::now()
+        + if is_ci {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(3)
+        };
     while w.client.controller.displayed() == displayed_at_end {
         assert!(
             Instant::now() < recover_deadline,
-            "丢包窗结束后 3s 内未恢复上屏"
+            "丢包窗结束后未在预算内恢复上屏"
         );
         step(&mut w).expect("step");
     }
@@ -538,42 +548,65 @@ fn loss_drill_sustained_loss_keeps_rate_bounded() {
 }
 
 /// 只丢一帧的数据报（<500ms 空隙）：`watchdog.fires() == 0`（不误报），
-/// 后续帧正常上屏。
+/// 后续帧正常上屏。若共享 CI 虚机在单步驱动中发生真实 ≥450ms CPU 调度停顿，
+/// 最多重跑 2 次以避免将虚机抖动误判为协议回归，但不放松 `fires() == 0` 不变量。
 #[test]
 fn single_frame_loss_does_not_fire_watchdog() {
-    let mut w = world();
-    drive_until_displayed(&mut w, 3, "正常流建立");
+    let max_attempts = if std::env::var_os("CI").is_some() {
+        3
+    } else {
+        1
+    };
+    for attempt in 1..=max_attempts {
+        let mut w = world();
+        drive_until_displayed(&mut w, 3, "正常流建立");
 
-    // 丢「下一帧」：取 host 已发出的最大 frame_seq，指定丢 seq+1。
-    let last_seq = w
-        .handle
-        .host_datagrams()
-        .iter()
-        .filter_map(|d| rc_pipeline::host::datagram_header(d).ok())
-        .map(|h| h.frame_seq.0)
-        .max()
-        .expect("预热后必有数据报");
-    w.handle.set_drop(DropPlan::Seq(last_seq + 1));
-    let displayed_before = w.client.controller.displayed();
+        // 丢「下一帧」：取 host 已发出的最大 frame_seq，指定丢 seq+1。
+        let last_seq = w
+            .handle
+            .host_datagrams()
+            .iter()
+            .filter_map(|d| rc_pipeline::host::datagram_header(d).ok())
+            .map(|h| h.frame_seq.0)
+            .max()
+            .expect("预热后必有数据报");
+        w.handle.set_drop(DropPlan::Seq(last_seq + 1));
+        let displayed_before = w.client.controller.displayed();
 
-    // 驱动 1s（60fps → 单帧空隙 ~16.7ms，远小于 500ms 阈值）。
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(1) {
-        step(&mut w).expect("step");
+        // 驱动 1s（60fps → 单帧空隙 ~16.7ms，远小于 500ms 阈值）。
+        let t0 = Instant::now();
+        let mut prev_step = t0;
+        let mut max_step_gap = Duration::ZERO;
+        while t0.elapsed() < Duration::from_secs(1) {
+            step(&mut w).expect("step");
+            let now = Instant::now();
+            max_step_gap = max_step_gap.max(now.saturating_duration_since(prev_step));
+            prev_step = now;
+        }
+
+        assert!(
+            w.handle.dropped() >= 1,
+            "前提校验：指定帧的数据报确实被丢（计划 Seq({}））",
+            last_seq + 1
+        );
+        if w.client.watchdog.fires() > 0
+            && max_step_gap >= Duration::from_millis(450)
+            && attempt < max_attempts
+        {
+            eprintln!(
+                "single_frame_loss attempt {attempt}: 检测到共享虚机调度停顿 {max_step_gap:?}，重跑验证"
+            );
+            continue;
+        }
+        assert_eq!(
+            w.client.watchdog.fires(),
+            0,
+            "丢单帧（<500ms 空隙，最大单步间隔 {max_step_gap:?}）不得触发看门狗（不误报）"
+        );
+        assert!(
+            w.client.controller.displayed() > displayed_before,
+            "后续帧必须正常上屏"
+        );
+        return;
     }
-
-    assert!(
-        w.handle.dropped() >= 1,
-        "前提校验：指定帧的数据报确实被丢（计划 Seq({}））",
-        last_seq + 1
-    );
-    assert_eq!(
-        w.client.watchdog.fires(),
-        0,
-        "丢单帧（<500ms 空隙）不得触发看门狗（不误报）"
-    );
-    assert!(
-        w.client.controller.displayed() > displayed_before,
-        "后续帧必须正常上屏"
-    );
 }

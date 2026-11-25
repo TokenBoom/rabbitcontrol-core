@@ -8,8 +8,10 @@
 
 #![deny(unsafe_code)]
 
-/// `TOOL_CHANNEL_DISPLAY_CTRL` 单条 JSON 载荷的最大允许字节数（96 KiB，支撑桌面壁纸与能力通告）。
-pub const MAX_DISPLAY_CTRL_BYTES: usize = 96 * 1024;
+/// `TOOL_CHANNEL_DISPLAY_CTRL` 单条 JSON 载荷的最大允许字节数（对齐 `rc_session::MAX_TOOL_PAYLOAD_BYTES` = 256 KiB，
+/// 保证经 `encode_display_ctrl` 编码后的载荷绝不会超过会话层单帧上限而卡死通道）。
+pub const MAX_DISPLAY_CTRL_BYTES: usize = rc_session::MAX_TOOL_PAYLOAD_BYTES;
+const _: () = assert!(MAX_DISPLAY_CTRL_BYTES <= rc_session::MAX_TOOL_PAYLOAD_BYTES);
 
 /// 热切换流分辨率允许的最大宽度上限（5K / 超宽屏）。
 pub const MAX_STREAM_WIDTH: u32 = 5120;
@@ -155,6 +157,25 @@ pub struct DisplayPreset {
     pub is_hidpi: bool,
 }
 
+/// 一台被控端显示器（物理屏或虚拟屏）的摘要描述。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DisplayDescriptor {
+    /// 平台显示器唯一标识（macOS `CGDirectDisplayID`）。
+    pub id: u32,
+    /// 可读展示名称（如 `"显示屏1 (Built-in Retina Display)"` 或 `"虚拟显示屏 2"`）。
+    pub name: String,
+    /// 当前逻辑宽度（像素/点）。
+    pub width: u32,
+    /// 当前逻辑高度（像素/点）。
+    pub height: u32,
+    /// 是否为主显示器。
+    #[serde(default)]
+    pub is_main: bool,
+    /// 是否为本会话创建的虚拟显示器。
+    #[serde(default)]
+    pub is_virtual: bool,
+}
+
 /// 经 `TOOL_CHANNEL_DISPLAY_CTRL`（可靠 Stream A）双向传递的显示控制消息。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -213,6 +234,89 @@ pub enum DisplayControlMsg {
     },
     /// 控制端 → 被控端：请求立即锁定被控端屏幕。
     LockScreen,
+    /// 控制端 → 被控端：设置防窥模式（`"off"` / `"privacy"` / `"black"`）及屏保主题/自定义图片。
+    SetPrivacyMode {
+        /// 防窥模式（`"off"` | `"privacy"` | `"black"`）。
+        mode: String,
+        /// 内置预设 ID（如 `"preset-1"` .. `"preset-6"` 或 `"custom"`）。
+        #[serde(default)]
+        preset: String,
+        /// 自定义屏保图片的 Base64 载荷（JPEG/PNG，仅 `preset == "custom"` 时传递）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom_image_base64: Option<String>,
+    },
+    /// 被控端 → 控制端：回传当前生效的防窥模式状态。
+    PrivacyState {
+        /// 当前生效防窥模式（`"off"` | `"privacy"` | `"black"`）。
+        mode: String,
+        /// 当前生效预设 ID。
+        #[serde(default)]
+        preset: String,
+        /// 当前被控端是否支持物理隐私幕布。
+        #[serde(default)]
+        supported: bool,
+    },
+    /// 控制端 → 被控端：控制被控端本机扬声器静音与退出时是否恢复。
+    SetHostMute {
+        /// `true` = 静音被控端本机扬声器；`false` = 取消静音。
+        muted: bool,
+        /// 远控结束时是否自动恢复被控端原始声音状态。
+        #[serde(default)]
+        restore_on_exit: bool,
+    },
+    /// 被控端 → 控制端：回传被控端本机静音状态。
+    HostMuteState {
+        /// 当前被控端是否处于静音态。
+        muted: bool,
+        /// 当前被控端是否支持系统静音控制。
+        #[serde(default)]
+        supported: bool,
+    },
+    /// 控制端 → 被控端：设置鼠标模式（`"smart"` / `"remote"` / `"local"`）。
+    SetMouseMode {
+        /// 目标鼠标模式。
+        mode: String,
+    },
+    /// 被控端 → 控制端：回传当前生效鼠标模式。
+    MouseModeState {
+        /// 生效鼠标模式。
+        mode: String,
+    },
+    /// 控制端 → 被控端：请求刷新全部可用显示器（物理屏 + 虚拟屏）列表。
+    ListDisplays,
+    /// 被控端 → 控制端：推送全部可用显示器列表及当前正在采集的显示器 ID。
+    DisplaysState {
+        /// 可用显示器列表。
+        #[serde(default)]
+        displays: Vec<DisplayDescriptor>,
+        /// 当前正在采集的显示器 ID。
+        active_display_id: u32,
+    },
+    /// 控制端 → 被控端：切换当前采集与输入映射的目标显示器。
+    SwitchDisplay {
+        /// 目标显示器 ID。
+        display_id: u32,
+    },
+    /// 控制端 → 被控端：创建一个新的虚拟显示器并可选切换至该屏。
+    CreateVirtualDisplay {
+        /// 期望逻辑宽度（像素）。
+        width: u32,
+        /// 期望逻辑高度（像素）。
+        height: u32,
+        /// 是否启用 HiDPI 2x 模式。
+        #[serde(default)]
+        hidpi: bool,
+    },
+    /// 控制端 → 被控端：销毁一个由本会话创建的虚拟显示器。
+    RemoveVirtualDisplay {
+        /// 待销毁的虚拟显示器 ID。
+        display_id: u32,
+    },
+    /// 被控端 → 控制端：虚拟显示器创建或切换失败提示。
+    VirtualDisplayError {
+        /// 人类可读错误原因。
+        message: String,
+    },
 }
 
 const BASE64_ALPHABET: &[u8; 64] =
@@ -771,7 +875,7 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip_and_size_limit() {
-        assert_eq!(MAX_DISPLAY_CTRL_BYTES, 96 * 1024);
+        assert_eq!(MAX_DISPLAY_CTRL_BYTES, rc_session::MAX_TOOL_PAYLOAD_BYTES);
 
         let caps = DisplayControlMsg::Capabilities {
             current_width: 1512,

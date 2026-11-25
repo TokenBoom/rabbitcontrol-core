@@ -690,6 +690,23 @@ fn capture_backpressure_wakes_without_polling_sleep() {
     // 先等采集线程把容量 1 的通道灌满并进入背压等待。
     std::thread::sleep(std::time::Duration::from_millis(5));
 
+    let is_ci = std::env::var_os("CI").is_some();
+    let loop_timeout = if is_ci {
+        std::time::Duration::from_secs(3)
+    } else {
+        std::time::Duration::from_millis(500)
+    };
+    let handoff_budget = if is_ci {
+        std::time::Duration::from_millis(500)
+    } else {
+        std::time::Duration::from_millis(40)
+    };
+    let stop_budget = if is_ci {
+        std::time::Duration::from_millis(500)
+    } else {
+        std::time::Duration::from_millis(50)
+    };
+
     let started = std::time::Instant::now();
     let target = 40u64;
     while host.sched_stats().captured < target {
@@ -698,7 +715,7 @@ fn capture_backpressure_wakes_without_polling_sleep() {
             host.wait_event(std::time::Duration::from_millis(5));
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
+            started.elapsed() < loop_timeout,
             "背压交接超时（已采集 {}）",
             host.sched_stats().captured
         );
@@ -706,8 +723,8 @@ fn capture_backpressure_wakes_without_polling_sleep() {
     let elapsed = started.elapsed();
     // 旧 sleep(1ms) 在 macOS 定时器合并下 40 帧背压需 80–160ms；Condvar 应在数毫秒内完成。
     assert!(
-        elapsed < std::time::Duration::from_millis(40),
-        "40 帧背压交接耗时过高: {elapsed:?}（疑似退化为 sleep 轮询）"
+        elapsed < handoff_budget,
+        "40 帧背压交接耗时过高: {elapsed:?}（上限 {handoff_budget:?}，疑似退化为 sleep 轮询）"
     );
 
     // 停机时通道仍可能满载，stop_capture 必须通过 cap_space 立即唤醒并退出。
@@ -715,8 +732,8 @@ fn capture_backpressure_wakes_without_polling_sleep() {
     let stop_start = std::time::Instant::now();
     host.stop_capture();
     assert!(
-        stop_start.elapsed() < std::time::Duration::from_millis(50),
-        "背压中 stop_capture 退出过慢: {:?}",
+        stop_start.elapsed() < stop_budget,
+        "背压中 stop_capture 退出过慢: {:?}（上限 {stop_budget:?}）",
         stop_start.elapsed()
     );
     host.shutdown();

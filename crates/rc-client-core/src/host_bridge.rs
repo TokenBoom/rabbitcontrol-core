@@ -47,7 +47,7 @@ use rc_session::{
 use rc_tools::{FileHostEngine, PortMapHostEngine, TerminalHostEngine};
 use rc_types::Resolution;
 
-use crate::display_ctrl::{self, DisplayControlMsg, DisplayPreset};
+use crate::display_ctrl::{self, DisplayControlMsg, DisplayDescriptor, DisplayPreset};
 use crate::lan_discovery;
 use crate::p2p::{self, P2pCandidates};
 pub use crate::relay_transport::SessionMtlsBundle;
@@ -1601,25 +1601,39 @@ enum HostTransportKind {
 /// - 仅当 `pending` 为空时从引擎最多拉取 `max_frames` 帧；
 /// - 任意帧发送返回 `Err`（如 TCP 中继背压）时立即停止并保留该帧及后续已拉取帧，
 ///   下一拍严格按 FIFO 顺序重试，确保可靠工具通道零丢块。
-fn flush_tool_channel_with_retry<E>(
+fn flush_tool_channel_with_retry_checked<E>(
     pending: &mut VecDeque<Vec<u8>>,
     max_frames: usize,
     poll_fn: impl FnOnce(usize) -> Vec<Vec<u8>>,
     mut send_fn: impl FnMut(Vec<u8>) -> Result<(), E>,
+    is_fatal_err: impl Fn(&E) -> bool,
 ) -> bool {
     if pending.is_empty() {
         pending.extend(poll_fn(max_frames));
     }
     let mut sent_any = false;
     while let Some(front) = pending.front() {
-        if send_fn(front.clone()).is_ok() {
-            pending.pop_front();
-            sent_any = true;
-        } else {
-            break;
+        match send_fn(front.clone()) {
+            Ok(()) => {
+                pending.pop_front();
+                sent_any = true;
+            }
+            Err(ref e) if is_fatal_err(e) => {
+                pending.pop_front();
+            }
+            Err(_) => break,
         }
     }
     sent_any
+}
+
+fn flush_tool_channel_with_retry<E>(
+    pending: &mut VecDeque<Vec<u8>>,
+    max_frames: usize,
+    poll_fn: impl FnOnce(usize) -> Vec<Vec<u8>>,
+    send_fn: impl FnMut(Vec<u8>) -> Result<(), E>,
+) -> bool {
+    flush_tool_channel_with_retry_checked(pending, max_frames, poll_fn, send_fn, |_| false)
 }
 
 /// Host 侧专用文件传输工作线程（H12）：将 `list_local_dir` / `write_all` / `sync_all` (`F_FULLFSYNC`)
@@ -1924,6 +1938,101 @@ fn pump_host_audio(
     busy
 }
 
+/// 单个远控会话最多允许创建的虚拟显示器数量上限（防止异常/恶意对端耗尽 WindowServer 虚拟屏资源）。
+const MAX_VIRTUAL_DISPLAYS_PER_SESSION: usize = 4;
+
+/// 校验隐私屏保自定义图片魔数（仅放行非空 PNG / JPEG / WebP）。
+fn is_valid_privacy_image_bytes(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+        || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || (bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+}
+
+/// 被控端会话级硬件副作用清理守卫（隐私幕布 / 系统静音恢复 / 虚拟显示器销毁）。
+///
+/// 无论会话正常结束、断线、报错还是 panic，[`Drop`] 均会确定性清理全部本会话创建的硬件状态。
+struct HostHardwareCleanupGuard {
+    prefer_hardware: bool,
+    privacy_active: bool,
+    host_audio_modified: bool,
+    restore_audio_on_exit: bool,
+    virtual_display_count: usize,
+}
+
+impl HostHardwareCleanupGuard {
+    fn new(prefer_hardware: bool) -> Self {
+        Self {
+            prefer_hardware,
+            privacy_active: false,
+            host_audio_modified: false,
+            restore_audio_on_exit: true,
+            virtual_display_count: 0,
+        }
+    }
+
+    fn cleanup_now(&mut self) {
+        if !self.prefer_hardware {
+            self.privacy_active = false;
+            self.host_audio_modified = false;
+            self.restore_audio_on_exit = true;
+            self.virtual_display_count = 0;
+            return;
+        }
+        if self.privacy_active {
+            crate::platform::clear_privacy_curtain();
+            self.privacy_active = false;
+        }
+        if self.host_audio_modified {
+            if self.restore_audio_on_exit {
+                crate::platform::restore_host_system_audio();
+            } else {
+                crate::platform::clear_host_audio_snapshot();
+            }
+        }
+        self.host_audio_modified = false;
+        self.restore_audio_on_exit = true;
+        if self.virtual_display_count > 0 {
+            crate::platform::destroy_all_virtual_displays();
+            self.virtual_display_count = 0;
+        }
+    }
+}
+
+impl Drop for HostHardwareCleanupGuard {
+    fn drop(&mut self) {
+        self.cleanup_now();
+    }
+}
+
+fn encode_host_displays_state(active_display_id: Option<u32>) -> Option<Vec<u8>> {
+    let raw = crate::platform::list_displays();
+    if raw.is_empty() {
+        return None;
+    }
+    let resolved_active = active_display_id
+        .filter(|id| raw.iter().any(|d| d.id == *id))
+        .or_else(|| raw.iter().find(|d| d.is_main).map(|d| d.id))
+        .unwrap_or(raw[0].id);
+    let displays = raw
+        .into_iter()
+        .map(|d| DisplayDescriptor {
+            id: d.id,
+            name: d.name,
+            width: d.width,
+            height: d.height,
+            is_main: d.is_main,
+            is_virtual: d.is_virtual,
+        })
+        .collect();
+    display_ctrl::encode_display_ctrl(&DisplayControlMsg::DisplaysState {
+        displays,
+        active_display_id: resolved_active,
+    })
+}
+
 fn trigger_host_lock_screen(lock_screen_count: &AtomicU64, prefer_hardware: bool) {
     lock_screen_count.fetch_add(1, Ordering::AcqRel);
     if prefer_hardware {
@@ -2119,6 +2228,9 @@ fn drive_ui_host_session_inner(
 ) -> String {
     let _activity =
         crate::platform::begin_latency_critical_activity("RabbitControl 被控会话", true);
+    let mut hw_cleanup = HostHardwareCleanupGuard::new(prefer_hardware);
+    let mut active_display_id: Option<u32> = None;
+    let mut shows_cursor = false;
 
     let mut detached_reason: Option<String> = None;
     let mut drive_err: Option<String> = None;
@@ -2173,6 +2285,11 @@ fn drive_ui_host_session_inner(
             host_hevc_available(hevc_runtime_failed),
         ) {
             pending_display_tx.push_back(payload);
+        }
+        if prefer_hardware && hardware_video_active {
+            if let Some(disp_payload) = encode_host_displays_state(active_display_id) {
+                pending_display_tx.push_back(disp_payload);
+            }
         }
     }
 
@@ -2349,9 +2466,15 @@ fn drive_ui_host_session_inner(
                                                         }
                                                     });
                                                 if width > 0 && height > 0 {
-                                                    if let Ok(switched_res) = display_mode_session
-                                                        .switch_to(width, height)
-                                                    {
+                                                    let switched_main =
+                                                        if active_display_id.is_none() {
+                                                            display_mode_session
+                                                                .switch_to(width, height)
+                                                                .ok()
+                                                        } else {
+                                                            None
+                                                        };
+                                                    if let Some(switched_res) = switched_main {
                                                         host.set_injector_screen_size(
                                                             switched_res.width,
                                                             switched_res.height,
@@ -2425,15 +2548,31 @@ fn drive_ui_host_session_inner(
                                                 {
                                                     hevc_runtime_failed = true;
                                                 }
-                                                let presets = build_hardware_display_presets(
-                                                    prefer_hardware,
-                                                    hardware_video_active,
-                                                    original_native_res,
-                                                );
+                                                let (caps_native, presets) =
+                                                    if active_display_id.is_some() {
+                                                        (
+                                                            session_native_res,
+                                                            display_ctrl::build_resolution_presets(
+                                                                session_native_res.width,
+                                                                session_native_res.height,
+                                                                session_max_res.width,
+                                                                session_max_res.height,
+                                                            ),
+                                                        )
+                                                    } else {
+                                                        (
+                                                            original_native_res
+                                                                .unwrap_or(session_native_res),
+                                                            build_hardware_display_presets(
+                                                                prefer_hardware,
+                                                                hardware_video_active,
+                                                                original_native_res,
+                                                            ),
+                                                        )
+                                                    };
                                                 if let Some(caps_payload) = encode_host_display_caps(
                                                     host,
-                                                    original_native_res
-                                                        .unwrap_or(session_native_res),
+                                                    caps_native,
                                                     session_max_res,
                                                     presets,
                                                     host_hevc_available(hevc_runtime_failed),
@@ -2483,14 +2622,31 @@ fn drive_ui_host_session_inner(
                                                 }
                                             }
                                             // 无论切换成功、幂等或拒绝，均回推最新 Capabilities，让控制端获知权威生效 codec。
-                                            let presets = build_hardware_display_presets(
-                                                prefer_hardware,
-                                                hardware_video_active,
-                                                original_native_res,
-                                            );
+                                            let (caps_native, presets) =
+                                                if active_display_id.is_some() {
+                                                    (
+                                                        session_native_res,
+                                                        display_ctrl::build_resolution_presets(
+                                                            session_native_res.width,
+                                                            session_native_res.height,
+                                                            session_max_res.width,
+                                                            session_max_res.height,
+                                                        ),
+                                                    )
+                                                } else {
+                                                    (
+                                                        original_native_res
+                                                            .unwrap_or(session_native_res),
+                                                        build_hardware_display_presets(
+                                                            prefer_hardware,
+                                                            hardware_video_active,
+                                                            original_native_res,
+                                                        ),
+                                                    )
+                                                };
                                             if let Some(caps_payload) = encode_host_display_caps(
                                                 host,
-                                                original_native_res.unwrap_or(session_native_res),
+                                                caps_native,
                                                 session_max_res,
                                                 presets,
                                                 host_hevc_available(hevc_runtime_failed),
@@ -2498,7 +2654,546 @@ fn drive_ui_host_session_inner(
                                                 pending_display_tx.push_back(caps_payload);
                                             }
                                         }
+                                        Some(DisplayControlMsg::SetPrivacyMode {
+                                            mode,
+                                            preset,
+                                            custom_image_base64,
+                                        }) => {
+                                            let norm_mode = match mode.as_str() {
+                                                "privacy" | "black" => mode.as_str(),
+                                                _ => "off",
+                                            };
+                                            let norm_preset = match preset.as_str() {
+                                                "preset-1" | "preset-2" | "preset-3"
+                                                | "preset-4" | "preset-5" | "preset-6"
+                                                | "custom" => preset.as_str(),
+                                                _ => "preset-1",
+                                            };
+                                            let (applied_mode, applied_preset, supported) =
+                                                if !(prefer_hardware && hardware_video_active) {
+                                                    ("off", norm_preset, false)
+                                                } else if norm_mode == "off" {
+                                                    let was_active = hw_cleanup.privacy_active;
+                                                    if was_active {
+                                                        crate::platform::clear_privacy_curtain();
+                                                        hw_cleanup.privacy_active = false;
+                                                        if let Some(cur) = host.negotiated() {
+                                                            let _ = host.force_reconfigure_stream(
+                                                                cur.width,
+                                                                cur.height,
+                                                                Some(cur.fps),
+                                                                Some(session_max_res),
+                                                                None,
+                                                            );
+                                                        }
+                                                    }
+                                                    ("off", norm_preset, true)
+                                                } else {
+                                                    let decoded_custom = custom_image_base64
+                                                        .as_deref()
+                                                        .and_then(display_ctrl::base64_decode)
+                                                        .filter(|b| {
+                                                            is_valid_privacy_image_bytes(b)
+                                                        });
+                                                    let eff_preset = if norm_preset == "custom"
+                                                        && decoded_custom.is_none()
+                                                    {
+                                                        "preset-1"
+                                                    } else {
+                                                        norm_preset
+                                                    };
+                                                    match crate::platform::set_privacy_curtain(
+                                                        norm_mode,
+                                                        eff_preset,
+                                                        decoded_custom.as_deref(),
+                                                    ) {
+                                                        Ok(()) => {
+                                                            hw_cleanup.privacy_active = true;
+                                                            // 重建 SCK 流使 SCContentFilter 立即排除新创建的幕布窗口。
+                                                            if let Some(cur) = host.negotiated() {
+                                                                let _ = host
+                                                                    .force_reconfigure_stream(
+                                                                        cur.width,
+                                                                        cur.height,
+                                                                        Some(cur.fps),
+                                                                        Some(session_max_res),
+                                                                        None,
+                                                                    );
+                                                            }
+                                                            (norm_mode, eff_preset, true)
+                                                        }
+                                                        Err(err) => {
+                                                            eprintln!(
+                                                                "[rc-ui-host] 设置防窥隐私幕布失败: {err}"
+                                                            );
+                                                            if hw_cleanup.privacy_active {
+                                                                crate::platform::clear_privacy_curtain();
+                                                                hw_cleanup.privacy_active = false;
+                                                            }
+                                                            ("off", eff_preset, false)
+                                                        }
+                                                    }
+                                                };
+                                            if let Some(p) = display_ctrl::encode_display_ctrl(
+                                                &DisplayControlMsg::PrivacyState {
+                                                    mode: applied_mode.to_string(),
+                                                    preset: applied_preset.to_string(),
+                                                    supported,
+                                                },
+                                            ) {
+                                                pending_display_tx.push_back(p);
+                                            }
+                                        }
+                                        Some(DisplayControlMsg::SetHostMute {
+                                            muted,
+                                            restore_on_exit,
+                                        }) => {
+                                            hw_cleanup.restore_audio_on_exit = restore_on_exit;
+                                            let (eff_muted, supported) = if !prefer_hardware {
+                                                (false, false)
+                                            } else {
+                                                match crate::platform::set_host_system_muted(muted)
+                                                {
+                                                    Ok(actual) => {
+                                                        hw_cleanup.host_audio_modified = true;
+                                                        (actual, true)
+                                                    }
+                                                    Err(err) => {
+                                                        eprintln!(
+                                                            "[rc-ui-host] 设置被控端系统静音失败: {err}"
+                                                        );
+                                                        (false, false)
+                                                    }
+                                                }
+                                            };
+                                            if let Some(p) = display_ctrl::encode_display_ctrl(
+                                                &DisplayControlMsg::HostMuteState {
+                                                    muted: eff_muted,
+                                                    supported,
+                                                },
+                                            ) {
+                                                pending_display_tx.push_back(p);
+                                            }
+                                        }
+                                        Some(DisplayControlMsg::SetMouseMode { mode }) => {
+                                            let norm = match mode.as_str() {
+                                                "remote" => "remote",
+                                                "local" => "local",
+                                                _ => "smart",
+                                            };
+                                            let want_cursor = norm == "remote";
+                                            if want_cursor != shows_cursor {
+                                                let prev_cursor = shows_cursor;
+                                                shows_cursor = want_cursor;
+                                                host.set_capture_options(
+                                                    active_display_id,
+                                                    shows_cursor,
+                                                );
+                                                if let Some(cur) = host.negotiated() {
+                                                    if let Err(err) = host.force_reconfigure_stream(
+                                                        cur.width,
+                                                        cur.height,
+                                                        Some(cur.fps),
+                                                        Some(session_max_res),
+                                                        None,
+                                                    ) {
+                                                        eprintln!(
+                                                            "[rc-ui-host] 切换鼠标光标采集失败（回滚）: {err}"
+                                                        );
+                                                        shows_cursor = prev_cursor;
+                                                        host.set_capture_options(
+                                                            active_display_id,
+                                                            shows_cursor,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            let reported_mode = if shows_cursor {
+                                                "remote"
+                                            } else if norm == "local" {
+                                                "local"
+                                            } else {
+                                                "smart"
+                                            };
+                                            if let Some(p) = display_ctrl::encode_display_ctrl(
+                                                &DisplayControlMsg::MouseModeState {
+                                                    mode: reported_mode.to_string(),
+                                                },
+                                            ) {
+                                                pending_display_tx.push_back(p);
+                                            }
+                                        }
+                                        Some(DisplayControlMsg::ListDisplays) => {
+                                            if prefer_hardware && hardware_video_active {
+                                                if let Some(p) =
+                                                    encode_host_displays_state(active_display_id)
+                                                {
+                                                    pending_display_tx.push_back(p);
+                                                }
+                                            }
+                                        }
+                                        Some(DisplayControlMsg::SwitchDisplay { display_id }) => {
+                                            if prefer_hardware && hardware_video_active {
+                                                let displays = crate::platform::list_displays();
+                                                if let Some(target) =
+                                                    displays.iter().find(|d| d.id == display_id)
+                                                {
+                                                    let prev_active = active_display_id;
+                                                    let prev_native = session_native_res;
+                                                    let prev_max = session_max_res;
+                                                    let next_active = if target.is_main {
+                                                        None
+                                                    } else {
+                                                        Some(target.id)
+                                                    };
+                                                    let disp_res = Resolution::new(
+                                                        target.width,
+                                                        target.height,
+                                                    )
+                                                    .to_even();
+                                                    let next_max = if target.is_main {
+                                                        compute_host_display_bounds(
+                                                            host,
+                                                            prefer_hardware,
+                                                            hardware_video_active,
+                                                        )
+                                                        .1
+                                                    } else {
+                                                        Resolution::new(
+                                                            disp_res.width.saturating_mul(2).min(
+                                                                display_ctrl::MAX_STREAM_WIDTH,
+                                                            ),
+                                                            disp_res.height.saturating_mul(2).min(
+                                                                display_ctrl::MAX_STREAM_HEIGHT,
+                                                            ),
+                                                        )
+                                                    };
+                                                    host.set_capture_options(
+                                                        next_active,
+                                                        shows_cursor,
+                                                    );
+                                                    let reconfig_ok =
+                                                        if let Some(cur) = host.negotiated() {
+                                                            host.force_reconfigure_stream(
+                                                                disp_res.width,
+                                                                disp_res.height,
+                                                                Some(cur.fps),
+                                                                Some(next_max),
+                                                                None,
+                                                            )
+                                                            .is_ok()
+                                                        } else {
+                                                            true
+                                                        };
+                                                    if reconfig_ok {
+                                                        active_display_id = next_active;
+                                                        session_native_res = disp_res;
+                                                        session_max_res = next_max;
+                                                        host.set_injector_screen_bounds(
+                                                            target.origin_x,
+                                                            target.origin_y,
+                                                            target.width,
+                                                            target.height,
+                                                        );
+                                                        let (caps_native, presets) = if target
+                                                            .is_main
+                                                        {
+                                                            let nat = original_native_res
+                                                                .unwrap_or(disp_res);
+                                                            (
+                                                                nat,
+                                                                build_hardware_display_presets(
+                                                                    prefer_hardware,
+                                                                    hardware_video_active,
+                                                                    Some(nat),
+                                                                ),
+                                                            )
+                                                        } else {
+                                                            (
+                                                                    disp_res,
+                                                                    display_ctrl::build_resolution_presets(
+                                                                        disp_res.width,
+                                                                        disp_res.height,
+                                                                        session_max_res.width,
+                                                                        session_max_res.height,
+                                                                    ),
+                                                                )
+                                                        };
+                                                        if let Some(cp) = encode_host_display_caps(
+                                                            host,
+                                                            caps_native,
+                                                            session_max_res,
+                                                            presets,
+                                                            host_hevc_available(
+                                                                hevc_runtime_failed,
+                                                            ),
+                                                        ) {
+                                                            pending_display_tx.push_back(cp);
+                                                        }
+                                                    } else {
+                                                        active_display_id = prev_active;
+                                                        session_native_res = prev_native;
+                                                        session_max_res = prev_max;
+                                                        host.set_capture_options(
+                                                            prev_active,
+                                                            shows_cursor,
+                                                        );
+                                                    }
+                                                }
+                                                if let Some(dp) =
+                                                    encode_host_displays_state(active_display_id)
+                                                {
+                                                    pending_display_tx.push_back(dp);
+                                                }
+                                            }
+                                        }
+                                        Some(DisplayControlMsg::CreateVirtualDisplay {
+                                            width,
+                                            height,
+                                            hidpi,
+                                        }) => {
+                                            if !(prefer_hardware && hardware_video_active) {
+                                                if let Some(ep) =
+                                                    display_ctrl::encode_display_ctrl(
+                                                        &DisplayControlMsg::VirtualDisplayError {
+                                                            message: "当前会话未启用硬件视频管线，无法创建虚拟屏"
+                                                                .to_string(),
+                                                        },
+                                                    )
+                                                {
+                                                    pending_display_tx.push_back(ep);
+                                                }
+                                            } else if hw_cleanup.virtual_display_count
+                                                >= MAX_VIRTUAL_DISPLAYS_PER_SESSION
+                                            {
+                                                if let Some(ep) =
+                                                    display_ctrl::encode_display_ctrl(
+                                                        &DisplayControlMsg::VirtualDisplayError {
+                                                            message: format!(
+                                                                "单次会话最多创建 {MAX_VIRTUAL_DISPLAYS_PER_SESSION} 个虚拟显示器"
+                                                            ),
+                                                        },
+                                                    )
+                                                {
+                                                    pending_display_tx.push_back(ep);
+                                                }
+                                            } else {
+                                                let req_w = if width >= 640 {
+                                                    width.min(3840)
+                                                } else {
+                                                    1920
+                                                };
+                                                let req_h = if height >= 480 {
+                                                    height.min(2160)
+                                                } else {
+                                                    1080
+                                                };
+                                                match crate::platform::create_virtual_display(
+                                                    req_w, req_h, hidpi,
+                                                ) {
+                                                    Ok(vinfo) => {
+                                                        hw_cleanup.virtual_display_count =
+                                                            hw_cleanup
+                                                                .virtual_display_count
+                                                                .saturating_add(1);
+                                                        // 等待 WindowServer 将新虚拟屏注册到 CG/SCK 列表。
+                                                        thread::sleep(Duration::from_millis(260));
+                                                        let fresh_list =
+                                                            crate::platform::list_displays();
+                                                        let resolved = fresh_list
+                                                            .iter()
+                                                            .find(|d| d.id == vinfo.id)
+                                                            .cloned()
+                                                            .unwrap_or(vinfo);
+                                                        let prev_active = active_display_id;
+                                                        let prev_native = session_native_res;
+                                                        let prev_max = session_max_res;
+                                                        let vres = Resolution::new(
+                                                            resolved.width,
+                                                            resolved.height,
+                                                        )
+                                                        .to_even();
+                                                        let next_max = Resolution::new(
+                                                            vres.width
+                                                                .saturating_mul(2)
+                                                                .min(
+                                                                    display_ctrl::MAX_STREAM_WIDTH,
+                                                                ),
+                                                            vres.height
+                                                                .saturating_mul(2)
+                                                                .min(
+                                                                    display_ctrl::MAX_STREAM_HEIGHT,
+                                                                ),
+                                                        );
+                                                        host.set_capture_options(
+                                                            Some(resolved.id),
+                                                            shows_cursor,
+                                                        );
+                                                        let switch_res = if let Some(cur) =
+                                                            host.negotiated()
+                                                        {
+                                                            host.force_reconfigure_stream(
+                                                                vres.width,
+                                                                vres.height,
+                                                                Some(cur.fps),
+                                                                Some(next_max),
+                                                                None,
+                                                            )
+                                                            .map(|_| ())
+                                                        } else {
+                                                            Ok(())
+                                                        };
+                                                        match switch_res {
+                                                            Ok(()) => {
+                                                                active_display_id =
+                                                                    Some(resolved.id);
+                                                                session_native_res = vres;
+                                                                session_max_res = next_max;
+                                                                host.set_injector_screen_bounds(
+                                                                    resolved.origin_x,
+                                                                    resolved.origin_y,
+                                                                    resolved.width,
+                                                                    resolved.height,
+                                                                );
+                                                                let presets =
+                                                                    display_ctrl::build_resolution_presets(
+                                                                        vres.width,
+                                                                        vres.height,
+                                                                        session_max_res.width,
+                                                                        session_max_res.height,
+                                                                    );
+                                                                if let Some(cp) =
+                                                                    encode_host_display_caps(
+                                                                        host,
+                                                                        vres,
+                                                                        session_max_res,
+                                                                        presets,
+                                                                        host_hevc_available(
+                                                                            hevc_runtime_failed,
+                                                                        ),
+                                                                    )
+                                                                {
+                                                                    pending_display_tx
+                                                                        .push_back(cp);
+                                                                }
+                                                            }
+                                                            Err(err) => {
+                                                                eprintln!(
+                                                                    "[rc-ui-host] 切换至虚拟屏失败（回滚）: {err}"
+                                                                );
+                                                                active_display_id = prev_active;
+                                                                session_native_res = prev_native;
+                                                                session_max_res = prev_max;
+                                                                host.set_capture_options(
+                                                                    prev_active,
+                                                                    shows_cursor,
+                                                                );
+                                                                if let Some(ep) =
+                                                                    display_ctrl::encode_display_ctrl(
+                                                                        &DisplayControlMsg::VirtualDisplayError {
+                                                                            message: format!(
+                                                                                "虚拟屏已创建但切换采集失败：{err}"
+                                                                            ),
+                                                                        },
+                                                                    )
+                                                                {
+                                                                    pending_display_tx
+                                                                        .push_back(ep);
+                                                                }
+                                                            }
+                                                        }
+                                                        if let Some(dp) =
+                                                            encode_host_displays_state(
+                                                                active_display_id,
+                                                            )
+                                                        {
+                                                            pending_display_tx.push_back(dp);
+                                                        }
+                                                    }
+                                                    Err(msg) => {
+                                                        if let Some(ep) =
+                                                            display_ctrl::encode_display_ctrl(
+                                                                &DisplayControlMsg::VirtualDisplayError {
+                                                                    message: msg,
+                                                                },
+                                                            )
+                                                        {
+                                                            pending_display_tx.push_back(ep);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Some(DisplayControlMsg::RemoveVirtualDisplay {
+                                            display_id,
+                                        }) if prefer_hardware && hardware_video_active => {
+                                            let was_active = active_display_id == Some(display_id);
+                                            let removed = crate::platform::destroy_virtual_display(
+                                                display_id,
+                                            );
+                                            if removed {
+                                                hw_cleanup.virtual_display_count = hw_cleanup
+                                                    .virtual_display_count
+                                                    .saturating_sub(1);
+                                            }
+                                            if removed && was_active {
+                                                active_display_id = None;
+                                                host.set_capture_options(None, shows_cursor);
+                                                let (main_native, main_max) =
+                                                    compute_host_display_bounds(
+                                                        host,
+                                                        prefer_hardware,
+                                                        hardware_video_active,
+                                                    );
+                                                let caps_native =
+                                                    original_native_res.unwrap_or(main_native);
+                                                session_native_res = main_native;
+                                                session_max_res = main_max;
+                                                let main_origin = crate::platform::list_displays()
+                                                    .into_iter()
+                                                    .find(|d| d.is_main)
+                                                    .map(|d| (d.origin_x, d.origin_y))
+                                                    .unwrap_or((0.0, 0.0));
+                                                host.set_injector_screen_bounds(
+                                                    main_origin.0,
+                                                    main_origin.1,
+                                                    main_native.width,
+                                                    main_native.height,
+                                                );
+                                                if let Some(cur) = host.negotiated() {
+                                                    let _ = host.force_reconfigure_stream(
+                                                        main_native.width,
+                                                        main_native.height,
+                                                        Some(cur.fps),
+                                                        Some(session_max_res),
+                                                        None,
+                                                    );
+                                                }
+                                                let presets = build_hardware_display_presets(
+                                                    prefer_hardware,
+                                                    hardware_video_active,
+                                                    Some(caps_native),
+                                                );
+                                                if let Some(cp) = encode_host_display_caps(
+                                                    host,
+                                                    caps_native,
+                                                    session_max_res,
+                                                    presets,
+                                                    host_hevc_available(hevc_runtime_failed),
+                                                ) {
+                                                    pending_display_tx.push_back(cp);
+                                                }
+                                            }
+                                            if let Some(dp) =
+                                                encode_host_displays_state(active_display_id)
+                                            {
+                                                pending_display_tx.push_back(dp);
+                                            }
+                                        }
                                         _ => {}
+                                    }
+                                    while pending_display_tx.len() > 64 {
+                                        pending_display_tx.pop_front();
                                     }
                                 }
                                 _ => {}
@@ -2554,11 +3249,12 @@ fn drive_ui_host_session_inner(
                         ) {
                             tools_busy = true;
                         }
-                        if flush_tool_channel_with_retry(
+                        if flush_tool_channel_with_retry_checked(
                             &mut pending_display_tx,
                             MAX_TOOL_FRAMES_PER_TICK,
                             |_| Vec::new(),
                             |frame| host.send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, frame),
+                            |e| matches!(e, rc_types::Error::InvalidConfig(_)),
                         ) {
                             tools_busy = true;
                         }
@@ -2634,28 +3330,69 @@ fn drive_ui_host_session_inner(
                         host.reset_clipboard_epoch();
                         last_busy = true;
                         pending_display_tx.clear();
-                        let presets = build_hardware_display_presets(
-                            prefer_hardware,
-                            hardware_video_active,
-                            original_native_res,
-                        );
+                        let (caps_native, presets) = if active_display_id.is_some() {
+                            (
+                                session_native_res,
+                                display_ctrl::build_resolution_presets(
+                                    session_native_res.width,
+                                    session_native_res.height,
+                                    session_max_res.width,
+                                    session_max_res.height,
+                                ),
+                            )
+                        } else {
+                            (
+                                original_native_res.unwrap_or(session_native_res),
+                                build_hardware_display_presets(
+                                    prefer_hardware,
+                                    hardware_video_active,
+                                    original_native_res,
+                                ),
+                            )
+                        };
                         if let Some(payload) = encode_host_display_caps(
                             host,
-                            original_native_res.unwrap_or(session_native_res),
+                            caps_native,
                             session_max_res,
                             presets,
                             host_hevc_available(hevc_runtime_failed),
                         ) {
                             pending_display_tx.push_back(payload);
                         }
+                        if prefer_hardware && hardware_video_active {
+                            if let Some(dp) = encode_host_displays_state(active_display_id) {
+                                pending_display_tx.push_back(dp);
+                            }
+                        }
                         emit_peer_connected(host, &host.peer_addr().to_string(), updates);
                     }
                     Ok(DetachOutcome::Replaced) => {
-                        // M9：新控制端顶替旧会话时复位音频静音与全部会话级工具引擎/待重试队列，
-                        // 避免新客户端继承旧客户端的静音状态、终端 PTY、端口映射或陈旧线帧。
+                        // M9：新控制端顶替旧会话时复位隐私幕布/被控端静音/虚拟屏、音频静音与全部会话级工具引擎，
+                        // 避免新客户端继承旧客户端的隐私/音频/虚拟屏状态、终端 PTY 或陈旧线帧。
+                        // `finalize_session` 已基于 `cfg.pipeline` 基线模板在主屏上启动新管线，
+                        // 仅当旧会话曾启用隐私幕布时需在清理幕布后重建一次 SCK 过滤器。
+                        let had_privacy_curtain = hw_cleanup.privacy_active;
+                        hw_cleanup.cleanup_now();
+                        active_display_id = None;
+                        shows_cursor = false;
+                        host.set_capture_options(None, false);
                         display_mode_session.restore();
+                        let main_origin = if prefer_hardware && hardware_video_active {
+                            crate::platform::list_displays()
+                                .into_iter()
+                                .find(|d| d.is_main)
+                                .map(|d| (d.origin_x, d.origin_y))
+                                .unwrap_or((0.0, 0.0))
+                        } else {
+                            (0.0, 0.0)
+                        };
                         if let Some(orig) = original_native_res {
-                            host.set_injector_screen_size(orig.width, orig.height);
+                            host.set_injector_screen_bounds(
+                                main_origin.0,
+                                main_origin.1,
+                                orig.width,
+                                orig.height,
+                            );
                         }
                         hevc_runtime_failed = false;
                         last_busy = true;
@@ -2672,6 +3409,17 @@ fn drive_ui_host_session_inner(
                             prefer_hardware,
                             hardware_video_active,
                         );
+                        if had_privacy_curtain {
+                            if let Some(cur) = host.negotiated() {
+                                let _ = host.force_reconfigure_stream(
+                                    cur.width,
+                                    cur.height,
+                                    Some(cur.fps),
+                                    Some(session_max_res),
+                                    None,
+                                );
+                            }
+                        }
                         let presets = build_hardware_display_presets(
                             prefer_hardware,
                             hardware_video_active,
@@ -2685,6 +3433,11 @@ fn drive_ui_host_session_inner(
                             host_hevc_available(hevc_runtime_failed),
                         ) {
                             pending_display_tx.push_back(payload);
+                        }
+                        if prefer_hardware && hardware_video_active {
+                            if let Some(dp) = encode_host_displays_state(active_display_id) {
+                                pending_display_tx.push_back(dp);
+                            }
                         }
                         wallpaper_rx = if prefer_hardware && hardware_video_active {
                             Some(spawn_wallpaper_fetcher())
@@ -3322,6 +4075,7 @@ fn run_host_worker(
     });
 
     let mut next_listener = Some(first_listener);
+    let mut pending_listening_notify = false;
     // U-M1：`first_listener` 在 `HostHandle::spawn` 时以初始版本 0 构造；
     // 若在工作线程进入此处前调用方已调用 `set_password` 或修改鉴权配置，必须立即可见并重建。
     let mut observed_pw_ver = 0u64;
@@ -3345,10 +4099,11 @@ fn run_host_worker(
                     HostListener::AwaitingMtlsCert
                 } else {
                     // 前一轮 `HostSession` / `QuicEndpoint` 在 tokio 后台异步释放 UDP 端口，
-                    // 立即重绑 `actual_addr` 可能短暂遇到 `AddrInUse`；短退避重试至多 10 次（~200ms）。
+                    // 立即重绑 `actual_addr` 可能短暂遇到 `AddrInUse`；短退避重试至多 25 次（~500ms）。
                     let mut last_err = String::new();
                     let mut rebuilt = None;
-                    for attempt in 0..10 {
+                    let mut emitted_fallback_listening = false;
+                    for attempt in 0..25 {
                         if stop_flag.load(Ordering::Acquire) {
                             break;
                         }
@@ -3392,7 +4147,7 @@ fn run_host_worker(
                             }
                             Err(e) => {
                                 last_err = e;
-                                if attempt < 9 {
+                                if attempt < 24 {
                                     thread::sleep(Duration::from_millis(20));
                                 }
                             }
@@ -3465,12 +4220,41 @@ fn run_host_worker(
                                     display_addr: display_addr.clone(),
                                     backend,
                                 });
+                                emitted_fallback_listening = true;
                             }
                             rebuilt = Some(fb_listener);
                         }
                     }
                     match rebuilt {
-                        Some(l) => l,
+                        Some(l) => {
+                            if pending_listening_notify
+                                && !emitted_fallback_listening
+                                && !stop_flag.load(Ordering::Acquire)
+                            {
+                                let backend = match &l {
+                                    HostListener::Plain(b) => b
+                                        .backend_label
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .clone(),
+                                    HostListener::MtlsLan { .. }
+                                    | HostListener::AwaitingMtlsCert => {
+                                        if opts.prefer_hardware {
+                                            "auto".to_string()
+                                        } else {
+                                            "fake".to_string()
+                                        }
+                                    }
+                                };
+                                updates.push(HostUpdate::Listening {
+                                    listen_addr: actual_addr.to_string(),
+                                    display_addr: display_addr.clone(),
+                                    backend,
+                                });
+                            }
+                            pending_listening_notify = false;
+                            l
+                        }
                         None => {
                             if !stop_flag.load(Ordering::Acquire) {
                                 updates.push(HostUpdate::Error { message: last_err });
@@ -3526,6 +4310,7 @@ fn run_host_worker(
                         || config_version.load(Ordering::Acquire) != observed_cfg_ver
                     {
                         // 密码或鉴权配置在等待期间被刷新：重建 HostSession 使新配置对下一次握手生效。
+                        pending_listening_notify = true;
                         break false;
                     }
                     // 每轮 accept 分片前重锚 Pending 墙钟并刷新当前显示器分辨率能力，避免外接屏/分辨率切换后使用陈旧 caps。
@@ -3594,13 +4379,12 @@ fn run_host_worker(
                     &updates,
                     &stop_flag,
                 );
+                let _ = last_backend;
                 updates.push(HostUpdate::ClientDisconnected { reason });
                 if !stop_flag.load(Ordering::Acquire) {
-                    updates.push(HostUpdate::Listening {
-                        listen_addr: actual_addr.to_string(),
-                        display_addr: display_addr.clone(),
-                        backend: last_backend,
-                    });
+                    // 等外层循环真正完成新 UDP/QUIC 监听重绑后再发出 `Listening`，
+                    // 避免对端在旧 quinn::Endpoint 异步释放窗口内重连撞上 CONNECTION_REFUSED。
+                    pending_listening_notify = true;
                 }
                 incoming_relay.purge_for_peer_before(
                     lan_peer_did.as_deref(),
@@ -3624,6 +4408,7 @@ fn run_host_worker(
                         continue;
                     }
                     if config_version.load(Ordering::Acquire) != observed_cfg_ver {
+                        pending_listening_notify = true;
                         break;
                     }
                     thread::sleep(Duration::from_millis(50));
@@ -3659,6 +4444,7 @@ fn run_host_worker(
                     }
                     if config_version.load(Ordering::Acquire) != observed_cfg_ver {
                         need_rebind = true;
+                        pending_listening_notify = true;
                         break;
                     }
                     observed_pw_ver = password_version.load(Ordering::Acquire);
@@ -3756,6 +4542,7 @@ fn run_host_worker(
                         Err(rc_types::Error::Timeout(_)) => continue,
                         Err(_) => {
                             need_rebind = true;
+                            pending_listening_notify = true;
                             break;
                         }
                     }

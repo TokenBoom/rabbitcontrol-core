@@ -94,6 +94,10 @@ pub struct PipelineConfig {
     pub codec: rc_encode::Codec,
     /// 是否启用异步解码/上屏工作线程（解耦 QUIC 接收线程与解码/Metal 上屏耗时；默认 `false` 保持单测确定性）。
     pub async_decode: bool,
+    /// 可选目标显示器 ID（`None` = 主显示器；`Some(id)` = 指定物理或虚拟显示器）。
+    pub display_id: Option<u32>,
+    /// 采集画面是否包含被控端系统鼠标光标（默认 `false`，主控端/智能光标合成；选择「使用被控端鼠标」时为 `true`）。
+    pub shows_cursor: bool,
     /// 媒体分片预算（字节）：[`HostPipeline`](host::HostPipeline) 调
     /// [`split_frame`](rc_proto::split_frame) 时单片载荷的上限。
     ///
@@ -122,6 +126,8 @@ impl Default for PipelineConfig {
             clock_origin_us: None,
             codec: rc_encode::Codec::H264,
             async_decode: false,
+            display_id: None,
+            shows_cursor: false,
             max_packet_payload: MAX_PAYLOAD,
         }
     }

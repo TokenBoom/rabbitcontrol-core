@@ -56,6 +56,27 @@ pub struct PlatformDisplayMode {
     pub is_hidpi: bool,
 }
 
+/// 宿主系统在线显示器（物理屏或虚拟屏）完整描述。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlatformDisplayInfo {
+    /// 平台显示器唯一标识（macOS `CGDirectDisplayID`）。
+    pub id: u32,
+    /// 可读名称。
+    pub name: String,
+    /// 逻辑宽度（点）。
+    pub width: u32,
+    /// 逻辑高度（点）。
+    pub height: u32,
+    /// 全局桌面坐标系原点 X（点）。
+    pub origin_x: f64,
+    /// 全局桌面坐标系原点 Y（点）。
+    pub origin_y: f64,
+    /// 是否为主显示器。
+    pub is_main: bool,
+    /// 是否为本进程创建的虚拟显示器。
+    pub is_virtual: bool,
+}
+
 /// 被控期间临时切换系统显示器分辨率的 RAII 守卫（`Drop` 时自动恢复原生分辨率）。
 pub trait DisplayModeSessionGuard: Send {
     /// 返回接管前记录的原生逻辑分辨率。
@@ -121,6 +142,54 @@ pub trait ClientPlatformHooks: Send + Sync {
     fn lock_screen_now(&self) -> bool {
         false
     }
+
+    /// 开启或更新被控端物理防窥隐私幕布（遮挡所有物理屏但对屏幕采集排除）；
+    /// `mode` 为 `"privacy"` / `"black"` / `"off"`。
+    fn set_privacy_curtain(
+        &self,
+        _mode: &str,
+        _preset: &str,
+        _custom_image_bytes: Option<&[u8]>,
+    ) -> Result<(), String> {
+        Err("当前平台暂不支持物理防窥隐私幕布".to_string())
+    }
+
+    /// 关闭并销毁被控端全部物理防窥隐私幕布窗口（幂等）。
+    fn clear_privacy_curtain(&self) {}
+
+    /// 设置被控端本机扬声器系统静音状态，返回设置后的静音状态。
+    fn set_host_system_muted(&self, _muted: bool) -> Result<bool, String> {
+        Err("当前平台暂不支持被控端系统静音".to_string())
+    }
+
+    /// 恢复被控端本机扬声器在进入远控前的原始静音状态（幂等）。
+    fn restore_host_system_audio(&self) {}
+
+    /// 清除已保存的被控端声音快照而不修改当前硬件静音状态（用于 `restore_on_exit == false` 结束会话，防止污染下一次会话）。
+    fn clear_host_audio_snapshot(&self) {}
+
+    /// 枚举当前全部在线显示器（含物理屏与本进程创建的虚拟屏）。
+    fn list_displays(&self) -> Vec<PlatformDisplayInfo> {
+        Vec::new()
+    }
+
+    /// 创建一个虚拟显示器，返回新显示器的完整描述。
+    fn create_virtual_display(
+        &self,
+        _width: u32,
+        _height: u32,
+        _hidpi: bool,
+    ) -> Result<PlatformDisplayInfo, String> {
+        Err("当前平台暂不支持创建虚拟显示器".to_string())
+    }
+
+    /// 销毁由本进程创建的指定虚拟显示器；成功销毁返回 `true`。
+    fn destroy_virtual_display(&self, _display_id: u32) -> bool {
+        false
+    }
+
+    /// 销毁本进程创建的全部虚拟显示器（幂等，会话退出时调用）。
+    fn destroy_all_virtual_displays(&self) {}
 
     /// 创建绑定到主显示器的系统输入注入器。
     fn create_main_display_injector(&self) -> Option<Box<dyn rc_input::InputInjector>> {
@@ -202,6 +271,81 @@ pub fn capture_wallpaper_jpeg(max_width: u32, max_height: u32) -> Option<Vec<u8>
 /// 立即锁定当前主屏幕。
 pub fn lock_screen_now() -> bool {
     PLATFORM_HOOKS.get().is_some_and(|h| h.lock_screen_now())
+}
+
+/// 开启或更新被控端物理防窥隐私幕布。
+pub fn set_privacy_curtain(
+    mode: &str,
+    preset: &str,
+    custom_image_bytes: Option<&[u8]>,
+) -> Result<(), String> {
+    match PLATFORM_HOOKS.get() {
+        Some(h) => h.set_privacy_curtain(mode, preset, custom_image_bytes),
+        None => Err("当前平台未注册防窥隐私幕布钩子".to_string()),
+    }
+}
+
+/// 关闭并销毁被控端全部物理防窥隐私幕布窗口。
+pub fn clear_privacy_curtain() {
+    if let Some(h) = PLATFORM_HOOKS.get() {
+        h.clear_privacy_curtain();
+    }
+}
+
+/// 设置被控端本机扬声器静音状态。
+pub fn set_host_system_muted(muted: bool) -> Result<bool, String> {
+    match PLATFORM_HOOKS.get() {
+        Some(h) => h.set_host_system_muted(muted),
+        None => Err("当前平台未注册系统静音钩子".to_string()),
+    }
+}
+
+/// 恢复被控端本机扬声器原始声音设置。
+pub fn restore_host_system_audio() {
+    if let Some(h) = PLATFORM_HOOKS.get() {
+        h.restore_host_system_audio();
+    }
+}
+
+/// 清除被控端已保存的原始声音快照（不改动当前音量/静音状态）。
+pub fn clear_host_audio_snapshot() {
+    if let Some(h) = PLATFORM_HOOKS.get() {
+        h.clear_host_audio_snapshot();
+    }
+}
+
+/// 枚举当前全部在线显示器（含物理屏与虚拟屏）。
+pub fn list_displays() -> Vec<PlatformDisplayInfo> {
+    PLATFORM_HOOKS
+        .get()
+        .map(|h| h.list_displays())
+        .unwrap_or_default()
+}
+
+/// 创建一个新的虚拟显示器。
+pub fn create_virtual_display(
+    width: u32,
+    height: u32,
+    hidpi: bool,
+) -> Result<PlatformDisplayInfo, String> {
+    match PLATFORM_HOOKS.get() {
+        Some(h) => h.create_virtual_display(width, height, hidpi),
+        None => Err("当前平台未注册虚拟显示器钩子".to_string()),
+    }
+}
+
+/// 销毁指定的虚拟显示器。
+pub fn destroy_virtual_display(display_id: u32) -> bool {
+    PLATFORM_HOOKS
+        .get()
+        .is_some_and(|h| h.destroy_virtual_display(display_id))
+}
+
+/// 销毁本进程创建的全部虚拟显示器。
+pub fn destroy_all_virtual_displays() {
+    if let Some(h) = PLATFORM_HOOKS.get() {
+        h.destroy_all_virtual_displays();
+    }
 }
 
 /// 创建绑定主显示器的系统输入注入器。

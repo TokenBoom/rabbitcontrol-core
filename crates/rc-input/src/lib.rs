@@ -375,6 +375,11 @@ pub trait InputInjector: Send {
     /// 设置屏幕尺寸（像素），用于坐标反归一化。显示器热插拔后上层
     /// 应重新调用。
     fn set_screen_size(&mut self, w: u32, h: u32);
+    /// 设置目标显示器在全局桌面坐标系中的边界（支持多屏/虚拟屏非零原点）；
+    /// 默认回退为只更新宽高。
+    fn set_screen_bounds(&mut self, _origin_x: f64, _origin_y: f64, w: u32, h: u32) {
+        self.set_screen_size(w, h);
+    }
 }
 
 /// 输入捕获器（控制端）：从本机输入子系统取事件并转成归一化事件。

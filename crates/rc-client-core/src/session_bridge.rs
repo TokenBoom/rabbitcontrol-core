@@ -49,7 +49,7 @@ use rc_types::Resolution;
 
 use crate::cert_manager::OwnerGrantPayload;
 use crate::display_ctrl::{
-    self, DisplayControlMsg, DisplayPreset, HighRefreshAdvisory, StreamCodec,
+    self, DisplayControlMsg, DisplayDescriptor, DisplayPreset, HighRefreshAdvisory, StreamCodec,
 };
 use crate::hud::{HudSample, HudSnapshot};
 use crate::lan_discovery;
@@ -339,6 +339,39 @@ pub enum SessionUpdate {
     Wallpaper {
         /// 内联 Data URL。
         data_url: String,
+    },
+    /// 被控端回传当前生效的防窥隐私幕布状态。
+    PrivacyState {
+        /// 防窥模式（`"off"` | `"privacy"` | `"black"`）。
+        mode: String,
+        /// 当前预设 ID。
+        preset: String,
+        /// 被控端是否支持隐私幕布。
+        supported: bool,
+    },
+    /// 被控端回传本机静音运行状态。
+    HostMuteState {
+        /// 当前是否静音。
+        muted: bool,
+        /// 被控端是否支持系统静音控制。
+        supported: bool,
+    },
+    /// 被控端回传鼠标光标模式。
+    MouseModeState {
+        /// 当前生效鼠标模式（`"smart"` | `"remote"` | `"local"`）。
+        mode: String,
+    },
+    /// 被控端回传全部可用显示器列表及当前活动显示器 ID。
+    DisplaysState {
+        /// 可用物理屏与虚拟屏列表。
+        displays: Vec<DisplayDescriptor>,
+        /// 当前正在采集的显示器 ID。
+        active_display_id: u32,
+    },
+    /// 虚拟显示器创建或切换失败提示。
+    VirtualDisplayError {
+        /// 错误原因。
+        message: String,
     },
     /// 当收到对端 `ByeReason::SessionSwitching` 时先推送 `SessionSwitching` 通知前端自动短延迟重连。
     SessionSwitching {
@@ -1698,22 +1731,36 @@ fn encode_audio_ctrl_muted(muted: bool) -> Vec<u8> {
         .into_bytes()
 }
 
+/// 冲刷单个工具通道的待发送队列：遇到瞬态背压 `Err` 时停止并保留队首，
+/// 遇到不可恢复的配置/超限错误（`is_fatal_err` 返回 `true`）时丢弃该非法帧以免永久阻塞后续可靠控制消息。
+fn flush_pending_tool_queue_checked<E>(
+    pending: &mut VecDeque<Vec<u8>>,
+    mut send_fn: impl FnMut(Vec<u8>) -> Result<(), E>,
+    is_fatal_err: impl Fn(&E) -> bool,
+) -> bool {
+    let mut sent_any = false;
+    while let Some(front) = pending.front() {
+        match send_fn(front.clone()) {
+            Ok(()) => {
+                pending.pop_front();
+                sent_any = true;
+            }
+            Err(ref e) if is_fatal_err(e) => {
+                pending.pop_front();
+            }
+            Err(_) => break,
+        }
+    }
+    sent_any
+}
+
 /// 冲刷单个工具通道的待发送队列：遇到发送 `Err`（如 TCP 中继背压）时立即停止并保留队首，
 /// 下一拍严格按 FIFO 顺序重试，绝不丢弃任何可靠工具帧。
 fn flush_pending_tool_queue<E>(
     pending: &mut VecDeque<Vec<u8>>,
-    mut send_fn: impl FnMut(Vec<u8>) -> Result<(), E>,
+    send_fn: impl FnMut(Vec<u8>) -> Result<(), E>,
 ) -> bool {
-    let mut sent_any = false;
-    while let Some(front) = pending.front() {
-        if send_fn(front.clone()).is_ok() {
-            pending.pop_front();
-            sent_any = true;
-        } else {
-            break;
-        }
-    }
-    sent_any
+    flush_pending_tool_queue_checked(pending, send_fn, |_| false)
 }
 
 #[derive(Clone)]
@@ -1756,6 +1803,7 @@ impl Drop for RelayInterruptSlotGuard<'_> {
 /// 绝不遗留僵尸线程（U10）。
 pub struct SessionHandle {
     cmd_tx: Arc<BoundedQueue<SessionCommand>>,
+    display_ctrl_tx: Arc<BoundedQueue<DisplayControlMsg>>,
     input_tx: Arc<BoundedInputQueue>,
     update_rx: Arc<BoundedUpdateQueue>,
     file_event_rx: Arc<BoundedQueue<FileEvent>>,
@@ -1788,6 +1836,7 @@ impl SessionHandle {
         preallocated_surface: Option<PreallocatedRenderSurface>,
     ) -> Self {
         let cmd_tx = Arc::new(BoundedQueue::new(COMMAND_CHANNEL_CAP));
+        let display_ctrl_tx = Arc::new(BoundedQueue::new(COMMAND_CHANNEL_CAP));
         let input_tx = Arc::new(BoundedInputQueue::new(INPUT_CHANNEL_CAP));
         let update_rx = Arc::new(BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP));
         let file_event_rx = Arc::new(BoundedQueue::new(FILE_EVENT_CHANNEL_CAP));
@@ -1806,6 +1855,7 @@ impl SessionHandle {
         let base_config = cfg.clone();
 
         let t_cmd = Arc::clone(&cmd_tx);
+        let t_display_ctrl = Arc::clone(&display_ctrl_tx);
         let t_input = Arc::clone(&input_tx);
         let t_update = Arc::clone(&update_rx);
         let t_terminal_events = Arc::clone(&terminal_event_rx);
@@ -1829,6 +1879,7 @@ impl SessionHandle {
                         cfg,
                         preallocated_surface,
                         t_cmd,
+                        t_display_ctrl,
                         t_input,
                         Arc::clone(&t_update),
                         t_layer,
@@ -1866,6 +1917,7 @@ impl SessionHandle {
 
         Self {
             cmd_tx,
+            display_ctrl_tx,
             input_tx,
             update_rx,
             file_event_rx,
@@ -1911,6 +1963,14 @@ impl SessionHandle {
             return;
         }
         self.cmd_tx.push_drop_oldest(cmd);
+    }
+
+    /// 发送显示/防窥/多屏控制消息（经 `TOOL_CHANNEL_DISPLAY_CTRL` 可靠送达被控端）。
+    pub fn send_display_ctrl(&self, msg: DisplayControlMsg) {
+        if !self.is_running() {
+            return;
+        }
+        self.display_ctrl_tx.push_drop_oldest(msg);
     }
 
     /// 动态切换当前会话的只读观看模式标记（供 `set_session_watch_only` 同步控制输入通道与采集器）。
@@ -2404,6 +2464,7 @@ fn run_session_thread(
     cfg: UiSessionConfig,
     preallocated_surface: Option<PreallocatedRenderSurface>,
     cmd_rx: Arc<BoundedQueue<SessionCommand>>,
+    display_ctrl_rx: Arc<BoundedQueue<DisplayControlMsg>>,
     input_rx: Arc<BoundedInputQueue>,
     update_tx: Arc<BoundedUpdateQueue>,
     layer_lease: Arc<Mutex<Option<LayerLease>>>,
@@ -3088,6 +3149,16 @@ fn run_session_thread(
                 }
             }
         }
+        if client.state() == SessionState::Streaming {
+            for dmsg in display_ctrl_rx.drain_all() {
+                if let Some(payload) = display_ctrl::encode_display_ctrl(&dmsg) {
+                    while pending_display_tx.len() >= COMMAND_CHANNEL_CAP {
+                        pending_display_tx.pop_front();
+                    }
+                    pending_display_tx.push_back(payload);
+                }
+            }
+        }
         if disconnect_requested || disconnect_flag.load(Ordering::Acquire) {
             end_reason = "用户主动断开".to_string();
             break;
@@ -3334,9 +3405,11 @@ fn run_session_thread(
                     }) {
                         tools_busy = true;
                     }
-                    if flush_pending_tool_queue(&mut pending_display_tx, |frame| {
-                        client.send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, frame)
-                    }) {
+                    if flush_pending_tool_queue_checked(
+                        &mut pending_display_tx,
+                        |frame| client.send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, frame),
+                        |e| matches!(e, rc_types::Error::InvalidConfig(_)),
+                    ) {
                         tools_busy = true;
                     }
                 }
@@ -3750,9 +3823,39 @@ fn handle_display_ctrl_msg(
                 None
             }
         }
+        DisplayControlMsg::PrivacyState {
+            mode,
+            preset,
+            supported,
+        } => Some(SessionUpdate::PrivacyState {
+            mode,
+            preset,
+            supported,
+        }),
+        DisplayControlMsg::HostMuteState { muted, supported } => {
+            Some(SessionUpdate::HostMuteState { muted, supported })
+        }
+        DisplayControlMsg::MouseModeState { mode } => Some(SessionUpdate::MouseModeState { mode }),
+        DisplayControlMsg::DisplaysState {
+            displays,
+            active_display_id,
+        } => Some(SessionUpdate::DisplaysState {
+            displays,
+            active_display_id,
+        }),
+        DisplayControlMsg::VirtualDisplayError { message } => {
+            Some(SessionUpdate::VirtualDisplayError { message })
+        }
         DisplayControlMsg::SetStream { .. }
         | DisplayControlMsg::LockScreen
-        | DisplayControlMsg::SetCodec { .. } => None,
+        | DisplayControlMsg::SetCodec { .. }
+        | DisplayControlMsg::SetPrivacyMode { .. }
+        | DisplayControlMsg::SetHostMute { .. }
+        | DisplayControlMsg::SetMouseMode { .. }
+        | DisplayControlMsg::ListDisplays
+        | DisplayControlMsg::SwitchDisplay { .. }
+        | DisplayControlMsg::CreateVirtualDisplay { .. }
+        | DisplayControlMsg::RemoveVirtualDisplay { .. } => None,
     }
 }
 

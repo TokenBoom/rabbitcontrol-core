@@ -45,6 +45,15 @@ pub const MIN_TERMINAL_FONT_SIZE: u16 = 10;
 /// 远程终端允许的最大字体大小（px）。
 pub const MAX_TERMINAL_FONT_SIZE: u16 = 28;
 
+/// 客户端安全锁密码最小长度（字符）。
+pub const MIN_CLIENT_LOCK_PASSWORD_LEN: usize = 8;
+/// 客户端安全锁密码最大长度（字符）。
+pub const MAX_CLIENT_LOCK_PASSWORD_LEN: usize = 16;
+/// 客户端安全锁密码 PBKDF2-HMAC-SHA256 迭代次数。
+const CLIENT_LOCK_PBKDF2_ITERS: u32 = 100_000;
+/// 自定义隐私屏保图片最大字节数（4 MiB）。
+pub const MAX_PRIVACY_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
 /// 允许的最小自定义分辨率宽度（像素）。
 pub const MIN_RESOLUTION_WIDTH: u32 = 320;
 
@@ -157,6 +166,59 @@ pub struct AppPrefs {
     /// 按设备标识（或连接目标）持久化的 W4 TCP 端口映射规则列表。
     #[serde(default)]
     pub saved_portmaps: BTreeMap<String, Vec<SavedPortMapRule>>,
+    /// 客户端主界面当前是否处于「安全锁定」状态（默认 `false`）。
+    #[serde(default)]
+    pub client_lock_enabled: bool,
+    /// 客户端「安全锁定」PBKDF2 盐值（16 字节小写 hex）。
+    #[serde(default)]
+    pub client_lock_salt_hex: Option<String>,
+    /// 客户端「安全锁定」PBKDF2-HMAC-SHA256 摘要（32 字节小写 hex）。
+    #[serde(default)]
+    pub client_lock_hash_hex: Option<String>,
+    /// 被控端防窥模式偏好（`"off"` | `"privacy"` | `"black"`，默认 `"off"`）。
+    #[serde(default = "default_privacy_mode")]
+    pub privacy_mode: String,
+    /// 隐私屏保选中的预设标识（`"default_dark"` | `"guard"` | `"work"` | `"terminal"` | `"focus"` | `"bluescreen"` | `"custom"`）。
+    #[serde(default = "default_privacy_preset")]
+    pub privacy_preset: String,
+    /// 自定义隐私屏保图片文件名（位于 `privacy/` 目录内）。
+    #[serde(default)]
+    pub privacy_custom_image: Option<String>,
+    /// 远控连接时是否自动静音被控端（默认 `false`）。
+    #[serde(default)]
+    pub host_mute_on_connect: bool,
+    /// 远程结束后是否恢复被控端声音设置（默认 `true`）。
+    #[serde(default = "default_host_restore_audio_on_exit")]
+    pub host_restore_audio_on_exit: bool,
+    /// 外设：是否发送系统快捷键到被控端（如 `Cmd+Tab`，默认 `true`）。
+    #[serde(default = "default_send_system_shortcuts")]
+    pub send_system_shortcuts: bool,
+    /// 外设：不透传到被控端的系统快捷键例外列表（例如 `["Cmd+Space"]`）。
+    #[serde(default)]
+    pub shortcut_exceptions: Vec<String>,
+    /// 外设：鼠标模式（`"smart"` | `"remote"` | `"local"`，默认 `"smart"`）。
+    #[serde(default = "default_mouse_mode")]
+    pub mouse_mode: String,
+}
+
+fn default_privacy_mode() -> String {
+    "off".to_string()
+}
+
+fn default_privacy_preset() -> String {
+    "preset-1".to_string()
+}
+
+fn default_host_restore_audio_on_exit() -> bool {
+    true
+}
+
+fn default_send_system_shortcuts() -> bool {
+    true
+}
+
+fn default_mouse_mode() -> String {
+    "smart".to_string()
 }
 
 fn default_bitrate_preset() -> String {
@@ -212,6 +274,17 @@ impl Default for AppPrefs {
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
             device_snapshots: BTreeMap::new(),
             saved_portmaps: BTreeMap::new(),
+            client_lock_enabled: false,
+            client_lock_salt_hex: None,
+            client_lock_hash_hex: None,
+            privacy_mode: default_privacy_mode(),
+            privacy_preset: default_privacy_preset(),
+            privacy_custom_image: None,
+            host_mute_on_connect: false,
+            host_restore_audio_on_exit: default_host_restore_audio_on_exit(),
+            send_system_shortcuts: default_send_system_shortcuts(),
+            shortcut_exceptions: Vec::new(),
+            mouse_mode: default_mouse_mode(),
         }
     }
 }
@@ -286,6 +359,119 @@ pub struct StreamPrefsPatch {
     pub show_hud: Option<bool>,
     /// 可选「退出时锁定被控端」开关。
     pub lock_on_exit: Option<bool>,
+}
+
+/// 被控端防窥模式与静音偏好的增量补丁。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PrivacyPrefsPatch {
+    /// 防窥模式（`"off"` | `"privacy"` | `"black"`）。
+    pub privacy_mode: Option<String>,
+    /// 隐私屏保预设（`"default_dark"` | `"guard"` | `"work"` | `"terminal"` | `"focus"` | `"bluescreen"` | `"custom"`）。
+    pub privacy_preset: Option<String>,
+    /// 连接时是否自动静音被控端。
+    pub host_mute_on_connect: Option<bool>,
+    /// 远程结束后是否恢复被控端声音设置。
+    pub host_restore_audio_on_exit: Option<bool>,
+}
+
+/// 外设偏好（系统快捷键透传、例外规则与鼠标模式）的增量补丁。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PeripheralsPrefsPatch {
+    /// 是否将系统快捷键（如 `Cmd+Tab`）发送到被控端。
+    pub send_system_shortcuts: Option<bool>,
+    /// 例外快捷键列表（保持由本机响应）。
+    pub shortcut_exceptions: Option<Vec<String>>,
+    /// 鼠标模式（`"smart"` | `"remote"` | `"local"`）。
+    pub mouse_mode: Option<String>,
+}
+
+fn decode_hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// 对账号字符串做脱敏展示（邮箱保留首尾并遮罩中间，手机号保留前 3 后 2）。
+pub fn mask_account_display(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some((local, domain)) = trimmed.split_once('@') {
+        let chars: Vec<char> = local.chars().collect();
+        let masked_local = if chars.len() <= 2 {
+            format!("{}***", chars.first().copied().unwrap_or('*'))
+        } else if chars.len() <= 4 {
+            format!("{}{}***", chars[0], chars[1])
+        } else {
+            format!("{}{}****{}", chars[0], chars[1], chars[chars.len() - 1])
+        };
+        format!("{masked_local}@{domain}")
+    } else {
+        let chars: Vec<char> = trimmed.chars().collect();
+        if chars.len() <= 5 {
+            format!("{}***", chars.first().copied().unwrap_or('*'))
+        } else {
+            let head: String = chars[..3].iter().collect();
+            let tail: String = chars[chars.len() - 2..].iter().collect();
+            format!("{head}******{tail}")
+        }
+    }
+}
+
+/// 返回自定义隐私屏保图片保存目录（`<config_dir>/privacy`）。
+pub fn default_privacy_dir() -> PathBuf {
+    crate::config_paths::config_dir().join("privacy")
+}
+
+/// 原子保存自定义隐私屏保图片（PNG/JPEG/WebP，最大 4 MiB）并返回文件名。
+pub fn save_privacy_custom_image(dir: &Path, bytes: &[u8]) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("图片数据不能为空".to_string());
+    }
+    if bytes.len() > MAX_PRIVACY_IMAGE_BYTES {
+        return Err("自定义隐私屏保图片不能超过 4 MB".to_string());
+    }
+    let ext = if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        "png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpg"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        return Err("仅支持 PNG、JPEG 或 WebP 格式图片".to_string());
+    };
+    let filename = format!("custom-curtain.{ext}");
+    let target = dir.join(&filename);
+    atomic_write_bytes(&target, bytes, false).map_err(|e| format!("保存隐私屏保图片失败：{e}"))?;
+    Ok(filename)
+}
+
+/// 从隐私屏保目录安全读取指定图片字节（校验无路径穿越）。
+pub fn load_privacy_custom_image(dir: &Path, filename: &str) -> Option<Vec<u8>> {
+    let mut comps = Path::new(filename).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(_)), None) => {}
+        _ => return None,
+    }
+    let path = dir.join(filename);
+    let data = fs::read(path).ok()?;
+    if data.is_empty() || data.len() > MAX_PRIVACY_IMAGE_BYTES {
+        return None;
+    }
+    Some(data)
 }
 
 fn is_valid_bitrate_preset(preset: &str) -> bool {
@@ -473,6 +659,159 @@ impl AppPrefs {
         Ok(())
     }
 
+    /// 判断是否已配置客户端「安全锁定」密码。
+    pub fn has_client_lock_password(&self) -> bool {
+        self.client_lock_salt_hex
+            .as_deref()
+            .is_some_and(|s| s.len() == 32 && decode_hex_bytes(s).is_some())
+            && self
+                .client_lock_hash_hex
+                .as_deref()
+                .is_some_and(|h| h.len() == 64 && decode_hex_bytes(h).is_some())
+    }
+
+    /// 校验并设置客户端「安全锁定」密码（8–16 位，使用 PBKDF2-HMAC-SHA256 加随机盐安全存储，不落明文）。
+    pub fn set_client_lock_password(&mut self, password: &str) -> Result<(), String> {
+        let len = password.chars().count();
+        if !(MIN_CLIENT_LOCK_PASSWORD_LEN..=MAX_CLIENT_LOCK_PASSWORD_LEN).contains(&len) {
+            return Err(format!(
+                "安全密码长度必须为 {MIN_CLIENT_LOCK_PASSWORD_LEN}-{MAX_CLIENT_LOCK_PASSWORD_LEN} 位"
+            ));
+        }
+        if password.chars().any(|ch| ch.is_control() || ch == '\0') {
+            return Err("安全密码不能包含控制字符".to_string());
+        }
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let mut hash = [0u8; 32];
+        let iters = std::num::NonZeroU32::new(CLIENT_LOCK_PBKDF2_ITERS)
+            .expect("CLIENT_LOCK_PBKDF2_ITERS must be non-zero");
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            iters,
+            &salt,
+            password.as_bytes(),
+            &mut hash,
+        );
+        self.client_lock_salt_hex = Some(encode_hex_lower(&salt));
+        self.client_lock_hash_hex = Some(encode_hex_lower(&hash));
+        Ok(())
+    }
+
+    /// 常量时间校验输入的客户端「安全锁定」密码是否正确。
+    pub fn verify_client_lock_password(&self, password: &str) -> bool {
+        let (Some(salt_hex), Some(hash_hex)) = (
+            self.client_lock_salt_hex.as_deref(),
+            self.client_lock_hash_hex.as_deref(),
+        ) else {
+            return false;
+        };
+        let (Some(salt), Some(expected)) = (decode_hex_bytes(salt_hex), decode_hex_bytes(hash_hex))
+        else {
+            return false;
+        };
+        if salt.len() != 16 || expected.len() != 32 {
+            return false;
+        }
+        let iters = std::num::NonZeroU32::new(CLIENT_LOCK_PBKDF2_ITERS)
+            .expect("CLIENT_LOCK_PBKDF2_ITERS must be non-zero");
+        ring::pbkdf2::verify(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            iters,
+            &salt,
+            password.as_bytes(),
+            &expected,
+        )
+        .is_ok()
+    }
+
+    /// 校验并原子应用防窥模式与被控端静音偏好。
+    pub fn apply_privacy_patch(&mut self, patch: PrivacyPrefsPatch) -> Result<(), String> {
+        if let Some(ref mode) = patch.privacy_mode {
+            if !matches!(mode.as_str(), "off" | "privacy" | "black") {
+                return Err(format!("无效防窥模式：{mode:?}"));
+            }
+        }
+        if let Some(ref preset) = patch.privacy_preset {
+            if !matches!(
+                preset.as_str(),
+                "preset-1"
+                    | "preset-2"
+                    | "preset-3"
+                    | "preset-4"
+                    | "preset-5"
+                    | "preset-6"
+                    | "custom"
+            ) {
+                return Err(format!("无效隐私屏保预设：{preset:?}"));
+            }
+        }
+        if let Some(mode) = patch.privacy_mode {
+            self.privacy_mode = mode;
+        }
+        if let Some(preset) = patch.privacy_preset {
+            self.privacy_preset = preset;
+        }
+        if let Some(mute) = patch.host_mute_on_connect {
+            self.host_mute_on_connect = mute;
+        }
+        if let Some(restore) = patch.host_restore_audio_on_exit {
+            self.host_restore_audio_on_exit = restore;
+        }
+        Ok(())
+    }
+
+    /// 校验并原子应用外设偏好（系统快捷键透传、例外列表与鼠标模式）。
+    pub fn apply_peripherals_patch(&mut self, patch: PeripheralsPrefsPatch) -> Result<(), String> {
+        if let Some(ref mode) = patch.mouse_mode {
+            if !matches!(mode.as_str(), "smart" | "remote" | "local") {
+                return Err(format!("无效鼠标模式：{mode:?}"));
+            }
+        }
+        if let Some(ref list) = patch.shortcut_exceptions {
+            if list.len() > 32 {
+                return Err("快捷键例外列表最多支持 32 项".to_string());
+            }
+            for item in list {
+                let t = item.trim();
+                if t.is_empty() || t.chars().count() > 32 || t.chars().any(char::is_control) {
+                    return Err(format!("无效快捷键配置：{item:?}"));
+                }
+            }
+        }
+        if let Some(send) = patch.send_system_shortcuts {
+            self.send_system_shortcuts = send;
+        }
+        if let Some(list) = patch.shortcut_exceptions {
+            let mut dedup = Vec::with_capacity(list.len());
+            for item in list {
+                let clean = item.trim().to_string();
+                if !dedup.contains(&clean) {
+                    dedup.push(clean);
+                }
+            }
+            self.shortcut_exceptions = dedup;
+        }
+        if let Some(mode) = patch.mouse_mode {
+            self.mouse_mode = mode;
+        }
+        Ok(())
+    }
+
+    /// 读取自定义隐私屏保图片的 `data:image/...;base64,...` 预览 URL。
+    pub fn privacy_custom_data_url(&self, dir: &Path) -> Option<String> {
+        let name = self.privacy_custom_image.as_deref()?;
+        let bytes = load_privacy_custom_image(dir, name)?;
+        let mime = if name.ends_with(".png") {
+            "image/png"
+        } else if name.ends_with(".webp") {
+            "image/webp"
+        } else {
+            "image/jpeg"
+        };
+        Some(format!("data:{mime};base64,{}", base64_encode(&bytes)))
+    }
+
     /// 导出包含内联 Data URL 的设备快照视图列表。
     pub fn snapshot_views(&self, wallpapers_dir: &Path) -> Vec<DeviceSnapshotView> {
         self.device_snapshots
@@ -610,6 +949,49 @@ fn sanitize_prefs(prefs: &mut AppPrefs) {
         rules.truncate(32);
         !rules.is_empty()
     });
+    // 客户端安全锁定：若磁盘配置缺失/损坏盐值或哈希，强制关闭锁定避免永久锁死无法解锁。
+    if !prefs.has_client_lock_password() {
+        prefs.client_lock_enabled = false;
+        prefs.client_lock_salt_hex = None;
+        prefs.client_lock_hash_hex = None;
+    }
+    if !matches!(prefs.privacy_mode.as_str(), "off" | "privacy" | "black") {
+        prefs.privacy_mode = default_privacy_mode();
+    }
+    if !matches!(
+        prefs.privacy_preset.as_str(),
+        "preset-1" | "preset-2" | "preset-3" | "preset-4" | "preset-5" | "preset-6" | "custom"
+    ) {
+        prefs.privacy_preset = default_privacy_preset();
+    }
+    if let Some(ref custom_file) = prefs.privacy_custom_image {
+        let mut comps = Path::new(custom_file).components();
+        let safe = matches!(
+            (comps.next(), comps.next()),
+            (Some(Component::Normal(_)), None)
+        ) && custom_file.len() <= 64;
+        if !safe {
+            prefs.privacy_custom_image = None;
+        }
+    }
+    if !matches!(prefs.mouse_mode.as_str(), "smart" | "remote" | "local") {
+        prefs.mouse_mode = default_mouse_mode();
+    }
+    let mut clean_exc = Vec::with_capacity(prefs.shortcut_exceptions.len().min(32));
+    for item in &prefs.shortcut_exceptions {
+        let t = item.trim();
+        if !t.is_empty()
+            && t.chars().count() <= 32
+            && !t.chars().any(char::is_control)
+            && !clean_exc.iter().any(|x| x == t)
+        {
+            clean_exc.push(t.to_string());
+            if clean_exc.len() >= 32 {
+                break;
+            }
+        }
+    }
+    prefs.shortcut_exceptions = clean_exc;
 }
 
 /// 从指定路径读取应用偏好设置；文件不存在或内容损坏时回退默认值，并对越界字段自动修正。
@@ -790,10 +1172,12 @@ mod tests {
 
     #[test]
     fn default_paths_and_prefs_match_spec() {
+        let base = crate::config_paths::config_dir();
         let prefs_path = default_prefs_path();
-        assert!(prefs_path.ends_with(".config/rabbitcontrol/prefs.json"));
+        assert_eq!(prefs_path, base.join("prefs.json"));
         let wp_dir = default_wallpapers_dir();
-        assert!(wp_dir.ends_with(".config/rabbitcontrol/wallpapers"));
+        assert_eq!(wp_dir, base.join("wallpapers"));
+        assert!(crate::config_paths::user_config_dir().ends_with(".config/rabbitcontrol"));
 
         let prefs = AppPrefs::default();
         assert!(!prefs.allow_remote_assist);

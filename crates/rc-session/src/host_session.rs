@@ -283,6 +283,14 @@ pub struct HostSession {
     last_sent_frame_seq: Option<u64>,
     /// 本会话当前生效的视频编码器（初始跟随 `cfg.pipeline.codec`，每次全新会话落成时复位）。
     active_codec: rc_encode::Codec,
+    /// 下一次管线热重建目标显示器 ID（与 `cfg.pipeline.display_id` 基线模板分离，避免污染新会话 `finalize_session`）。
+    target_display_id: Option<u32>,
+    /// 下一次管线热重建目标光标采集开关（同上）。
+    target_shows_cursor: bool,
+    /// 当前在线运行管线实际使用的目标显示器 ID（仅在管线构建成功后更新，确保热重建失败时可精确回滚）。
+    live_display_id: Option<u32>,
+    /// 当前在线运行管线实际使用的光标采集开关（同上）。
+    live_shows_cursor: bool,
 }
 
 impl Drop for HostSession {
@@ -315,6 +323,10 @@ impl HostSession {
         };
         let endpoint = QuicEndpoint::new(&net, &identity)?;
         let active_codec = cfg.pipeline.codec;
+        let target_display_id = cfg.pipeline.display_id;
+        let target_shows_cursor = cfg.pipeline.shows_cursor;
+        let live_display_id = cfg.pipeline.display_id;
+        let live_shows_cursor = cfg.pipeline.shows_cursor;
         Ok(Self {
             cfg,
             endpoint: Some(endpoint),
@@ -366,6 +378,10 @@ impl HostSession {
             frame_seq_offset: 0,
             last_sent_frame_seq: None,
             active_codec,
+            target_display_id,
+            target_shows_cursor,
+            live_display_id,
+            live_shows_cursor,
         })
     }
 
@@ -384,6 +400,10 @@ impl HostSession {
             .clone()
             .unwrap_or_else(|| Arc::new(Mutex::new(OwnerReplayCache::default())));
         let active_codec = cfg.pipeline.codec;
+        let target_display_id = cfg.pipeline.display_id;
+        let target_shows_cursor = cfg.pipeline.shows_cursor;
+        let live_display_id = cfg.pipeline.display_id;
+        let live_shows_cursor = cfg.pipeline.shows_cursor;
         Ok(Self {
             cfg,
             endpoint: None,
@@ -435,6 +455,10 @@ impl HostSession {
             frame_seq_offset: 0,
             last_sent_frame_seq: None,
             active_codec,
+            target_display_id,
+            target_shows_cursor,
+            live_display_id,
+            live_shows_cursor,
         })
     }
 
@@ -1120,6 +1144,37 @@ impl HostSession {
         max_resolution: Option<rc_types::Resolution>,
         codec: Option<rc_encode::Codec>,
     ) -> Result<SessionParams> {
+        self.reconfigure_stream_inner(width, height, fps, max_resolution, codec, false)
+    }
+
+    /// 强制重建被控端采集与编码管线（即便分辨率/帧率/编解码器未变化，用于切换目标显示器、
+    /// `shows_cursor` 光标捕获开关或隐私幕布窗口过滤列表生效）。
+    pub fn force_reconfigure_stream(
+        &mut self,
+        width: u32,
+        height: u32,
+        fps: Option<u32>,
+        max_resolution: Option<rc_types::Resolution>,
+        codec: Option<rc_encode::Codec>,
+    ) -> Result<SessionParams> {
+        self.reconfigure_stream_inner(width, height, fps, max_resolution, codec, true)
+    }
+
+    /// 更新下一次管线热重建使用的目标显示器 ID 与系统光标采集开关（不修改 `cfg.pipeline` 基线模板，确保全新顶替会话始终回到主屏默认态）。
+    pub fn set_capture_options(&mut self, display_id: Option<u32>, shows_cursor: bool) {
+        self.target_display_id = display_id;
+        self.target_shows_cursor = shows_cursor;
+    }
+
+    fn reconfigure_stream_inner(
+        &mut self,
+        width: u32,
+        height: u32,
+        fps: Option<u32>,
+        max_resolution: Option<rc_types::Resolution>,
+        codec: Option<rc_encode::Codec>,
+        force: bool,
+    ) -> Result<SessionParams> {
         match self.state {
             SessionState::Streaming => {}
             other => {
@@ -1153,7 +1208,8 @@ impl HostSession {
         };
         let target_codec = codec.unwrap_or(self.active_codec);
 
-        if target_w == cur.width
+        if !force
+            && target_w == cur.width
             && target_h == cur.height
             && target_fps == cur.fps
             && target_codec == self.active_codec
@@ -1167,6 +1223,8 @@ impl HostSession {
         pcfg.fps = target_fps;
         pcfg.bitrate_bps = target_bitrate;
         pcfg.codec = target_codec;
+        pcfg.display_id = self.target_display_id;
+        pcfg.shows_cursor = self.target_shows_cursor;
         pcfg.max_packet_payload = rc_net::quic::max_media_payload(self.cfg.mtu);
         // 先校验目标配置再拆旧管线，避免非法参数把正在运行的流拆空。
         pcfg.validate()?;
@@ -1177,6 +1235,8 @@ impl HostSession {
         prev_pcfg.fps = cur.fps;
         prev_pcfg.bitrate_bps = target_bitrate;
         prev_pcfg.codec = prev_codec;
+        prev_pcfg.display_id = self.live_display_id;
+        prev_pcfg.shows_cursor = self.live_shows_cursor;
         prev_pcfg.max_packet_payload = rc_net::quic::max_media_payload(self.cfg.mtu);
 
         // 先按 S6 红线拆除旧管线并释放句柄（确保旧 SCStream / VTEncoder 完全释放），
@@ -1208,6 +1268,8 @@ impl HostSession {
             |session: &mut Self, already_tried_codec: Option<rc_encode::Codec>| {
                 let same_as_failed_target = prev_pcfg.resolution == pcfg.resolution
                     && prev_pcfg.fps == pcfg.fps
+                    && prev_pcfg.display_id == pcfg.display_id
+                    && prev_pcfg.shows_cursor == pcfg.shows_cursor
                     && already_tried_codec == Some(prev_codec);
                 if same_as_failed_target {
                     return;
@@ -1223,6 +1285,10 @@ impl HostSession {
                     session.pipeline = Some(restored);
                     session.pipeline_alive = true;
                     session.active_codec = prev_codec;
+                    session.target_display_id = prev_pcfg.display_id;
+                    session.target_shows_cursor = prev_pcfg.shows_cursor;
+                    session.live_display_id = prev_pcfg.display_id;
+                    session.live_shows_cursor = prev_pcfg.shows_cursor;
                 }
             };
         let mut pipeline = match build_pipeline(
@@ -1260,6 +1326,8 @@ impl HostSession {
         pipeline.set_clock(Arc::clone(&self.clock));
         pipeline.request_idr();
         self.active_codec = actual_codec;
+        self.live_display_id = pcfg.display_id;
+        self.live_shows_cursor = pcfg.shows_cursor;
         let pacing_bps = u64::from(target_bitrate).saturating_mul(2).max(200_000_000);
         if let Some(t) = self.transport.as_mut() {
             t.set_pacing_rate(pacing_bps);
@@ -1880,6 +1948,13 @@ impl HostSession {
         self.cfg.injector.set_screen_size(w, h);
     }
 
+    /// 动态更新注入器的目标显示器边界（多屏/虚拟屏切换时同步原点与宽高）。
+    pub fn set_injector_screen_bounds(&mut self, origin_x: f64, origin_y: f64, w: u32, h: u32) {
+        self.cfg
+            .injector
+            .set_screen_bounds(origin_x, origin_y, w, h);
+    }
+
     // ─────────────────────────────────────────────────────────────
     // 私有实现
     // ─────────────────────────────────────────────────────────────
@@ -2229,6 +2304,10 @@ impl HostSession {
         self.last_manual_bitrate_gen = 0;
         self.last_remote_probe_bitrate = None;
         self.active_codec = self.cfg.pipeline.codec;
+        self.target_display_id = self.cfg.pipeline.display_id;
+        self.target_shows_cursor = self.cfg.pipeline.shows_cursor;
+        self.live_display_id = self.cfg.pipeline.display_id;
+        self.live_shows_cursor = self.cfg.pipeline.shows_cursor;
         // 发现 8：全新会话（非 resume）关键批计数归零——client 侧同一
         // session_id 换新后计数也从 1 起，两侧 InputAck `key_batch_seq`
         // 口径对齐；resume 路径不经此处，计数延续。
