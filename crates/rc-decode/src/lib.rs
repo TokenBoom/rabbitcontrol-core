@@ -32,8 +32,19 @@ pub mod fake;
 pub use fake::{FakeDecoder, FakeDecoderConfig};
 pub use rc_types::{Error, Result};
 
+use std::time::Duration;
+
 use rc_capture::FrameTexture;
 use rc_types::{FrameKind, Timestamp};
+
+/// 异步流水线解码提交结果（[`Decoder::submit_decode`] 返回值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeSubmitStatus {
+    /// 帧已提交至异步硬件解码器，调用方需通过 [`Decoder::recv_decoded`] 回收输出。
+    Submitted,
+    /// 参考链断裂或首帧缺参数集，未提交硬件；调用方应向发送端请求关键帧。
+    NeedKeyframe,
+}
 
 /// 视频解码器。实现必须满足 D1/D3/D4/D5（见 crate 文档）。
 pub trait Decoder: Send {
@@ -64,6 +75,37 @@ pub trait Decoder: Send {
     /// 进一出一（D5）的实现没有内部缓冲，恒返回 `Ok(())`；保留本方法是
     /// 为了契约稳定（硬件解码器在复位 / 分辨率切换时需要冲刷）。
     fn flush(&mut self) -> Result<()>;
+
+    /// 是否支持 2-deep 异步流水线解码（[`Decoder::submit_decode`] /
+    /// [`Decoder::recv_decoded`]）。默认返回 `false`。
+    fn supports_pipelined_decode(&self) -> bool {
+        false
+    }
+
+    /// 异步提交一帧待解码码流（仅当 [`Decoder::supports_pipelined_decode`] 为 `true` 时可用）。
+    ///
+    /// 调用方以 `token` 关联输入与输出，并需保证在途帧数不超过实现上限（铁律 1：≤ 2）。
+    fn submit_decode(
+        &mut self,
+        _token: u64,
+        _data: &[u8],
+        _kind: FrameKind,
+        _deadline_ts: Timestamp,
+    ) -> Result<DecodeSubmitStatus> {
+        Err(Error::InvalidConfig(
+            "pipelined decode not supported".into(),
+        ))
+    }
+
+    /// 按 FIFO 提交顺序接收下一帧已完成的异步解码输出；超时无就绪返回 `Ok(None)`。
+    fn recv_decoded(&mut self, _timeout: Duration) -> Result<Option<(u64, DecodeOutput)>> {
+        Ok(None)
+    }
+
+    /// 当前已提交但尚未被 [`Decoder::recv_decoded`] 回收的在途帧数。
+    fn in_flight_count(&self) -> usize {
+        0
+    }
 }
 
 /// [`Decoder::decode`] 的输出。
@@ -88,4 +130,24 @@ pub struct DecodedFrame {
     pub width: u32,
     /// 帧高（像素）。
     pub height: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_pipelined_decoder_methods_reject_submit_and_return_none() {
+        let mut dec = FakeDecoder::new(FakeDecoderConfig::default()).expect("假解码器配置合法");
+        assert!(!dec.supports_pipelined_decode());
+        assert_eq!(dec.in_flight_count(), 0);
+        assert!(dec
+            .recv_decoded(Duration::from_millis(1))
+            .expect("recv_decoded 默认返回 Ok(None)")
+            .is_none());
+        let err = dec
+            .submit_decode(1, &[0, 0, 0, 1, 0x65], FrameKind::Idr, Timestamp(50_000))
+            .expect_err("不支持流水线的解码器调用 submit_decode 应返回 Err");
+        assert!(matches!(err, Error::InvalidConfig(_)));
+    }
 }

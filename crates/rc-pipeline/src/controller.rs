@@ -8,7 +8,7 @@
 //!   兜底，`unfinished == 0`。
 
 use crate::{select_all, PipelineConfig};
-use rc_decode::{DecodeOutput, Decoder};
+use rc_decode::{DecodeOutput, DecodeSubmitStatus, Decoder};
 use rc_proto::{MediaHeader, HEADER_LEN};
 use rc_render::Renderer;
 use rc_trace::{Mark, Outcome, TraceCollector};
@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// 重组中的帧。
 struct Partial {
@@ -111,6 +112,235 @@ const HIGH_RES_DECODE_BUDGET_US: u32 = 10_000;
 /// `async_decode` 有界帧队列容量（严格遵守 TASK.md 铁律 1：解码队列上限 ≤ 2；
 /// 配合解码线程在途 1 帧可吸收 2–3 帧公网 TCP 微突发而不打断 P 帧参考链，同时硬约束排队不超 2 帧）。
 const ASYNC_DECODE_QUEUE_CAP: usize = 2;
+/// 硬件异步流水线解码的最大在途帧数（严格遵守铁律 1：≤ 2）。
+const MAX_PIPELINED_DECODE_IN_FLIGHT: usize = 2;
+
+struct InFlightDecodeMeta {
+    seq: FrameSeq,
+    capture_ts: Timestamp,
+    received_ts: Timestamp,
+}
+
+fn take_in_flight_meta(
+    in_flight: &mut VecDeque<InFlightDecodeMeta>,
+    token: u64,
+) -> Option<InFlightDecodeMeta> {
+    if in_flight.front().is_some_and(|m| m.seq.0 == token) {
+        return in_flight.pop_front();
+    }
+    in_flight
+        .iter()
+        .position(|m| m.seq.0 == token)
+        .and_then(|pos| in_flight.remove(pos))
+}
+
+/// 处理单帧解码输出并推进渲染与完成记录；返回 `true` 表示遇到致命错误需终止工作线程。
+#[allow(clippy::too_many_arguments)]
+fn handle_async_decode_result(
+    res: Result<DecodeOutput>,
+    seq: FrameSeq,
+    capture_ts: Timestamp,
+    received_ts: Timestamp,
+    fallback_now_us: u32,
+    decoder: &dyn Decoder,
+    renderer: &mut dyn Renderer,
+    clock_w: &ClockSlot,
+    shared_w: &Mutex<AsyncSharedState>,
+    need_kf_w: &AtomicBool,
+    disp_w: &AtomicU64,
+) -> bool {
+    match res {
+        Ok(DecodeOutput::NeedKeyframe) => {
+            need_kf_w.store(true, Ordering::Release);
+            let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+            s.completed.push_back(AsyncFrameOutcome::Finished {
+                seq,
+                capture_ts,
+                received_ts,
+                decoded_ts: None,
+                presented_ts: None,
+                outcome: Outcome::DecodeError,
+            });
+            false
+        }
+        Ok(DecodeOutput::Nothing) => {
+            let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+            s.completed.push_back(AsyncFrameOutcome::Finished {
+                seq,
+                capture_ts,
+                received_ts,
+                decoded_ts: None,
+                presented_ts: None,
+                outcome: Outcome::DecodeError,
+            });
+            false
+        }
+        Ok(DecodeOutput::Frame(decoded)) => {
+            let decoded_ts = read_clock(clock_w, fallback_now_us);
+            let presented = renderer.present(decoded);
+            let presented_ts = read_clock(clock_w, fallback_now_us);
+            match presented {
+                Ok(_) => {
+                    disp_w.fetch_add(1, Ordering::Relaxed);
+                    if decoder.needs_keyframe() {
+                        need_kf_w.store(true, Ordering::Release);
+                    }
+                    let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+                    s.completed.push_back(AsyncFrameOutcome::Finished {
+                        seq,
+                        capture_ts,
+                        received_ts,
+                        decoded_ts: Some(decoded_ts),
+                        presented_ts: Some(presented_ts),
+                        outcome: Outcome::Displayed,
+                    });
+                    false
+                }
+                Err(e) => {
+                    let fatal = e.is_fatal();
+                    let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+                    s.completed.push_back(AsyncFrameOutcome::Finished {
+                        seq,
+                        capture_ts,
+                        received_ts,
+                        decoded_ts: Some(decoded_ts),
+                        presented_ts: None,
+                        outcome: Outcome::DecodeError,
+                    });
+                    if fatal {
+                        s.fatal_error = Some(e);
+                        return true;
+                    }
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            let fatal = e.is_fatal();
+            if decoder.needs_keyframe() {
+                need_kf_w.store(true, Ordering::Release);
+            }
+            let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+            s.completed.push_back(AsyncFrameOutcome::Finished {
+                seq,
+                capture_ts,
+                received_ts,
+                decoded_ts: None,
+                presented_ts: None,
+                outcome: Outcome::DecodeError,
+            });
+            if fatal {
+                s.fatal_error = Some(e);
+                return true;
+            }
+            false
+        }
+    }
+}
+
+/// 排空一条异步流水线解码结果；返回 `None` 表示无就绪帧，`Some(true)` 遇到致命错误，`Some(false)` 正常消费。
+#[allow(clippy::too_many_arguments)]
+fn poll_pipelined_decode_once(
+    timeout: Duration,
+    decoder: &mut dyn Decoder,
+    renderer: &mut dyn Renderer,
+    in_flight: &mut VecDeque<InFlightDecodeMeta>,
+    clock_w: &ClockSlot,
+    shared_w: &Mutex<AsyncSharedState>,
+    need_kf_w: &AtomicBool,
+    disp_w: &AtomicU64,
+) -> Option<bool> {
+    match decoder.recv_decoded(timeout) {
+        Ok(None) => None,
+        Ok(Some((token, out))) => {
+            let meta = take_in_flight_meta(in_flight, token)?;
+            let now_us = read_clock(clock_w, meta.received_ts.0).0;
+            Some(handle_async_decode_result(
+                Ok(out),
+                meta.seq,
+                meta.capture_ts,
+                meta.received_ts,
+                now_us,
+                decoder,
+                renderer,
+                clock_w,
+                shared_w,
+                need_kf_w,
+                disp_w,
+            ))
+        }
+        Err(e) => {
+            let Some(meta) = in_flight.pop_front() else {
+                if e.is_fatal() {
+                    let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+                    s.fatal_error = Some(e);
+                    return Some(true);
+                }
+                return Some(false);
+            };
+            let now_us = read_clock(clock_w, meta.received_ts.0).0;
+            Some(handle_async_decode_result(
+                Err(e),
+                meta.seq,
+                meta.capture_ts,
+                meta.received_ts,
+                now_us,
+                decoder,
+                renderer,
+                clock_w,
+                shared_w,
+                need_kf_w,
+                disp_w,
+            ))
+        }
+    }
+}
+
+/// 在编码格式切换或停机前排空全部在途异步解码帧（最多等待 2s，兜底补齐结局保 `unfinished == 0`）。
+#[allow(clippy::too_many_arguments)]
+fn drain_pipelined_in_flight(
+    decoder: &mut dyn Decoder,
+    renderer: &mut dyn Renderer,
+    in_flight: &mut VecDeque<InFlightDecodeMeta>,
+    clock_w: &ClockSlot,
+    shared_w: &Mutex<AsyncSharedState>,
+    need_kf_w: &AtomicBool,
+    disp_w: &AtomicU64,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !in_flight.is_empty() {
+        if let Some(fatal) = poll_pipelined_decode_once(
+            Duration::from_millis(5),
+            decoder,
+            renderer,
+            in_flight,
+            clock_w,
+            shared_w,
+            need_kf_w,
+            disp_w,
+        ) {
+            if fatal {
+                return true;
+            }
+            continue;
+        }
+        if Instant::now() >= deadline {
+            while let Some(meta) = in_flight.pop_front() {
+                let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+                s.completed.push_back(AsyncFrameOutcome::Finished {
+                    seq: meta.seq,
+                    capture_ts: meta.capture_ts,
+                    received_ts: meta.received_ts,
+                    decoded_ts: None,
+                    presented_ts: None,
+                    outcome: Outcome::DecodeError,
+                });
+            }
+            break;
+        }
+    }
+    false
+}
 
 fn frame_decode_budget_us(cfg: &PipelineConfig, kind: FrameKind) -> u32 {
     let pixels = u64::from(cfg.resolution.width) * u64::from(cfg.resolution.height);
@@ -196,121 +426,219 @@ impl ControllerPipeline {
                 .name("rc-ctrl-decode".into())
                 .spawn(move || {
                     crate::promote_current_thread_qos();
+                    let mut in_flight: VecDeque<InFlightDecodeMeta> =
+                        VecDeque::with_capacity(MAX_PIPELINED_DECODE_IN_FLIGHT);
                     loop {
-                        let pending = {
-                            let (lock, cv) = &*slot_w;
-                            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                            loop {
-                                if let Some(frame) = guard.pop_front() {
-                                    break Some(frame);
-                                }
-                                if stop_w.load(Ordering::Acquire) {
-                                    break None;
-                                }
-                                guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
-                            }
-                        };
-                        let Some(frame) = pending else {
-                            break;
-                        };
-                        maybe_swap_decoder_for_codec(
-                            &cfg_w,
-                            &mut active_codec_w,
-                            &mut decoder,
-                            frame.is_hevc,
-                        );
-                        let now_us = read_clock(&clock_w, frame.received_ts.0).0;
-                        let budget = frame_decode_budget_us(&cfg_w, frame.kind);
-                        let res = decoder.decode(
-                            &frame.payload_all,
-                            frame.kind,
-                            Timestamp(now_us.saturating_add(budget)),
-                        );
-                        match res {
-                            Ok(DecodeOutput::NeedKeyframe) => {
-                                need_kf_w.store(true, Ordering::Release);
-                                let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
-                                s.completed.push_back(AsyncFrameOutcome::Finished {
-                                    seq: frame.seq,
-                                    capture_ts: frame.capture_ts,
-                                    received_ts: frame.received_ts,
-                                    decoded_ts: None,
-                                    presented_ts: None,
-                                    outcome: Outcome::DecodeError,
-                                });
-                            }
-                            Ok(DecodeOutput::Nothing) => {
-                                let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
-                                s.completed.push_back(AsyncFrameOutcome::Finished {
-                                    seq: frame.seq,
-                                    capture_ts: frame.capture_ts,
-                                    received_ts: frame.received_ts,
-                                    decoded_ts: None,
-                                    presented_ts: None,
-                                    outcome: Outcome::DecodeError,
-                                });
-                            }
-                            Ok(DecodeOutput::Frame(decoded)) => {
-                                let decoded_ts = read_clock(&clock_w, now_us);
-                                let presented = renderer.present(decoded);
-                                let presented_ts = read_clock(&clock_w, now_us);
-                                match presented {
-                                    Ok(_) => {
-                                        disp_w.fetch_add(1, Ordering::Relaxed);
-                                        if decoder.needs_keyframe() {
-                                            need_kf_w.store(true, Ordering::Release);
-                                        }
-                                        let mut s =
-                                            shared_w.lock().unwrap_or_else(|e| e.into_inner());
-                                        s.completed.push_back(AsyncFrameOutcome::Finished {
-                                            seq: frame.seq,
-                                            capture_ts: frame.capture_ts,
-                                            received_ts: frame.received_ts,
-                                            decoded_ts: Some(decoded_ts),
-                                            presented_ts: Some(presented_ts),
-                                            outcome: Outcome::Displayed,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        let fatal = e.is_fatal();
-                                        let mut s =
-                                            shared_w.lock().unwrap_or_else(|e| e.into_inner());
-                                        s.completed.push_back(AsyncFrameOutcome::Finished {
-                                            seq: frame.seq,
-                                            capture_ts: frame.capture_ts,
-                                            received_ts: frame.received_ts,
-                                            decoded_ts: Some(decoded_ts),
-                                            presented_ts: None,
-                                            outcome: Outcome::DecodeError,
-                                        });
-                                        if fatal {
-                                            s.fatal_error = Some(e);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let fatal = e.is_fatal();
-                                if decoder.needs_keyframe() {
-                                    need_kf_w.store(true, Ordering::Release);
-                                }
-                                let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
-                                s.completed.push_back(AsyncFrameOutcome::Finished {
-                                    seq: frame.seq,
-                                    capture_ts: frame.capture_ts,
-                                    received_ts: frame.received_ts,
-                                    decoded_ts: None,
-                                    presented_ts: None,
-                                    outcome: Outcome::DecodeError,
-                                });
+                        // 1) 若后端支持 2-deep 流水线解码，优先非阻塞排空全部已就绪帧并立刻上屏。
+                        let mut did_work = false;
+                        if !in_flight.is_empty() {
+                            while let Some(fatal) = poll_pipelined_decode_once(
+                                Duration::ZERO,
+                                decoder.as_mut(),
+                                renderer.as_mut(),
+                                &mut in_flight,
+                                &clock_w,
+                                &shared_w,
+                                &need_kf_w,
+                                &disp_w,
+                            ) {
+                                did_work = true;
                                 if fatal {
-                                    s.fatal_error = Some(e);
-                                    break;
+                                    let _ = decoder.flush();
+                                    return;
                                 }
                             }
                         }
+
+                        // 2) 非阻塞拉取待解码帧：若走流水线则补满 ≤2 帧在途，否则单帧同步解码。
+                        let pipelined = decoder.supports_pipelined_decode();
+                        let mut popped_any = false;
+                        while !pipelined || in_flight.len() < MAX_PIPELINED_DECODE_IN_FLIGHT {
+                            let next_frame = {
+                                let (lock, _) = &*slot_w;
+                                let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                                guard.pop_front()
+                            };
+                            let Some(frame) = next_frame else {
+                                break;
+                            };
+                            popped_any = true;
+                            did_work = true;
+
+                            let target_codec = if frame.is_hevc {
+                                rc_encode::Codec::Hevc
+                            } else {
+                                rc_encode::Codec::H264
+                            };
+                            if target_codec != active_codec_w
+                                && !in_flight.is_empty()
+                                && drain_pipelined_in_flight(
+                                    decoder.as_mut(),
+                                    renderer.as_mut(),
+                                    &mut in_flight,
+                                    &clock_w,
+                                    &shared_w,
+                                    &need_kf_w,
+                                    &disp_w,
+                                )
+                            {
+                                let _ = decoder.flush();
+                                return;
+                            }
+                            maybe_swap_decoder_for_codec(
+                                &cfg_w,
+                                &mut active_codec_w,
+                                &mut decoder,
+                                frame.is_hevc,
+                            );
+
+                            let now_us = read_clock(&clock_w, frame.received_ts.0).0;
+                            let budget = frame_decode_budget_us(&cfg_w, frame.kind);
+                            let deadline = Timestamp(now_us.saturating_add(budget));
+
+                            if decoder.supports_pipelined_decode() {
+                                match decoder.submit_decode(
+                                    frame.seq.0,
+                                    &frame.payload_all,
+                                    frame.kind,
+                                    deadline,
+                                ) {
+                                    Ok(DecodeSubmitStatus::Submitted) => {
+                                        in_flight.push_back(InFlightDecodeMeta {
+                                            seq: frame.seq,
+                                            capture_ts: frame.capture_ts,
+                                            received_ts: frame.received_ts,
+                                        });
+                                    }
+                                    Ok(DecodeSubmitStatus::NeedKeyframe) => {
+                                        if handle_async_decode_result(
+                                            Ok(DecodeOutput::NeedKeyframe),
+                                            frame.seq,
+                                            frame.capture_ts,
+                                            frame.received_ts,
+                                            now_us,
+                                            decoder.as_ref(),
+                                            renderer.as_mut(),
+                                            &clock_w,
+                                            &shared_w,
+                                            &need_kf_w,
+                                            &disp_w,
+                                        ) {
+                                            let _ = decoder.flush();
+                                            return;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if handle_async_decode_result(
+                                            Err(e),
+                                            frame.seq,
+                                            frame.capture_ts,
+                                            frame.received_ts,
+                                            now_us,
+                                            decoder.as_ref(),
+                                            renderer.as_mut(),
+                                            &clock_w,
+                                            &shared_w,
+                                            &need_kf_w,
+                                            &disp_w,
+                                        ) {
+                                            let _ = decoder.flush();
+                                            return;
+                                        }
+                                    }
+                                }
+                            } else {
+                                let res = decoder.decode(&frame.payload_all, frame.kind, deadline);
+                                if handle_async_decode_result(
+                                    res,
+                                    frame.seq,
+                                    frame.capture_ts,
+                                    frame.received_ts,
+                                    now_us,
+                                    decoder.as_ref(),
+                                    renderer.as_mut(),
+                                    &clock_w,
+                                    &shared_w,
+                                    &need_kf_w,
+                                    &disp_w,
+                                ) {
+                                    let _ = decoder.flush();
+                                    return;
+                                }
+                                break;
+                            }
+                        }
+
+                        if !did_work {
+                            if !in_flight.is_empty() {
+                                let wait = if in_flight.len() < MAX_PIPELINED_DECODE_IN_FLIGHT {
+                                    Duration::from_micros(250)
+                                } else {
+                                    Duration::from_millis(2)
+                                };
+                                if let Some(true) = poll_pipelined_decode_once(
+                                    wait,
+                                    decoder.as_mut(),
+                                    renderer.as_mut(),
+                                    &mut in_flight,
+                                    &clock_w,
+                                    &shared_w,
+                                    &need_kf_w,
+                                    &disp_w,
+                                ) {
+                                    let _ = decoder.flush();
+                                    return;
+                                }
+                                if stop_w.load(Ordering::Acquire) {
+                                    let slot_empty = {
+                                        let (lock, _) = &*slot_w;
+                                        lock.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                                    };
+                                    if slot_empty {
+                                        let _ = drain_pipelined_in_flight(
+                                            decoder.as_mut(),
+                                            renderer.as_mut(),
+                                            &mut in_flight,
+                                            &clock_w,
+                                            &shared_w,
+                                            &need_kf_w,
+                                            &disp_w,
+                                        );
+                                        break;
+                                    }
+                                }
+                            } else {
+                                let (lock, cv) = &*slot_w;
+                                let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                                while guard.is_empty() && !stop_w.load(Ordering::Acquire) {
+                                    guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                                }
+                                if guard.is_empty() && stop_w.load(Ordering::Acquire) {
+                                    break;
+                                }
+                            }
+                        } else if !popped_any
+                            && stop_w.load(Ordering::Acquire)
+                            && in_flight.is_empty()
+                        {
+                            let slot_empty = {
+                                let (lock, _) = &*slot_w;
+                                lock.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                            };
+                            if slot_empty {
+                                break;
+                            }
+                        }
                     }
+                    let _ = drain_pipelined_in_flight(
+                        decoder.as_mut(),
+                        renderer.as_mut(),
+                        &mut in_flight,
+                        &clock_w,
+                        &shared_w,
+                        &need_kf_w,
+                        &disp_w,
+                    );
                     let _ = decoder.flush();
                 })
                 .map_err(|e| Error::InvalidConfig(format!("spawn ctrl decode thread: {e}")))?;
@@ -727,3 +1055,174 @@ impl Drop for ControllerPipeline {
 
 /// HEADER_LEN 再导出（诊断输出用）。
 pub const HEADER_BYTES: usize = HEADER_LEN;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rc_capture::FrameTexture;
+    use rc_decode::{DecodeOutput, DecodeSubmitStatus, DecodedFrame, Decoder};
+    use rc_proto::{split_frame_with_flags, HeaderFlags};
+    use rc_render::{FakeRenderer, FakeRendererConfig};
+    use rc_types::{CpuFrame, PixelFormat};
+    use std::sync::atomic::AtomicUsize;
+
+    struct MockPipelinedDecoder {
+        in_flight: VecDeque<(u64, FrameKind)>,
+        max_observed_in_flight: Arc<AtomicUsize>,
+        seen_idr: bool,
+    }
+
+    impl Decoder for MockPipelinedDecoder {
+        fn decode(
+            &mut self,
+            _data: &[u8],
+            _kind: FrameKind,
+            _deadline_ts: Timestamp,
+        ) -> Result<DecodeOutput> {
+            panic!("pipelined async worker should call submit_decode/recv_decoded");
+        }
+
+        fn needs_keyframe(&self) -> bool {
+            !self.seen_idr
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.in_flight.clear();
+            Ok(())
+        }
+
+        fn supports_pipelined_decode(&self) -> bool {
+            true
+        }
+
+        fn submit_decode(
+            &mut self,
+            token: u64,
+            _data: &[u8],
+            kind: FrameKind,
+            _deadline_ts: Timestamp,
+        ) -> Result<DecodeSubmitStatus> {
+            if !self.seen_idr && kind != FrameKind::Idr {
+                return Ok(DecodeSubmitStatus::NeedKeyframe);
+            }
+            if self.in_flight.len() >= MAX_PIPELINED_DECODE_IN_FLIGHT {
+                return Err(Error::Decoder("pipelined decode limit exceeded".into()));
+            }
+            if kind == FrameKind::Idr {
+                self.seen_idr = true;
+            }
+            self.in_flight.push_back((token, kind));
+            let cur = self.in_flight.len();
+            self.max_observed_in_flight.fetch_max(cur, Ordering::SeqCst);
+            Ok(DecodeSubmitStatus::Submitted)
+        }
+
+        fn recv_decoded(&mut self, timeout: Duration) -> Result<Option<(u64, DecodeOutput)>> {
+            if self.in_flight.is_empty() {
+                return Ok(None);
+            }
+            if timeout.is_zero() && self.in_flight.len() < 2 {
+                // 延迟首次非阻塞回收，便于验证双帧并发提交。
+                return Ok(None);
+            }
+            let Some((token, _)) = self.in_flight.pop_front() else {
+                return Ok(None);
+            };
+            Ok(Some((
+                token,
+                DecodeOutput::Frame(DecodedFrame {
+                    texture: FrameTexture::Cpu(CpuFrame {
+                        width: 4,
+                        height: 4,
+                        format: PixelFormat::Bgra8,
+                        stride: 16,
+                        data: vec![0; 64],
+                    }),
+                    decode_done_ts: Timestamp(100),
+                    width: 4,
+                    height: 4,
+                }),
+            )))
+        }
+
+        fn in_flight_count(&self) -> usize {
+            self.in_flight.len()
+        }
+    }
+
+    #[test]
+    fn async_controller_uses_2deep_pipelined_decode_and_drains_cleanly() {
+        let max_obs = Arc::new(AtomicUsize::new(0));
+        let dec = MockPipelinedDecoder {
+            in_flight: VecDeque::new(),
+            max_observed_in_flight: Arc::clone(&max_obs),
+            seen_idr: false,
+        };
+        let ren = FakeRenderer::new(FakeRendererConfig::default()).expect("假渲染器配置合法");
+        let cfg = PipelineConfig {
+            async_decode: true,
+            ..PipelineConfig::default()
+        };
+        let mut ctrl = ControllerPipeline::with_backends(cfg, Box::new(dec), Box::new(ren))
+            .expect("controller init");
+
+        // 第 0 帧：首帧前 P 帧触发 NeedKeyframe（不占用在途槽）
+        let p0 = split_frame_with_flags(
+            FrameSeq(0),
+            FrameKind::P,
+            HeaderFlags::empty(),
+            Timestamp(100),
+            Timestamp(120),
+            0,
+            &[1, 2, 3, 4],
+            1200,
+        );
+        for d in &p0 {
+            ctrl.push_datagram(d, 200).expect("push p0");
+        }
+        // 投递 IDR 后按 2 帧微突发节奏推送 4 个 P 帧（不超出 ASYNC_DECODE_QUEUE_CAP=2），
+        // 确定性验证 2-deep 并发在途与 shutdown 排空。
+        let push_frame = |ctrl: &mut ControllerPipeline, seq: u64, kind: FrameKind| {
+            let pkts = split_frame_with_flags(
+                FrameSeq(seq),
+                kind,
+                HeaderFlags::empty(),
+                Timestamp((seq as u32) * 16_000),
+                Timestamp((seq as u32) * 16_000 + 100),
+                seq as u16,
+                &[0, 0, 0, 1, 0x65, seq as u8],
+                1200,
+            );
+            for d in &pkts {
+                ctrl.push_datagram(d, (seq as u32) * 16_000 + 200)
+                    .expect("push frame");
+            }
+        };
+        push_frame(&mut ctrl, 1, FrameKind::Idr);
+        let wait_displayed = |ctrl: &mut ControllerPipeline, target: u64| {
+            let dl = Instant::now() + Duration::from_secs(2);
+            while ctrl.displayed() < target && Instant::now() < dl {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        wait_displayed(&mut ctrl, 1);
+
+        push_frame(&mut ctrl, 2, FrameKind::P);
+        push_frame(&mut ctrl, 3, FrameKind::P);
+        wait_displayed(&mut ctrl, 3);
+
+        push_frame(&mut ctrl, 4, FrameKind::P);
+        push_frame(&mut ctrl, 5, FrameKind::P);
+        wait_displayed(&mut ctrl, 5);
+
+        ctrl.shutdown();
+
+        let sum = ctrl.trace().summary();
+        assert_eq!(sum.unfinished, 0, "shutdown 后不得有未完结帧");
+        assert_eq!(ctrl.displayed(), 5, "5 帧（1 IDR + 4 P）应全部解码上屏");
+        assert!(
+            max_obs.load(Ordering::SeqCst) <= MAX_PIPELINED_DECODE_IN_FLIGHT,
+            "在途帧数不得超过铁律 1 上限 2"
+        );
+    }
+}
