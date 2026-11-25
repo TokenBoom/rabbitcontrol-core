@@ -178,6 +178,12 @@ pub struct HostSession {
     /// T15：当前生效目标码率（None = 尚无 SetBitrate，取协商值）。
     /// 会话侧自行记账，不查编码线程——编码器在管线线程内。
     current_bitrate: Option<u32>,
+    /// 最近一次手动指定码率（`BitrateReason::Manual`，供宿主自适应码率同步上限）。
+    last_manual_bitrate: Option<u32>,
+    /// 手动指定码率单调递增代次（区分用户重复选择同一数值码率的多次显式操作）。
+    last_manual_bitrate_gen: u64,
+    /// 最近一次收到对端探针请求码率（`ControlMessage::SetBitrate { reason: Probe }`）。
+    last_remote_probe_bitrate: Option<u32>,
     /// 已发过 Bye（停机路径只发一次）。
     bye_sent: bool,
     /// 进入 Closed 的原因（summary 用）。
@@ -320,6 +326,9 @@ impl HostSession {
             session_id: None,
             negotiated: None,
             current_bitrate: None,
+            last_manual_bitrate: None,
+            last_manual_bitrate_gen: 0,
+            last_remote_probe_bitrate: None,
             bye_sent: false,
             closed_reason: None,
             early_events_dropped: 0,
@@ -386,6 +395,9 @@ impl HostSession {
             session_id: None,
             negotiated: None,
             current_bitrate: None,
+            last_manual_bitrate: None,
+            last_manual_bitrate_gen: 0,
+            last_remote_probe_bitrate: None,
             bye_sent: false,
             closed_reason: None,
             early_events_dropped: 0,
@@ -2133,6 +2145,9 @@ impl HostSession {
         // 发现 7：不复用上一会话的 SetBitrate 记账——current_bitrate
         // 归 None（回落到本会话协商值；resume 路径不经此处，计数延续）。
         self.current_bitrate = None;
+        self.last_manual_bitrate = None;
+        self.last_manual_bitrate_gen = 0;
+        self.last_remote_probe_bitrate = None;
         self.active_codec = self.cfg.pipeline.codec;
         // 发现 8：全新会话（非 resume）关键批计数归零——client 侧同一
         // session_id 换新后计数也从 1 起，两侧 InputAck `key_batch_seq`
@@ -2209,11 +2224,19 @@ impl HostSession {
             // T15（0x07）：SetBitrate → HostPipeline::set_bitrate 转发。
             // 应用失败只记 stderr 不拆会话（一次码率调整不值得杀连接）。
             ControlMessage::SetBitrate { bps, reason } => {
-                if let Err(e) = self.on_set_bitrate(bps, reason as u8) {
-                    eprintln!(
-                        "rc-session host: SetBitrate({bps}, reason={}) 应用失败（不拆会话）: {e}",
-                        reason as u8
-                    );
+                let is_remote_probe = reason == crate::proto::BitrateReason::Probe;
+                match self.on_set_bitrate(bps, reason as u8) {
+                    Ok(()) => {
+                        if is_remote_probe {
+                            self.last_remote_probe_bitrate = Some(bps);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "rc-session host: SetBitrate({bps}, reason={}) 应用失败（不拆会话）: {e}",
+                            reason as u8
+                        );
+                    }
                 }
                 Ok(ControlFlow::Handled)
             }
@@ -2291,6 +2314,11 @@ impl HostSession {
         })?;
         pipeline.set_bitrate(bps)?;
         self.current_bitrate = Some(bps);
+        if reason == crate::proto::BitrateReason::Manual as u8 {
+            self.last_manual_bitrate = Some(bps);
+            self.last_manual_bitrate_gen = self.last_manual_bitrate_gen.wrapping_add(1);
+            self.last_remote_probe_bitrate = None;
+        }
         let pacing_bps = u64::from(bps).saturating_mul(2).max(200_000_000);
         if let Some(t) = self.transport.as_mut() {
             t.set_pacing_rate(pacing_bps);
@@ -2333,6 +2361,34 @@ impl HostSession {
         self.current_bitrate
             .or_else(|| self.negotiated.map(|n| n.bitrate_bps))
             .unwrap_or(0)
+    }
+
+    /// 最近一次收到的手动码率（`BitrateReason::Manual`），尚未收到手动调整时返回 `None`。
+    pub fn last_manual_bitrate_bps(&self) -> Option<u32> {
+        self.last_manual_bitrate
+    }
+
+    /// 最近一次手动码率的单调递增代次（尚未收到手动调整或新会话重置后为 `0`）。
+    pub fn last_manual_bitrate_gen(&self) -> u64 {
+        self.last_manual_bitrate_gen
+    }
+
+    /// 最近一次收到对端探针请求的码率（`ControlMessage::SetBitrate { reason: Probe }`），
+    /// 尚未收到或已被手动调整覆盖时返回 `None`。
+    pub fn last_remote_probe_bitrate_bps(&self) -> Option<u32> {
+        self.last_remote_probe_bitrate
+    }
+
+    /// 当前底层传输层的发送队列积压字节数（无活跃传输层时返回 0）。
+    pub fn transport_tx_queued_bytes(&self) -> usize {
+        self.transport.as_ref().map_or(0, |t| t.tx_queued_bytes())
+    }
+
+    /// 当前底层传输层累计因背压淘汰的数据报总数（无活跃传输层时返回 0）。
+    pub fn transport_tx_dropped_datagrams(&self) -> u64 {
+        self.transport
+            .as_ref()
+            .map_or(0, |t| t.tx_dropped_datagrams())
     }
 
     /// stderr 记一次忽略日志（按标签限流，不刷屏）。

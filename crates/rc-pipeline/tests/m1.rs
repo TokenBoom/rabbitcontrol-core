@@ -831,3 +831,82 @@ fn async_decode_gates_broken_p_frames_until_idr() {
     );
     let _ = FrameKind::P;
 }
+
+#[test]
+fn async_decode_absorbs_burst_without_breaking_p_chain() {
+    use rc_types::FrameSeq;
+
+    let mut c = cfg();
+    c.async_decode = true;
+    let mut controller = ControllerPipeline::with_backends(c, fake_decoder(), fake_renderer())
+        .expect("async controller ok");
+
+    let mut cap = fake_capture(FakeContent::Dynamic, 60);
+    let mut enc = fake_encoder();
+    let mut make_pkts = |seq: u64, force_idr: bool| -> Vec<Vec<u8>> {
+        let frame = cap
+            .next_frame(std::time::Duration::from_millis(50))
+            .expect("capture ok")
+            .expect("frame present");
+        let encoded = enc
+            .encode(&frame, force_idr, Timestamp(frame.timestamp.0 + 50_000))
+            .expect("encode ok");
+        rc_proto::split_frame(
+            FrameSeq(seq),
+            encoded.kind,
+            frame.timestamp,
+            encoded.encode_done_ts,
+            0,
+            &encoded.data,
+            rc_proto::MAX_PAYLOAD,
+        )
+    };
+
+    // 先连续无间隔投入 2 帧（seq=0 IDR + seq=1 P），验证容量 2 的微突发缓冲不会打断参考链。
+    for seq in 0u64..2 {
+        let pkts = make_pkts(seq, seq == 0);
+        for p in pkts {
+            let _ = controller
+                .push_datagram(&p, 10_000 * (seq as u32 + 1))
+                .expect("push ok");
+        }
+    }
+
+    for _ in 0..80 {
+        if controller.displayed() >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            !controller.take_keyframe_request(),
+            "突发 2 帧内不应误触发断链关键帧请求"
+        );
+    }
+
+    // 再连续无间隔投入 2 张 P 帧（seq=2 + seq=3），确认队列释放后持续无断链上屏。
+    for seq in 2u64..4 {
+        let pkts = make_pkts(seq, false);
+        for p in pkts {
+            let _ = controller
+                .push_datagram(&p, 10_000 * (seq as u32 + 1))
+                .expect("push ok");
+        }
+    }
+
+    for _ in 0..80 {
+        if controller.displayed() >= 4 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            !controller.take_keyframe_request(),
+            "连续两轮 2 帧突发不应误触发断链关键帧请求"
+        );
+    }
+
+    assert_eq!(controller.displayed(), 4, "连续 4 帧应全部完整解码上屏");
+    controller.shutdown();
+    let s = controller.trace().summary();
+    assert_eq!(s.unfinished, 0);
+    assert_eq!(s.decode_errors, 0);
+}

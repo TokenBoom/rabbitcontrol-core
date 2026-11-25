@@ -118,6 +118,16 @@ pub trait Transport: Send {
 
     /// 动态调整媒体发包 pacing 上限（bps；`0` 表示不限速；不支持 pacing 的实现可忽略）。
     fn set_pacing_rate(&mut self, _bps: u64) {}
+
+    /// 当前发送端待发送媒体队列字节数（用于传输背压观测与自适应码率控制；默认 0）。
+    fn tx_queued_bytes(&self) -> usize {
+        0
+    }
+
+    /// 累计因发送队列溢出而淘汰的媒体数据报数量（默认 0）。
+    fn tx_dropped_datagrams(&self) -> u64 {
+        0
+    }
 }
 
 /// 从传输层收到的事件。

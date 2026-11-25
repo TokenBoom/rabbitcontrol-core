@@ -194,6 +194,18 @@ impl Transport for P2pQuicConnection {
     fn stats(&self) -> NetStats {
         self.transport.stats()
     }
+
+    fn set_pacing_rate(&mut self, bps: u64) {
+        self.transport.set_pacing_rate(bps);
+    }
+
+    fn tx_queued_bytes(&self) -> usize {
+        self.transport.tx_queued_bytes()
+    }
+
+    fn tx_dropped_datagrams(&self) -> u64 {
+        self.transport.tx_dropped_datagrams()
+    }
 }
 
 /// 将 [`PunchPacket`] 编码为 29 字节固定二进制包。

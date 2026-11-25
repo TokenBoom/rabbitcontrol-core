@@ -889,6 +889,18 @@ impl Transport for CancellableHostTransport {
     fn stats(&self) -> NetStats {
         self.inner.stats()
     }
+
+    fn set_pacing_rate(&mut self, bps: u64) {
+        self.inner.set_pacing_rate(bps);
+    }
+
+    fn tx_queued_bytes(&self) -> usize {
+        self.inner.tx_queued_bytes()
+    }
+
+    fn tx_dropped_datagrams(&self) -> u64 {
+        self.inner.tx_dropped_datagrams()
+    }
 }
 
 /// 构造一轮直连 QUIC `HostSession`（优先硬件注入/采集/编码，无权限或非 macOS 自动降级假栈）。
@@ -1950,6 +1962,131 @@ fn drive_ui_host_session(
     )
 }
 
+const RELAY_MIN_BITRATE_BPS: u32 = 2_000_000;
+const RELAY_QUEUE_HIGH_BYTES: usize = 192 * 1024;
+const RELAY_QUEUE_LOW_BYTES: usize = 32 * 1024;
+const RELAY_HIGH_QUEUE_HOLD: Duration = Duration::from_millis(150);
+const RELAY_BACKOFF_COOLDOWN: Duration = Duration::from_millis(500);
+const RELAY_RAMP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// 被控端 TCP Relay 连续码率控制器：将手动上限、`local_bps`（发送队列/淘汰 AIMD）与
+/// 对端控制端 RTT 限速上限（`remote_probe_cap_bps`）解耦，恒取三者最小值以避免双端抢权互盖。
+struct RelayBitrateController {
+    manual_cap_bps: u32,
+    local_bps: u32,
+    remote_probe_cap_bps: Option<u32>,
+    last_dropped: u64,
+    high_queue_since: Option<Instant>,
+    last_adjust: Instant,
+    clean_since: Instant,
+    last_manual_seen: Option<(u64, u32)>,
+    last_remote_probe_seen: Option<u32>,
+}
+
+impl RelayBitrateController {
+    fn new(initial_bps: u32, now: Instant) -> Self {
+        let cap = initial_bps.max(1);
+        Self {
+            manual_cap_bps: cap,
+            local_bps: cap,
+            remote_probe_cap_bps: None,
+            last_dropped: 0,
+            high_queue_since: None,
+            last_adjust: now,
+            clean_since: now,
+            last_manual_seen: None,
+            last_remote_probe_seen: None,
+        }
+    }
+
+    fn effective_bps(&self) -> u32 {
+        self.local_bps
+            .min(self.remote_probe_cap_bps.unwrap_or(self.manual_cap_bps))
+            .min(self.manual_cap_bps)
+            .max(1)
+    }
+
+    fn sync_external_caps(
+        &mut self,
+        manual: Option<(u64, u32)>,
+        remote_probe_bps: Option<u32>,
+        current_host_bps: u32,
+        now: Instant,
+    ) -> Option<u32> {
+        if let Some((gen, m)) = manual {
+            if self.last_manual_seen != Some((gen, m)) {
+                self.last_manual_seen = Some((gen, m));
+                self.manual_cap_bps = m.max(1);
+                self.local_bps = self.manual_cap_bps;
+                self.remote_probe_cap_bps = None;
+                self.last_remote_probe_seen = remote_probe_bps;
+                self.high_queue_since = None;
+                self.last_adjust = now;
+                self.clean_since = now;
+            }
+        }
+        if self.last_remote_probe_seen != remote_probe_bps {
+            self.last_remote_probe_seen = remote_probe_bps;
+            self.remote_probe_cap_bps = remote_probe_bps.map(|v| v.clamp(1, self.manual_cap_bps));
+        }
+        let target = self.effective_bps();
+        (current_host_bps.max(1) != target).then_some(target)
+    }
+
+    fn poll(&mut self, now: Instant, queued_bytes: usize, dropped_total: u64) -> Option<u32> {
+        let prev_eff = self.effective_bps();
+        let has_new_drops = dropped_total > self.last_dropped;
+        self.last_dropped = dropped_total;
+
+        if queued_bytes >= RELAY_QUEUE_HIGH_BYTES {
+            self.high_queue_since.get_or_insert(now);
+        } else {
+            self.high_queue_since = None;
+        }
+        let sustained_high_queue = self
+            .high_queue_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= RELAY_HIGH_QUEUE_HOLD);
+
+        if has_new_drops || sustained_high_queue {
+            self.clean_since = now;
+            if now.saturating_duration_since(self.last_adjust) >= RELAY_BACKOFF_COOLDOWN {
+                let floor = RELAY_MIN_BITRATE_BPS.min(self.manual_cap_bps).max(1);
+                let next =
+                    (((self.local_bps as f64) * 0.75) as u32).clamp(floor, self.manual_cap_bps);
+                self.last_adjust = now;
+                self.high_queue_since = None;
+                self.local_bps = next;
+                let next_eff = self.effective_bps();
+                if next_eff != prev_eff {
+                    return Some(next_eff);
+                }
+            }
+            return None;
+        }
+
+        if queued_bytes <= RELAY_QUEUE_LOW_BYTES {
+            if self.local_bps < self.manual_cap_bps
+                && now.saturating_duration_since(self.clean_since) >= RELAY_RAMP_INTERVAL
+                && now.saturating_duration_since(self.last_adjust) >= RELAY_RAMP_INTERVAL
+            {
+                let step = (self.local_bps / 7).max(2_000_000);
+                let next = self.local_bps.saturating_add(step).min(self.manual_cap_bps);
+                self.last_adjust = now;
+                self.clean_since = now;
+                self.local_bps = next;
+                let next_eff = self.effective_bps();
+                if next_eff != prev_eff {
+                    return Some(next_eff);
+                }
+            }
+        } else {
+            self.clean_since = now;
+        }
+
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drive_ui_host_session_inner(
     host: &mut HostSession,
@@ -2044,6 +2181,9 @@ fn drive_ui_host_session_inner(
     let mut audio_muted = false;
     let mut audio_seq: u32 = 0;
     let mut last_busy = true;
+    let mut relay_bitrate_ctrl = (transport_kind == HostTransportKind::Relay)
+        .then(|| RelayBitrateController::new(host.current_bitrate_bps().max(1), Instant::now()));
+    let mut last_relay_bwe_at = Instant::now();
 
     while !stop_flag.load(Ordering::Acquire)
         && !disconnect_flag.load(Ordering::Acquire)
@@ -2073,6 +2213,39 @@ fn drive_ui_host_session_inner(
                         }
                         if host.state() != SessionState::Streaming {
                             continue;
+                        }
+
+                        if let Some(ref mut ctrl) = relay_bitrate_ctrl {
+                            let now_bwe = Instant::now();
+                            let manual_cap = host
+                                .last_manual_bitrate_bps()
+                                .map(|bps| (host.last_manual_bitrate_gen(), bps));
+                            if let Some(clamped_bps) = ctrl.sync_external_caps(
+                                manual_cap,
+                                host.last_remote_probe_bitrate_bps(),
+                                host.current_bitrate_bps().max(1),
+                                now_bwe,
+                            ) {
+                                let _ = host.on_set_bitrate(
+                                    clamped_bps,
+                                    rc_session::proto::BitrateReason::Probe as u8,
+                                );
+                            }
+                            if now_bwe.saturating_duration_since(last_relay_bwe_at)
+                                >= Duration::from_millis(100)
+                            {
+                                last_relay_bwe_at = now_bwe;
+                                if let Some(next_bps) = ctrl.poll(
+                                    now_bwe,
+                                    host.transport_tx_queued_bytes(),
+                                    host.transport_tx_dropped_datagrams(),
+                                ) {
+                                    let _ = host.on_set_bitrate(
+                                        next_bps,
+                                        rc_session::proto::BitrateReason::Probe as u8,
+                                    );
+                                }
+                            }
                         }
 
                         // 0) 非阻塞检查后台音频采集与桌面壁纸初始化是否就绪（H13）。
@@ -4087,5 +4260,95 @@ mod tests {
         assert!(queue
             .pop_ready(Duration::from_secs(30), Duration::ZERO)
             .is_none());
+    }
+
+    #[test]
+    fn relay_bitrate_controller_backs_off_on_queue_or_drops_and_ramps_back_up() {
+        let t0 = Instant::now();
+        let mut ctrl = RelayBitrateController::new(14_000_000, t0);
+
+        // 1) 持续高排队 150ms + 冷却 500ms 后触发回退（×0.75 = 10.5 Mbps）
+        assert_eq!(
+            ctrl.poll(t0 + Duration::from_millis(50), 200 * 1024, 0),
+            None
+        );
+        assert_eq!(
+            ctrl.poll(t0 + Duration::from_millis(520), 200 * 1024, 0),
+            Some(10_500_000)
+        );
+
+        // 2) 丢包淘汰同样触发回退（冷却期外）：10.5M * 0.75 = 7.875M
+        assert_eq!(
+            ctrl.poll(t0 + Duration::from_millis(1_100), 16 * 1024, 3),
+            Some(7_875_000)
+        );
+
+        // 3) 排队清空并维持低水位 >= 2s 后逐步爬坡恢复
+        assert_eq!(
+            ctrl.poll(t0 + Duration::from_millis(2_000), 8 * 1024, 3),
+            None
+        );
+        let ramped = ctrl.poll(t0 + Duration::from_millis(3_200), 8 * 1024, 3);
+        assert_eq!(ramped, Some(9_875_000));
+
+        // 4) 用户手动下调码率后，上限同步刷新且不再超过新上限
+        assert_eq!(
+            ctrl.sync_external_caps(
+                Some((1, 8_000_000)),
+                None,
+                8_000_000,
+                t0 + Duration::from_millis(3_300),
+            ),
+            None
+        );
+        assert_eq!(ctrl.poll(t0 + Duration::from_millis(6_000), 0, 3), None);
+
+        // 5) 控制端 RTT 探针要求降至 4M，且本机排队清空时不得覆盖抬高；
+        //    随后即使控制端试图用 Probe 拉高至 7.5M，但宿主自身排队回退至 6M 时必须立刻钳制回 6M。
+        assert_eq!(
+            ctrl.sync_external_caps(
+                Some((1, 8_000_000)),
+                Some(4_000_000),
+                4_000_000,
+                t0 + Duration::from_millis(6_100),
+            ),
+            None
+        );
+        assert_eq!(ctrl.poll(t0 + Duration::from_millis(9_000), 0, 3), None);
+        assert_eq!(
+            ctrl.sync_external_caps(
+                Some((1, 8_000_000)),
+                Some(7_000_000),
+                7_000_000,
+                t0 + Duration::from_millis(9_100),
+            ),
+            None
+        );
+        assert_eq!(
+            ctrl.poll(t0 + Duration::from_millis(9_600), 0, 4),
+            Some(6_000_000)
+        );
+        assert_eq!(
+            ctrl.sync_external_caps(
+                Some((1, 8_000_000)),
+                Some(7_500_000),
+                7_500_000,
+                t0 + Duration::from_millis(9_700),
+            ),
+            Some(6_000_000)
+        );
+
+        // 6) 用户再次显式手选同数值 8M（manual_gen 递增为 2）：必须识别为新手动指令，
+        //    重置本机/远端拥塞上限，不得在下一拍把 8M 覆回 6M。
+        assert_eq!(
+            ctrl.sync_external_caps(
+                Some((2, 8_000_000)),
+                None,
+                8_000_000,
+                t0 + Duration::from_millis(9_800),
+            ),
+            None
+        );
+        assert_eq!(ctrl.effective_bps(), 8_000_000);
     }
 }

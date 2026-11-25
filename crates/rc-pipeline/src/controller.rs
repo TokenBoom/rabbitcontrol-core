@@ -66,7 +66,7 @@ enum ControllerExecMode {
         active_codec: rc_encode::Codec,
     },
     Async {
-        slot: Arc<(Mutex<Option<PendingAsyncFrame>>, Condvar)>,
+        slot: Arc<(Mutex<VecDeque<PendingAsyncFrame>>, Condvar)>,
         stop: Arc<AtomicBool>,
         shared: Arc<Mutex<AsyncSharedState>>,
         need_keyframe: Arc<AtomicBool>,
@@ -108,6 +108,9 @@ const MAX_PARTIALS: usize = 2;
 const DECODE_BUDGET_US: u32 = 3_000;
 /// 高分屏（>2.6M 像素）或 IDR 帧解码 deadline 余量（微秒）。
 const HIGH_RES_DECODE_BUDGET_US: u32 = 10_000;
+/// `async_decode` 有界帧队列容量（严格遵守 TASK.md 铁律 1：解码队列上限 ≤ 2；
+/// 配合解码线程在途 1 帧可吸收 2–3 帧公网 TCP 微突发而不打断 P 帧参考链，同时硬约束排队不超 2 帧）。
+const ASYNC_DECODE_QUEUE_CAP: usize = 2;
 
 fn frame_decode_budget_us(cfg: &PipelineConfig, kind: FrameKind) -> u32 {
     let pixels = u64::from(cfg.resolution.width) * u64::from(cfg.resolution.height);
@@ -169,7 +172,12 @@ impl ControllerPipeline {
         let clock: ClockSlot = Arc::new(Mutex::new(None));
         let active_codec = cfg.codec;
         let mode = if cfg.async_decode {
-            let slot = Arc::new((Mutex::new(None::<PendingAsyncFrame>), Condvar::new()));
+            let slot = Arc::new((
+                Mutex::new(VecDeque::<PendingAsyncFrame>::with_capacity(
+                    ASYNC_DECODE_QUEUE_CAP,
+                )),
+                Condvar::new(),
+            ));
             let stop = Arc::new(AtomicBool::new(false));
             let shared = Arc::new(Mutex::new(AsyncSharedState::default()));
             let need_keyframe = Arc::new(AtomicBool::new(false));
@@ -193,7 +201,7 @@ impl ControllerPipeline {
                             let (lock, cv) = &*slot_w;
                             let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
                             loop {
-                                if let Some(frame) = guard.take() {
+                                if let Some(frame) = guard.pop_front() {
                                     break Some(frame);
                                 }
                                 if stop_w.load(Ordering::Acquire) {
@@ -537,34 +545,31 @@ impl ControllerPipeline {
                     kind,
                     is_hevc,
                 };
-                let dropped_frame = {
+                let dropped_frames: Vec<(FrameSeq, Timestamp, Timestamp)> = {
                     let (lock, cv) = &**slot;
                     let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let dropped = match guard.take() {
-                        // 槽内已有待解的帧且新帧是 P 帧：保留参考链仍完整的旧帧（`prev`），
-                        // 拒绝覆写为缺参考的新 P 帧，避免把断链 P 帧送进硬解触发 -12909。
-                        Some(prev) if kind != FrameKind::Idr => {
-                            *guard = Some(prev);
-                            Some((seq, capture_ts, received_ts))
+                    let mut dropped = Vec::new();
+                    if kind == FrameKind::Idr {
+                        while let Some(prev) = guard.pop_front() {
+                            dropped.push((prev.seq, prev.capture_ts, prev.received_ts));
                         }
-                        // 新帧是 IDR：用最新 IDR 取代槽内未解旧帧立即恢复参考链。
-                        Some(prev) => {
-                            *guard = Some(incoming);
-                            Some((prev.seq, prev.capture_ts, prev.received_ts))
-                        }
-                        None => {
-                            *guard = Some(incoming);
-                            None
-                        }
-                    };
+                        guard.push_back(incoming);
+                    } else if guard.len() < ASYNC_DECODE_QUEUE_CAP {
+                        guard.push_back(incoming);
+                    } else {
+                        // 队列满时保留已有参考链完整的前序待解帧，丢弃本帧并标记断链等待 IDR。
+                        dropped.push((seq, capture_ts, received_ts));
+                    }
                     cv.notify_one();
                     dropped
                 };
-                if let Some((d_seq, d_cap, d_recv)) = dropped_frame {
-                    let f = self.trace.begin(d_seq);
-                    f.mark(Mark::Captured, d_cap);
-                    f.mark(Mark::Received, d_recv);
-                    f.finish(Outcome::DroppedStale);
+                if !dropped_frames.is_empty() {
+                    for (d_seq, d_cap, d_recv) in dropped_frames {
+                        let f = self.trace.begin(d_seq);
+                        f.mark(Mark::Captured, d_cap);
+                        f.mark(Mark::Received, d_recv);
+                        f.finish(Outcome::DroppedStale);
+                    }
                     if kind != FrameKind::Idr {
                         self.async_chain_broken = true;
                         self.need_keyframe = true;
@@ -630,11 +635,14 @@ impl ControllerPipeline {
                 if let Some(handle) = worker.take() {
                     let _ = handle.join();
                 }
-                let leftover = {
+                let leftovers: Vec<PendingAsyncFrame> = {
                     let (lock, _) = &**slot;
-                    lock.lock().unwrap_or_else(|e| e.into_inner()).take()
+                    lock.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .drain(..)
+                        .collect()
                 };
-                if let Some(p) = leftover {
+                for p in leftovers {
                     let f = self.trace.begin(p.seq);
                     f.mark(Mark::Captured, p.capture_ts);
                     f.mark(Mark::Received, p.received_ts);

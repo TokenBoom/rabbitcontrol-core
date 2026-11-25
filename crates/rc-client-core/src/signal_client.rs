@@ -154,11 +154,17 @@ pub struct DeviceStatusEvent {
 /// 动态 Access Token 提供器类型（由上层接入 `AuthSessionManager::ensure_valid_access_token`）。
 pub type TokenProvider = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
 
+/// 当注册被服务端以 `token_expired` 拒绝时，强制刷新失效 Access Token 的回调类型
+/// （入参为刚被拒绝的过期令牌，由上层接入 `AuthSessionManager::refresh_after_unauthorized`）。
+pub type TokenRefresher = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
 /// 信令客户端启动扩展参数（注入动态 Token 提供器、设备公钥、远程协助与动态局域网探测开关）。
 #[derive(Clone, Default)]
 pub struct SignalClientOptions {
     /// 可选动态 Access Token 提供器；每次建连与断线重连注册时自动拉取最新（必要时已轮换的）令牌。
     pub token_provider: Option<TokenProvider>,
+    /// 可选强制刷新回调；当注册因 `token_expired`（例如设备休眠恢复或时钟偏差）失败时触发强制刷新。
+    pub token_refresher: Option<TokenRefresher>,
     /// 可选本机设备 Ed25519 公钥（64 位小写十六进制）。
     pub device_pubkey: Option<String>,
     /// 初始是否允许他人远程协助（默认 `false`）。
@@ -171,6 +177,7 @@ impl fmt::Debug for SignalClientOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SignalClientOptions")
             .field("has_token_provider", &self.token_provider.is_some())
+            .field("has_token_refresher", &self.token_refresher.is_some())
             .field("device_pubkey", &self.device_pubkey)
             .field("allow_remote_assist", &self.allow_remote_assist)
             .field("dynamic_lan_discovery", &self.dynamic_lan_discovery)
@@ -401,6 +408,7 @@ struct SharedState {
     lan_addrs: Vec<String>,
     enabled: bool,
     token_provider: Option<TokenProvider>,
+    token_refresher: Option<TokenRefresher>,
     device_pubkey: Option<String>,
     allow_remote_assist: AtomicU8,
 }
@@ -714,26 +722,28 @@ impl SignalClientHandle {
             cfg.disabled_snapshot()
         };
 
-        let (token_provider, device_pubkey, initial_assist, dynamic_lan_discovery) = match options {
-            Some(opts) => {
-                let pubkey = opts
-                    .device_pubkey
-                    .map(|s| s.trim().to_ascii_lowercase())
-                    .filter(|s| !s.is_empty());
-                let assist = if opts.allow_remote_assist {
-                    ASSIST_TRUE
-                } else {
-                    ASSIST_FALSE
-                };
-                (
-                    opts.token_provider,
-                    pubkey,
-                    assist,
-                    opts.dynamic_lan_discovery,
-                )
-            }
-            None => (None, None, ASSIST_UNSET, false),
-        };
+        let (token_provider, token_refresher, device_pubkey, initial_assist, dynamic_lan_discovery) =
+            match options {
+                Some(opts) => {
+                    let pubkey = opts
+                        .device_pubkey
+                        .map(|s| s.trim().to_ascii_lowercase())
+                        .filter(|s| !s.is_empty());
+                    let assist = if opts.allow_remote_assist {
+                        ASSIST_TRUE
+                    } else {
+                        ASSIST_FALSE
+                    };
+                    (
+                        opts.token_provider,
+                        opts.token_refresher,
+                        pubkey,
+                        assist,
+                        opts.dynamic_lan_discovery,
+                    )
+                }
+                None => (None, None, None, ASSIST_UNSET, false),
+            };
 
         let shared = Arc::new(SharedState {
             status: Mutex::new(initial_snapshot.clone()),
@@ -755,6 +765,7 @@ impl SignalClientHandle {
             lan_addrs: clean_lan_addrs.clone(),
             enabled: active,
             token_provider,
+            token_refresher,
             device_pubkey,
             allow_remote_assist: AtomicU8::new(initial_assist),
         });
@@ -1204,6 +1215,7 @@ fn worker_loop(
 ) {
     let mut backoff_idx = 0usize;
     let mut cached_device_id = cfg.cached_device_id.clone();
+    let mut expired_token: Option<String> = None;
     let default_signal_addr = format_host_port(&cfg.server_host, cfg.signal_port);
     let default_relay_addr = format_host_port(&cfg.server_host, cfg.relay_port);
 
@@ -1226,6 +1238,7 @@ fn worker_loop(
             &hostname,
             &lan_addrs,
             &mut cached_device_id,
+            &mut expired_token,
             &default_signal_addr,
             &default_relay_addr,
             timing,
@@ -1434,11 +1447,45 @@ fn run_single_connection(
     hostname: &str,
     lan_addrs: &[String],
     cached_device_id: &mut Option<String>,
+    expired_token: &mut Option<String>,
     default_signal_addr: &str,
     default_relay_addr: &str,
     timing: SignalTiming,
     on_status: &mut dyn FnMut(ServerStatusSnapshot),
 ) -> ConnectionOutcome {
+    if shared.stop_flag.load(Ordering::Acquire) {
+        return ConnectionOutcome::Stopped;
+    }
+
+    // 在拨号建连前完成 Access Token 获取/强制刷新，避免 HTTP 刷新往返挤占服务端
+    // handshake_timeout（10s），并在刷新瞬态失败时保留 expired_token 供下轮重试。
+    let access_token = match (&shared.token_refresher, expired_token.take()) {
+        (Some(refresher), Some(stale)) => match refresher(&stale) {
+            Ok(token) => Some(token),
+            Err(err) => {
+                *expired_token = Some(stale);
+                return ConnectionOutcome::ConnectFailed(format!(
+                    "刷新失效信令认证令牌失败：{err}"
+                ));
+            }
+        },
+        _ => match &shared.token_provider {
+            Some(provider) => match provider() {
+                Ok(token) => Some(token),
+                Err(err) => {
+                    return ConnectionOutcome::ConnectFailed(format!(
+                        "获取信令认证令牌失败：{err}"
+                    ));
+                }
+            },
+            None => None,
+        },
+    };
+    if shared.stop_flag.load(Ordering::Acquire) {
+        return ConnectionOutcome::Stopped;
+    }
+    let mut sent_access_token = access_token.clone();
+
     let stream = match dial_tcp(default_signal_addr, HANDSHAKE_TIMEOUT, &shared.stop_flag) {
         Ok(s) => s,
         Err(DialError::Stopped) => return ConnectionOutcome::Stopped,
@@ -1541,17 +1588,6 @@ fn run_single_connection(
         )
     };
 
-    let access_token = match &shared.token_provider {
-        Some(provider) => match provider() {
-            Ok(token) => Some(token),
-            Err(err) => {
-                writer_template.shutdown_and_close();
-                return ConnectionOutcome::ConnectFailed(format!("获取信令认证令牌失败：{err}"));
-            }
-        },
-        None => None,
-    };
-
     let clean_hostname = sanitize_hostname(hostname);
     let clean_lan_addrs = sanitize_lan_addrs(lan_addrs);
     // 初始注册时尚未绑定持久化 UDP 探测端口（local_udp_port == 0），必须上报空列表，
@@ -1635,6 +1671,9 @@ fn run_single_connection(
                     break (device_id, fmt_id, eff_relay, eff_udp);
                 }
                 IncomingSignalMsg::Error { code, message } => {
+                    if code == "token_expired" {
+                        *expired_token = sent_access_token.take();
+                    }
                     if code == "device_id_mismatch" {
                         // 本地缓存的设备码与服务端记录不一致，清空缓存以便下轮重新签发。
                         *cached_device_id = None;
@@ -3176,6 +3215,7 @@ mod tests {
             lan_addrs: Vec::new(),
             enabled: true,
             token_provider: None,
+            token_refresher: None,
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
         };
@@ -3553,6 +3593,7 @@ mod tests {
             lan_addrs: Vec::new(),
             enabled: true,
             token_provider: None,
+            token_refresher: None,
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
         });
@@ -3739,6 +3780,7 @@ mod tests {
             lan_addrs: Vec::new(),
             enabled: true,
             token_provider: None,
+            token_refresher: None,
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
         };
@@ -3840,6 +3882,7 @@ mod tests {
             lan_addrs: Vec::new(),
             enabled: true,
             token_provider: None,
+            token_refresher: None,
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
         };
@@ -4091,6 +4134,7 @@ mod tests {
             device_pubkey: Some("A".repeat(64)),
             allow_remote_assist: false,
             dynamic_lan_discovery: false,
+            ..SignalClientOptions::default()
         };
         let fast_timing = SignalTiming {
             heartbeat_interval: Duration::from_secs(30),
@@ -4254,5 +4298,201 @@ mod tests {
                 10061
             )));
         }
+    }
+
+    #[test]
+    fn signal_client_forces_token_refresh_on_token_expired_register_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            // Round 1: reject expired token with token_expired error
+            let (mut s1, _) = listener.accept().unwrap();
+            let reg1 = read_test_frame(&mut s1);
+            assert_eq!(reg1["type"], "register");
+            assert_eq!(reg1["access_token"], "stale-tok");
+            write_test_frame(
+                &mut s1,
+                &serde_json::json!({
+                    "type": "error",
+                    "code": "token_expired",
+                    "message": "access token expired"
+                }),
+            );
+            drop(s1);
+
+            // Round 2: accept forced-refreshed token
+            let (mut s2, _) = listener.accept().unwrap();
+            let reg2 = read_test_frame(&mut s2);
+            assert_eq!(reg2["type"], "register");
+            assert_eq!(reg2["access_token"], "fresh-tok");
+            write_test_frame(
+                &mut s2,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "123456789",
+                    "formatted_id": "123 456 789",
+                    "udp_probe_addr": "",
+                    "relay_addr": ""
+                }),
+            );
+            let _ = s2.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut buf = [0u8; 64];
+            while matches!(s2.read(&mut buf), Ok(n) if n > 0) {}
+        });
+
+        let refresh_called = Arc::new(Mutex::new(Vec::<String>::new()));
+        let refresh_log = Arc::clone(&refresh_called);
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: addr.port(),
+            relay_port: 21117,
+            use_https: false,
+            device_key: crate::server_config::generate_device_key(),
+            ..ServerConfig::default()
+        };
+        let opts = SignalClientOptions {
+            token_provider: Some(Arc::new(|| Ok("stale-tok".to_string()))),
+            token_refresher: Some(Arc::new(move |stale| {
+                refresh_log.lock().unwrap().push(stale.to_string());
+                Ok("fresh-tok".to_string())
+            })),
+            ..SignalClientOptions::default()
+        };
+        let fast_timing = SignalTiming {
+            heartbeat_interval: Duration::from_secs(30),
+            activity_timeout: Duration::from_secs(75),
+            stable_threshold: Duration::from_secs(30),
+            backoffs: [
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+            ],
+        };
+        let mut client = SignalClientHandle::spawn_with_timing(
+            cfg,
+            "refresh-test".to_string(),
+            Vec::new(),
+            Some(opts),
+            fast_timing,
+            |_| {},
+        );
+
+        let snap = wait_until_connected(&client, Duration::from_secs(4));
+        assert_eq!(snap.device_id.as_deref(), Some("123456789"));
+        assert_eq!(refresh_called.lock().unwrap().as_slice(), &["stale-tok"]);
+        client.stop();
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn signal_client_preserves_expired_token_and_skips_dial_when_refresh_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let accept_count_srv = Arc::clone(&accept_count);
+
+        let server_thread = thread::spawn(move || {
+            // Round 1: reject stale-tok with token_expired
+            let (mut s1, _) = listener.accept().unwrap();
+            accept_count_srv.fetch_add(1, Ordering::SeqCst);
+            let reg1 = read_test_frame(&mut s1);
+            assert_eq!(reg1["type"], "register");
+            assert_eq!(reg1["access_token"], "stale-tok");
+            write_test_frame(
+                &mut s1,
+                &serde_json::json!({
+                    "type": "error",
+                    "code": "token_expired",
+                    "message": "access token expired"
+                }),
+            );
+            drop(s1);
+
+            // Round 2 (refresh failed) must NOT dial TCP; the very next accepted socket
+            // must already carry the refreshed token from Round 3.
+            let (mut s2, _) = listener.accept().unwrap();
+            accept_count_srv.fetch_add(1, Ordering::SeqCst);
+            let reg2 = read_test_frame(&mut s2);
+            assert_eq!(reg2["type"], "register");
+            assert_eq!(reg2["access_token"], "fresh-tok-after-retry");
+            write_test_frame(
+                &mut s2,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "234567890",
+                    "formatted_id": "234 567 890",
+                    "udp_probe_addr": "",
+                    "relay_addr": ""
+                }),
+            );
+            let _ = s2.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut buf = [0u8; 64];
+            while matches!(s2.read(&mut buf), Ok(n) if n > 0) {}
+        });
+
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider_calls_cb = Arc::clone(&provider_calls);
+        let refresh_attempts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let refresh_attempts_cb = Arc::clone(&refresh_attempts);
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: addr.port(),
+            relay_port: 21117,
+            use_https: false,
+            device_key: crate::server_config::generate_device_key(),
+            ..ServerConfig::default()
+        };
+        let opts = SignalClientOptions {
+            token_provider: Some(Arc::new(move || {
+                provider_calls_cb.fetch_add(1, Ordering::SeqCst);
+                Ok("stale-tok".to_string())
+            })),
+            token_refresher: Some(Arc::new(move |stale| {
+                let mut log = refresh_attempts_cb.lock().unwrap();
+                log.push(stale.to_string());
+                if log.len() == 1 {
+                    Err("transient refresh failure".to_string())
+                } else {
+                    Ok("fresh-tok-after-retry".to_string())
+                }
+            })),
+            ..SignalClientOptions::default()
+        };
+        let fast_timing = SignalTiming {
+            heartbeat_interval: Duration::from_secs(30),
+            activity_timeout: Duration::from_secs(75),
+            stable_threshold: Duration::from_secs(30),
+            backoffs: [
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+            ],
+        };
+        let mut client = SignalClientHandle::spawn_with_timing(
+            cfg,
+            "refresh-retry-test".to_string(),
+            Vec::new(),
+            Some(opts),
+            fast_timing,
+            |_| {},
+        );
+
+        let snap = wait_until_connected(&client, Duration::from_secs(4));
+        assert_eq!(snap.device_id.as_deref(), Some("234567890"));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(accept_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            refresh_attempts.lock().unwrap().as_slice(),
+            &["stale-tok", "stale-tok"]
+        );
+        client.stop();
+        server_thread.join().unwrap();
     }
 }

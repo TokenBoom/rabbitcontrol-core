@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -64,9 +64,19 @@ pub const RELAY_RX_QUEUE_CAP: usize = 4096;
 pub const MAX_RX_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
 /// 发送端 `Datagram` 队列有界容量（支撑 1512×982+ 高画质 IDR 多片突发而不截断丢包）。
-const RELAY_TX_DATAGRAM_CAP: usize = 4096;
-/// 发送端 `Datagram` 队列总字节上限（4 MiB），防止突发拥塞无限积压内存。
-const RELAY_TX_DATAGRAM_MAX_BYTES: usize = 4 * 1024 * 1024;
+const RELAY_TX_DATAGRAM_CAP: usize = 1024;
+/// 发送端 `Datagram` 队列总字节上限（768 KiB），在兼容高分单张 IDR 的同时防止 WAN 拥塞下秒级积压。
+const RELAY_TX_DATAGRAM_MAX_BYTES: usize = 768 * 1024;
+/// 写线程单次合批加密并写入 TCP 的最大明文字节数（32 KiB）。
+const RELAY_TX_BATCH_MAX_BYTES: usize = 32 * 1024;
+/// TLS 读线程单次 TCP 读缓冲（128 KiB）。
+const RELAY_READER_TLS_BUF_BYTES: usize = 128 * 1024;
+/// 非 Linux 平台套接字发送缓冲上限（512 KiB），避免 macOS 自动扩到 4 MiB 放大排队延迟。
+#[cfg(not(target_os = "linux"))]
+const RELAY_SO_SNDBUF: usize = 512 * 1024;
+/// 非 Linux 平台套接字接收缓冲上限（2 MiB）。
+#[cfg(not(target_os = "linux"))]
+const RELAY_SO_RCVBUF: usize = 2 * 1024 * 1024;
 /// 发送端 `Reliable` / `ReliableUrgent` 队列有界容量。
 const RELAY_TX_RELIABLE_CAP: usize = 512;
 /// 后台写线程单次 TCP 写超时（防止对端黑洞永久卡住写线程）。
@@ -244,10 +254,51 @@ impl RelayShutdownHandle {
     }
 }
 
+/// 媒体数据报 32B 包头魔数 `"RCV1"`。
+const MEDIA_MAGIC: &[u8; 4] = b"RCV1";
+
+/// 从带 5 字节中继帧头的 `CH_DATAGRAM` 帧中提取 `rc-proto` `frame_seq`（供整帧原子淘汰）。
+fn extract_relay_media_frame_seq(relay_frame: &[u8]) -> Option<u64> {
+    if relay_frame.len() >= 17 && relay_frame[0] == CH_DATAGRAM && &relay_frame[5..9] == MEDIA_MAGIC
+    {
+        Some(u64::from_le_bytes(relay_frame[9..17].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
+/// 从裸 `NetEvent::Datagram` 负载中提取 `rc-proto` `frame_seq`（供接收端整帧原子淘汰）。
+fn extract_payload_media_frame_seq(payload: &[u8]) -> Option<u64> {
+    if payload.len() >= 12 && &payload[0..4] == MEDIA_MAGIC {
+        Some(u64::from_le_bytes(payload[4..12].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug)]
-enum TxItem {
-    Frame(Vec<u8>),
+enum TxBatch {
+    Frames { payload_bytes: u64 },
     FlushTls,
+}
+
+#[derive(Debug)]
+struct DropRateWindow {
+    prev_enqueued: u64,
+    prev_dropped: u64,
+    last_sample_at: Instant,
+    cached_rate: f32,
+}
+
+impl DropRateWindow {
+    fn new() -> Self {
+        Self {
+            prev_enqueued: 0,
+            prev_dropped: 0,
+            last_sample_at: Instant::now(),
+            cached_rate: 0.0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -256,6 +307,7 @@ struct TxQueueInner {
     reliable: VecDeque<Vec<u8>>,
     datagram: VecDeque<Vec<u8>>,
     datagram_bytes: usize,
+    abandoned_frame_seq: Option<u64>,
     flush_needed: bool,
     closed: bool,
     writer_exited: bool,
@@ -268,6 +320,10 @@ struct TxQueue {
     datagram_cap: usize,
     datagram_max_bytes: usize,
     reliable_cap: usize,
+    queued_datagram_bytes: AtomicUsize,
+    enqueued_datagrams: AtomicU64,
+    dropped_datagrams: AtomicU64,
+    loss_window: Mutex<DropRateWindow>,
 }
 
 impl TxQueue {
@@ -278,6 +334,7 @@ impl TxQueue {
                 reliable: VecDeque::with_capacity(16),
                 datagram: VecDeque::with_capacity(datagram_cap.min(256)),
                 datagram_bytes: 0,
+                abandoned_frame_seq: None,
                 flush_needed: false,
                 closed: false,
                 writer_exited: false,
@@ -286,7 +343,41 @@ impl TxQueue {
             datagram_cap,
             datagram_max_bytes,
             reliable_cap,
+            queued_datagram_bytes: AtomicUsize::new(0),
+            enqueued_datagrams: AtomicU64::new(0),
+            dropped_datagrams: AtomicU64::new(0),
+            loss_window: Mutex::new(DropRateWindow::new()),
         }
+    }
+
+    fn queued_bytes(&self) -> usize {
+        self.queued_datagram_bytes.load(Ordering::Relaxed)
+    }
+
+    fn dropped_datagrams(&self) -> u64 {
+        self.dropped_datagrams.load(Ordering::Relaxed)
+    }
+
+    fn recent_loss_rate(&self) -> f32 {
+        let cur_enq = self.enqueued_datagrams.load(Ordering::Relaxed);
+        let cur_drop = self.dropped_datagrams.load(Ordering::Relaxed);
+        let mut win = self.loss_window.lock().unwrap_or_else(|e| e.into_inner());
+        let elapsed = win.last_sample_at.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            let d_enq = cur_enq.saturating_sub(win.prev_enqueued);
+            let d_drop = cur_drop.saturating_sub(win.prev_dropped);
+            win.cached_rate = if d_enq == 0 {
+                0.0
+            } else {
+                ((d_drop as f64) / (d_enq as f64)).clamp(0.0, 1.0) as f32
+            };
+            win.prev_enqueued = cur_enq;
+            win.prev_dropped = cur_drop;
+            win.last_sample_at = Instant::now();
+        } else if win.prev_enqueued == 0 && cur_enq > 0 && cur_drop > 0 {
+            win.cached_rate = ((cur_drop as f64) / (cur_enq as f64)).clamp(0.0, 1.0) as f32;
+        }
+        win.cached_rate
     }
 
     fn enqueue_urgent(&self, frame: Vec<u8>) -> Result<()> {
@@ -317,24 +408,66 @@ impl TxQueue {
 
     fn enqueue_datagram(&self, frame: Vec<u8>) -> Result<()> {
         let frame_len = frame.len();
+        let incoming_seq = extract_relay_media_frame_seq(&frame);
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if guard.closed {
             return Err(Error::Network("relay transport closed".to_string()));
         }
-        if frame_len > self.datagram_max_bytes {
+        self.enqueued_datagrams.fetch_add(1, Ordering::Relaxed);
+        if incoming_seq.is_some() && guard.abandoned_frame_seq == incoming_seq {
+            self.dropped_datagrams.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
+        if incoming_seq.is_some() && guard.abandoned_frame_seq != incoming_seq {
+            guard.abandoned_frame_seq = None;
+        }
+        if frame_len > self.datagram_max_bytes {
+            if let Some(seq) = incoming_seq {
+                guard.abandoned_frame_seq = Some(seq);
+            }
+            self.dropped_datagrams.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        let mut evicted_count = 0u64;
         while guard.datagram.len() >= self.datagram_cap
             || guard.datagram_bytes.saturating_add(frame_len) > self.datagram_max_bytes
         {
             if let Some(dropped) = guard.datagram.pop_front() {
                 guard.datagram_bytes = guard.datagram_bytes.saturating_sub(dropped.len());
+                evicted_count += 1;
+                if let Some(victim_seq) = extract_relay_media_frame_seq(&dropped) {
+                    while let Some(next_front) = guard.datagram.front() {
+                        if extract_relay_media_frame_seq(next_front) == Some(victim_seq) {
+                            let extra = guard.datagram.pop_front().expect("front checked");
+                            guard.datagram_bytes = guard.datagram_bytes.saturating_sub(extra.len());
+                            evicted_count += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if Some(victim_seq) == incoming_seq {
+                        // 超大单帧自身耗尽队列上限时整帧放弃并拒收后续尾包，避免发出必废残片。
+                        guard.abandoned_frame_seq = Some(victim_seq);
+                        evicted_count += 1;
+                        self.queued_datagram_bytes
+                            .store(guard.datagram_bytes, Ordering::Relaxed);
+                        self.dropped_datagrams
+                            .fetch_add(evicted_count, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                }
             } else {
                 break;
             }
         }
         guard.datagram_bytes = guard.datagram_bytes.saturating_add(frame_len);
         guard.datagram.push_back(frame);
+        self.queued_datagram_bytes
+            .store(guard.datagram_bytes, Ordering::Relaxed);
+        if evicted_count > 0 {
+            self.dropped_datagrams
+                .fetch_add(evicted_count, Ordering::Relaxed);
+        }
         self.cv.notify_one();
         Ok(())
     }
@@ -347,24 +480,54 @@ impl TxQueue {
         }
     }
 
-    /// 按严格优先级弹出下一发送任务：`urgent > reliable > datagram > flush_tls`。
-    /// 队列全部为空且已关闭时返回 `None`。
-    fn pop_next_item(&self) -> Option<TxItem> {
+    /// 按严格优先级弹出最多 `max_bytes` 字节同优先级帧合批写入 `out`：
+    /// `urgent > reliable > datagram > flush_tls`；队列全部为空且已关闭时返回 `None`。
+    fn pop_batch_into(&self, out: &mut Vec<u8>, max_bytes: usize) -> Option<TxBatch> {
+        out.clear();
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(frame) = guard.urgent.pop_front() {
-                return Some(TxItem::Frame(frame));
+            if !guard.urgent.is_empty() {
+                let mut payload_bytes = 0u64;
+                while let Some(front) = guard.urgent.front() {
+                    if !out.is_empty() && out.len().saturating_add(front.len()) > max_bytes {
+                        break;
+                    }
+                    let frame = guard.urgent.pop_front().expect("front checked");
+                    payload_bytes += frame.len().saturating_sub(5) as u64;
+                    out.extend_from_slice(&frame);
+                }
+                return Some(TxBatch::Frames { payload_bytes });
             }
-            if let Some(frame) = guard.reliable.pop_front() {
-                return Some(TxItem::Frame(frame));
+            if !guard.reliable.is_empty() {
+                let mut payload_bytes = 0u64;
+                while let Some(front) = guard.reliable.front() {
+                    if !out.is_empty() && out.len().saturating_add(front.len()) > max_bytes {
+                        break;
+                    }
+                    let frame = guard.reliable.pop_front().expect("front checked");
+                    payload_bytes += frame.len().saturating_sub(5) as u64;
+                    out.extend_from_slice(&frame);
+                }
+                return Some(TxBatch::Frames { payload_bytes });
             }
-            if let Some(frame) = guard.datagram.pop_front() {
-                guard.datagram_bytes = guard.datagram_bytes.saturating_sub(frame.len());
-                return Some(TxItem::Frame(frame));
+            if !guard.datagram.is_empty() {
+                let mut payload_bytes = 0u64;
+                while let Some(front) = guard.datagram.front() {
+                    if !out.is_empty() && out.len().saturating_add(front.len()) > max_bytes {
+                        break;
+                    }
+                    let frame = guard.datagram.pop_front().expect("front checked");
+                    guard.datagram_bytes = guard.datagram_bytes.saturating_sub(frame.len());
+                    payload_bytes += frame.len().saturating_sub(5) as u64;
+                    out.extend_from_slice(&frame);
+                }
+                self.queued_datagram_bytes
+                    .store(guard.datagram_bytes, Ordering::Relaxed);
+                return Some(TxBatch::Frames { payload_bytes });
             }
             if guard.flush_needed {
                 guard.flush_needed = false;
-                return Some(TxItem::FlushTls);
+                return Some(TxBatch::FlushTls);
             }
             if guard.closed {
                 return None;
@@ -375,16 +538,34 @@ impl TxQueue {
 
     #[cfg(test)]
     fn pop_next(&self) -> Option<Vec<u8>> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            match self.pop_next_item()? {
-                TxItem::Frame(f) => return Some(f),
-                TxItem::FlushTls => continue,
+            if let Some(frame) = guard.urgent.pop_front() {
+                return Some(frame);
             }
+            if let Some(frame) = guard.reliable.pop_front() {
+                return Some(frame);
+            }
+            if let Some(frame) = guard.datagram.pop_front() {
+                guard.datagram_bytes = guard.datagram_bytes.saturating_sub(frame.len());
+                self.queued_datagram_bytes
+                    .store(guard.datagram_bytes, Ordering::Relaxed);
+                return Some(frame);
+            }
+            if guard.flush_needed {
+                guard.flush_needed = false;
+                continue;
+            }
+            if guard.closed {
+                return None;
+            }
+            guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
         }
     }
 
     fn mark_closed(&self) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.abandoned_frame_seq = None;
         guard.closed = true;
         self.cv.notify_all();
     }
@@ -393,6 +574,8 @@ impl TxQueue {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.datagram.clear();
         guard.datagram_bytes = 0;
+        guard.abandoned_frame_seq = None;
+        self.queued_datagram_bytes.store(0, Ordering::Relaxed);
         guard.closed = true;
         self.cv.notify_all();
     }
@@ -455,6 +638,21 @@ fn evict_oldest_datagram(guard: &mut RxQueueInner) -> bool {
             guard.total_bytes = guard
                 .total_bytes
                 .saturating_sub(event_payload_bytes(&removed));
+            if let NetEvent::Datagram(ref payload) = removed {
+                if let Some(victim_seq) = extract_payload_media_frame_seq(payload) {
+                    let mut dropped_bytes = 0usize;
+                    guard.events.retain(|ev| match ev {
+                        NetEvent::Datagram(p)
+                            if extract_payload_media_frame_seq(p) == Some(victim_seq) =>
+                        {
+                            dropped_bytes = dropped_bytes.saturating_add(p.len());
+                            false
+                        }
+                        _ => true,
+                    });
+                    guard.total_bytes = guard.total_bytes.saturating_sub(dropped_bytes);
+                }
+            }
         }
         true
     } else {
@@ -666,6 +864,18 @@ impl Transport for E2eeRelayTransport {
     fn stats(&self) -> NetStats {
         self.inner.stats()
     }
+
+    fn set_pacing_rate(&mut self, bps: u64) {
+        self.inner.set_pacing_rate(bps);
+    }
+
+    fn tx_queued_bytes(&self) -> usize {
+        self.inner.tx_queued_bytes()
+    }
+
+    fn tx_dropped_datagrams(&self) -> u64 {
+        self.inner.tx_dropped_datagrams()
+    }
 }
 
 impl TcpRelayTransport {
@@ -787,10 +997,19 @@ impl Transport for TcpRelayTransport {
     fn stats(&self) -> NetStats {
         NetStats {
             rtt_us: self.rtt_us,
+            loss_rate: self.tx.recent_loss_rate(),
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_recv: self.bytes_recv.load(Ordering::Relaxed),
             ..NetStats::default()
         }
+    }
+
+    fn tx_queued_bytes(&self) -> usize {
+        self.tx.queued_bytes()
+    }
+
+    fn tx_dropped_datagrams(&self) -> u64 {
+        self.tx.dropped_datagrams()
     }
 }
 
@@ -1245,41 +1464,52 @@ impl TlsStack {
         Ok(())
     }
 
-    fn encrypt_frame(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
-        let mid = match self.inner.as_mut() {
+    fn encrypt_into(
+        &mut self,
+        plain: &[u8],
+        mid_scratch: &mut Vec<u8>,
+        wire_out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        wire_out.clear();
+        let mid_slice: &[u8] = match self.inner.as_mut() {
             Some(inner) => {
-                let mut buf = Vec::with_capacity(frame.len() + 64);
-                Self::write_all_e2ee(inner, frame, &mut buf)?;
-                buf
+                mid_scratch.clear();
+                Self::write_all_e2ee(inner, plain, mid_scratch)?;
+                mid_scratch.as_slice()
             }
-            None => frame.to_vec(),
+            None => plain,
         };
         match self.outer.as_mut() {
-            Some(outer) => {
-                let mut wire = Vec::with_capacity(mid.len() + 64);
-                Self::write_all_client(outer, &mid, &mut wire)?;
-                Ok(wire)
+            Some(outer) => Self::write_all_client(outer, mid_slice, wire_out),
+            None => {
+                wire_out.extend_from_slice(mid_slice);
+                Ok(())
             }
-            None => Ok(mid),
         }
     }
 
-    fn drain_pending_writes(&mut self) -> io::Result<Vec<u8>> {
-        let mut mid = Vec::new();
+    fn drain_pending_writes_into(
+        &mut self,
+        mid_scratch: &mut Vec<u8>,
+        wire_out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        mid_scratch.clear();
+        wire_out.clear();
         if let Some(inner) = self.inner.as_mut() {
-            Self::drain_e2ee_out(inner, &mut mid)?;
+            Self::drain_e2ee_out(inner, mid_scratch)?;
         }
         match self.outer.as_mut() {
             Some(outer) => {
-                let mut wire = Vec::new();
-                if !mid.is_empty() {
-                    Self::write_all_client(outer, &mid, &mut wire)?;
+                if !mid_scratch.is_empty() {
+                    Self::write_all_client(outer, mid_scratch, wire_out)
                 } else {
-                    Self::drain_client_out(outer, &mut wire)?;
+                    Self::drain_client_out(outer, wire_out)
                 }
-                Ok(wire)
             }
-            None => Ok(mid),
+            None => {
+                wire_out.extend_from_slice(mid_scratch);
+                Ok(())
+            }
         }
     }
 
@@ -1370,20 +1600,19 @@ impl TlsStack {
         Ok((self.wants_write(), eof))
     }
 
-    fn decrypt_chunk(
+    fn decrypt_chunk_into(
         &mut self,
         net_bytes: &[u8],
+        mid_scratch: &mut Vec<u8>,
         out_plain: &mut Vec<u8>,
     ) -> io::Result<(bool, bool)> {
         let mut eof = false;
-        let mid_buf: Vec<u8>;
         let mid_slice: &[u8] = if let Some(outer) = self.outer.as_mut() {
-            let mut tmp_mid = Vec::with_capacity(net_bytes.len());
-            if Self::feed_client_ciphertext(outer, net_bytes, &mut tmp_mid)? {
+            mid_scratch.clear();
+            if Self::feed_client_ciphertext(outer, net_bytes, mid_scratch)? {
                 eof = true;
             }
-            mid_buf = tmp_mid;
-            &mid_buf
+            mid_scratch.as_slice()
         } else {
             net_bytes
         };
@@ -1940,51 +2169,61 @@ fn writer_loop(
     }
     let _exit_guard = WriterExitGuard(&tx);
 
-    while let Some(item) = tx.pop_next_item() {
-        let (wire_bytes, payload_len) = match (&tls_stack, item) {
-            (None, TxItem::Frame(frame)) => {
-                let len = frame.len().saturating_sub(5) as u64;
-                (frame, len)
+    let mut plain_buf = Vec::with_capacity(RELAY_TX_BATCH_MAX_BYTES + 2048);
+    let mut mid_scratch = Vec::with_capacity(RELAY_TX_BATCH_MAX_BYTES + 256);
+    let mut wire_buf = Vec::with_capacity(RELAY_TX_BATCH_MAX_BYTES + 512);
+
+    while let Some(batch) = tx.pop_batch_into(&mut plain_buf, RELAY_TX_BATCH_MAX_BYTES) {
+        let payload_len = match (&tls_stack, batch) {
+            (None, TxBatch::Frames { payload_bytes }) => {
+                if let Err(err) = write_all_retry(&mut stream, &plain_buf) {
+                    // 任何写错误（含部分写超时）必须立刻切断套接字，避免帧边界错位。
+                    shutdown_handle.shutdown();
+                    rx.push_disconnected(format!("relay write error: {err}"));
+                    return;
+                }
+                payload_bytes
             }
-            (None, TxItem::FlushTls) => continue,
-            (Some(tls), TxItem::Frame(frame)) => {
-                let len = frame.len().saturating_sub(5) as u64;
+            (None, TxBatch::FlushTls) => continue,
+            (Some(tls), TxBatch::Frames { payload_bytes }) => {
+                let res = tls.lock().unwrap_or_else(|e| e.into_inner()).encrypt_into(
+                    &plain_buf,
+                    &mut mid_scratch,
+                    &mut wire_buf,
+                );
+                if let Err(err) = res {
+                    shutdown_handle.shutdown();
+                    rx.push_disconnected(format!("relay tls encrypt error: {err}"));
+                    return;
+                }
+                if let Err(err) = write_all_retry(&mut stream, &wire_buf) {
+                    shutdown_handle.shutdown();
+                    rx.push_disconnected(format!("relay write error: {err}"));
+                    return;
+                }
+                payload_bytes
+            }
+            (Some(tls), TxBatch::FlushTls) => {
                 let res = tls
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .encrypt_frame(&frame);
-                match res {
-                    Ok(wire) => (wire, len),
-                    Err(err) => {
-                        shutdown_handle.shutdown();
-                        rx.push_disconnected(format!("relay tls encrypt error: {err}"));
-                        return;
-                    }
+                    .drain_pending_writes_into(&mut mid_scratch, &mut wire_buf);
+                if let Err(err) = res {
+                    shutdown_handle.shutdown();
+                    rx.push_disconnected(format!("relay tls flush error: {err}"));
+                    return;
                 }
-            }
-            (Some(tls), TxItem::FlushTls) => {
-                let res = tls
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .drain_pending_writes();
-                match res {
-                    Ok(wire) if wire.is_empty() => continue,
-                    Ok(wire) => (wire, 0),
-                    Err(err) => {
-                        shutdown_handle.shutdown();
-                        rx.push_disconnected(format!("relay tls flush error: {err}"));
-                        return;
-                    }
+                if wire_buf.is_empty() {
+                    continue;
                 }
+                if let Err(err) = write_all_retry(&mut stream, &wire_buf) {
+                    shutdown_handle.shutdown();
+                    rx.push_disconnected(format!("relay write error: {err}"));
+                    return;
+                }
+                0
             }
         };
-
-        if let Err(err) = write_all_retry(&mut stream, &wire_bytes) {
-            // 任何写错误（含部分写超时）必须立刻切断套接字，避免帧边界错位。
-            shutdown_handle.shutdown();
-            rx.push_disconnected(format!("relay write error: {err}"));
-            return;
-        }
         if payload_len > 0 {
             bytes_sent.fetch_add(payload_len, Ordering::Relaxed);
         }
@@ -2181,7 +2420,8 @@ fn reader_loop_tls(
 ) {
     let mut plain_buf = initial_plaintext;
     let mut read_pos = 0usize;
-    let mut net_buf = vec![0u8; 32 * 1024];
+    let mut net_buf = vec![0u8; RELAY_READER_TLS_BUF_BYTES];
+    let mut mid_scratch = Vec::with_capacity(RELAY_READER_TLS_BUF_BYTES);
 
     // 先排空握手结束时 TLS 缓冲中可能已携带的首批明文载荷（无需额外 TCP 读）。
     let init_res = tls
@@ -2250,7 +2490,7 @@ fn reader_loop_tls(
         let decrypt_res = tls
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .decrypt_chunk(&net_buf[..n], &mut plain_buf);
+            .decrypt_chunk_into(&net_buf[..n], &mut mid_scratch, &mut plain_buf);
         match decrypt_res {
             Ok((wants_write, eof)) => {
                 if wants_write {
@@ -2293,6 +2533,12 @@ fn configure_tcp_keepalive(stream: &TcpStream) {
         .with_time(KEEPALIVE_IDLE)
         .with_interval(KEEPALIVE_INTERVAL);
     let _ = sock_ref.set_tcp_keepalive(&ka);
+    // 非 Linux 平台（如 macOS autosndbufmax=4MiB）收紧发送/接收缓冲，避免内核侧积压数秒过期画面。
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sock_ref.set_send_buffer_size(RELAY_SO_SNDBUF);
+        let _ = sock_ref.set_recv_buffer_size(RELAY_SO_RCVBUF);
+    }
 }
 
 enum SingleConnectErr {
@@ -3604,5 +3850,131 @@ pub(crate) mod tests {
         assert!(c_res.is_err(), "SAN device_id mismatch must reject peer");
         let _ = h_jh3.join();
         let _ = srv_jh3.join();
+    }
+
+    fn make_media_relay_frame(seq: u64, fill: u8, payload_len: usize) -> Vec<u8> {
+        let mut payload = vec![fill; 32 + payload_len];
+        payload[0..4].copy_from_slice(b"RCV1");
+        payload[4..12].copy_from_slice(&seq.to_le_bytes());
+        TcpRelayTransport::build_frame(CH_DATAGRAM, &payload).unwrap()
+    }
+
+    #[test]
+    fn relay_tx_queue_evicts_media_frame_atomically_and_tracks_drops() {
+        // 3 个 100B 帧（每帧 5B 中继头 + 32B 媒体头 + 63B 负载 = 100B），
+        // 上限设 350B：seq=1 (3 片 = 300B) 入队；再入队 seq=2 (1 片 = 100B)
+        // 时会触发淘汰，必须整帧原子移除 seq=1 的全部 3 片而不是只删 1 片留下残片。
+        let q = TxQueue::new(64, 350, 8);
+        for _ in 0..3 {
+            q.enqueue_datagram(make_media_relay_frame(1, 0x11, 63))
+                .unwrap();
+        }
+        assert_eq!(q.queued_bytes(), 300);
+        assert_eq!(q.dropped_datagrams(), 0);
+
+        q.enqueue_datagram(make_media_relay_frame(2, 0x22, 63))
+            .unwrap();
+        assert_eq!(q.queued_bytes(), 100);
+        assert_eq!(q.dropped_datagrams(), 3);
+        assert!(q.recent_loss_rate() > 0.0);
+
+        q.mark_closed();
+        let mut remaining = Vec::new();
+        while let Some(f) = q.pop_next() {
+            remaining.push(extract_relay_media_frame_seq(&f));
+        }
+        assert_eq!(remaining, vec![Some(2)]);
+        assert_eq!(q.queued_bytes(), 0);
+    }
+
+    #[test]
+    fn relay_tx_queue_batches_contiguous_datagrams_preserving_urgent_priority() {
+        let q = TxQueue::new(64, 64 * 1024, 16);
+        let d1 = TcpRelayTransport::build_frame(CH_DATAGRAM, b"dgram-1").unwrap();
+        let d2 = TcpRelayTransport::build_frame(CH_DATAGRAM, b"dgram-2").unwrap();
+        let r1 = TcpRelayTransport::build_frame(CH_RELIABLE, b"ctrl-1").unwrap();
+        let u1 = TcpRelayTransport::build_frame(CH_RELIABLE_URGENT, b"urg-1").unwrap();
+
+        q.enqueue_datagram(d1.clone()).unwrap();
+        q.enqueue_datagram(d2.clone()).unwrap();
+        q.enqueue_reliable(r1.clone()).unwrap();
+        q.enqueue_urgent(u1.clone()).unwrap();
+        q.mark_closed();
+
+        let mut out = Vec::new();
+        assert!(matches!(
+            q.pop_batch_into(&mut out, RELAY_TX_BATCH_MAX_BYTES),
+            Some(TxBatch::Frames { payload_bytes: 5 })
+        ));
+        assert_eq!(out, u1);
+
+        assert!(matches!(
+            q.pop_batch_into(&mut out, RELAY_TX_BATCH_MAX_BYTES),
+            Some(TxBatch::Frames { payload_bytes: 6 })
+        ));
+        assert_eq!(out, r1);
+
+        // 连续两条 datagram 应在单批中被合并写出。
+        assert!(matches!(
+            q.pop_batch_into(&mut out, RELAY_TX_BATCH_MAX_BYTES),
+            Some(TxBatch::Frames { payload_bytes: 14 })
+        ));
+        let mut expected_d = d1;
+        expected_d.extend_from_slice(&d2);
+        assert_eq!(out, expected_d);
+        assert!(q
+            .pop_batch_into(&mut out, RELAY_TX_BATCH_MAX_BYTES)
+            .is_none());
+    }
+
+    #[test]
+    fn relay_rx_queue_evicts_media_frame_atomically() {
+        let q = RxQueue::new(64, 250);
+        for fill in [1u8, 2u8] {
+            let mut p = vec![fill; 100];
+            p[0..4].copy_from_slice(b"RCV1");
+            p[4..12].copy_from_slice(&10u64.to_le_bytes());
+            q.push_datagram(p);
+        }
+        // 第三个 100B 分片属于 seq=11，将触发 250B 上限淘汰：必须把 seq=10 的两片一并删净。
+        let mut p11 = vec![3u8; 100];
+        p11[0..4].copy_from_slice(b"RCV1");
+        p11[4..12].copy_from_slice(&11u64.to_le_bytes());
+        q.push_datagram(p11);
+
+        let events = q.poll(Duration::ZERO);
+        let seqs: Vec<Option<u64>> = events
+            .iter()
+            .map(|ev| match ev {
+                NetEvent::Datagram(p) => extract_payload_media_frame_seq(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seqs, vec![Some(11)]);
+    }
+
+    #[test]
+    fn relay_tx_queue_abandons_oversized_single_frame_without_zombie_tail() {
+        // 队列上限 250B：seq=1 共 4 片 × 100B = 400B > 250B；
+        // 第 3 片触发自我淘汰后，不仅前 2 片要原子移除，第 3/4 片尾包也绝不能入队。
+        let q = TxQueue::new(64, 250, 8);
+        for _ in 0..4 {
+            q.enqueue_datagram(make_media_relay_frame(1, 0x11, 63))
+                .unwrap();
+        }
+        assert_eq!(q.queued_bytes(), 0);
+        assert_eq!(q.dropped_datagrams(), 4);
+
+        // 下一帧正常大小帧 seq=2 应正常入队出队。
+        q.enqueue_datagram(make_media_relay_frame(2, 0x22, 63))
+            .unwrap();
+        assert_eq!(q.queued_bytes(), 100);
+        q.mark_closed();
+
+        let mut remaining = Vec::new();
+        while let Some(f) = q.pop_next() {
+            remaining.push(extract_relay_media_frame_seq(&f));
+        }
+        assert_eq!(remaining, vec![Some(2)]);
     }
 }

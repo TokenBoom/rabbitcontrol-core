@@ -694,6 +694,18 @@ impl Transport for BridgeTransport {
     fn stats(&self) -> NetStats {
         self.inner.stats()
     }
+
+    fn set_pacing_rate(&mut self, bps: u64) {
+        self.inner.set_pacing_rate(bps);
+    }
+
+    fn tx_queued_bytes(&self) -> usize {
+        self.inner.tx_queued_bytes()
+    }
+
+    fn tx_dropped_datagrams(&self) -> u64 {
+        self.inner.tx_dropped_datagrams()
+    }
 }
 
 /// 会话级非文件工具客户端枢纽（W3 远程终端 + W4 TCP 端口映射）。
@@ -2036,6 +2048,18 @@ impl Transport for LanQuicTransport {
     fn stats(&self) -> NetStats {
         self.transport.stats()
     }
+
+    fn set_pacing_rate(&mut self, bps: u64) {
+        self.transport.set_pacing_rate(bps);
+    }
+
+    fn tx_queued_bytes(&self) -> usize {
+        self.transport.tx_queued_bytes()
+    }
+
+    fn tx_dropped_datagrams(&self) -> u64 {
+        self.transport.tx_dropped_datagrams()
+    }
 }
 
 pub(crate) fn is_mtls_cert_or_config_error(msg: &str) -> bool {
@@ -2129,6 +2153,118 @@ pub fn classify_relay_connect_error(
     }
     let _ = (encrypt_connection, had_outer_mtls);
     format!("中继连接失败：{raw}")
+}
+
+const RELAY_RTT_MIN_BITRATE_BPS: u32 = 2_000_000;
+const RELAY_RTT_INFLATE_ABS_US: u64 = 45_000;
+const RELAY_RTT_COOLDOWN: Duration = Duration::from_secs(2);
+const RELAY_RTT_MIN_WINDOW: Duration = Duration::from_secs(20);
+
+/// 控制端 TCP Relay 基于 `ProbePong` RTT 膨胀的辅助调速器（捕获 Server→Client 段 TCP 队列膨胀）。
+struct RelayRttController {
+    min_rtt_us: Option<u64>,
+    min_rtt_updated_at: Option<Instant>,
+    window_min_rtt_us: Option<u64>,
+    cap_bps: u32,
+    current_bps: u32,
+    clean_probes: u32,
+    last_pongs: u64,
+    last_adjust: Instant,
+}
+
+impl RelayRttController {
+    fn new(initial_bps: u32, now: Instant) -> Self {
+        let cap = initial_bps.max(1);
+        Self {
+            min_rtt_us: None,
+            min_rtt_updated_at: None,
+            window_min_rtt_us: None,
+            cap_bps: cap,
+            current_bps: cap,
+            clean_probes: 0,
+            last_pongs: 0,
+            last_adjust: now,
+        }
+    }
+
+    fn on_manual_bitrate(&mut self, bps: u32, now: Instant) {
+        let v = bps.max(1);
+        self.cap_bps = v;
+        self.current_bps = v;
+        self.clean_probes = 0;
+        self.last_adjust = now;
+    }
+
+    fn on_probe(&mut self, now: Instant, pongs_received: u64, rtt_us: Option<u64>) -> Option<u32> {
+        if pongs_received <= self.last_pongs {
+            return None;
+        }
+        self.last_pongs = pongs_received;
+        let rtt = rtt_us?;
+        let min_rtt = match (self.min_rtt_us, self.min_rtt_updated_at) {
+            (Some(m), Some(updated_at)) => {
+                if rtt <= m {
+                    self.min_rtt_us = Some(rtt);
+                    self.min_rtt_updated_at = Some(now);
+                    self.window_min_rtt_us = None;
+                    rtt
+                } else {
+                    let candidate = self.window_min_rtt_us.map_or(rtt, |w| w.min(rtt));
+                    if now.saturating_duration_since(updated_at) >= RELAY_RTT_MIN_WINDOW {
+                        self.min_rtt_us = Some(candidate);
+                        self.min_rtt_updated_at = Some(now);
+                        self.window_min_rtt_us = None;
+                        candidate
+                    } else {
+                        self.window_min_rtt_us = Some(candidate);
+                        m
+                    }
+                }
+            }
+            _ => {
+                self.min_rtt_us = Some(rtt);
+                self.min_rtt_updated_at = Some(now);
+                self.window_min_rtt_us = None;
+                rtt
+            }
+        };
+
+        if rtt > min_rtt.saturating_add(RELAY_RTT_INFLATE_ABS_US) && rtt > min_rtt.saturating_mul(2)
+        {
+            self.clean_probes = 0;
+            if now.saturating_duration_since(self.last_adjust) >= RELAY_RTT_COOLDOWN {
+                let floor = RELAY_RTT_MIN_BITRATE_BPS.min(self.cap_bps).max(1);
+                let next = (((self.current_bps as f64) * 0.75) as u32).clamp(floor, self.cap_bps);
+                self.last_adjust = now;
+                if next != self.current_bps {
+                    self.current_bps = next;
+                    return Some(next);
+                }
+            }
+            return None;
+        }
+
+        if rtt <= min_rtt.saturating_add(15_000) {
+            self.clean_probes = self.clean_probes.saturating_add(1);
+            if self.clean_probes >= 3
+                && self.current_bps < self.cap_bps
+                && now.saturating_duration_since(self.last_adjust) >= RELAY_RTT_COOLDOWN
+            {
+                let step = (self.current_bps / 5).max(2_000_000);
+                let next = self.current_bps.saturating_add(step).min(self.cap_bps);
+                self.last_adjust = now;
+                self.clean_probes = 0;
+                if next != self.current_bps {
+                    self.current_bps = next;
+                    return Some(next);
+                }
+            }
+        } else {
+            self.clean_probes = 0;
+        }
+
+        None
+    }
 }
 
 fn prepare_peer_mtls_bundle(
@@ -2810,6 +2946,9 @@ fn run_session_thread(
     let mut hud_height = negotiated.height;
 
     // ── 驱动循环（无 duration 上限，直到 Disconnect 或对端 Bye/错误）──
+    let is_tcp_relay = transport_label == "TCP Relay";
+    let mut relay_rtt_ctrl = is_tcp_relay
+        .then(|| RelayRttController::new(negotiated.bitrate_bps.max(1), Instant::now()));
     let mut last_busy = true;
     let mut epoch_sid = session_id;
     let mut disconnect_requested = false;
@@ -2824,6 +2963,9 @@ fn run_session_thread(
                 }
                 SessionCommand::SetBitrate { bps } => {
                     if bps > 0 && client.state() == SessionState::Streaming {
+                        if let Some(ref mut ctrl) = relay_rtt_ctrl {
+                            ctrl.on_manual_bitrate(bps, Instant::now());
+                        }
                         let mut buf = Vec::new();
                         ControlMessage::SetBitrate {
                             bps,
@@ -2896,9 +3038,11 @@ fn run_session_thread(
                 client
                     .pump_probes(now_us)
                     .map_err(|e| format!("探测泵失败: {e}"))?;
-                client
-                    .start_bw_probe(now_us)
-                    .map_err(|e| format!("带宽粗测失败: {e}"))?;
+                if !is_tcp_relay {
+                    client
+                        .start_bw_probe(now_us)
+                        .map_err(|e| format!("带宽粗测失败: {e}"))?;
+                }
                 if clipboard_enabled_flag.load(Ordering::Acquire) {
                     let _ = client.pump_clipboard(now_us);
                 }
@@ -2920,6 +3064,26 @@ fn run_session_thread(
                         format!("对端已关闭 ({stop:?})")
                     };
                     break;
+                }
+
+                if let Some(ref mut ctrl) = relay_rtt_ctrl {
+                    if client.state() == SessionState::Streaming {
+                        let snap = client.probe_snapshot();
+                        if let Some(next_bps) =
+                            ctrl.on_probe(Instant::now(), snap.pongs_received, snap.rtt_us_median)
+                        {
+                            let mut buf = Vec::new();
+                            ControlMessage::SetBitrate {
+                                bps: next_bps,
+                                reason: BitrateReason::Probe,
+                            }
+                            .encode(&mut buf);
+                            pending_control
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push_back(buf);
+                        }
+                    }
                 }
 
                 // 2a) 音频帧解码与播放（M9：采样率/声道数变更时先 stop 旧播放器再按新格式重建）。
@@ -4378,5 +4542,77 @@ mod tests {
             true,
         );
         assert!(cert_err.contains("mTLS 证书身份校验失败"), "{cert_err}");
+    }
+
+    #[test]
+    fn relay_rtt_controller_backs_off_on_rtt_spike_and_recovers_when_clean() {
+        let t0 = Instant::now();
+        let mut ctrl = RelayRttController::new(14_000_000, t0);
+
+        // 1) 基准 RTT = 22ms
+        assert_eq!(
+            ctrl.on_probe(t0 + Duration::from_secs(1), 1, Some(22_000)),
+            None
+        );
+        // 2) RTT 膨胀至 95ms（> 22+45 且 > 44ms），冷却满足后触发 0.75 回退 → 10.5M
+        assert_eq!(
+            ctrl.on_probe(t0 + Duration::from_secs(3), 2, Some(95_000)),
+            Some(10_500_000)
+        );
+        // 3) 连续 3 次正常 RTT（24ms <= 22+15ms）且冷却满足后逐步回升
+        assert_eq!(
+            ctrl.on_probe(t0 + Duration::from_secs(4), 3, Some(24_000)),
+            None
+        );
+        assert_eq!(
+            ctrl.on_probe(t0 + Duration::from_secs(5), 4, Some(24_000)),
+            None
+        );
+        assert_eq!(
+            ctrl.on_probe(t0 + Duration::from_secs(6), 5, Some(23_000)),
+            Some(12_600_000)
+        );
+        // 4) 手动设定码率同步覆盖上限
+        ctrl.on_manual_bitrate(8_000_000, t0 + Duration::from_secs(7));
+        assert_eq!(
+            ctrl.on_probe(t0 + Duration::from_secs(10), 6, Some(22_000)),
+            None
+        );
+    }
+
+    #[test]
+    fn relay_rtt_controller_ages_min_rtt_after_permanent_baseline_shift() {
+        let t0 = Instant::now();
+        let mut ctrl = RelayRttController::new(14_000_000, t0);
+
+        // 1) 初始低延迟基线 20ms
+        assert_eq!(
+            ctrl.on_probe(t0 + Duration::from_secs(1), 1, Some(20_000)),
+            None
+        );
+
+        // 2) 切换热点/路由后基线永久抬升至 75ms，窗口老化前持续回退至 2 Mbps
+        let mut pong = 1u64;
+        for sec in (3..=19).step_by(2) {
+            pong += 1;
+            let _ = ctrl.on_probe(t0 + Duration::from_secs(sec), pong, Some(75_000));
+        }
+        assert_eq!(ctrl.current_bps, RELAY_RTT_MIN_BITRATE_BPS);
+
+        // 3) 达到 20s 窗口后 min_rtt_us 自动老化刷新为 75ms，后续 75ms 探测可正常爬坡恢复
+        let mut recovered = false;
+        for sec in 21..=60 {
+            pong += 1;
+            if let Some(next) = ctrl.on_probe(t0 + Duration::from_secs(sec), pong, Some(75_000)) {
+                if next > RELAY_RTT_MIN_BITRATE_BPS {
+                    recovered = true;
+                }
+            }
+        }
+        assert!(
+            recovered,
+            "min_rtt aging must allow recovery after baseline shift"
+        );
+        assert_eq!(ctrl.current_bps, 14_000_000);
     }
 }
