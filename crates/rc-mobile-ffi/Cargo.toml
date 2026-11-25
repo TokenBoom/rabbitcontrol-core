@@ -12,6 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [dependencies]
 rc-client-core = { path = "../rc-client-core" }
 serde = { version = "1", features = ["derive"] }
+rc-input = { path = "../rc-input" }
 serde_json = "1"
 
 [dev-dependencies]

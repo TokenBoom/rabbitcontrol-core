@@ -15,6 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use rc_client_core::lan_discovery::LanDiscoveryHandle;
 
 pub mod auth;
+pub mod session;
 
 /// 返回核心库版本字符串(调用方负责用 `rc_string_free` 释放)。
 #[no_mangle]
