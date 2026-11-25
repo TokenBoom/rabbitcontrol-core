@@ -30,6 +30,11 @@ fn lock_sessions() -> std::sync::MutexGuard<'static, HashMap<u64, SessionHandle>
     sessions().lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 在会话上执行闭包(供 tools/runtime 复用);会话不存在返回 None。
+pub(crate) fn with_session<R>(id: u64, f: impl FnOnce(&SessionHandle) -> R) -> Option<R> {
+    lock_sessions().get(&id).map(f)
+}
+
 /// 注册会话句柄并返回 id(供 runtime 一键连接复用)。
 pub(crate) fn register_session(handle: SessionHandle) -> u64 {
     let id = next_id();
