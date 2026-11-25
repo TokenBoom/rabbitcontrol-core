@@ -20,6 +20,7 @@ members = [
     "crates/rc-tools",
     "crates/rc-client-core",
     "crates/rc-mobile-ffi",
+    "crates/rc-decode-vt",
 ]
 
 [workspace.package]

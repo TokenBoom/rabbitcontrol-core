@@ -88,11 +88,12 @@ pub extern "C" fn rc_session_open(json: *const c_char) -> *mut c_char {
             height: req.height,
             fps: req.fps,
             bitrate_bps: req.bitrate_bps,
-            prefer_hardware: false,
+            prefer_hardware: true,
             clipboard_enabled: false,
             audio_enabled: false,
             ..UiSessionConfig::default()
         };
+        crate::video::rc_video_init();
         let handle = SessionHandle::spawn(cfg);
         let id = next_id();
         lock_sessions().insert(id, handle);

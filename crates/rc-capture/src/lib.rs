@@ -125,7 +125,7 @@ pub enum FrameTexture {
     #[cfg(windows)]
     D3D11(*mut std::ffi::c_void),
     /// macOS CoreVideo 像素缓冲（`CVPixelBufferRef`，不透明句柄）。
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     CVPixelBuffer(*mut std::ffi::c_void),
     /// Linux DMA-BUF。
     #[cfg(target_os = "linux")]
@@ -139,7 +139,7 @@ impl fmt::Debug for FrameTexture {
             FrameTexture::Cpu(frame) => f.debug_tuple("Cpu").field(frame).finish(),
             #[cfg(windows)]
             FrameTexture::D3D11(ptr) => write!(f, "D3D11({ptr:p})"),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             FrameTexture::CVPixelBuffer(ptr) => write!(f, "CVPixelBuffer({ptr:p})"),
             #[cfg(target_os = "linux")]
             FrameTexture::DmaBuf(handle) => f.debug_tuple("DmaBuf").field(handle).finish(),
