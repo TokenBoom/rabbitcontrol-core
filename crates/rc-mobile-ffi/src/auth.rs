@@ -200,3 +200,69 @@ pub extern "C" fn rc_auth_list_devices(json: *const c_char) -> *mut c_char {
         Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
     }
 }
+
+/// 修改密码。输入:`{server..., access_token, current_password, new_password}`;
+/// 成功返回新的 `AuthTokenResponse`(服务端会吊销旧令牌)。
+#[no_mangle]
+pub extern "C" fn rc_auth_change_password(json: *const c_char) -> *mut c_char {
+    #[derive(Deserialize)]
+    struct Req {
+        #[serde(flatten)]
+        server: ServerParams,
+        access_token: String,
+        current_password: String,
+        new_password: String,
+    }
+    let result = parse_json::<Req>(json).and_then(|req| {
+        client(&req.server)
+            .map(|c| c.change_password(&req.access_token, &req.current_password, &req.new_password))
+    });
+    match result {
+        Ok(r) => respond(r),
+        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+    }
+}
+
+/// 设备重命名(设置别名)。输入:`{server..., access_token, device_id, alias}`。
+#[no_mangle]
+pub extern "C" fn rc_auth_rename_device(json: *const c_char) -> *mut c_char {
+    device_op(json, false)
+}
+
+/// 设备解绑删除。输入:`{server..., access_token, device_id}`。
+#[no_mangle]
+pub extern "C" fn rc_auth_remove_device(json: *const c_char) -> *mut c_char {
+    device_op(json, true)
+}
+
+fn device_op(json: *const c_char, is_remove: bool) -> *mut c_char {
+    #[derive(Deserialize)]
+    struct Req {
+        #[serde(flatten)]
+        server: ServerParams,
+        access_token: String,
+        device_id: String,
+        #[serde(default)]
+        alias: Option<String>,
+    }
+    let result = parse_json::<Req>(json).and_then(|req| {
+        client(&req.server).map(|c| {
+            if is_remove {
+                c.remove_device(&req.access_token, &req.device_id)
+                    .map(|_| serde_json::json!({ "ok": true }))
+            } else {
+                c.rename_device(
+                    &req.access_token,
+                    &req.device_id,
+                    req.alias.as_deref().unwrap_or(""),
+                )
+                .map(|d| serde_json::json!({ "ok": true, "device": d }))
+            }
+        })
+    });
+    match result {
+        Ok(Ok(v)) => to_c_string(v.to_string()),
+        Ok(Err(e)) => to_c_string(error_json(&e)),
+        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+    }
+}
