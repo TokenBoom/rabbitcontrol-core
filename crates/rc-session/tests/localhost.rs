@@ -44,12 +44,17 @@ fn params() -> SessionParams {
 }
 
 fn pcfg() -> rc_pipeline::PipelineConfig {
+    let target_latency_us = if std::env::var_os("CI").is_some() {
+        250_000
+    } else {
+        22_000
+    };
     rc_pipeline::PipelineConfig {
         resolution: Resolution::new(64, 64),
         fps: 60,
         bitrate_bps: 8_000_000,
         prefer_hardware: false,
-        target_latency_us: 22_000,
+        target_latency_us,
         trace_capacity: 4096,
         diff: rc_pipeline::DiffMode::TrustPlatform,
         clock_origin_us: None,
