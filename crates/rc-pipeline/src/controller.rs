@@ -14,7 +14,7 @@ use rc_render::Renderer;
 use rc_trace::{Mark, Outcome, TraceCollector};
 use rc_types::{Error, FrameKind, FrameSeq, Result, Timestamp};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -72,6 +72,7 @@ enum ControllerExecMode {
         shared: Arc<Mutex<AsyncSharedState>>,
         need_keyframe: Arc<AtomicBool>,
         displayed: Arc<AtomicU64>,
+        in_flight_len: Arc<AtomicUsize>,
         worker: Option<JoinHandle<()>>,
     },
 }
@@ -110,10 +111,14 @@ const DECODE_BUDGET_US: u32 = 3_000;
 /// 高分屏（>2.6M 像素）或 IDR 帧解码 deadline 余量（微秒）。
 const HIGH_RES_DECODE_BUDGET_US: u32 = 10_000;
 /// `async_decode` 有界帧队列容量（严格遵守 TASK.md 铁律 1：解码队列上限 ≤ 2；
-/// 配合解码线程在途 1 帧可吸收 2–3 帧公网 TCP 微突发而不打断 P 帧参考链，同时硬约束排队不超 2 帧）。
+/// 配合解码线程在途帧可吸收公网 TCP 微突发而不打断 P 帧参考链，同时硬约束排队不超 2 帧）。
 const ASYNC_DECODE_QUEUE_CAP: usize = 2;
 /// 硬件异步流水线解码的最大在途帧数（严格遵守铁律 1：≤ 2）。
 const MAX_PIPELINED_DECODE_IN_FLIGHT: usize = 2;
+/// 解码段总深度硬上限（`slot` 待解 + 硬件在途 ≤ 3，避免 2+2=4 帧堆积违背低延迟红线）。
+const ASYNC_DECODE_TOTAL_CAP: usize = 3;
+/// 停机 / 切码时排空异步在途帧的最长墙钟等待。
+const PIPELINED_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct InFlightDecodeMeta {
     seq: FrameSeq,
@@ -123,15 +128,68 @@ struct InFlightDecodeMeta {
 
 fn take_in_flight_meta(
     in_flight: &mut VecDeque<InFlightDecodeMeta>,
+    in_flight_len_w: &AtomicUsize,
+    held_frames: usize,
     token: u64,
 ) -> Option<InFlightDecodeMeta> {
-    if in_flight.front().is_some_and(|m| m.seq.0 == token) {
-        return in_flight.pop_front();
+    let item = if in_flight.front().is_some_and(|m| m.seq.0 == token) {
+        in_flight.pop_front()
+    } else {
+        in_flight
+            .iter()
+            .position(|m| m.seq.0 == token)
+            .and_then(|pos| in_flight.remove(pos))
+    };
+    if item.is_some() {
+        in_flight_len_w.store(in_flight.len() + held_frames, Ordering::Release);
     }
-    in_flight
-        .iter()
-        .position(|m| m.seq.0 == token)
-        .and_then(|pos| in_flight.remove(pos))
+    item
+}
+
+fn push_in_flight_meta(
+    in_flight: &mut VecDeque<InFlightDecodeMeta>,
+    in_flight_len_w: &AtomicUsize,
+    meta: InFlightDecodeMeta,
+) {
+    in_flight.push_back(meta);
+    in_flight_len_w.store(in_flight.len(), Ordering::Release);
+}
+
+/// 将 `in_flight` 中剩余全部帧以 `Outcome::DecodeError` 结案，确保 P4（`unfinished == 0`）。
+fn fail_remaining_in_flight(
+    in_flight: &mut VecDeque<InFlightDecodeMeta>,
+    in_flight_len_w: &AtomicUsize,
+    held_frames: usize,
+    shared_w: &Mutex<AsyncSharedState>,
+) {
+    if in_flight.is_empty() {
+        in_flight_len_w.store(held_frames, Ordering::Release);
+        return;
+    }
+    let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+    while let Some(meta) = in_flight.pop_front() {
+        s.completed.push_back(AsyncFrameOutcome::Finished {
+            seq: meta.seq,
+            capture_ts: meta.capture_ts,
+            received_ts: meta.received_ts,
+            decoded_ts: None,
+            presented_ts: None,
+            outcome: Outcome::DecodeError,
+        });
+    }
+    in_flight_len_w.store(held_frames, Ordering::Release);
+}
+
+fn finish_aborted_frame(frame: &PendingAsyncFrame, shared_w: &Mutex<AsyncSharedState>) {
+    let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+    s.completed.push_back(AsyncFrameOutcome::Finished {
+        seq: frame.seq,
+        capture_ts: frame.capture_ts,
+        received_ts: frame.received_ts,
+        decoded_ts: None,
+        presented_ts: None,
+        outcome: Outcome::DecodeError,
+    });
 }
 
 /// 处理单帧解码输出并推进渲染与完成记录；返回 `true` 表示遇到致命错误需终止工作线程。
@@ -238,25 +296,39 @@ fn handle_async_decode_result(
     }
 }
 
-/// 排空一条异步流水线解码结果；返回 `None` 表示无就绪帧，`Some(true)` 遇到致命错误，`Some(false)` 正常消费。
+/// 排空一条异步流水线解码结果；返回 `None` 表示无就绪帧，`Some(true)` 遇到致命错误，`Some(false)` 正常消费或已回收孤儿项。
 #[allow(clippy::too_many_arguments)]
 fn poll_pipelined_decode_once(
     timeout: Duration,
     decoder: &mut dyn Decoder,
     renderer: &mut dyn Renderer,
     in_flight: &mut VecDeque<InFlightDecodeMeta>,
+    in_flight_len_w: &AtomicUsize,
+    held_frames: usize,
     clock_w: &ClockSlot,
     shared_w: &Mutex<AsyncSharedState>,
     need_kf_w: &AtomicBool,
     disp_w: &AtomicU64,
 ) -> Option<bool> {
     match decoder.recv_decoded(timeout) {
-        Ok(None) => None,
-        Ok(Some((token, out))) => {
-            let meta = take_in_flight_meta(in_flight, token)?;
+        Ok(None) => {
+            if !in_flight.is_empty() && decoder.in_flight_count() == 0 {
+                // 底层解码器已无任何在途帧但上层仍记录在途：回收孤儿项防止 100% CPU 空转与永久死锁。
+                fail_remaining_in_flight(in_flight, in_flight_len_w, held_frames, shared_w);
+                need_kf_w.store(true, Ordering::Release);
+                return Some(false);
+            }
+            None
+        }
+        Ok(Some((token, frame_res))) => {
+            let Some(meta) = take_in_flight_meta(in_flight, in_flight_len_w, held_frames, token)
+            else {
+                // 忽略未知/过时 token，继续排空后续合法结果（不返回 None 误截断排空循环）。
+                return Some(false);
+            };
             let now_us = read_clock(clock_w, meta.received_ts.0).0;
             Some(handle_async_decode_result(
-                Ok(out),
+                frame_res,
                 meta.seq,
                 meta.capture_ts,
                 meta.received_ts,
@@ -270,73 +342,60 @@ fn poll_pipelined_decode_once(
             ))
         }
         Err(e) => {
-            let Some(meta) = in_flight.pop_front() else {
-                if e.is_fatal() {
-                    let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
-                    s.fatal_error = Some(e);
-                    return Some(true);
-                }
-                return Some(false);
-            };
-            let now_us = read_clock(clock_w, meta.received_ts.0).0;
-            Some(handle_async_decode_result(
-                Err(e),
-                meta.seq,
-                meta.capture_ts,
-                meta.received_ts,
-                now_us,
-                decoder,
-                renderer,
-                clock_w,
-                shared_w,
-                need_kf_w,
-                disp_w,
-            ))
+            // 解码器级错误无法归属单一 token：先冲刷底层再结案全部剩余在途帧。
+            let _ = decoder.flush();
+            fail_remaining_in_flight(in_flight, in_flight_len_w, held_frames, shared_w);
+            need_kf_w.store(true, Ordering::Release);
+            if e.is_fatal() {
+                let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+                s.fatal_error = Some(e);
+                return Some(true);
+            }
+            Some(false)
         }
     }
 }
 
-/// 在编码格式切换或停机前排空全部在途异步解码帧（最多等待 2s，兜底补齐结局保 `unfinished == 0`）。
+/// 在编码格式切换或停机前排空全部在途异步解码帧（最多等待 `timeout`，超时冲刷解码器并兜底补齐结局保 `unfinished == 0`）。
 #[allow(clippy::too_many_arguments)]
 fn drain_pipelined_in_flight(
+    timeout: Duration,
     decoder: &mut dyn Decoder,
     renderer: &mut dyn Renderer,
     in_flight: &mut VecDeque<InFlightDecodeMeta>,
+    in_flight_len_w: &AtomicUsize,
+    held_frames: usize,
     clock_w: &ClockSlot,
     shared_w: &Mutex<AsyncSharedState>,
     need_kf_w: &AtomicBool,
     disp_w: &AtomicU64,
 ) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + timeout;
     while !in_flight.is_empty() {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            let _ = decoder.flush();
+            fail_remaining_in_flight(in_flight, in_flight_len_w, held_frames, shared_w);
+            need_kf_w.store(true, Ordering::Release);
+            break;
+        }
         if let Some(fatal) = poll_pipelined_decode_once(
-            Duration::from_millis(5),
+            remain.min(Duration::from_millis(5)),
             decoder,
             renderer,
             in_flight,
+            in_flight_len_w,
+            held_frames,
             clock_w,
             shared_w,
             need_kf_w,
             disp_w,
         ) {
             if fatal {
+                fail_remaining_in_flight(in_flight, in_flight_len_w, held_frames, shared_w);
                 return true;
             }
             continue;
-        }
-        if Instant::now() >= deadline {
-            while let Some(meta) = in_flight.pop_front() {
-                let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
-                s.completed.push_back(AsyncFrameOutcome::Finished {
-                    seq: meta.seq,
-                    capture_ts: meta.capture_ts,
-                    received_ts: meta.received_ts,
-                    decoded_ts: None,
-                    presented_ts: None,
-                    outcome: Outcome::DecodeError,
-                });
-            }
-            break;
         }
     }
     false
@@ -379,6 +438,57 @@ fn maybe_swap_decoder_for_codec(
     }
 }
 
+/// 异步模式编解码切换：仅当确实需要切换且新解码器成功创建时才排空旧解码器在途帧，
+/// 避免 `!prefer_hardware` 或新解码器构造失败时每帧多余同步排空；返回 `true` 表示排空期间遇致命错误。
+#[allow(clippy::too_many_arguments)]
+fn maybe_swap_async_decoder_for_codec(
+    cfg: &PipelineConfig,
+    active_codec: &mut rc_encode::Codec,
+    decoder: &mut Box<dyn Decoder>,
+    renderer: &mut dyn Renderer,
+    in_flight: &mut VecDeque<InFlightDecodeMeta>,
+    in_flight_len_w: &AtomicUsize,
+    clock_w: &ClockSlot,
+    shared_w: &Mutex<AsyncSharedState>,
+    need_kf_w: &AtomicBool,
+    disp_w: &AtomicU64,
+    is_hevc: bool,
+) -> bool {
+    let target = if is_hevc {
+        rc_encode::Codec::Hevc
+    } else {
+        rc_encode::Codec::H264
+    };
+    if target == *active_codec || !cfg.prefer_hardware {
+        return false;
+    }
+    let mut next_cfg = cfg.clone();
+    next_cfg.codec = target;
+    let Ok((new_dec, _)) = crate::select_decoder_labeled(&next_cfg) else {
+        return false;
+    };
+    if !in_flight.is_empty()
+        && drain_pipelined_in_flight(
+            PIPELINED_DRAIN_TIMEOUT,
+            decoder.as_mut(),
+            renderer,
+            in_flight,
+            in_flight_len_w,
+            1,
+            clock_w,
+            shared_w,
+            need_kf_w,
+            disp_w,
+        )
+    {
+        return true;
+    }
+    let _ = decoder.flush();
+    *decoder = new_dec;
+    *active_codec = target;
+    false
+}
+
 impl ControllerPipeline {
     /// 用工厂后端创建（auto 模式）。
     pub fn new(cfg: PipelineConfig) -> Result<Self> {
@@ -412,12 +522,14 @@ impl ControllerPipeline {
             let shared = Arc::new(Mutex::new(AsyncSharedState::default()));
             let need_keyframe = Arc::new(AtomicBool::new(false));
             let displayed = Arc::new(AtomicU64::new(0));
+            let in_flight_len = Arc::new(AtomicUsize::new(0));
 
             let slot_w = Arc::clone(&slot);
             let stop_w = Arc::clone(&stop);
             let shared_w = Arc::clone(&shared);
             let need_kf_w = Arc::clone(&need_keyframe);
             let disp_w = Arc::clone(&displayed);
+            let in_flight_len_w = Arc::clone(&in_flight_len);
             let clock_w = Arc::clone(&clock);
             let cfg_w = cfg.clone();
             let mut active_codec_w = active_codec;
@@ -428,36 +540,69 @@ impl ControllerPipeline {
                     crate::promote_current_thread_qos();
                     let mut in_flight: VecDeque<InFlightDecodeMeta> =
                         VecDeque::with_capacity(MAX_PIPELINED_DECODE_IN_FLIGHT);
-                    loop {
+                    let mut stop_deadline: Option<Instant> = None;
+                    'worker: loop {
+                        if stop_w.load(Ordering::Acquire) {
+                            let dl = *stop_deadline
+                                .get_or_insert_with(|| Instant::now() + PIPELINED_DRAIN_TIMEOUT);
+                            if Instant::now() >= dl {
+                                break 'worker;
+                            }
+                        }
+
                         // 1) 若后端支持 2-deep 流水线解码，优先非阻塞排空全部已就绪帧并立刻上屏。
                         let mut did_work = false;
-                        if !in_flight.is_empty() {
-                            while let Some(fatal) = poll_pipelined_decode_once(
+                        while !in_flight.is_empty() {
+                            if stop_w.load(Ordering::Acquire) {
+                                let dl = *stop_deadline.get_or_insert_with(|| {
+                                    Instant::now() + PIPELINED_DRAIN_TIMEOUT
+                                });
+                                if Instant::now() >= dl {
+                                    break 'worker;
+                                }
+                            }
+                            let Some(fatal) = poll_pipelined_decode_once(
                                 Duration::ZERO,
                                 decoder.as_mut(),
                                 renderer.as_mut(),
                                 &mut in_flight,
+                                &in_flight_len_w,
+                                0,
                                 &clock_w,
                                 &shared_w,
                                 &need_kf_w,
                                 &disp_w,
-                            ) {
-                                did_work = true;
-                                if fatal {
-                                    let _ = decoder.flush();
-                                    return;
-                                }
+                            ) else {
+                                break;
+                            };
+                            did_work = true;
+                            if fatal {
+                                fail_remaining_in_flight(
+                                    &mut in_flight,
+                                    &in_flight_len_w,
+                                    0,
+                                    &shared_w,
+                                );
+                                let _ = decoder.flush();
+                                return;
                             }
                         }
 
                         // 2) 非阻塞拉取待解码帧：若走流水线则补满 ≤2 帧在途，否则单帧同步解码。
-                        let pipelined = decoder.supports_pipelined_decode();
                         let mut popped_any = false;
-                        while !pipelined || in_flight.len() < MAX_PIPELINED_DECODE_IN_FLIGHT {
+                        while !decoder.supports_pipelined_decode()
+                            || in_flight.len() < MAX_PIPELINED_DECODE_IN_FLIGHT
+                        {
                             let next_frame = {
                                 let (lock, _) = &*slot_w;
                                 let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                                guard.pop_front()
+                                let popped = guard.pop_front();
+                                if popped.is_some() {
+                                    // 在 slot 锁内即计入本帧在途占位，消除 pop_front 与 submit_decode 间的 TOCTOU 窗口，
+                                    // 严格维持待解 + 在途 ≤ ASYNC_DECODE_TOTAL_CAP (3)。
+                                    in_flight_len_w.store(in_flight.len() + 1, Ordering::Release);
+                                }
+                                popped
                             };
                             let Some(frame) = next_frame else {
                                 break;
@@ -465,32 +610,24 @@ impl ControllerPipeline {
                             popped_any = true;
                             did_work = true;
 
-                            let target_codec = if frame.is_hevc {
-                                rc_encode::Codec::Hevc
-                            } else {
-                                rc_encode::Codec::H264
-                            };
-                            if target_codec != active_codec_w
-                                && !in_flight.is_empty()
-                                && drain_pipelined_in_flight(
-                                    decoder.as_mut(),
-                                    renderer.as_mut(),
-                                    &mut in_flight,
-                                    &clock_w,
-                                    &shared_w,
-                                    &need_kf_w,
-                                    &disp_w,
-                                )
-                            {
-                                let _ = decoder.flush();
-                                return;
-                            }
-                            maybe_swap_decoder_for_codec(
+                            if maybe_swap_async_decoder_for_codec(
                                 &cfg_w,
                                 &mut active_codec_w,
                                 &mut decoder,
+                                renderer.as_mut(),
+                                &mut in_flight,
+                                &in_flight_len_w,
+                                &clock_w,
+                                &shared_w,
+                                &need_kf_w,
+                                &disp_w,
                                 frame.is_hevc,
-                            );
+                            ) {
+                                finish_aborted_frame(&frame, &shared_w);
+                                in_flight_len_w.store(in_flight.len(), Ordering::Release);
+                                let _ = decoder.flush();
+                                return;
+                            }
 
                             let now_us = read_clock(&clock_w, frame.received_ts.0).0;
                             let budget = frame_decode_budget_us(&cfg_w, frame.kind);
@@ -504,13 +641,18 @@ impl ControllerPipeline {
                                     deadline,
                                 ) {
                                     Ok(DecodeSubmitStatus::Submitted) => {
-                                        in_flight.push_back(InFlightDecodeMeta {
-                                            seq: frame.seq,
-                                            capture_ts: frame.capture_ts,
-                                            received_ts: frame.received_ts,
-                                        });
+                                        push_in_flight_meta(
+                                            &mut in_flight,
+                                            &in_flight_len_w,
+                                            InFlightDecodeMeta {
+                                                seq: frame.seq,
+                                                capture_ts: frame.capture_ts,
+                                                received_ts: frame.received_ts,
+                                            },
+                                        );
                                     }
                                     Ok(DecodeSubmitStatus::NeedKeyframe) => {
+                                        in_flight_len_w.store(in_flight.len(), Ordering::Release);
                                         if handle_async_decode_result(
                                             Ok(DecodeOutput::NeedKeyframe),
                                             frame.seq,
@@ -524,11 +666,18 @@ impl ControllerPipeline {
                                             &need_kf_w,
                                             &disp_w,
                                         ) {
+                                            fail_remaining_in_flight(
+                                                &mut in_flight,
+                                                &in_flight_len_w,
+                                                0,
+                                                &shared_w,
+                                            );
                                             let _ = decoder.flush();
                                             return;
                                         }
                                     }
                                     Err(e) => {
+                                        in_flight_len_w.store(in_flight.len(), Ordering::Release);
                                         if handle_async_decode_result(
                                             Err(e),
                                             frame.seq,
@@ -542,6 +691,12 @@ impl ControllerPipeline {
                                             &need_kf_w,
                                             &disp_w,
                                         ) {
+                                            fail_remaining_in_flight(
+                                                &mut in_flight,
+                                                &in_flight_len_w,
+                                                0,
+                                                &shared_w,
+                                            );
                                             let _ = decoder.flush();
                                             return;
                                         }
@@ -549,6 +704,7 @@ impl ControllerPipeline {
                                 }
                             } else {
                                 let res = decoder.decode(&frame.payload_all, frame.kind, deadline);
+                                in_flight_len_w.store(in_flight.len(), Ordering::Release);
                                 if handle_async_decode_result(
                                     res,
                                     frame.seq,
@@ -562,6 +718,12 @@ impl ControllerPipeline {
                                     &need_kf_w,
                                     &disp_w,
                                 ) {
+                                    fail_remaining_in_flight(
+                                        &mut in_flight,
+                                        &in_flight_len_w,
+                                        0,
+                                        &shared_w,
+                                    );
                                     let _ = decoder.flush();
                                     return;
                                 }
@@ -581,30 +743,32 @@ impl ControllerPipeline {
                                     decoder.as_mut(),
                                     renderer.as_mut(),
                                     &mut in_flight,
+                                    &in_flight_len_w,
+                                    0,
                                     &clock_w,
                                     &shared_w,
                                     &need_kf_w,
                                     &disp_w,
                                 ) {
+                                    fail_remaining_in_flight(
+                                        &mut in_flight,
+                                        &in_flight_len_w,
+                                        0,
+                                        &shared_w,
+                                    );
                                     let _ = decoder.flush();
                                     return;
                                 }
                                 if stop_w.load(Ordering::Acquire) {
+                                    let dl = *stop_deadline.get_or_insert_with(|| {
+                                        Instant::now() + PIPELINED_DRAIN_TIMEOUT
+                                    });
                                     let slot_empty = {
                                         let (lock, _) = &*slot_w;
                                         lock.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
                                     };
-                                    if slot_empty {
-                                        let _ = drain_pipelined_in_flight(
-                                            decoder.as_mut(),
-                                            renderer.as_mut(),
-                                            &mut in_flight,
-                                            &clock_w,
-                                            &shared_w,
-                                            &need_kf_w,
-                                            &disp_w,
-                                        );
-                                        break;
+                                    if slot_empty || Instant::now() >= dl {
+                                        break 'worker;
                                     }
                                 }
                             } else {
@@ -614,7 +778,7 @@ impl ControllerPipeline {
                                     guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
                                 }
                                 if guard.is_empty() && stop_w.load(Ordering::Acquire) {
-                                    break;
+                                    break 'worker;
                                 }
                             }
                         } else if !popped_any
@@ -626,14 +790,20 @@ impl ControllerPipeline {
                                 lock.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
                             };
                             if slot_empty {
-                                break;
+                                break 'worker;
                             }
                         }
                     }
+                    let drain_budget = stop_deadline.map_or(PIPELINED_DRAIN_TIMEOUT, |dl| {
+                        dl.saturating_duration_since(Instant::now())
+                    });
                     let _ = drain_pipelined_in_flight(
+                        drain_budget,
                         decoder.as_mut(),
                         renderer.as_mut(),
                         &mut in_flight,
+                        &in_flight_len_w,
+                        0,
                         &clock_w,
                         &shared_w,
                         &need_kf_w,
@@ -649,6 +819,7 @@ impl ControllerPipeline {
                 shared,
                 need_keyframe,
                 displayed,
+                in_flight_len,
                 worker: Some(worker),
             }
         } else {
@@ -847,7 +1018,11 @@ impl ControllerPipeline {
                     }
                 }
             }
-            ControllerExecMode::Async { slot, .. } => {
+            ControllerExecMode::Async {
+                slot,
+                in_flight_len,
+                ..
+            } => {
                 let received_ts = Timestamp(now_us);
                 if kind == FrameKind::Idr {
                     self.async_chain_broken = false;
@@ -876,16 +1051,20 @@ impl ControllerPipeline {
                 let dropped_frames: Vec<(FrameSeq, Timestamp, Timestamp)> = {
                     let (lock, cv) = &**slot;
                     let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let cur_in_flight = in_flight_len.load(Ordering::Acquire);
                     let mut dropped = Vec::new();
                     if kind == FrameKind::Idr {
                         while let Some(prev) = guard.pop_front() {
                             dropped.push((prev.seq, prev.capture_ts, prev.received_ts));
                         }
                         guard.push_back(incoming);
-                    } else if guard.len() < ASYNC_DECODE_QUEUE_CAP {
+                    } else if guard.len() < ASYNC_DECODE_QUEUE_CAP
+                        && guard.len().saturating_add(cur_in_flight) < ASYNC_DECODE_TOTAL_CAP
+                    {
                         guard.push_back(incoming);
                     } else {
-                        // 队列满时保留已有参考链完整的前序待解帧，丢弃本帧并标记断链等待 IDR。
+                        // 队列满（或待解+硬件在途达到总深度上限）时保留已有参考链完整的前序帧，
+                        // 丢弃本帧并标记断链等待 IDR。
                         dropped.push((seq, capture_ts, received_ts));
                     }
                     cv.notify_one();
@@ -955,9 +1134,10 @@ impl ControllerPipeline {
             ControllerExecMode::Async {
                 slot, stop, worker, ..
             } => {
-                stop.store(true, Ordering::Release);
                 {
-                    let (_, cv) = &**slot;
+                    let (lock, cv) = &**slot;
+                    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    stop.store(true, Ordering::Release);
                     cv.notify_all();
                 }
                 if let Some(handle) = worker.take() {
@@ -1041,9 +1221,10 @@ impl Drop for ControllerPipeline {
             slot, stop, worker, ..
         } = &mut self.mode
         {
-            stop.store(true, Ordering::Release);
             {
-                let (_, cv) = &**slot;
+                let (lock, cv) = &**slot;
+                let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                stop.store(true, Ordering::Release);
                 cv.notify_all();
             }
             if let Some(handle) = worker.take() {
@@ -1117,7 +1298,10 @@ mod tests {
             Ok(DecodeSubmitStatus::Submitted)
         }
 
-        fn recv_decoded(&mut self, timeout: Duration) -> Result<Option<(u64, DecodeOutput)>> {
+        fn recv_decoded(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<(u64, Result<DecodeOutput>)>> {
             if self.in_flight.is_empty() {
                 return Ok(None);
             }
@@ -1130,7 +1314,7 @@ mod tests {
             };
             Ok(Some((
                 token,
-                DecodeOutput::Frame(DecodedFrame {
+                Ok(DecodeOutput::Frame(DecodedFrame {
                     texture: FrameTexture::Cpu(CpuFrame {
                         width: 4,
                         height: 4,
@@ -1141,13 +1325,271 @@ mod tests {
                     decode_done_ts: Timestamp(100),
                     width: 4,
                     height: 4,
-                }),
+                })),
             )))
         }
 
         fn in_flight_count(&self) -> usize {
             self.in_flight.len()
         }
+    }
+
+    /// 可配置行为的假流水线解码器：用于验证致命错误结案、失步回收与卡死停机超时。
+    struct FaultyPipelinedDecoder {
+        in_flight: VecDeque<u64>,
+        fail_fatal_on_token: Option<u64>,
+        fail_nonfatal_on_token: Option<u64>,
+        drop_internally_on_submit: bool,
+        stall_forever: bool,
+        /// 在途帧数首次达到该阈值前暂不释放任何输出，确保双帧并发用例与调度无关。
+        min_in_flight_to_release: usize,
+        released: bool,
+        flushed: Arc<AtomicUsize>,
+    }
+
+    impl FaultyPipelinedDecoder {
+        fn new() -> (Self, Arc<AtomicUsize>) {
+            let flushed = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    in_flight: VecDeque::new(),
+                    fail_fatal_on_token: None,
+                    fail_nonfatal_on_token: None,
+                    drop_internally_on_submit: false,
+                    stall_forever: false,
+                    min_in_flight_to_release: 1,
+                    released: false,
+                    flushed: Arc::clone(&flushed),
+                },
+                flushed,
+            )
+        }
+    }
+
+    impl Decoder for FaultyPipelinedDecoder {
+        fn decode(
+            &mut self,
+            _data: &[u8],
+            _kind: FrameKind,
+            _deadline_ts: Timestamp,
+        ) -> Result<DecodeOutput> {
+            unreachable!()
+        }
+
+        fn needs_keyframe(&self) -> bool {
+            false
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.in_flight.clear();
+            self.flushed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn supports_pipelined_decode(&self) -> bool {
+            true
+        }
+
+        fn submit_decode(
+            &mut self,
+            token: u64,
+            _data: &[u8],
+            _kind: FrameKind,
+            _deadline_ts: Timestamp,
+        ) -> Result<DecodeSubmitStatus> {
+            if self.drop_internally_on_submit {
+                // 模拟底层静默丢弃在途帧（制造上层/底层失步：上层以为在途，底层 in_flight_count == 0）
+                self.in_flight.clear();
+                return Ok(DecodeSubmitStatus::Submitted);
+            }
+            self.in_flight.push_back(token);
+            Ok(DecodeSubmitStatus::Submitted)
+        }
+
+        fn recv_decoded(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<(u64, Result<DecodeOutput>)>> {
+            if self.stall_forever {
+                if !timeout.is_zero() {
+                    std::thread::sleep(timeout.min(Duration::from_millis(5)));
+                }
+                return Ok(None);
+            }
+            if self.in_flight.is_empty() {
+                return Ok(None);
+            }
+            if !self.released {
+                if self.in_flight.len() < self.min_in_flight_to_release {
+                    if !timeout.is_zero() {
+                        std::thread::sleep(timeout.min(Duration::from_millis(2)));
+                    }
+                    return Ok(None);
+                }
+                self.released = true;
+            }
+            if timeout.is_zero() && self.in_flight.len() < 2 {
+                return Ok(None);
+            }
+            let Some(token) = self.in_flight.pop_front() else {
+                return Ok(None);
+            };
+            if self.fail_fatal_on_token == Some(token) {
+                return Ok(Some((token, Err(Error::Decoder("fatal unit".into())))));
+            }
+            if self.fail_nonfatal_on_token == Some(token) {
+                return Ok(Some((token, Err(Error::Timeout(Duration::from_millis(5))))));
+            }
+            Ok(Some((
+                token,
+                Ok(DecodeOutput::Frame(DecodedFrame {
+                    texture: FrameTexture::Cpu(CpuFrame {
+                        width: 4,
+                        height: 4,
+                        format: PixelFormat::Bgra8,
+                        stride: 16,
+                        data: vec![0; 64],
+                    }),
+                    decode_done_ts: Timestamp(100),
+                    width: 4,
+                    height: 4,
+                })),
+            )))
+        }
+
+        fn in_flight_count(&self) -> usize {
+            self.in_flight.len()
+        }
+    }
+
+    fn push_test_frame(ctrl: &mut ControllerPipeline, seq: u64, kind: FrameKind) {
+        let pkts = split_frame_with_flags(
+            FrameSeq(seq),
+            kind,
+            HeaderFlags::empty(),
+            Timestamp((seq as u32) * 16_000),
+            Timestamp((seq as u32) * 16_000 + 100),
+            seq as u16,
+            &[0, 0, 0, 1, 0x65, seq as u8],
+            1200,
+        );
+        for d in &pkts {
+            let _ = ctrl.push_datagram(d, (seq as u32) * 16_000 + 200);
+        }
+    }
+
+    #[test]
+    fn pipelined_fatal_error_finishes_remaining_in_flight_frames_without_leak() {
+        let (mut dec, _) = FaultyPipelinedDecoder::new();
+        dec.fail_fatal_on_token = Some(1);
+        dec.min_in_flight_to_release = 2;
+        let ren = FakeRenderer::new(FakeRendererConfig::default()).expect("假渲染器");
+        let cfg = PipelineConfig {
+            async_decode: true,
+            ..PipelineConfig::default()
+        };
+        let mut ctrl = ControllerPipeline::with_backends(cfg, Box::new(dec), Box::new(ren))
+            .expect("controller init");
+
+        push_test_frame(&mut ctrl, 1, FrameKind::Idr);
+        push_test_frame(&mut ctrl, 2, FrameKind::P);
+        std::thread::sleep(Duration::from_millis(50));
+        ctrl.shutdown();
+
+        let sum = ctrl.trace().summary();
+        assert_eq!(sum.unfinished, 0, "致命错误后剩余在途帧也必须结案: {sum:?}");
+        assert!(sum.decode_errors >= 2, "两帧均应记录 DecodeError: {sum:?}");
+    }
+
+    #[test]
+    fn pipelined_desync_reaps_orphans_and_requests_keyframe() {
+        let (mut dec, _) = FaultyPipelinedDecoder::new();
+        dec.drop_internally_on_submit = true;
+        let ren = FakeRenderer::new(FakeRendererConfig::default()).expect("假渲染器");
+        let cfg = PipelineConfig {
+            async_decode: true,
+            ..PipelineConfig::default()
+        };
+        let mut ctrl = ControllerPipeline::with_backends(cfg, Box::new(dec), Box::new(ren))
+            .expect("controller init");
+
+        push_test_frame(&mut ctrl, 1, FrameKind::Idr);
+        push_test_frame(&mut ctrl, 2, FrameKind::P);
+
+        let dl = Instant::now() + Duration::from_secs(1);
+        let mut saw_kf = false;
+        while Instant::now() < dl {
+            if ctrl.take_keyframe_request() {
+                saw_kf = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_kf, "底层在途失步后应回收孤儿并请求关键帧");
+        ctrl.shutdown();
+        let sum = ctrl.trace().summary();
+        assert_eq!(sum.unfinished, 0, "失步回收后不得有未完结帧: {sum:?}");
+    }
+
+    #[test]
+    fn pipelined_per_frame_nonfatal_error_preserves_sibling_frame() {
+        let (mut dec, _) = FaultyPipelinedDecoder::new();
+        dec.fail_nonfatal_on_token = Some(1);
+        dec.min_in_flight_to_release = 2;
+        let ren = FakeRenderer::new(FakeRendererConfig::default()).expect("假渲染器");
+        let cfg = PipelineConfig {
+            async_decode: true,
+            ..PipelineConfig::default()
+        };
+        let mut ctrl = ControllerPipeline::with_backends(cfg, Box::new(dec), Box::new(ren))
+            .expect("controller init");
+
+        push_test_frame(&mut ctrl, 1, FrameKind::Idr);
+        push_test_frame(&mut ctrl, 2, FrameKind::P);
+
+        let dl = Instant::now() + Duration::from_secs(1);
+        while ctrl.displayed() < 1 && Instant::now() < dl {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ctrl.displayed(), 1, "帧 1 非致命失败后帧 2 仍应正常上屏");
+        ctrl.shutdown();
+        let sum = ctrl.trace().summary();
+        assert_eq!(sum.unfinished, 0);
+        assert_eq!(sum.decode_errors, 1);
+    }
+
+    #[test]
+    fn pipelined_stalled_decoder_with_queued_slot_shuts_down_within_budget() {
+        let (mut dec, flushed) = FaultyPipelinedDecoder::new();
+        dec.stall_forever = true;
+        let ren = FakeRenderer::new(FakeRendererConfig::default()).expect("假渲染器");
+        let cfg = PipelineConfig {
+            async_decode: true,
+            ..PipelineConfig::default()
+        };
+        let mut ctrl = ControllerPipeline::with_backends(cfg, Box::new(dec), Box::new(ren))
+            .expect("controller init");
+
+        // 塞满 2 帧在途 + 1 帧排队（总深度受 ASYNC_DECODE_TOTAL_CAP=3 约束）+ 第 4 帧被拒
+        push_test_frame(&mut ctrl, 1, FrameKind::Idr);
+        push_test_frame(&mut ctrl, 2, FrameKind::P);
+        std::thread::sleep(Duration::from_millis(20));
+        push_test_frame(&mut ctrl, 3, FrameKind::P);
+        push_test_frame(&mut ctrl, 4, FrameKind::P);
+
+        let t0 = Instant::now();
+        ctrl.shutdown();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "卡死解码器停机不应永久阻塞，实际耗时 {elapsed:?}"
+        );
+        assert!(
+            flushed.load(Ordering::SeqCst) >= 1,
+            "超时停机应调用 decoder.flush()"
+        );
+        let sum = ctrl.trace().summary();
+        assert_eq!(sum.unfinished, 0, "停机后全部在途与排队帧均须结案: {sum:?}");
     }
 
     #[test]

@@ -97,8 +97,14 @@ pub trait Decoder: Send {
         ))
     }
 
-    /// 按 FIFO 提交顺序接收下一帧已完成的异步解码输出；超时无就绪返回 `Ok(None)`。
-    fn recv_decoded(&mut self, _timeout: Duration) -> Result<Option<(u64, DecodeOutput)>> {
+    /// 按 FIFO 提交顺序接收下一帧已完成的异步解码输出。
+    ///
+    /// 返回值契约：
+    /// - `Ok(None)`：超时前尚无就绪帧，未消费任何在途帧；
+    /// - `Ok(Some((token, Ok(output))))`：对应 `token` 帧成功解码（消费该在途帧）；
+    /// - `Ok(Some((token, Err(err))))`：对应 `token` 帧解码失败（精确归因并消费该在途帧）；
+    /// - `Err(err)`：无法归属到单一 `token` 的解码器级错误（调用方须 `flush` 并结案全部剩余在途帧）。
+    fn recv_decoded(&mut self, _timeout: Duration) -> Result<Option<(u64, Result<DecodeOutput>)>> {
         Ok(None)
     }
 
