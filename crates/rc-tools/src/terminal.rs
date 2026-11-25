@@ -2642,7 +2642,7 @@ mod tests {
             if let Some(id) = found {
                 break id;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         };
         client.send_input(attached_id, b"echo LIVE_OUTPUT_PRESERVED\n");
         for f in client.poll_outgoing(4) {
@@ -2670,7 +2670,7 @@ mod tests {
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
             live_acc.contains("LIVE_OUTPUT_PRESERVED"),
@@ -2847,7 +2847,7 @@ mod tests {
             if ready {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(ready, "expected FontReady event");
         assert_eq!(client.get_cached_font(&font_id), Some(sfnt.as_slice()));
