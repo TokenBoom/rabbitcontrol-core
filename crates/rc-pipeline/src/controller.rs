@@ -88,6 +88,8 @@ pub struct ControllerPipeline {
     highest_evicted: Option<FrameSeq>,
     /// 需要向对端请求关键帧（粘住直到成功解出一个 IDR）。
     need_keyframe: bool,
+    /// `async_decode` 模式下参考链是否因丢帧/覆盖断链，等待下一张 IDR 重建。
+    async_chain_broken: bool,
     /// 已上屏帧数（诊断）。
     displayed: u64,
     /// 会话时钟（微秒）。**管线是计时员**：`Decoded` / `Presented` 在操作
@@ -329,6 +331,7 @@ impl ControllerPipeline {
             highest_delivered: None,
             highest_evicted: None,
             need_keyframe: false,
+            async_chain_broken: false,
             displayed: 0,
             clock,
         })
@@ -510,6 +513,19 @@ impl ControllerPipeline {
             }
             ControllerExecMode::Async { slot, .. } => {
                 let received_ts = Timestamp(now_us);
+                if kind == FrameKind::Idr {
+                    self.async_chain_broken = false;
+                } else if self.async_chain_broken {
+                    let f = self.trace.begin(seq);
+                    f.mark(Mark::Captured, capture_ts);
+                    f.mark(Mark::Received, received_ts);
+                    f.finish(Outcome::DroppedStale);
+                    self.need_keyframe = true;
+                    if self.drain_async_completions()? {
+                        presented_now = true;
+                    }
+                    return Ok(presented_now);
+                }
                 let incoming = PendingAsyncFrame {
                     seq,
                     payload_all,
@@ -522,10 +538,13 @@ impl ControllerPipeline {
                     let (lock, cv) = &**slot;
                     let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
                     let dropped = match guard.take() {
-                        Some(prev) if prev.kind == FrameKind::Idr && kind != FrameKind::Idr => {
+                        // 槽内已有待解的帧且新帧是 P 帧：保留参考链仍完整的旧帧（`prev`），
+                        // 拒绝覆写为缺参考的新 P 帧，避免把断链 P 帧送进硬解触发 -12909。
+                        Some(prev) if kind != FrameKind::Idr => {
                             *guard = Some(prev);
                             Some((seq, capture_ts, received_ts))
                         }
+                        // 新帧是 IDR：用最新 IDR 取代槽内未解旧帧立即恢复参考链。
                         Some(prev) => {
                             *guard = Some(incoming);
                             Some((prev.seq, prev.capture_ts, prev.received_ts))
@@ -544,6 +563,7 @@ impl ControllerPipeline {
                     f.mark(Mark::Received, d_recv);
                     f.finish(Outcome::DroppedStale);
                     if kind != FrameKind::Idr {
+                        self.async_chain_broken = true;
                         self.need_keyframe = true;
                     }
                 }
@@ -656,6 +676,10 @@ impl ControllerPipeline {
     /// 淘汰残帧：更新已淘汰水位线，并幂等记录 `LostInNetwork`（同一 `seq` 不重复 `begin`）。
     fn mark_lost(&mut self, seq: FrameSeq, capture_ts: Timestamp) {
         self.highest_evicted = Some(self.highest_evicted.map_or(seq, |prev| prev.max(seq)));
+        if matches!(self.mode, ControllerExecMode::Async { .. }) {
+            self.async_chain_broken = true;
+            self.need_keyframe = true;
+        }
         if let Some(f) = self.trace.get_mut(seq) {
             f.mark(Mark::Captured, capture_ts);
             f.finish(Outcome::LostInNetwork);

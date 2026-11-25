@@ -721,3 +721,100 @@ fn capture_backpressure_wakes_without_polling_sleep() {
     );
     host.shutdown();
 }
+
+// ── 12. async_decode 模式下丢包/槽位溢出后门控断链 P 帧直到 IDR 恢复 ──
+#[test]
+fn async_decode_gates_broken_p_frames_until_idr() {
+    use rc_types::{FrameKind, FrameSeq};
+
+    let mut c = cfg();
+    c.async_decode = true;
+    let mut controller = ControllerPipeline::with_backends(c, fake_decoder(), fake_renderer())
+        .expect("async controller ok");
+
+    let mut cap = fake_capture(FakeContent::Dynamic, 60);
+    let mut enc = fake_encoder();
+    let mut make_pkts = |seq: u64, force_idr: bool, mtu: usize| -> Vec<Vec<u8>> {
+        let frame = cap
+            .next_frame(std::time::Duration::from_millis(50))
+            .expect("capture ok")
+            .expect("frame present");
+        let encoded = enc
+            .encode(&frame, force_idr, Timestamp(frame.timestamp.0 + 50_000))
+            .expect("encode ok");
+        rc_proto::split_frame(
+            FrameSeq(seq),
+            encoded.kind,
+            frame.timestamp,
+            encoded.encode_done_ts,
+            0,
+            &encoded.data,
+            mtu,
+        )
+    };
+
+    // 先导 IDR（seq=0）建好参考链并等上屏。
+    for p in make_pkts(0, true, rc_proto::MAX_PAYLOAD) {
+        let _ = controller.push_datagram(&p, 1_200).expect("seq 0");
+    }
+    for _ in 0..40 {
+        if controller.displayed() >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let _ = controller.take_keyframe_request();
+    }
+    assert_eq!(controller.displayed(), 1, "先导 IDR 应上屏");
+    let _ = controller.take_keyframe_request();
+
+    // seq=1 拆成多个分片但故意缺包，再推 seq=2 完整 P 帧触发 LostInNetwork + 断链门控。
+    let p1 = make_pkts(1, false, 16);
+    assert!(p1.len() >= 2, "P 帧需至少拆出 2 包用于丢包模拟");
+    let _ = controller
+        .push_datagram(&p1[0], 2_200)
+        .expect("seq 1 part 0");
+    for p in make_pkts(2, false, rc_proto::MAX_PAYLOAD) {
+        let _ = controller.push_datagram(&p, 3_200).expect("seq 2");
+    }
+    assert!(
+        controller.take_keyframe_request(),
+        "断链后必须触发关键帧请求"
+    );
+    assert_eq!(
+        controller
+            .trace()
+            .get(FrameSeq(1))
+            .and_then(|f| f.outcome()),
+        Some(Outcome::LostInNetwork)
+    );
+    assert_eq!(
+        controller
+            .trace()
+            .get(FrameSeq(2))
+            .and_then(|f| f.outcome()),
+        Some(Outcome::DroppedStale)
+    );
+
+    // 再发一个 IDR（seq=3）重置参考链并正常解码上屏。
+    for p in make_pkts(3, true, rc_proto::MAX_PAYLOAD) {
+        let _ = controller.push_datagram(&p, 4_200).expect("seq 3 idr");
+    }
+    for _ in 0..40 {
+        if controller.displayed() >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let _ = controller.take_keyframe_request();
+    }
+    controller.shutdown();
+    let s = controller.trace().summary();
+    assert_eq!(
+        s.decode_errors, 0,
+        "断链门控后不得再向解码器投喂残缺链 P 帧: {s:?}"
+    );
+    assert!(
+        controller.displayed() >= 2,
+        "IDR 恢复后应至少上屏 2 帧: {s:?}"
+    );
+    let _ = FrameKind::P;
+}
