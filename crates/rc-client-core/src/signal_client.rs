@@ -2292,7 +2292,7 @@ enum SingleConnectErr {
 
 fn is_connect_in_progress(err: &io::Error) -> bool {
     matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) || {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             matches!(err.raw_os_error(), Some(36 | 37))
         }
@@ -2304,7 +2304,7 @@ fn is_connect_in_progress(err: &io::Error) -> bool {
         {
             matches!(err.raw_os_error(), Some(10035..=10037))
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux", windows)))]
         {
             false
         }
