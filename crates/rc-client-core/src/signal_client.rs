@@ -2290,13 +2290,20 @@ enum SingleConnectErr {
     Io(io::Error),
 }
 
-fn is_connect_in_progress(err: &io::Error) -> bool {
+/// 判断非阻塞 `connect()` 返回的 `io::Error` 是否表示握手仍在进行中（`EINPROGRESS` / `EALREADY` / `WSAEWOULDBLOCK` 等）。
+pub(crate) fn is_connect_in_progress(err: &io::Error) -> bool {
     matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) || {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        ))]
         {
             matches!(err.raw_os_error(), Some(36 | 37))
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             matches!(err.raw_os_error(), Some(115 | 114))
         }
@@ -2304,7 +2311,16 @@ fn is_connect_in_progress(err: &io::Error) -> bool {
         {
             matches!(err.raw_os_error(), Some(10035..=10037))
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        #[cfg(not(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "linux",
+            target_os = "android",
+            windows
+        )))]
         {
             false
         }
@@ -4195,5 +4211,48 @@ mod tests {
         );
         client.stop();
         let _ = accept_jh.join();
+    }
+
+    #[test]
+    fn is_connect_in_progress_recognizes_platform_errno_and_rejects_fatal_errors() {
+        assert!(is_connect_in_progress(&io::Error::from(
+            ErrorKind::WouldBlock
+        )));
+        assert!(is_connect_in_progress(&io::Error::from(
+            ErrorKind::Interrupted
+        )));
+        assert!(!is_connect_in_progress(&io::Error::from(
+            ErrorKind::ConnectionRefused
+        )));
+
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        ))]
+        {
+            assert!(is_connect_in_progress(&io::Error::from_raw_os_error(36)));
+            assert!(is_connect_in_progress(&io::Error::from_raw_os_error(37)));
+            assert!(!is_connect_in_progress(&io::Error::from_raw_os_error(61)));
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert!(is_connect_in_progress(&io::Error::from_raw_os_error(115)));
+            assert!(is_connect_in_progress(&io::Error::from_raw_os_error(114)));
+            assert!(!is_connect_in_progress(&io::Error::from_raw_os_error(111)));
+        }
+
+        #[cfg(windows)]
+        {
+            assert!(is_connect_in_progress(&io::Error::from_raw_os_error(10035)));
+            assert!(is_connect_in_progress(&io::Error::from_raw_os_error(10036)));
+            assert!(is_connect_in_progress(&io::Error::from_raw_os_error(10037)));
+            assert!(!is_connect_in_progress(&io::Error::from_raw_os_error(
+                10061
+            )));
+        }
     }
 }

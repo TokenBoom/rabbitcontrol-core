@@ -2301,27 +2301,6 @@ enum SingleConnectErr {
     Io(io::Error),
 }
 
-fn is_connect_in_progress(err: &io::Error) -> bool {
-    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) || {
-        #[cfg(target_os = "macos")]
-        {
-            matches!(err.raw_os_error(), Some(36 | 37))
-        }
-        #[cfg(target_os = "linux")]
-        {
-            matches!(err.raw_os_error(), Some(115 | 114))
-        }
-        #[cfg(windows)]
-        {
-            matches!(err.raw_os_error(), Some(10035..=10037))
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-        {
-            false
-        }
-    }
-}
-
 fn connect_single_cancellable(
     addr: SocketAddr,
     timeout: Duration,
@@ -2338,7 +2317,7 @@ fn connect_single_cancellable(
     let sock_addr = SockAddr::from(addr);
     match socket.connect(&sock_addr) {
         Ok(()) => {}
-        Err(err) if is_connect_in_progress(&err) => {
+        Err(err) if crate::signal_client::is_connect_in_progress(&err) => {
             let deadline = Instant::now() + timeout;
             let mut sleep_ms = 5u64;
             loop {
