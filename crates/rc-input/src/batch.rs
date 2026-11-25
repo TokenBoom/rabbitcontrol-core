@@ -6,7 +6,8 @@
 //! - **按键不可丢**（I3）：`MouseButton` / `MouseWheel` / `Key` 全部按序保留；
 //! - **关键事件立即到期**（I7）：批内一旦出现按键/按钮/滚轮，下一次
 //!   [`InputBatcher::poll`] 不再等待窗口直接放行；
-//! - **窗口 4ms**（I6）：只有移动时最多压 `window` 再发（250Hz 发送率）。
+//! - **窗口 4ms**（I6）：空闲期（`last_emit` 为空或距上次非空发包 `≥ window`）的首条
+//!   `MouseMove` 前沿立即放行（0ms 等待）；窗口内后续移动最多压 `window` 再发（≈250Hz 发送率）。
 //!
 //! 批处理器**不读时钟**：`push` / `poll` 的 `now` 全部由调用方注入，
 //! 与 rc-sched 的时间注入约定一致，逻辑可离线确定性单测。
@@ -137,9 +138,13 @@ pub struct InputBatcher {
     window: Duration,
     /// 当前批次第一项事件的时刻（批年龄从它起算，约束移动的最大延迟）。
     window_start: Option<Instant>,
+    /// 当前批次最后一次 `push` 的注入时刻（供无参 `flush` 延续注入时钟域）。
+    last_push: Option<Instant>,
+    /// 上一次 `poll` / `flush` 吐出非空批次的时刻（用于空闲期首移动作前沿立即放行）。
+    last_emit: Option<Instant>,
     /// 批内待发事件（保序；连续移动已被合并为最新值）。
     pending: Vec<InputEvent>,
-    /// 批内出现过关键事件（I7）：下一次 poll 无视窗口直接放行。
+    /// 批内出现过关键事件（I7）或空闲前沿首移：下一次 poll 无视窗口直接放行。
     critical: bool,
     /// 修饰键精确跟踪（I8）。
     modifiers: ModifierState,
@@ -152,6 +157,8 @@ impl InputBatcher {
         Self {
             window,
             window_start: None,
+            last_push: None,
+            last_emit: None,
             pending: Vec::new(),
             critical: false,
             modifiers: ModifierState::new(),
@@ -160,7 +167,8 @@ impl InputBatcher {
 
     /// 压入一条事件（`now` 为事件时刻，由调用方注入）。
     ///
-    /// - `MouseMove`：批尾是移动则**原位覆盖**（I2），否则追加；
+    /// - `MouseMove`：批为空且距上次发包已满 `window`（含首次）则置前沿立即放行；
+    ///   批尾是移动则**原位覆盖**（I2），否则追加；
     /// - `Key`：先更新修饰键状态，`modifiers` 字段重写为最新快照（I8），
     ///   然后追加；
     /// - `MouseButton` / `MouseWheel` / `Key`：标记关键（I7）；
@@ -168,6 +176,13 @@ impl InputBatcher {
     pub fn push(&mut self, ev: InputEvent, now: Instant) {
         match ev {
             InputEvent::MouseMove { x, y } => {
+                if self.pending.is_empty()
+                    && self
+                        .last_emit
+                        .map_or(true, |t| now.saturating_duration_since(t) >= self.window)
+                {
+                    self.critical = true;
+                }
                 if let Some(InputEvent::MouseMove { x: lx, y: ly }) = self.pending.last_mut() {
                     *lx = x;
                     *ly = y;
@@ -203,31 +218,44 @@ impl InputBatcher {
         if self.window_start.is_none() {
             self.window_start = Some(now);
         }
+        self.last_push = Some(now);
     }
 
     /// 取出到期批次；未到期 / 空批返回空表。
     ///
     /// 到期条件（任一）：
-    /// 1. 批内有关键事件（I7，不等窗口）；
+    /// 1. 批内有关键事件或空闲期前沿首移（I7 / leading-edge，不等窗口）；
     /// 2. 距批次首事件 ≥ `window`（I6）。
     pub fn poll(&mut self, now: Instant) -> Vec<InputEvent> {
         let Some(start) = self.window_start else {
             return Vec::new();
         };
-        if !self.critical && now.duration_since(start) < self.window {
+        if !self.critical && now.saturating_duration_since(start) < self.window {
             return Vec::new();
         }
-        self.take()
+        let out = self.take();
+        if !out.is_empty() {
+            self.last_emit = Some(now);
+        }
+        out
     }
 
     /// 无条件冲刷全部待发事件（松键、点击、会话收尾等显式时机）。
     pub fn flush(&mut self) -> Vec<InputEvent> {
-        self.take()
+        let emit_ts = self.last_push.or(self.window_start);
+        let out = self.take();
+        if !out.is_empty() {
+            if let Some(ts) = emit_ts {
+                self.last_emit = Some(ts);
+            }
+        }
+        out
     }
 
     /// 交出批次并复位窗口状态。
     fn take(&mut self) -> Vec<InputEvent> {
         self.window_start = None;
+        self.last_push = None;
         self.critical = false;
         std::mem::take(&mut self.pending)
     }
@@ -322,23 +350,31 @@ mod tests {
         ));
     }
 
-    /// I7：移动开窗后窗口未到期，按钮一进来立即放行整批（含最新移动）。
+    /// I7：活动批窗口内（非空闲前沿）移动尚未到期时，按钮一进来立即放行整批（含最新移动）。
+    ///
+    /// 注：空闲期首条移动现已前沿立即放行（0ms），故先发一条移动进入活动窗口语义，
+    /// 再验证窗口内后续移动在点击到达前不会提前发包、点击一到立刻同批放行。
     #[test]
     fn button_events_flush_immediately() {
         let mut b = InputBatcher::new(DEFAULT_WINDOW);
         let t0 = Instant::now();
-        b.push(InputEvent::MouseMove { x: 10, y: 20 }, t0);
+        // 首移（空闲前沿）立即发包，建立 last_emit
+        b.push(InputEvent::MouseMove { x: 1, y: 1 }, t0);
+        assert_eq!(b.poll(t0), vec![InputEvent::MouseMove { x: 1, y: 1 }]);
+
+        let t1 = t0 + Duration::from_millis(1);
+        b.push(InputEvent::MouseMove { x: 10, y: 20 }, t1);
         // 窗口内、无关键事件：不出批
-        assert!(b.poll(t0 + Duration::from_millis(1)).is_empty());
+        assert!(b.poll(t1 + Duration::from_millis(1)).is_empty());
         // 关键事件进入
         b.push(
             InputEvent::MouseButton {
                 button: MouseButton::Left,
                 pressed: true,
             },
-            t0 + Duration::from_millis(2),
+            t1 + Duration::from_millis(2),
         );
-        let out = b.poll(t0 + Duration::from_millis(2));
+        let out = b.poll(t1 + Duration::from_millis(2));
         assert_eq!(
             out,
             vec![
@@ -352,25 +388,111 @@ mod tests {
         );
     }
 
-    /// I6：只有移动时，窗口内不发送，窗口到期才发送。
+    /// I6：空闲首移立即放行；窗口内（距 `last_emit < window`）后续移动需等满 `window` 才发送。
     #[test]
     fn batch_window_respected() {
         let mut b = InputBatcher::new(DEFAULT_WINDOW);
         let t0 = Instant::now();
+        // 空闲首移：前沿立即放行
         b.push(InputEvent::MouseMove { x: 1, y: 2 }, t0);
+        assert_eq!(b.poll(t0), vec![InputEvent::MouseMove { x: 1, y: 2 }]);
+
+        // 1ms 后再移动：距 last_emit 不足 4ms，必须等待完整窗口
+        let t1 = t0 + Duration::from_millis(1);
+        b.push(InputEvent::MouseMove { x: 3, y: 4 }, t1);
         // 差 1ms 到期：不发
-        assert!(b.poll(t0 + Duration::from_millis(3)).is_empty());
+        assert!(b.poll(t1 + Duration::from_millis(3)).is_empty());
         // 到期：发
-        let out = b.poll(t0 + DEFAULT_WINDOW);
-        assert_eq!(out, vec![InputEvent::MouseMove { x: 1, y: 2 }]);
-        // 发完后窗口重置：新移动重新开窗
-        b.push(InputEvent::MouseMove { x: 3, y: 4 }, t0 + DEFAULT_WINDOW);
-        assert!(b
-            .poll(t0 + DEFAULT_WINDOW + Duration::from_millis(1))
-            .is_empty());
+        let t2 = t1 + DEFAULT_WINDOW;
+        assert_eq!(b.poll(t2), vec![InputEvent::MouseMove { x: 3, y: 4 }]);
+
+        // 紧接着立即移动（距 last_emit = 0ms）：重新开窗等待
+        b.push(InputEvent::MouseMove { x: 5, y: 6 }, t2);
+        assert!(b.poll(t2 + Duration::from_millis(1)).is_empty());
         assert_eq!(
-            b.poll(t0 + DEFAULT_WINDOW * 2),
-            vec![InputEvent::MouseMove { x: 3, y: 4 }]
+            b.poll(t2 + DEFAULT_WINDOW),
+            vec![InputEvent::MouseMove { x: 5, y: 6 }]
+        );
+    }
+
+    /// 空闲前沿立即放行：首次、以及停顿 ≥ `window` 后的首条 `MouseMove` 均在 `poll(now)` 0ms 放行。
+    #[test]
+    fn idle_first_move_flushes_immediately() {
+        let mut b = InputBatcher::new(DEFAULT_WINDOW);
+        let t0 = Instant::now();
+
+        // 1. 全新批处理器首条移动：0ms 即刻放行
+        b.push(InputEvent::MouseMove { x: 50, y: 60 }, t0);
+        assert_eq!(b.poll(t0), vec![InputEvent::MouseMove { x: 50, y: 60 }]);
+
+        // 2. 紧随其后（< 4ms）再次移动：受窗口约束，不抢跑
+        let t1 = t0 + Duration::from_millis(2);
+        b.push(InputEvent::MouseMove { x: 55, y: 65 }, t1);
+        assert!(b.poll(t1).is_empty());
+        let t2 = t1 + DEFAULT_WINDOW;
+        assert_eq!(b.poll(t2), vec![InputEvent::MouseMove { x: 55, y: 65 }]);
+
+        // 3. 静置 >= DEFAULT_WINDOW 后再移动：再次前沿 0ms 放行
+        let t_after_idle = t2 + DEFAULT_WINDOW;
+        b.push(InputEvent::MouseMove { x: 80, y: 90 }, t_after_idle);
+        assert_eq!(
+            b.poll(t_after_idle),
+            vec![InputEvent::MouseMove { x: 80, y: 90 }]
+        );
+    }
+
+    /// `flush()` 仅在非空时更新 `last_emit`，空 `flush()` 不破坏空闲前沿语义。
+    #[test]
+    fn flush_updates_last_emit_only_when_non_empty() {
+        let mut b = InputBatcher::new(DEFAULT_WINDOW);
+        let t0 = Instant::now();
+        assert!(b.flush().is_empty());
+
+        // 空 flush 之后，首条移动仍立即放行
+        b.push(InputEvent::MouseMove { x: 10, y: 10 }, t0);
+        assert_eq!(b.flush(), vec![InputEvent::MouseMove { x: 10, y: 10 }]);
+
+        // 非空 flush 更新了 last_emit=t0；1ms 后的新移动必须等待窗口
+        let t1 = t0 + Duration::from_millis(1);
+        b.push(InputEvent::MouseMove { x: 20, y: 20 }, t1);
+        assert!(b.poll(t1 + Duration::from_millis(2)).is_empty());
+        assert_eq!(
+            b.poll(t1 + DEFAULT_WINDOW),
+            vec![InputEvent::MouseMove { x: 20, y: 20 }]
+        );
+    }
+
+    /// 1000Hz 连续移动突刺：首移 0ms 放行，随后按 4ms 窗口正常合并（1s 仅 ~200 批且保最新坐标）。
+    #[test]
+    fn thousand_hz_burst_coalesces_after_leading_edge() {
+        let mut b = InputBatcher::new(DEFAULT_WINDOW);
+        let t0 = Instant::now();
+        let mut emitted_batches = Vec::new();
+        for i in 0..1000u16 {
+            let now = t0 + Duration::from_millis(u64::from(i));
+            b.push(InputEvent::MouseMove { x: i, y: i * 2 }, now);
+            let out = b.poll(now);
+            if !out.is_empty() {
+                assert_eq!(out.len(), 1, "纯移动每批只留最新 1 条");
+                emitted_batches.push((i, out[0]));
+            }
+        }
+        let tail = b.flush();
+        if !tail.is_empty() {
+            assert_eq!(tail.len(), 1);
+            emitted_batches.push((999, tail[0]));
+        }
+
+        // 第 0 tick（空闲前沿）必须 0ms 放行
+        assert_eq!(
+            emitted_batches[0],
+            (0, InputEvent::MouseMove { x: 0, y: 0 })
+        );
+        // 第 0 tick 1 批 + 后续 199 个 5ms 周期（1..=995）+ 尾部 flush（996..=999）共 201 批（合并率 79.9%）
+        assert_eq!(emitted_batches.len(), 201);
+        assert_eq!(
+            emitted_batches.last().copied(),
+            Some((999, InputEvent::MouseMove { x: 999, y: 1998 }))
         );
     }
 
