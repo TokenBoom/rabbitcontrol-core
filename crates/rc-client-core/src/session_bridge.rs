@@ -48,7 +48,9 @@ use rc_tools::{
 use rc_types::Resolution;
 
 use crate::cert_manager::OwnerGrantPayload;
-use crate::display_ctrl::{self, DisplayControlMsg, DisplayPreset};
+use crate::display_ctrl::{
+    self, DisplayControlMsg, DisplayPreset, HighRefreshAdvisory, StreamCodec,
+};
 use crate::hud::{HudSample, HudSnapshot};
 use crate::lan_discovery;
 use crate::p2p::{self, P2pCandidates};
@@ -247,6 +249,11 @@ pub enum SessionCommand {
         /// 目标帧率（fps；`0` 表示保持当前帧率）。
         fps: u32,
     },
+    /// 热切换远端视频流编解码器（`h264` / `hevc`，经 `TOOL_CHANNEL_DISPLAY_CTRL` 下发被控端）。
+    SetCodec {
+        /// 目标视频编码器。
+        codec: StreamCodec,
+    },
     /// 请求立即锁定被控端屏幕（经 `TOOL_CHANNEL_DISPLAY_CTRL` 发送）。
     LockRemoteScreen,
 }
@@ -315,6 +322,18 @@ pub enum SessionUpdate {
         max_fps: u32,
         /// 严格保持原生宽高比、由高到低排列的分辨率预设列表。
         presets: Vec<DisplayPreset>,
+        /// 当前生效视频编码器（`"hevc"` / `"h264"`；旧版被控端未上报时为 `None`）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codec: Option<String>,
+        /// 被控端声明支持的视频编码器列表（如 `["hevc", "h264"]`）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        supported_codecs: Vec<String>,
+        /// 当前控制端硬件解码路径是否支持 HEVC。
+        #[serde(default)]
+        client_supports_hevc: bool,
+        /// 针对当前分辨率、帧率与编码器的高刷满帧甜点与 HEVC 建议。
+        #[serde(default)]
+        advisory: HighRefreshAdvisory,
     },
     /// 被控端推送的当前桌面壁纸缩略图（`data:image/jpeg;base64,...` / `data:image/png;base64,...`）。
     Wallpaper {
@@ -2935,15 +2954,22 @@ fn run_session_thread(
     let mut pending_term_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_portmap_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_display_tx: VecDeque<Vec<u8>> = VecDeque::new();
-    if cfg.prefer_hardware && is_hardware_decoder && rc_pipeline::platform_supports_hevc() {
+    let client_supports_hevc =
+        cfg.prefer_hardware && is_hardware_decoder && rc_pipeline::platform_supports_hevc();
+    let mut active_codec = StreamCodec::H264;
+    let mut user_pinned_codec: Option<StreamCodec> = None;
+    let mut host_supports_hevc = false;
+    if client_supports_hevc {
         if let Some(payload) = display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetCodec {
             codec: "hevc".to_string(),
         }) {
             pending_display_tx.push_back(payload);
+            active_codec = StreamCodec::Hevc;
         }
     }
     let mut hud_width = negotiated.width;
     let mut hud_height = negotiated.height;
+    let mut current_fps = negotiated.fps;
 
     // ── 驱动循环（无 duration 上限，直到 Disconnect 或对端 Bye/错误）──
     let is_tcp_relay = transport_label == "TCP Relay";
@@ -3007,14 +3033,50 @@ fn run_session_thread(
                     pending_audio_ctrl = Some(encode_audio_ctrl_muted(muted));
                 }
                 SessionCommand::SetStreamParams { width, height, fps } => {
+                    let (eff_w, eff_h) = if width > 0 && height > 0 {
+                        (width, height)
+                    } else {
+                        (hud_width, hud_height)
+                    };
+                    let eff_fps = if fps > 0 { fps } else { current_fps };
+                    // 当用户未手动锁定 H.264、切入超出 H.264 高刷甜点的分辨率/帧率组合且双端均支持 HEVC 时，
+                    // 通过 SetStream 附带 codec="hevc" 原子升级，避免两次硬件管线重建与中间态 Capabilities 抖动。
+                    let auto_hevc = active_codec == StreamCodec::H264
+                        && user_pinned_codec != Some(StreamCodec::H264)
+                        && host_supports_hevc
+                        && client_supports_hevc
+                        && !display_ctrl::is_within_high_refresh_sweet_spot(
+                            eff_w,
+                            eff_h,
+                            eff_fps,
+                            StreamCodec::H264,
+                        );
                     if let Some(payload) =
                         display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetStream {
                             width,
                             height,
                             fps,
+                            codec: auto_hevc.then(|| StreamCodec::Hevc.as_str().to_string()),
                         })
                     {
                         pending_display_tx.push_back(payload);
+                        if auto_hevc {
+                            active_codec = StreamCodec::Hevc;
+                        }
+                    }
+                }
+                SessionCommand::SetCodec { codec } => {
+                    if codec == StreamCodec::Hevc && !client_supports_hevc {
+                        continue;
+                    }
+                    user_pinned_codec = Some(codec);
+                    if let Some(payload) =
+                        display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetCodec {
+                            codec: codec.as_str().to_string(),
+                        })
+                    {
+                        pending_display_tx.push_back(payload);
+                        active_codec = codec;
                     }
                 }
                 SessionCommand::LockRemoteScreen => {
@@ -3142,9 +3204,30 @@ fn run_session_thread(
                         pending_file_in.push_back(payload);
                     } else if channel == TOOL_CHANNEL_DISPLAY_CTRL {
                         if let Some(msg) = display_ctrl::decode_display_ctrl(&payload) {
-                            if let Some(upd) =
-                                handle_display_ctrl_msg(msg, &mut hud_width, &mut hud_height)
-                            {
+                            if let Some(upd) = handle_display_ctrl_msg(
+                                msg,
+                                &mut hud_width,
+                                &mut hud_height,
+                                client_supports_hevc,
+                            ) {
+                                if let SessionUpdate::DisplayConfig {
+                                    fps,
+                                    ref codec,
+                                    ref supported_codecs,
+                                    ..
+                                } = upd
+                                {
+                                    if fps > 0 {
+                                        current_fps = fps;
+                                    }
+                                    let reported_codec =
+                                        codec.as_deref().and_then(StreamCodec::parse_lossy);
+                                    active_codec = reported_codec.unwrap_or(StreamCodec::H264);
+                                    host_supports_hevc = supported_codecs.iter().any(|c| {
+                                        StreamCodec::parse_lossy(c) == Some(StreamCodec::Hevc)
+                                    }) || reported_codec
+                                        == Some(StreamCodec::Hevc);
+                                }
                                 update_tx.push(upd);
                             }
                         }
@@ -3344,15 +3427,32 @@ fn run_session_thread(
                         };
                         break;
                     }
-                    ReconnectOutcome::Resumed | ReconnectOutcome::Rebuilt => {
+                    outcome @ (ReconnectOutcome::Resumed | ReconnectOutcome::Rebuilt) => {
                         client.reset_clipboard_epoch();
                         if let Some(n) = client.negotiated() {
                             hud_width = n.width;
                             hud_height = n.height;
+                            if n.fps > 0 {
+                                current_fps = n.fps;
+                            }
                         }
                         // M9：重连恢复或重建后若本地处于静音态，重新向主机同步静音控制消息。
                         if audio_muted {
                             pending_audio_ctrl = Some(encode_audio_ctrl_muted(true));
+                        }
+                        // 全新重建后被控端回到默认 H.264，若未手动锁定 H.264 且支持 HEVC，重新协商 HEVC。
+                        if matches!(outcome, ReconnectOutcome::Rebuilt)
+                            && client_supports_hevc
+                            && user_pinned_codec != Some(StreamCodec::H264)
+                        {
+                            if let Some(payload) =
+                                display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetCodec {
+                                    codec: StreamCodec::Hevc.as_str().to_string(),
+                                })
+                            {
+                                pending_display_tx.push_back(payload);
+                                active_codec = StreamCodec::Hevc;
+                            }
                         }
                     }
                     ReconnectOutcome::Connecting => {}
@@ -3576,6 +3676,7 @@ fn handle_display_ctrl_msg(
     msg: DisplayControlMsg,
     hud_width: &mut u32,
     hud_height: &mut u32,
+    client_supports_hevc: bool,
 ) -> Option<SessionUpdate> {
     match msg {
         DisplayControlMsg::Capabilities {
@@ -3588,6 +3689,8 @@ fn handle_display_ctrl_msg(
             max_height,
             max_fps,
             presets,
+            current_codec,
+            supported_codecs,
         } => {
             if current_width > 0 && current_height > 0 {
                 *hud_width = current_width;
@@ -3603,6 +3706,23 @@ fn handle_display_ctrl_msg(
             } else {
                 presets
             };
+            let parsed_codec = current_codec
+                .as_deref()
+                .and_then(StreamCodec::parse_lossy)
+                .unwrap_or(StreamCodec::H264);
+            let host_supports_hevc = supported_codecs
+                .iter()
+                .any(|c| StreamCodec::parse_lossy(c) == Some(StreamCodec::Hevc))
+                || parsed_codec == StreamCodec::Hevc;
+            let advisory = display_ctrl::evaluate_high_refresh_advisory(
+                current_width,
+                current_height,
+                current_fps,
+                parsed_codec,
+                host_supports_hevc,
+                client_supports_hevc,
+                &resolved_presets,
+            );
             Some(SessionUpdate::DisplayConfig {
                 width: current_width,
                 height: current_height,
@@ -3611,6 +3731,10 @@ fn handle_display_ctrl_msg(
                 native_height,
                 max_fps,
                 presets: resolved_presets,
+                codec: current_codec,
+                supported_codecs,
+                client_supports_hevc,
+                advisory,
             })
         }
         DisplayControlMsg::Wallpaper { mime, data_base64 } => {
@@ -4327,14 +4451,31 @@ mod tests {
                 max_height: 1600,
                 max_fps: 120,
                 presets: custom_presets.clone(),
+                current_codec: Some("h264".to_string()),
+                supported_codecs: vec!["hevc".to_string(), "h264".to_string()],
             },
             &mut hud_w,
             &mut hud_h,
+            true,
         )
         .expect("capabilities update");
         assert_eq!((hud_w, hud_h), (2560, 1600));
         match upd {
-            SessionUpdate::DisplayConfig { presets, .. } => assert_eq!(presets, custom_presets),
+            SessionUpdate::DisplayConfig {
+                presets,
+                codec,
+                supported_codecs,
+                client_supports_hevc,
+                advisory,
+                ..
+            } => {
+                assert_eq!(presets, custom_presets);
+                assert_eq!(codec.as_deref(), Some("h264"));
+                assert_eq!(supported_codecs, vec!["hevc", "h264"]);
+                assert!(client_supports_hevc);
+                assert_eq!(advisory.level, display_ctrl::HighRefreshLevel::SuggestHevc);
+                assert!(advisory.can_enable_hevc);
+            }
             other => panic!("expected DisplayConfig, got {other:?}"),
         }
 
@@ -4349,15 +4490,21 @@ mod tests {
                 max_height: 1080,
                 max_fps: 60,
                 presets: Vec::new(),
+                current_codec: None,
+                supported_codecs: Vec::new(),
             },
             &mut hud_w,
             &mut hud_h,
+            false,
         )
         .expect("fallback capabilities update");
         match fallback_upd {
-            SessionUpdate::DisplayConfig { presets, .. } => {
+            SessionUpdate::DisplayConfig {
+                presets, advisory, ..
+            } => {
                 assert!(!presets.is_empty());
                 assert!(presets.iter().any(|p| p.is_native && p.width == 1920));
+                assert_eq!(advisory.level, display_ctrl::HighRefreshLevel::Optimal);
             }
             other => panic!("expected DisplayConfig, got {other:?}"),
         }
@@ -4371,6 +4518,7 @@ mod tests {
             },
             &mut hud_w,
             &mut hud_h,
+            false,
         );
         assert_eq!(
             wp,
@@ -4386,6 +4534,7 @@ mod tests {
                 },
                 &mut hud_w,
                 &mut hud_h,
+                false,
             ),
             None
         );
@@ -4397,6 +4546,7 @@ mod tests {
                 },
                 &mut hud_w,
                 &mut hud_h,
+                false,
             ),
             None
         );
@@ -4408,8 +4558,27 @@ mod tests {
                 },
                 &mut hud_w,
                 &mut hud_h,
+                false,
             ),
             None
+        );
+
+        // 3) SessionCommand::SetCodec JSON 往返且保持 Copy 语义。
+        let cmd_hevc: SessionCommand =
+            serde_json::from_str(r#"{"type":"set_codec","codec":"hevc"}"#).expect("parse hevc");
+        let cmd_h264: SessionCommand =
+            serde_json::from_str(r#"{"type":"set_codec","codec":"h264"}"#).expect("parse h264");
+        assert_eq!(
+            cmd_hevc,
+            SessionCommand::SetCodec {
+                codec: StreamCodec::Hevc
+            }
+        );
+        assert_eq!(
+            cmd_h264,
+            SessionCommand::SetCodec {
+                codec: StreamCodec::H264
+            }
         );
     }
 

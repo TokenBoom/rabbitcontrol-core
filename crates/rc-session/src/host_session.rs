@@ -1075,6 +1075,11 @@ impl HostSession {
         self.audio_rx.drain(..).collect()
     }
 
+    /// 当前生效视频编码器（默认 `Codec::H264`，热切换后同步更新）。
+    pub fn active_codec(&self) -> rc_encode::Codec {
+        self.active_codec
+    }
+
     /// 在握手前刷新被控端当前显示器的逻辑分辨率能力（防止空闲监听期切换外接屏/分辨率后使用陈旧能力）。
     pub fn update_caps_resolution(&mut self, width: u32, height: u32) {
         if width >= 2 && height >= 2 {
@@ -1156,6 +1161,24 @@ impl HostSession {
             return Ok(cur);
         }
 
+        let target_bitrate = self.current_bitrate.unwrap_or(cur.bitrate_bps);
+        let mut pcfg = self.cfg.pipeline.clone();
+        pcfg.resolution = rc_types::Resolution::new(target_w, target_h);
+        pcfg.fps = target_fps;
+        pcfg.bitrate_bps = target_bitrate;
+        pcfg.codec = target_codec;
+        pcfg.max_packet_payload = rc_net::quic::max_media_payload(self.cfg.mtu);
+        // 先校验目标配置再拆旧管线，避免非法参数把正在运行的流拆空。
+        pcfg.validate()?;
+
+        let prev_codec = self.active_codec;
+        let mut prev_pcfg = self.cfg.pipeline.clone();
+        prev_pcfg.resolution = rc_types::Resolution::new(cur.width, cur.height);
+        prev_pcfg.fps = cur.fps;
+        prev_pcfg.bitrate_bps = target_bitrate;
+        prev_pcfg.codec = prev_codec;
+        prev_pcfg.max_packet_payload = rc_net::quic::max_media_payload(self.cfg.mtu);
+
         // 先按 S6 红线拆除旧管线并释放句柄（确保旧 SCStream / VTEncoder 完全释放），
         // 但保留 tool_rx / audio_ctrl_rx / audio_rx 以免中断并行的工具与音频流。
         self.teardown_pipeline_only();
@@ -1164,27 +1187,79 @@ impl HostSession {
             .last_sent_frame_seq
             .map_or(self.frame_seq_offset, |last| last.saturating_add(1));
 
-        let target_bitrate = self.current_bitrate.unwrap_or(cur.bitrate_bps);
-        let mut pcfg = self.cfg.pipeline.clone();
-        pcfg.resolution = rc_types::Resolution::new(target_w, target_h);
-        pcfg.fps = target_fps;
-        pcfg.bitrate_bps = target_bitrate;
-        pcfg.codec = target_codec;
-        pcfg.max_packet_payload = rc_net::quic::max_media_payload(self.cfg.mtu);
-        pcfg.validate()?;
-
-        let mut pipeline = if let Some(f) = self.pipeline_factory_for.as_mut() {
-            f(&pcfg)?
-        } else if let Some(f) = self.pipeline_factory.as_mut() {
-            f()?
-        } else {
-            let capture = rc_pipeline::select_capture(&pcfg)?;
-            let encoder = rc_pipeline::select_encoder(&pcfg)?;
-            HostPipeline::with_backends_paced(pcfg, capture, encoder, self.cfg.pace_capture)?
+        let mut actual_codec = target_codec;
+        let build_pipeline =
+            |cfg: &PipelineConfig,
+             factory_for: &mut Option<PipelineFactoryFor>,
+             factory: &mut Option<Box<dyn FnMut() -> Result<HostPipeline> + Send>>,
+             pace_capture: bool|
+             -> Result<HostPipeline> {
+                if let Some(f) = factory_for.as_mut() {
+                    f(cfg)
+                } else if let Some(f) = factory.as_mut() {
+                    f()
+                } else {
+                    let capture = rc_pipeline::select_capture(cfg)?;
+                    let encoder = rc_pipeline::select_encoder(cfg)?;
+                    HostPipeline::with_backends_paced(cfg.clone(), capture, encoder, pace_capture)
+                }
+            };
+        let try_restore_prev =
+            |session: &mut Self, already_tried_codec: Option<rc_encode::Codec>| {
+                let same_as_failed_target = prev_pcfg.resolution == pcfg.resolution
+                    && prev_pcfg.fps == pcfg.fps
+                    && already_tried_codec == Some(prev_codec);
+                if same_as_failed_target {
+                    return;
+                }
+                if let Ok(mut restored) = build_pipeline(
+                    &prev_pcfg,
+                    &mut session.pipeline_factory_for,
+                    &mut session.pipeline_factory,
+                    session.cfg.pace_capture,
+                ) {
+                    restored.set_clock(Arc::clone(&session.clock));
+                    restored.request_idr();
+                    session.pipeline = Some(restored);
+                    session.pipeline_alive = true;
+                    session.active_codec = prev_codec;
+                }
+            };
+        let mut pipeline = match build_pipeline(
+            &pcfg,
+            &mut self.pipeline_factory_for,
+            &mut self.pipeline_factory,
+            self.cfg.pace_capture,
+        ) {
+            Ok(p) => p,
+            Err(hevc_err) if target_codec == rc_encode::Codec::Hevc => {
+                // HEVC 初始化失败时在会话层显式回退 H.264，保证 active_codec、HeaderFlags 与真实码流一致。
+                let mut h264_cfg = pcfg.clone();
+                h264_cfg.codec = rc_encode::Codec::H264;
+                actual_codec = rc_encode::Codec::H264;
+                match build_pipeline(
+                    &h264_cfg,
+                    &mut self.pipeline_factory_for,
+                    &mut self.pipeline_factory,
+                    self.cfg.pace_capture,
+                ) {
+                    Ok(p) => p,
+                    Err(h264_err) => {
+                        try_restore_prev(self, Some(rc_encode::Codec::H264));
+                        return Err(Error::Encoder(format!(
+                            "HEVC 重建失败 ({hevc_err})；回退 H.264 亦失败 ({h264_err})"
+                        )));
+                    }
+                }
+            }
+            Err(e) => {
+                try_restore_prev(self, Some(target_codec));
+                return Err(e);
+            }
         };
         pipeline.set_clock(Arc::clone(&self.clock));
         pipeline.request_idr();
-        self.active_codec = target_codec;
+        self.active_codec = actual_codec;
         let pacing_bps = u64::from(target_bitrate).saturating_mul(2).max(200_000_000);
         if let Some(t) = self.transport.as_mut() {
             t.set_pacing_rate(pacing_bps);
@@ -1786,6 +1861,11 @@ impl HostSession {
         self.pipeline
             .as_ref()
             .expect("pipeline exists after handshake (state == Streaming)")
+    }
+
+    /// 当前是否存在可用的活动媒体管线（用于热重建失败后防止调用 [`Self::pipeline`] 触发 panic）。
+    pub fn has_pipeline(&self) -> bool {
+        self.pipeline.is_some()
     }
 
     /// 管线是否有尚未被 `tick` 消费的挂起事件（采集到达或编码完成）。

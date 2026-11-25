@@ -26,6 +26,119 @@ const MIN_PRESET_HEIGHT: u32 = 360;
 /// 去重与「接近原生」判定的像素容差（避免出现高度几乎一致的重复档位）。
 const PRESET_PROXIMITY_PX: u32 = 24;
 
+/// 触发高刷甜点评估与提示的最低目标帧率（fps；60fps 及以下不打扰）。
+pub const HIGH_REFRESH_FPS_THRESHOLD: u32 = 90;
+
+/// HEVC（H.265）在低延迟双槽在途（`max_in_flight = 2`）下的推荐高刷满帧像素率上限（px/s）。
+///
+/// 对齐 Apple Silicon M1 Pro 实测：`2560×1664@120`（511M px/s → 118.7fps）、
+/// `3440×1440@120`（594M px/s → 119.1fps）均可稳态满帧；`3024×1964@120`（713M px/s → ~83fps）
+/// 与 `3840×2160@120`（995M px/s → ~84fps）超出满帧甜点。
+pub const HEVC_HIGH_REFRESH_MAX_PIXEL_RATE: u64 = 600_000_000;
+
+/// H.264 在低延迟双槽在途（`max_in_flight = 2`）下的推荐高刷满帧像素率上限（px/s）。
+///
+/// 对齐 Apple Silicon M1 Pro 实测：`1512×982@120`（178M px/s → 117.9fps）、
+/// `1920×1200@120`（276M px/s → 118.3fps）均可稳态满帧；`2560×1600@120`（492M px/s → ~91fps）、
+/// `3024×1964@120`（713M px/s → ~60fps）超出 H.264 满帧甜点。
+pub const H264_HIGH_REFRESH_MAX_PIXEL_RATE: u64 = 280_000_000;
+
+/// 视频流编解码器选择（纯值枚举，保持 `SessionCommand: Copy` 语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamCodec {
+    /// H.264 / AVC。
+    H264,
+    /// H.265 / HEVC。
+    Hevc,
+}
+
+impl StreamCodec {
+    /// 转为协议标准小写名称（`"h264"` / `"hevc"`）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+        }
+    }
+
+    /// 大小写不敏感解析协议编码器名称（兼容 `"h265"` 别名）。
+    pub fn parse_lossy(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("hevc") || trimmed.eq_ignore_ascii_case("h265") {
+            Some(Self::Hevc)
+        } else if trimmed.eq_ignore_ascii_case("h264") || trimmed.eq_ignore_ascii_case("avc") {
+            Some(Self::H264)
+        } else {
+            None
+        }
+    }
+
+    /// 当前编码器在高刷（`>= 90fps`）下的推荐满帧像素率上限（px/s）。
+    pub const fn high_refresh_max_pixel_rate(self) -> u64 {
+        match self {
+            Self::Hevc => HEVC_HIGH_REFRESH_MAX_PIXEL_RATE,
+            Self::H264 => H264_HIGH_REFRESH_MAX_PIXEL_RATE,
+        }
+    }
+}
+
+/// 高刷（`>= 90fps`）流参数与编码器甜点评估级别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HighRefreshLevel {
+    /// 当前分辨率、帧率与编码器组合位于满帧甜点内（或帧率 `< 90fps`）。
+    Optimal,
+    /// 当前为 H.264 且超出 H.264 高刷甜点，切至 HEVC 后可落入满帧甜点。
+    SuggestHevc,
+    /// 当前组合超出硬件高刷满帧甜点（即便启用 HEVC 或客户端不支持 HEVC 仍受限）。
+    AboveSweetSpot,
+}
+
+/// 高刷甜点评估的机器可读原因码（供各端本地化展示文案）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HighRefreshReason {
+    /// 处于高刷满帧甜点内或非高刷模式。
+    Optimal,
+    /// 当前 H.264 超甜点且双端均支持 HEVC，开启 HEVC 可显著提升帧率。
+    H264SuggestHevc,
+    /// 当前 H.264 超甜点且至少一端不支持 HEVC，建议降低分辨率。
+    H264NoHevc,
+    /// 当前已是 HEVC，但分辨率像素率仍高于高刷满帧甜点，建议切回甜点分辨率。
+    HevcOverBudget,
+}
+
+/// 针对当前（或待切换）分辨率、帧率与编解码器的高刷预期管理评估结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct HighRefreshAdvisory {
+    /// 评估级别（`optimal` / `suggest_hevc` / `above_sweet_spot`）。
+    pub level: HighRefreshLevel,
+    /// 机器可读原因码。
+    pub reason: HighRefreshReason,
+    /// 是否可立即向被控端请求切换至 HEVC（当前为 H.264 且双端均支持 HEVC）。
+    pub can_enable_hevc: bool,
+    /// 推荐的高刷满帧分辨率宽度（像素，`Optimal` 时为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_width: Option<u32>,
+    /// 推荐的高刷满帧分辨率高度（像素，`Optimal` 时为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_height: Option<u32>,
+}
+
+impl Default for HighRefreshAdvisory {
+    fn default() -> Self {
+        Self {
+            level: HighRefreshLevel::Optimal,
+            reason: HighRefreshReason::Optimal,
+            can_enable_hevc: false,
+            recommended_width: None,
+            recommended_height: None,
+        }
+    }
+}
+
 /// 一条可供前端分辨率菜单展示的等比分辨率预设。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DisplayPreset {
@@ -67,8 +180,14 @@ pub enum DisplayControlMsg {
         /// 被控端权威计算或上报的可选分辨率预设列表（为空时由控制端按原生宽高比回退生成）。
         #[serde(default)]
         presets: Vec<DisplayPreset>,
+        /// 当前生效视频编码器（`"hevc"` 或 `"h264"`；旧版被控端未上报时为 `None`）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_codec: Option<String>,
+        /// 被控端支持的硬件视频编码器列表（如 `["hevc", "h264"]`；旧版未上报时为空）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        supported_codecs: Vec<String>,
     },
-    /// 控制端 → 被控端：请求热切换视频流的分辨率与帧率。
+    /// 控制端 → 被控端：请求热切换视频流的分辨率与帧率（可选附带目标编解码器实现单次原子重建）。
     SetStream {
         /// 目标视频宽度（像素；`0` 表示保持当前分辨率）。
         width: u32,
@@ -76,6 +195,9 @@ pub enum DisplayControlMsg {
         height: u32,
         /// 目标帧率（fps；`0` 表示保持当前帧率）。
         fps: u32,
+        /// 可选目标编解码器（`"hevc"` / `"h264"`；旧版控制端不发送时保持当前编解码器）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codec: Option<String>,
     },
     /// 控制端 → 被控端：请求切换或协商视频编解码器（如 `"hevc"` / `"h264"`）。
     SetCodec {
@@ -326,6 +448,194 @@ pub fn build_resolution_presets(
     presets
 }
 
+/// 判断给定 `(width, height, fps)` 是否落入指定编码器的高刷满帧甜点（非高刷 `< 90fps` 恒为 `true`）。
+pub fn is_within_high_refresh_sweet_spot(
+    width: u32,
+    height: u32,
+    fps: u32,
+    codec: StreamCodec,
+) -> bool {
+    if fps < HIGH_REFRESH_FPS_THRESHOLD || width == 0 || height == 0 {
+        return true;
+    }
+    let pixel_rate = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(u64::from(fps));
+    pixel_rate <= codec.high_refresh_max_pixel_rate()
+}
+
+/// 从预设列表中挑选给定帧率与编码器下的推荐高刷满帧分辨率（甜点内像素最高者，平局偏好原生/HiDPI；无甜点匹配时回退最低像素预设）。
+pub fn select_recommended_preset(
+    presets: &[DisplayPreset],
+    fps: u32,
+    codec: StreamCodec,
+) -> Option<(u32, u32)> {
+    let best_in_budget = presets
+        .iter()
+        .filter(|p| is_within_high_refresh_sweet_spot(p.width, p.height, fps, codec))
+        .max_by_key(|p| {
+            let pixels = u64::from(p.width).saturating_mul(u64::from(p.height));
+            (pixels, p.is_native, p.is_hidpi)
+        });
+    best_in_budget
+        .or_else(|| {
+            presets.iter().min_by_key(|p| {
+                let pixels = u64::from(p.width).saturating_mul(u64::from(p.height));
+                (pixels, !p.is_native, !p.is_hidpi)
+            })
+        })
+        .map(|p| (p.width, p.height))
+}
+
+/// 评估当前（或目标）分辨率、帧率与编解码器组合的高刷预期与 HEVC 升级建议。
+pub fn evaluate_high_refresh_advisory(
+    width: u32,
+    height: u32,
+    fps: u32,
+    current_codec: StreamCodec,
+    host_supports_hevc: bool,
+    client_supports_hevc: bool,
+    presets: &[DisplayPreset],
+) -> HighRefreshAdvisory {
+    if fps < HIGH_REFRESH_FPS_THRESHOLD || width == 0 || height == 0 {
+        return HighRefreshAdvisory::default();
+    }
+    let pixel_rate = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(u64::from(fps));
+
+    match current_codec {
+        StreamCodec::Hevc => {
+            if pixel_rate <= HEVC_HIGH_REFRESH_MAX_PIXEL_RATE {
+                HighRefreshAdvisory::default()
+            } else {
+                let rec = select_recommended_preset(presets, fps, StreamCodec::Hevc);
+                HighRefreshAdvisory {
+                    level: HighRefreshLevel::AboveSweetSpot,
+                    reason: HighRefreshReason::HevcOverBudget,
+                    can_enable_hevc: false,
+                    recommended_width: rec.map(|(w, _)| w),
+                    recommended_height: rec.map(|(_, h)| h),
+                }
+            }
+        }
+        StreamCodec::H264 => {
+            if pixel_rate <= H264_HIGH_REFRESH_MAX_PIXEL_RATE {
+                HighRefreshAdvisory::default()
+            } else if host_supports_hevc && client_supports_hevc {
+                let level = if pixel_rate <= HEVC_HIGH_REFRESH_MAX_PIXEL_RATE {
+                    HighRefreshLevel::SuggestHevc
+                } else {
+                    HighRefreshLevel::AboveSweetSpot
+                };
+                let rec = select_recommended_preset(presets, fps, StreamCodec::Hevc);
+                HighRefreshAdvisory {
+                    level,
+                    reason: HighRefreshReason::H264SuggestHevc,
+                    can_enable_hevc: true,
+                    recommended_width: rec.map(|(w, _)| w),
+                    recommended_height: rec.map(|(_, h)| h),
+                }
+            } else {
+                let rec = select_recommended_preset(presets, fps, StreamCodec::H264);
+                HighRefreshAdvisory {
+                    level: HighRefreshLevel::AboveSweetSpot,
+                    reason: HighRefreshReason::H264NoHevc,
+                    can_enable_hevc: false,
+                    recommended_width: rec.map(|(w, _)| w),
+                    recommended_height: rec.map(|(_, h)| h),
+                }
+            }
+        }
+    }
+}
+
+/// 将分辨率预设拆分为「一级主菜单（最多 `primary_limit` 项）」与「其他分辨率二级菜单」。
+///
+/// 避免按像素纯降序导致 14" MBP 的原生 HiDPI（`1512×982`）与高刷甜点档被挤进二级菜单：
+/// - 若总数 `<= primary_limit + 1`，全部放一级菜单（不建只有 1 项的「其他分辨率」）；
+/// - 否则一级菜单优先收录：① 原生逻辑分辨率；② 当前生效分辨率；③ 高刷满帧甜点内最高清晰度档；
+///   ④ 最高超清物理档；⑤ 其余按 HiDPI 优先 + 分辨率降序补足至 `primary_limit`。
+pub fn partition_presets_for_menu(
+    presets: &[DisplayPreset],
+    current_width: u32,
+    current_height: u32,
+    fps: u32,
+    codec: StreamCodec,
+    primary_limit: usize,
+) -> (Vec<DisplayPreset>, Vec<DisplayPreset>) {
+    let limit = primary_limit.max(1);
+    if presets.len() <= limit.saturating_add(1) {
+        let mut primary = presets.to_vec();
+        primary.sort_by_key(|p| (!p.is_native, std::cmp::Reverse((p.height, p.width))));
+        return (primary, Vec::new());
+    }
+
+    let mut chosen = vec![false; presets.len()];
+    let mut primary = Vec::with_capacity(limit);
+
+    let mut pick = |idx: usize| {
+        if primary.len() < limit && idx < presets.len() && !chosen[idx] {
+            chosen[idx] = true;
+            primary.push(presets[idx].clone());
+        }
+    };
+
+    // 1) 原生逻辑分辨率必在一级菜单
+    if let Some(idx) = presets.iter().position(|p| p.is_native) {
+        pick(idx);
+    }
+
+    // 2) 当前正在使用的分辨率（若已选中且不在原生上）
+    if current_width > 0 && current_height > 0 {
+        if let Some(idx) = presets.iter().position(|p| {
+            p.width.abs_diff(current_width) <= 2 && p.height.abs_diff(current_height) <= 2
+        }) {
+            pick(idx);
+        }
+    }
+
+    // 3) 高刷甜点内像素最高的清晰度档位（如 2560×1600 / 1920×1200）
+    if let Some((rec_w, rec_h)) = select_recommended_preset(presets, fps, codec) {
+        if let Some(idx) = presets
+            .iter()
+            .position(|p| p.width == rec_w && p.height == rec_h)
+        {
+            pick(idx);
+        }
+    }
+
+    // 4) 最高物理分辨率档（如 3024×1964 / 3840×2160）保持直达入口
+    if let Some((idx, _)) = presets
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, p)| (p.width, p.height))
+    {
+        pick(idx);
+    }
+
+    // 5) 先补常用 HiDPI 档，再按像素降序补齐至 limit
+    for (idx, p) in presets.iter().enumerate() {
+        if p.is_hidpi {
+            pick(idx);
+        }
+    }
+    for idx in 0..presets.len() {
+        pick(idx);
+    }
+
+    // 一级菜单内按「原生置顶 → 其余按分辨率降序」排布，清晰稳定
+    primary.sort_by_key(|p| (!p.is_native, std::cmp::Reverse((p.height, p.width))));
+
+    let rest = presets
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !chosen[*idx])
+        .map(|(_, p)| p.clone())
+        .collect();
+    (primary, rest)
+}
+
 /// 将 [`DisplayControlMsg`] 序列化为 JSON 字节；超限（`> MAX_DISPLAY_CTRL_BYTES`）或序列化失败返回 `None`。
 pub fn encode_display_ctrl(msg: &DisplayControlMsg) -> Option<Vec<u8>> {
     let bytes = serde_json::to_vec(msg).ok()?;
@@ -473,11 +783,13 @@ mod tests {
             max_height: 1964,
             max_fps: 144,
             presets: build_resolution_presets(1512, 982, 3024, 1964),
+            current_codec: Some("hevc".to_string()),
+            supported_codecs: vec!["hevc".to_string(), "h264".to_string()],
         };
         let encoded_caps = encode_display_ctrl(&caps).expect("encode capabilities");
         assert_eq!(decode_display_ctrl(&encoded_caps), Some(caps));
 
-        // 兼容旧版缺少 `presets` 字段的 JSON
+        // 兼容旧版缺少 `presets` / `current_codec` / `supported_codecs` 字段的 JSON
         let legacy_json = serde_json::json!({
             "kind": "capabilities",
             "current_width": 1920,
@@ -503,6 +815,8 @@ mod tests {
                 max_height: 1080,
                 max_fps: 144,
                 presets: Vec::new(),
+                current_codec: None,
+                supported_codecs: Vec::new(),
             }
         );
 
@@ -510,9 +824,23 @@ mod tests {
             width: 2218,
             height: 1440,
             fps: 144,
+            codec: None,
         };
         let encoded_set = encode_display_ctrl(&set_stream).expect("encode set_stream");
         assert_eq!(decode_display_ctrl(&encoded_set), Some(set_stream));
+
+        let set_stream_hevc = DisplayControlMsg::SetStream {
+            width: 2560,
+            height: 1600,
+            fps: 120,
+            codec: Some("hevc".to_string()),
+        };
+        let encoded_set_hevc =
+            encode_display_ctrl(&set_stream_hevc).expect("encode set_stream_hevc");
+        assert_eq!(
+            decode_display_ctrl(&encoded_set_hevc),
+            Some(set_stream_hevc)
+        );
 
         let wallpaper = DisplayControlMsg::Wallpaper {
             mime: "image/jpeg".to_string(),
@@ -582,5 +910,244 @@ mod tests {
             fit_target_preserving_aspect(1280, 720, 1920, 1080, 3840, 2160),
             (1280, 720)
         );
+    }
+
+    #[test]
+    fn high_refresh_advisory_matches_m1_pro_sweet_spots() {
+        let mbp_modes = vec![
+            DisplayPreset {
+                width: 3024,
+                height: 1964,
+                label: "3024 × 1964".to_string(),
+                is_native: false,
+                is_hidpi: false,
+            },
+            DisplayPreset {
+                width: 2560,
+                height: 1600,
+                label: "2560 × 1600".to_string(),
+                is_native: false,
+                is_hidpi: false,
+            },
+            DisplayPreset {
+                width: 1920,
+                height: 1200,
+                label: "1920 × 1200".to_string(),
+                is_native: false,
+                is_hidpi: false,
+            },
+            DisplayPreset {
+                width: 1512,
+                height: 982,
+                label: "1512 × 982 (HiDPI)".to_string(),
+                is_native: true,
+                is_hidpi: true,
+            },
+        ];
+
+        // 60fps 下 3024×1964 H.264 不打扰
+        let at_60 = evaluate_high_refresh_advisory(
+            3024,
+            1964,
+            60,
+            StreamCodec::H264,
+            true,
+            true,
+            &mbp_modes,
+        );
+        assert_eq!(at_60.level, HighRefreshLevel::Optimal);
+        assert!(!at_60.can_enable_hevc);
+
+        // 120fps 下 1512×982 与 1920×1200 即使 H.264 也在甜点内
+        for (w, h) in [(1512, 982), (1920, 1200)] {
+            let adv = evaluate_high_refresh_advisory(
+                w,
+                h,
+                120,
+                StreamCodec::H264,
+                true,
+                true,
+                &mbp_modes,
+            );
+            assert_eq!(adv.level, HighRefreshLevel::Optimal, "{w}x{h}@120 H.264");
+        }
+
+        // 2560×1600@120：H.264 建议切 HEVC（切完即可满帧），HEVC 直接 Optimal
+        let mid_h264 = evaluate_high_refresh_advisory(
+            2560,
+            1600,
+            120,
+            StreamCodec::H264,
+            true,
+            true,
+            &mbp_modes,
+        );
+        assert_eq!(mid_h264.level, HighRefreshLevel::SuggestHevc);
+        assert_eq!(mid_h264.reason, HighRefreshReason::H264SuggestHevc);
+        assert!(mid_h264.can_enable_hevc);
+        assert_eq!(
+            (mid_h264.recommended_width, mid_h264.recommended_height),
+            (Some(2560), Some(1600))
+        );
+
+        let mid_hevc = evaluate_high_refresh_advisory(
+            2560,
+            1600,
+            120,
+            StreamCodec::Hevc,
+            true,
+            true,
+            &mbp_modes,
+        );
+        assert_eq!(mid_hevc.level, HighRefreshLevel::Optimal);
+
+        // 3024×1964@120：H.264 且双端支持 HEVC → AboveSweetSpot + can_enable_hevc=true + 推荐 2560×1600
+        let retina_h264_can_hevc = evaluate_high_refresh_advisory(
+            3024,
+            1964,
+            120,
+            StreamCodec::H264,
+            true,
+            true,
+            &mbp_modes,
+        );
+        assert_eq!(retina_h264_can_hevc.level, HighRefreshLevel::AboveSweetSpot);
+        assert_eq!(
+            retina_h264_can_hevc.reason,
+            HighRefreshReason::H264SuggestHevc
+        );
+        assert!(retina_h264_can_hevc.can_enable_hevc);
+        assert_eq!(
+            (
+                retina_h264_can_hevc.recommended_width,
+                retina_h264_can_hevc.recommended_height
+            ),
+            (Some(2560), Some(1600))
+        );
+
+        // 3024×1964@120：H.264 且客户端不支持 HEVC → H264NoHevc + 推荐 1920×1200
+        let retina_h264_no_hevc = evaluate_high_refresh_advisory(
+            3024,
+            1964,
+            120,
+            StreamCodec::H264,
+            true,
+            false,
+            &mbp_modes,
+        );
+        assert_eq!(retina_h264_no_hevc.level, HighRefreshLevel::AboveSweetSpot);
+        assert_eq!(retina_h264_no_hevc.reason, HighRefreshReason::H264NoHevc);
+        assert!(!retina_h264_no_hevc.can_enable_hevc);
+        assert_eq!(
+            (
+                retina_h264_no_hevc.recommended_width,
+                retina_h264_no_hevc.recommended_height
+            ),
+            (Some(1920), Some(1200))
+        );
+
+        // 3024×1964@120：已是 HEVC → HevcOverBudget + 推荐 2560×1600
+        let retina_hevc = evaluate_high_refresh_advisory(
+            3024,
+            1964,
+            120,
+            StreamCodec::Hevc,
+            true,
+            true,
+            &mbp_modes,
+        );
+        assert_eq!(retina_hevc.level, HighRefreshLevel::AboveSweetSpot);
+        assert_eq!(retina_hevc.reason, HighRefreshReason::HevcOverBudget);
+        assert!(!retina_hevc.can_enable_hevc);
+        assert_eq!(
+            (
+                retina_hevc.recommended_width,
+                retina_hevc.recommended_height
+            ),
+            (Some(2560), Some(1600))
+        );
+    }
+
+    #[test]
+    fn partition_presets_for_menu_surfaces_native_hidpi_and_sweet_spot() {
+        let mbp_all = vec![
+            DisplayPreset {
+                width: 3024,
+                height: 1964,
+                label: "3024 × 1964".into(),
+                is_native: false,
+                is_hidpi: false,
+            },
+            DisplayPreset {
+                width: 3024,
+                height: 1890,
+                label: "3024 × 1890".into(),
+                is_native: false,
+                is_hidpi: false,
+            },
+            DisplayPreset {
+                width: 2704,
+                height: 1756,
+                label: "2704 × 1756".into(),
+                is_native: false,
+                is_hidpi: false,
+            },
+            DisplayPreset {
+                width: 2560,
+                height: 1600,
+                label: "2560 × 1600".into(),
+                is_native: false,
+                is_hidpi: false,
+            },
+            DisplayPreset {
+                width: 1920,
+                height: 1200,
+                label: "1920 × 1200".into(),
+                is_native: false,
+                is_hidpi: false,
+            },
+            DisplayPreset {
+                width: 1800,
+                height: 1169,
+                label: "1800 × 1169 (HiDPI)".into(),
+                is_native: false,
+                is_hidpi: true,
+            },
+            DisplayPreset {
+                width: 1512,
+                height: 982,
+                label: "1512 × 982 (HiDPI)".into(),
+                is_native: true,
+                is_hidpi: true,
+            },
+            DisplayPreset {
+                width: 1280,
+                height: 800,
+                label: "1280 × 800 (HiDPI)".into(),
+                is_native: false,
+                is_hidpi: true,
+            },
+        ];
+
+        let (primary, rest) =
+            partition_presets_for_menu(&mbp_all, 1512, 982, 120, StreamCodec::Hevc, 5);
+        assert_eq!(primary.len(), 5);
+        assert_eq!(rest.len(), 3);
+        // 原生 HiDPI 必须置顶，HEVC 高刷甜点 2704×1756（4.75M px ≤ 5.0M px）与超清 3024×1964 均在一级菜单可见
+        assert!(primary[0].is_native);
+        assert_eq!((primary[0].width, primary[0].height), (1512, 982));
+        assert!(primary.iter().any(|p| p.width == 2704 && p.height == 1756));
+        assert!(primary.iter().any(|p| p.width == 3024 && p.height == 1964));
+
+        // H.264 120fps 下甜点档为 1920×1200（2.30M px ≤ 2.33M px），同样必须进入一级菜单
+        let (primary_h264, _) =
+            partition_presets_for_menu(&mbp_all, 1512, 982, 120, StreamCodec::H264, 5);
+        assert!(primary_h264[0].is_native);
+        assert!(primary_h264
+            .iter()
+            .any(|p| p.width == 1920 && p.height == 1200));
+        assert!(primary_h264
+            .iter()
+            .any(|p| p.width == 3024 && p.height == 1964));
     }
 }

@@ -501,6 +501,7 @@ fn live_display_reconfigure_updates_resolution_fps_and_keeps_streaming() {
                 native_height: 1080,
                 max_fps: 380,
                 presets,
+                ..
             } if presets.iter().any(|p| p.is_native && p.width == 1920 && p.height == 1080)
                 && presets.iter().any(|p| p.width == 1280 && p.height == 720)
         )),

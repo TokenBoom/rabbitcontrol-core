@@ -256,10 +256,9 @@ impl Scheduler {
     ) -> Decision {
         self.stats.captured += 1;
 
-        // R3: 重复帧
+        // R3: 重复帧（编码前跳过，不破坏参考链，绝不计入关键帧触发计数）
         if is_repeat {
             self.stats.dropped_repeat += 1;
-            self.consecutive_drops += 1;
             return Decision::Drop {
                 seq,
                 reason: DropReason::Repeat,
@@ -282,9 +281,11 @@ impl Scheduler {
 
         // R1: 预算满 → 丢弃当前到达帧（见 on_captured 文档的实测修正说明：
         // 硬件编码无法中途取消，逐出在途帧 = 反复作废在制工作的活锁）。
+        // 到达帧尚未进入编码器，编码端与解码端参考链完全无损，不计入 consecutive_drops，
+        // 避免高分辨率过载时误插昂贵 IDR 造成掉帧正反馈；若被丢帧本身是 IDR，
+        // 仍通过 `needs_keyframe: !kind.is_droppable()` 粘住关键帧请求。
         if self.in_flight.len() >= self.cfg.max_in_flight {
             self.stats.dropped_budget += 1;
-            self.consecutive_drops += 1;
             return Decision::Drop {
                 seq,
                 reason: DropReason::Budget,
@@ -562,17 +563,23 @@ mod tests {
         assert!(!s.on_encoded(FrameSeq(999), TS0));
     }
 
-    /// 连续丢帧达阈值后必须请求关键帧，且只请求一次
+    /// 连续超期丢帧达阈值后必须请求关键帧，且只请求一次
     #[test]
     fn consecutive_drops_trigger_single_keyframe_request() {
         let mut s = sched();
         for i in 0..3 {
             let seq = s.alloc_seq();
-            s.on_captured(seq, FrameKind::P, true, Timestamp(TS0 + i), TS0 + i);
+            s.on_captured(
+                seq,
+                FrameKind::P,
+                false,
+                Timestamp(TS0 + i),
+                TS0 + i + 30_000,
+            );
         }
         assert!(
             s.take_keyframe_request(),
-            "3 consecutive drops must request keyframe"
+            "3 consecutive stale drops must request keyframe"
         );
         assert!(
             !s.take_keyframe_request(),
@@ -582,13 +589,75 @@ mod tests {
     }
 
     #[test]
+    fn repeat_drops_do_not_trigger_spurious_keyframe_request() {
+        let mut s = sched();
+        for i in 0..10 {
+            let seq = s.alloc_seq();
+            let d = s.on_captured(seq, FrameKind::P, true, Timestamp(TS0 + i), TS0 + i);
+            assert!(matches!(
+                d,
+                Decision::Drop {
+                    reason: DropReason::Repeat,
+                    needs_keyframe: false,
+                    ..
+                }
+            ));
+        }
+        assert!(
+            !s.take_keyframe_request(),
+            "repeat drops must not break reference chain or request IDR"
+        );
+        assert_eq!(s.stats().keyframe_requests, 0);
+    }
+
+    #[test]
+    fn budget_drops_do_not_trigger_spurious_keyframe_request() {
+        let mut s = sched();
+        let a = s.alloc_seq();
+        let b = s.alloc_seq();
+        s.on_captured(a, FrameKind::P, false, Timestamp(TS0), TS0 + 100);
+        s.on_captured(b, FrameKind::P, false, Timestamp(TS0 + 1000), TS0 + 1100);
+
+        // 连续 6 帧因在途预算满在编码前被丢弃：参考链未断，不应误触 IDR 风暴。
+        for i in 0..6u32 {
+            let seq = s.alloc_seq();
+            let ts = TS0 + 2_000 + i * 1_000;
+            let d = s.on_captured(seq, FrameKind::P, false, Timestamp(ts), ts + 100);
+            assert!(matches!(
+                d,
+                Decision::Drop {
+                    reason: DropReason::Budget,
+                    needs_keyframe: false,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(s.stats().dropped_budget, 6);
+        assert!(
+            !s.take_keyframe_request(),
+            "pre-encode budget drops must not trigger spurious IDR"
+        );
+        assert_eq!(s.stats().keyframe_requests, 0);
+    }
+
+    #[test]
     fn successful_encode_resets_drop_counter() {
         let mut s = sched();
         let a = s.alloc_seq();
-        s.on_captured(a, FrameKind::P, true, Timestamp(TS0), TS0);
+        s.on_captured(a, FrameKind::P, false, Timestamp(TS0), TS0 + 30_000);
         let b = s.alloc_seq();
         s.on_captured(b, FrameKind::P, false, Timestamp(TS0 + 10), TS0 + 20);
-        // 计数已重置，不应请求关键帧
+        // 计数已重置，再丢 2 次仍不足阈值 3，不应请求关键帧
+        for i in 0..2 {
+            let seq = s.alloc_seq();
+            s.on_captured(
+                seq,
+                FrameKind::P,
+                false,
+                Timestamp(TS0 + 100 + i),
+                TS0 + 30_100 + i,
+            );
+        }
         assert!(!s.take_keyframe_request());
     }
 

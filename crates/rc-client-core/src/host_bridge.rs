@@ -784,11 +784,6 @@ fn make_host_pipeline_factory(
                         }
                     }
                 }
-                if final_try.is_err() && hw_cfg.codec == rc_encode::Codec::Hevc {
-                    let mut h264_cfg = hw_cfg.clone();
-                    h264_cfg.codec = rc_encode::Codec::H264;
-                    final_try = real_host_stack(&h264_cfg, existing_host_us);
-                }
                 match final_try {
                     Ok((p, l, origin_us)) => {
                         *backend_label.lock().unwrap_or_else(|e| e.into_inner()) = l;
@@ -800,10 +795,13 @@ fn make_host_pipeline_factory(
                     Err(err) => {
                         if hardware_video_active.load(Ordering::Acquire) {
                             // 活跃硬件会话热切换失败时绝不降级到 FakeEncoder（否则对端 VtDecoder
-                            // 持续收到非 H.264 伪帧导致黑屏），直接上报错误。
+                            // 持续收到非 H.264 伪帧导致黑屏），直接返回错误；
+                            // 若本次是 HEVC 尝试，HostSession 会透明回退 H.264，因此仅记录 stderr 不弹错误横幅。
                             let message = format!("硬件分辨率/帧率热切换失败：{err}");
                             eprintln!("[rc-ui-host] {message}");
-                            updates.push(HostUpdate::Error { message });
+                            if hw_cfg.codec != rc_encode::Codec::Hevc {
+                                updates.push(HostUpdate::Error { message });
+                            }
                             return Err(err);
                         }
                         // 注意：在 macOS 上若 SCK / VideoToolbox 初始化失败（常见原因：缺少「屏幕录制」
@@ -1812,15 +1810,27 @@ fn build_hardware_display_presets(
     presets
 }
 
+/// 计算当前被控端对外声明支持的视频编解码器列表（硬件路径且平台/运行时支持 HEVC 时优先列出 `"hevc"`）。
+fn host_supported_codecs(hevc_available: bool) -> Vec<String> {
+    if hevc_available {
+        vec!["hevc".to_string(), "h264".to_string()]
+    } else {
+        vec!["h264".to_string()]
+    }
+}
+
 /// 编码当前被控端 `DisplayControlMsg::Capabilities` 载荷。
 fn encode_host_display_caps(
     host: &HostSession,
     native_res: Resolution,
     max_res: Resolution,
     presets: Vec<DisplayPreset>,
+    hevc_available: bool,
 ) -> Option<Vec<u8>> {
     let cur = host.negotiated()?;
     let max_fps = host.caps().fps.max(1);
+    let current_codec = Some(host.active_codec().as_str().to_string());
+    let supported_codecs = host_supported_codecs(hevc_available);
     display_ctrl::encode_display_ctrl(&DisplayControlMsg::Capabilities {
         current_width: cur.width,
         current_height: cur.height,
@@ -1831,6 +1841,8 @@ fn encode_host_display_caps(
         max_height: max_res.height,
         max_fps,
         presets,
+        current_codec,
+        supported_codecs,
     })
 }
 
@@ -2142,6 +2154,11 @@ fn drive_ui_host_session_inner(
         None
     };
 
+    let mut hevc_runtime_failed = false;
+    let host_hevc_available = |failed: bool| {
+        prefer_hardware && hardware_video_active && !failed && rc_pipeline::platform_supports_hevc()
+    };
+
     if host.state() == SessionState::Streaming {
         let presets = build_hardware_display_presets(
             prefer_hardware,
@@ -2153,6 +2170,7 @@ fn drive_ui_host_session_inner(
             original_native_res.unwrap_or(session_native_res),
             session_max_res,
             presets,
+            host_hevc_available(hevc_runtime_failed),
         ) {
             pending_display_tx.push_back(payload);
         }
@@ -2312,9 +2330,24 @@ fn drive_ui_host_session_inner(
                                             width,
                                             height,
                                             fps,
+                                            codec,
                                         }) => {
                                             if let Some(cur) = host.negotiated() {
                                                 let target_fps = (fps > 0).then_some(fps);
+                                                let requested_codec = codec
+                                                    .as_deref()
+                                                    .and_then(
+                                                        display_ctrl::StreamCodec::parse_lossy,
+                                                    )
+                                                    .and_then(|c| match c {
+                                                        display_ctrl::StreamCodec::Hevc => {
+                                                            host_hevc_available(hevc_runtime_failed)
+                                                                .then_some(rc_encode::Codec::Hevc)
+                                                        }
+                                                        display_ctrl::StreamCodec::H264 => {
+                                                            Some(rc_encode::Codec::H264)
+                                                        }
+                                                    });
                                                 if width > 0 && height > 0 {
                                                     if let Ok(switched_res) = display_mode_session
                                                         .switch_to(width, height)
@@ -2335,14 +2368,17 @@ fn drive_ui_host_session_inner(
                                                                 .height
                                                                 .max(switched_res.height),
                                                         };
-                                                        if let Err(err) = host.reconfigure_stream(
-                                                            switched_res.width,
-                                                            switched_res.height,
-                                                            target_fps,
-                                                            Some(switched_res),
-                                                        ) {
+                                                        if let Err(err) = host
+                                                            .reconfigure_stream_with_codec(
+                                                                switched_res.width,
+                                                                switched_res.height,
+                                                                target_fps,
+                                                                Some(switched_res),
+                                                                requested_codec,
+                                                            )
+                                                        {
                                                             eprintln!(
-                                                        "[rc-ui-host] 热切换流参数 ({}x{}@{fps}fps) 失败: {err}",
+                                                        "[rc-ui-host] 热切换流参数 ({}x{}@{fps}fps, {requested_codec:?}) 失败: {err}",
                                                         switched_res.width, switched_res.height
                                                     );
                                                         }
@@ -2356,27 +2392,38 @@ fn drive_ui_host_session_inner(
                                                                 session_max_res.width,
                                                                 session_max_res.height,
                                                             );
-                                                        if let Err(err) = host.reconfigure_stream(
-                                                            target_w,
-                                                            target_h,
-                                                            target_fps,
-                                                            Some(session_max_res),
-                                                        ) {
+                                                        if let Err(err) = host
+                                                            .reconfigure_stream_with_codec(
+                                                                target_w,
+                                                                target_h,
+                                                                target_fps,
+                                                                Some(session_max_res),
+                                                                requested_codec,
+                                                            )
+                                                        {
                                                             eprintln!(
-                                                        "[rc-ui-host] 热切换流参数 ({target_w}x{target_h}@{fps}fps) 失败: {err}"
+                                                        "[rc-ui-host] 热切换流参数 ({target_w}x{target_h}@{fps}fps, {requested_codec:?}) 失败: {err}"
                                                     );
                                                         }
                                                     }
-                                                } else if let Err(err) = host.reconfigure_stream(
-                                                    cur.width,
-                                                    cur.height,
-                                                    target_fps,
-                                                    Some(session_max_res),
-                                                ) {
+                                                } else if let Err(err) = host
+                                                    .reconfigure_stream_with_codec(
+                                                        cur.width,
+                                                        cur.height,
+                                                        target_fps,
+                                                        Some(session_max_res),
+                                                        requested_codec,
+                                                    )
+                                                {
                                                     eprintln!(
-                                                "[rc-ui-host] 热切换流参数 ({}x{}@{fps}fps) 失败: {err}",
+                                                "[rc-ui-host] 热切换流参数 ({}x{}@{fps}fps, {requested_codec:?}) 失败: {err}",
                                                 cur.width, cur.height
                                             );
+                                                }
+                                                if requested_codec == Some(rc_encode::Codec::Hevc)
+                                                    && host.active_codec() != rc_encode::Codec::Hevc
+                                                {
+                                                    hevc_runtime_failed = true;
                                                 }
                                                 let presets = build_hardware_display_presets(
                                                     prefer_hardware,
@@ -2389,6 +2436,7 @@ fn drive_ui_host_session_inner(
                                                         .unwrap_or(session_native_res),
                                                     session_max_res,
                                                     presets,
+                                                    host_hevc_available(hevc_runtime_failed),
                                                 ) {
                                                     pending_display_tx.push_back(caps_payload);
                                                 }
@@ -2401,15 +2449,17 @@ fn drive_ui_host_session_inner(
                                             );
                                         }
                                         Some(DisplayControlMsg::SetCodec { codec }) => {
-                                            let target_codec = if codec.eq_ignore_ascii_case("hevc")
-                                                && rc_pipeline::platform_supports_hevc()
-                                            {
-                                                Some(rc_encode::Codec::Hevc)
-                                            } else if codec.eq_ignore_ascii_case("h264") {
-                                                Some(rc_encode::Codec::H264)
-                                            } else {
-                                                None
-                                            };
+                                            let target_codec =
+                                                display_ctrl::StreamCodec::parse_lossy(&codec)
+                                                    .and_then(|c| match c {
+                                                        display_ctrl::StreamCodec::Hevc => {
+                                                            host_hevc_available(hevc_runtime_failed)
+                                                                .then_some(rc_encode::Codec::Hevc)
+                                                        }
+                                                        display_ctrl::StreamCodec::H264 => {
+                                                            Some(rc_encode::Codec::H264)
+                                                        }
+                                                    });
                                             if let (Some(c), Some(cur)) =
                                                 (target_codec, host.negotiated())
                                             {
@@ -2426,6 +2476,26 @@ fn drive_ui_host_session_inner(
                                                         "[rc-ui-host] 热切换编解码器 ({c:?}) 失败（保持当前管线）: {err}"
                                                     );
                                                 }
+                                                if c == rc_encode::Codec::Hevc
+                                                    && host.active_codec() != rc_encode::Codec::Hevc
+                                                {
+                                                    hevc_runtime_failed = true;
+                                                }
+                                            }
+                                            // 无论切换成功、幂等或拒绝，均回推最新 Capabilities，让控制端获知权威生效 codec。
+                                            let presets = build_hardware_display_presets(
+                                                prefer_hardware,
+                                                hardware_video_active,
+                                                original_native_res,
+                                            );
+                                            if let Some(caps_payload) = encode_host_display_caps(
+                                                host,
+                                                original_native_res.unwrap_or(session_native_res),
+                                                session_max_res,
+                                                presets,
+                                                host_hevc_available(hevc_runtime_failed),
+                                            ) {
+                                                pending_display_tx.push_back(caps_payload);
                                             }
                                         }
                                         _ => {}
@@ -2507,8 +2577,17 @@ fn drive_ui_host_session_inner(
                             None => false,
                         };
 
+                        if !host.has_pipeline() {
+                            drive_err =
+                                Some("硬件视频管线热重建失败且无法恢复，会话已终止".to_string());
+                            break;
+                        }
+
                         last_busy = r.busy || tools_busy || audio_busy;
-                        if !last_busy && host.state() == SessionState::Streaming {
+                        if !last_busy
+                            && host.state() == SessionState::Streaming
+                            && host.has_pipeline()
+                        {
                             let wait_ms =
                                 if pending_file_in.is_empty() && pending_display_tx.is_empty() {
                                     2
@@ -2565,6 +2644,7 @@ fn drive_ui_host_session_inner(
                             original_native_res.unwrap_or(session_native_res),
                             session_max_res,
                             presets,
+                            host_hevc_available(hevc_runtime_failed),
                         ) {
                             pending_display_tx.push_back(payload);
                         }
@@ -2577,6 +2657,7 @@ fn drive_ui_host_session_inner(
                         if let Some(orig) = original_native_res {
                             host.set_injector_screen_size(orig.width, orig.height);
                         }
+                        hevc_runtime_failed = false;
                         last_busy = true;
                         host.reset_clipboard_epoch();
                         audio_muted = false;
@@ -2601,6 +2682,7 @@ fn drive_ui_host_session_inner(
                             original_native_res.unwrap_or(session_native_res),
                             session_max_res,
                             presets,
+                            host_hevc_available(hevc_runtime_failed),
                         ) {
                             pending_display_tx.push_back(payload);
                         }
