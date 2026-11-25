@@ -19,6 +19,7 @@ members = [
     "crates/rc-audio",
     "crates/rc-tools",
     "crates/rc-client-core",
+    "crates/rc-mobile-ffi",
 ]
 
 [workspace.package]
