@@ -1366,6 +1366,7 @@ impl HostHandle {
             clipboard_enabled: cfg.clipboard_enabled,
             audio_enabled: cfg.audio_enabled,
             forbid_passwordless_auto_approve: cfg.forbid_passwordless_auto_approve,
+            ephemeral_listen_port: cfg.listen_addr.port() == 0,
         };
 
         let t_updates = Arc::clone(&updates);
@@ -1586,6 +1587,7 @@ struct HostWorkerOptions {
     clipboard_enabled: bool,
     audio_enabled: bool,
     forbid_passwordless_auto_approve: bool,
+    ephemeral_listen_port: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4154,7 +4156,7 @@ fn run_host_worker(
                         }
                     }
                     if rebuilt.is_none()
-                        && actual_addr.port() == DEFAULT_HOST_PORT
+                        && (actual_addr.port() == DEFAULT_HOST_PORT || opts.ephemeral_listen_port)
                         && !stop_flag.load(Ordering::Acquire)
                     {
                         let fallback_addr = SocketAddr::new(actual_addr.ip(), 0);

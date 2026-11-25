@@ -896,6 +896,16 @@ fn awaiting_mtls_cert_never_downgrades_to_plain_and_recovers_once_cert_installed
     })
     .expect("spawn host awaiting mTLS cert");
 
+    let init_updates = collect_host_until(&host, Duration::from_secs(5), |us| {
+        us.iter().any(|u| matches!(u, HostUpdate::Listening { .. }))
+    });
+    assert!(
+        init_updates
+            .iter()
+            .any(|u| matches!(u, HostUpdate::Listening { .. })),
+        "initial awaiting-mTLS host did not emit Listening: {init_updates:?}"
+    );
+
     // 1) 未签发证书前禁止静默降级为 Plain：明文连接不得成功协商
     let plain_cfg = UiSessionConfig {
         connect_addr: host.listen_addr(),
@@ -930,6 +940,7 @@ fn awaiting_mtls_cert_never_downgrades_to_plain_and_recovers_once_cert_installed
     s_plain.join();
 
     // 2) 补齐证书并热更新后，自动切换至 MtlsLan 并完成 mTLS 建连
+    while host.try_recv_update().is_some() {}
     host.set_mtls_config(
         Some(SessionMtlsBundle {
             ca_cert_pem: ca.ca_pem.clone(),
@@ -941,7 +952,16 @@ fn awaiting_mtls_cert_never_downgrades_to_plain_and_recovers_once_cert_installed
         }),
         true,
     );
-    std::thread::sleep(Duration::from_millis(450));
+    let host_ready = collect_host_until(&host, Duration::from_secs(10), |us| {
+        us.iter()
+            .any(|u| matches!(u, HostUpdate::Listening { .. } | HostUpdate::Error { .. }))
+    });
+    assert!(
+        host_ready
+            .iter()
+            .any(|u| matches!(u, HostUpdate::Listening { .. })),
+        "host did not finish binding mTLS LAN listener after set_mtls_config: {host_ready:?}"
+    );
 
     let s_mtls = SessionHandle::spawn(UiSessionConfig {
         connect_addr: host.listen_addr(),
@@ -965,7 +985,7 @@ fn awaiting_mtls_cert_never_downgrades_to_plain_and_recovers_once_cert_installed
         }),
         ..UiSessionConfig::default()
     });
-    let mtls_updates = collect_client_until(&s_mtls, Duration::from_secs(6), |us| {
+    let mtls_updates = collect_client_until(&s_mtls, Duration::from_secs(12), |us| {
         us.iter().any(|u| {
             matches!(
                 u,
@@ -976,13 +996,17 @@ fn awaiting_mtls_cert_never_downgrades_to_plain_and_recovers_once_cert_installed
             )
         })
     });
-    assert!(mtls_updates.iter().any(|u| matches!(
-        u,
-        SessionUpdate::Negotiated {
-            mtls_active: true,
-            ..
-        }
-    )));
+    assert!(
+        mtls_updates.iter().any(|u| matches!(
+            u,
+            SessionUpdate::Negotiated {
+                mtls_active: true,
+                ..
+            }
+        )),
+        "mTLS reconnect after set_mtls_config failed (addr={}): {mtls_updates:?}",
+        host.listen_addr()
+    );
     s_mtls.send(SessionCommand::Disconnect);
     s_mtls.join();
     host.stop();
