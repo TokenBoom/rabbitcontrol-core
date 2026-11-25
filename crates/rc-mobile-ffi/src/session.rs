@@ -30,6 +30,13 @@ fn lock_sessions() -> std::sync::MutexGuard<'static, HashMap<u64, SessionHandle>
     sessions().lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 注册会话句柄并返回 id(供 runtime 一键连接复用)。
+pub(crate) fn register_session(handle: SessionHandle) -> u64 {
+    let id = next_id();
+    lock_sessions().insert(id, handle);
+    id
+}
+
 /// `rc_session_open` 输入。
 ///
 /// 最小直连示例:`{"connect_addr":"192.168.1.10:9901"}`;
@@ -94,9 +101,7 @@ pub extern "C" fn rc_session_open(json: *const c_char) -> *mut c_char {
             ..UiSessionConfig::default()
         };
         let handle = SessionHandle::spawn(cfg);
-        let id = next_id();
-        lock_sessions().insert(id, handle);
-        Ok(id)
+        Ok(register_session(handle))
     })();
     match result {
         Ok(id) => to_c_string(serde_json::json!({ "session_id": id }).to_string()),

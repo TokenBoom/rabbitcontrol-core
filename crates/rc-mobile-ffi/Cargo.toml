@@ -13,6 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 rc-client-core = { path = "../rc-client-core" }
 serde = { version = "1", features = ["derive"] }
 rc-input = { path = "../rc-input" }
+rc-session = { path = "../rc-session" }
 rc-pipeline = { path = "../rc-pipeline" }
 rc-render = { path = "../rc-render" }
 rc-decode = { path = "../rc-decode" }
