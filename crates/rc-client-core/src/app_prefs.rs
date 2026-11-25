@@ -129,9 +129,6 @@ pub struct AppPrefs {
     /// 是否在设备列表展示局域网发现设备（默认 `false`）。
     #[serde(default)]
     pub show_lan_devices: bool,
-    /// 是否允许同账号下自己的设备免密自控本机（默认 `true`）。
-    #[serde(default = "default_allow_owner_self_control")]
-    pub allow_owner_self_control: bool,
     /// 关闭主窗口时是否隐藏到系统菜单栏而非直接退出程序（默认 `true`）。
     #[serde(default = "default_close_to_tray")]
     pub close_to_tray: bool,
@@ -163,10 +160,6 @@ fn default_encrypt_connection() -> bool {
     DEFAULT_ENCRYPT_CONNECTION
 }
 
-fn default_allow_owner_self_control() -> bool {
-    true
-}
-
 fn default_close_to_tray() -> bool {
     true
 }
@@ -185,7 +178,6 @@ impl Default for AppPrefs {
             lock_on_exit: false,
             default_encrypt_connection: DEFAULT_ENCRYPT_CONNECTION,
             show_lan_devices: false,
-            allow_owner_self_control: true,
             close_to_tray: true,
             device_snapshots: BTreeMap::new(),
             saved_portmaps: BTreeMap::new(),
@@ -203,8 +195,6 @@ pub struct SecurityPrefsPatch {
     pub default_encrypt_connection: Option<bool>,
     /// 可选「显示局域网设备」开关。
     pub show_lan_devices: Option<bool>,
-    /// 可选「允许同账号免密自控」开关。
-    pub allow_owner_self_control: Option<bool>,
     /// 可选自定义访问验证码（`Some("")` 表示无密码；`Some(pw)` 长度不超过 64 字符且无控制字符）。
     pub custom_host_password: Option<String>,
     /// 为 `Some(true)` 时清除自定义密码并切回临时验证码模式。
@@ -336,9 +326,6 @@ impl AppPrefs {
         }
         if let Some(v) = patch.show_lan_devices {
             self.show_lan_devices = v;
-        }
-        if let Some(v) = patch.allow_owner_self_control {
-            self.allow_owner_self_control = v;
         }
         if clear_pw {
             self.custom_host_password = None;
@@ -786,7 +773,6 @@ mod tests {
             lock_on_exit: true,
             default_encrypt_connection: false,
             show_lan_devices: true,
-            allow_owner_self_control: false,
             close_to_tray: false,
             device_snapshots: BTreeMap::new(),
             saved_portmaps: BTreeMap::new(),
@@ -914,12 +900,19 @@ mod tests {
         assert_eq!(prefs.default_encrypt_connection, DEFAULT_ENCRYPT_CONNECTION);
         assert!(prefs.default_encrypt_connection);
         assert!(!prefs.show_lan_devices);
-        assert!(prefs.allow_owner_self_control);
 
         let json_val = serde_json::to_value(&prefs).unwrap();
         assert_eq!(json_val["defaultEncryptConnection"], true);
         assert_eq!(json_val["showLanDevices"], false);
-        assert_eq!(json_val["allowOwnerSelfControl"], true);
+
+        // 旧版配置含 allowOwnerSelfControl: false 也能兼容加载且不影响当前配置
+        let legacy: AppPrefs = serde_json::from_value(serde_json::json!({
+            "allowOwnerSelfControl": false,
+            "allowRemoteAssist": false
+        }))
+        .expect("legacy prefs with allowOwnerSelfControl should deserialize");
+        assert!(!legacy.allow_remote_assist);
+        assert!(legacy.default_encrypt_connection);
 
         // 合法更新
         prefs
@@ -927,7 +920,6 @@ mod tests {
                 allow_remote_assist: Some(true),
                 default_encrypt_connection: Some(false),
                 show_lan_devices: Some(true),
-                allow_owner_self_control: Some(false),
                 custom_host_password: Some("PIN99".to_string()),
                 clear_custom_host_password: None,
             })
@@ -935,7 +927,6 @@ mod tests {
         assert!(prefs.allow_remote_assist);
         assert!(!prefs.default_encrypt_connection);
         assert!(prefs.show_lan_devices);
-        assert!(!prefs.allow_owner_self_control);
         assert_eq!(prefs.custom_host_password.as_deref(), Some("PIN99"));
 
         // 清除密码

@@ -1967,23 +1967,97 @@ impl Transport for LanQuicTransport {
     }
 }
 
-fn is_mtls_cert_or_config_error(msg: &str) -> bool {
+pub(crate) fn is_mtls_cert_or_config_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("timeout") || lower.contains("timed out") || msg.contains("超时") {
+    if lower.contains("timeout")
+        || lower.contains("timed out")
+        || msg.contains("超时")
+        || lower.contains("connection refused")
+        || lower.contains("unexpected eof")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("unreachable")
+    {
         return false;
     }
     lower.contains("invalid peer certificate")
-        || lower.contains("certificate")
+        || lower.contains("invalidcertificate")
+        || lower.contains("badcertificate")
         || lower.contains("unknownissuer")
+        || lower.contains("unknown_issuer")
+        || lower.contains("notvalidforname")
+        || lower.contains("notvalidyet")
+        || lower.contains("expired")
+        || lower.contains("revoked")
         || lower.contains("badsignature")
         || lower.contains("san uri")
         || lower.contains("urn:rabbitcontrol")
-        || lower.contains("invalidconfig")
-        || lower.contains("tls alert")
-        || lower.contains("unexpected eof")
-        || lower.contains("handshakefailure")
-        || lower.contains("badcertificate")
-        || lower.contains("cert")
+        || lower.contains("no peer certificate")
+        || lower.contains("missing client certificate")
+        || msg.contains("设备证书")
+        || msg.contains("证书校验")
+        || msg.contains("身份不匹配")
+        || lower.contains("root ca")
+}
+
+/// 将底层中继建连错误映射为用户可读的具体中文提示，避免将超时/EOF/拒连一刀切报成 mTLS 错误。
+pub fn classify_relay_connect_error(
+    err: &rc_types::Error,
+    encrypt_connection: bool,
+    had_outer_mtls: bool,
+) -> String {
+    let raw = err.to_string();
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("relay connect cancelled") || lower.contains("cancelled") {
+        return "连接已取消".to_string();
+    }
+    if lower.contains("resolve relay addr") || lower.contains("resolved to no socket addresses") {
+        return format!("无法解析中继服务器地址，请检查网络或服务器配置：{raw}");
+    }
+    if lower.contains("connect relay tcp timed out") {
+        return "连接中继服务器超时，请检查网络或服务器中继端口".to_string();
+    }
+    if matches!(err, rc_types::Error::Timeout(_))
+        || lower.contains("relay pair timeout")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        return "对端未响应中继配对（对方可能离线、被控服务未就绪或网络受限）".to_string();
+    }
+    if lower.contains("hit eof before completing handshake")
+        || lower.contains("hit eof before completing e2ee mtls handshake")
+    {
+        return "对端已断开或拒绝连接（对方可能未开启远程协助、被控服务未就绪或已离线）"
+            .to_string();
+    }
+    if lower.contains("reply=0x01") || lower.contains("handshake rejected") {
+        return "中继服务器拒绝配对（会话凭据已失效、对方已离线或连接已满）".to_string();
+    }
+    if lower.contains("connection refused")
+        || lower.contains("unreachable")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("connect relay failed")
+    {
+        return format!("无法连接中继服务器（端口不可达或连接中断）：{raw}");
+    }
+    if is_mtls_cert_or_config_error(&raw) {
+        if lower.contains("e2ee") {
+            return format!("端到端 mTLS 证书身份校验失败：{raw}");
+        }
+        if had_outer_mtls || lower.contains("outer mtls") {
+            return format!("中继服务器 mTLS 证书校验失败：{raw}");
+        }
+        return format!("mTLS 证书配置或校验失败：{raw}");
+    }
+    if lower.contains("e2ee mtls handshake failed") {
+        return format!("建立端到端加密通道时连接中断：{raw}");
+    }
+    if lower.contains("outer mtls handshake failed") {
+        return format!("连接中继服务器加密通道时连接中断：{raw}");
+    }
+    let _ = (encrypt_connection, had_outer_mtls);
+    format!("中继连接失败：{raw}")
 }
 
 fn prepare_peer_mtls_bundle(
@@ -2059,7 +2133,14 @@ fn dial_lan_direct_quic(
     if let Some(mtls_cfg) = mtls {
         let transport = endpoint
             .connect_mtls_cancelable(lan_addr, mtls_cfg, "", LAN_DIRECT_PROBE_TIMEOUT, cancel)
-            .map_err(|e| format!("LAN mTLS 直连失败: {e}"))?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                if is_mtls_cert_or_config_error(&msg) {
+                    format!("LAN mTLS 证书校验失败: {msg}")
+                } else {
+                    format!("LAN 直连失败: {msg}")
+                }
+            })?;
         let fp = transport
             .peer_mtls_identity()
             .map(|id| id.cert_fingerprint_sha256);
@@ -2328,7 +2409,7 @@ fn run_session_thread(
                             &grant.relay_addr,
                             RelayRole::Client,
                             &grant.relay_token,
-                            Duration::from_secs(10),
+                            Duration::from_secs(12),
                             Arc::clone(&dial_cancel),
                             Some(&relay_mtls),
                             RelayE2eeMode::ClientRequired(bundle),
@@ -2338,7 +2419,7 @@ fn run_session_thread(
                                 if disconnect_flag.load(Ordering::Acquire) {
                                     return Ok("用户主动断开".to_string());
                                 }
-                                return Err(format!("mTLS 中继连接失败: {e}"));
+                                return Err(classify_relay_connect_error(&e, true, true));
                             }
                         };
                         let h = t.shutdown_handle();
@@ -2352,7 +2433,7 @@ fn run_session_thread(
                             &grant.relay_addr,
                             RelayRole::Client,
                             &grant.relay_token,
-                            Duration::from_secs(10),
+                            Duration::from_secs(12),
                             Arc::clone(&dial_cancel),
                             &relay_mtls,
                         ) {
@@ -2361,7 +2442,7 @@ fn run_session_thread(
                                 if disconnect_flag.load(Ordering::Acquire) {
                                     return Ok("用户主动断开".to_string());
                                 }
-                                return Err(format!("外层 mTLS 中继连接失败: {e}"));
+                                return Err(classify_relay_connect_error(&e, false, true));
                             }
                         };
                         let h = t.shutdown_handle();
@@ -2371,7 +2452,7 @@ fn run_session_thread(
                             &grant.relay_addr,
                             RelayRole::Client,
                             &grant.relay_token,
-                            Duration::from_secs(10),
+                            Duration::from_secs(12),
                             Arc::clone(&dial_cancel),
                         ) {
                             Ok(t) => t,
@@ -2379,7 +2460,7 @@ fn run_session_thread(
                                 if disconnect_flag.load(Ordering::Acquire) {
                                     return Ok("用户主动断开".to_string());
                                 }
-                                return Err(format!("中继连接失败: {e}"));
+                                return Err(classify_relay_connect_error(&e, false, false));
                             }
                         };
                         let h = t.shutdown_handle();
@@ -4151,5 +4232,66 @@ mod tests {
         if let Some(expected) = expected_same_subnet {
             assert!(candidates.contains(&expected));
         }
+    }
+
+    #[test]
+    fn error_classification_distinguishes_timeout_eof_reject_and_real_mtls() {
+        assert!(!is_mtls_cert_or_config_error(
+            "LAN 直连失败: unexpected eof"
+        ));
+        assert!(!is_mtls_cert_or_config_error(
+            "P2P QUIC Client 握手失败：connection refused"
+        ));
+        assert!(is_mtls_cert_or_config_error(
+            "LAN mTLS 证书校验失败: InvalidPeerCertificate(UnknownIssuer)"
+        ));
+
+        let pair_timeout = classify_relay_connect_error(
+            &rc_types::Error::Timeout(Duration::from_secs(12)),
+            true,
+            true,
+        );
+        assert!(
+            pair_timeout.contains("对端未响应中继配对"),
+            "{pair_timeout}"
+        );
+        assert!(!pair_timeout.contains("mTLS"), "{pair_timeout}");
+
+        let tcp_timeout = classify_relay_connect_error(
+            &rc_types::Error::Network("connect relay tcp timed out".to_string()),
+            true,
+            true,
+        );
+        assert!(tcp_timeout.contains("连接中继服务器超时"), "{tcp_timeout}");
+        assert!(!tcp_timeout.contains("mTLS"), "{tcp_timeout}");
+
+        let eof_err = classify_relay_connect_error(
+            &rc_types::Error::Network(
+                "relay stream hit EOF before completing handshake".to_string(),
+            ),
+            true,
+            true,
+        );
+        assert!(eof_err.contains("对端已断开或拒绝连接"), "{eof_err}");
+        assert!(!eof_err.contains("mTLS"), "{eof_err}");
+
+        let reject_err = classify_relay_connect_error(
+            &rc_types::Error::Network(
+                "relay handshake rejected by 1.2.3.4:21117 (reply=0x01)".to_string(),
+            ),
+            true,
+            true,
+        );
+        assert!(reject_err.contains("中继服务器拒绝配对"), "{reject_err}");
+        assert!(!reject_err.contains("mTLS"), "{reject_err}");
+
+        let cert_err = classify_relay_connect_error(
+            &rc_types::Error::Network(
+                "E2EE mTLS handshake failed: InvalidPeerCertificate(NotValidForName)".to_string(),
+            ),
+            true,
+            true,
+        );
+        assert!(cert_err.contains("mTLS 证书身份校验失败"), "{cert_err}");
     }
 }

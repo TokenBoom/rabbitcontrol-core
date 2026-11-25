@@ -325,10 +325,11 @@ impl BoundedRelayIncomingQueue {
         q.retain(|(enqueued_at, _)| enqueued_at.elapsed() <= ttl);
     }
 
-    fn purge_for_peer(&self, peer_device_id: Option<&str>, ttl: Duration) {
+    fn purge_for_peer_before(&self, peer_device_id: Option<&str>, cutoff: Instant, ttl: Duration) {
         let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         q.retain(|(enqueued_at, item)| {
-            enqueued_at.elapsed() <= ttl && peer_device_id != Some(item.peer_id.as_str())
+            enqueued_at.elapsed() <= ttl
+                && (peer_device_id != Some(item.peer_id.as_str()) || *enqueued_at >= cutoff)
         });
     }
 }
@@ -2666,8 +2667,13 @@ fn dial_relay_for_incoming(
                     disconnect_flag.store(false, Ordering::Release);
                     if !stop_flag.load(Ordering::Acquire) && !session_cancel.load(Ordering::Acquire)
                     {
+                        let friendly = crate::session_bridge::classify_relay_connect_error(
+                            &e,
+                            require_e2ee,
+                            true,
+                        );
                         updates.push(HostUpdate::Error {
-                            message: format!("mTLS 中继通道连接失败 ({}): {e}", incoming.peer_id),
+                            message: format!("{friendly} ({})", incoming.peer_id),
                         });
                     }
                     return None;
@@ -3255,6 +3261,7 @@ fn run_host_worker(
                 }
 
                 // 2) 进入串流会话（U-H1：显式驱动循环，覆盖 Streaming 与 Detached 退出）。
+                let session_started_at = Instant::now();
                 disconnect_flag.store(false, Ordering::Release);
                 let remote_addr = host.peer_addr().to_string();
                 emit_peer_connected(&host, &remote_addr, &updates);
@@ -3301,7 +3308,11 @@ fn run_host_worker(
                         backend: last_backend,
                     });
                 }
-                incoming_relay.purge_for_peer(lan_peer_did.as_deref(), RELAY_INCOMING_TTL);
+                incoming_relay.purge_for_peer_before(
+                    lan_peer_did.as_deref(),
+                    session_started_at,
+                    RELAY_INCOMING_TTL,
+                );
             }
             HostListener::AwaitingMtlsCert => {
                 while !stop_flag.load(Ordering::Acquire) {
@@ -3359,6 +3370,7 @@ fn run_host_worker(
                     observed_pw_ver = password_version.load(Ordering::Acquire);
                     match endpoint.accept(HOST_ACCEPT_SLICE) {
                         Ok(quic_transport) => {
+                            let session_started_at = Instant::now();
                             disconnect_flag.store(false, Ordering::Release);
                             let mtls_peer_did = quic_transport
                                 .peer_mtls_identity()
@@ -3435,8 +3447,9 @@ fn run_host_worker(
                                             backend: last_backend,
                                         });
                                     }
-                                    incoming_relay.purge_for_peer(
+                                    incoming_relay.purge_for_peer_before(
                                         mtls_peer_did.as_deref(),
+                                        session_started_at,
                                         RELAY_INCOMING_TTL,
                                     );
                                 }
@@ -3993,5 +4006,46 @@ mod tests {
 
         drop(worker);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relay_incoming_purge_before_keeps_new_switch_tokens_from_same_peer() {
+        let queue = BoundedRelayIncomingQueue::new(8);
+        let make_item = |peer_id: &str, token: &str| RelayIncoming {
+            session_id: format!("sess-{token}"),
+            peer_id: peer_id.to_string(),
+            relay_addr: "127.0.0.1:21117".to_string(),
+            relay_token: token.to_string(),
+            peer_public_addr: None,
+            peer_lan_addrs: Vec::new(),
+            local_udp_port: None,
+            owner_grant: None,
+            is_owner_connection: true,
+        };
+
+        queue.push(make_item("111222333", "old-token"));
+        thread::sleep(Duration::from_millis(10));
+        let session_started_at = Instant::now();
+        thread::sleep(Duration::from_millis(10));
+        queue.push(make_item("111222333", "new-relay-switch-token"));
+        queue.push(make_item("444555666", "other-peer-token"));
+
+        queue.purge_for_peer_before(
+            Some("111222333"),
+            session_started_at,
+            Duration::from_secs(30),
+        );
+
+        let first = queue
+            .pop_ready(Duration::from_secs(30), Duration::ZERO)
+            .expect("new switch token must survive purge");
+        assert_eq!(first.relay_token, "new-relay-switch-token");
+        let second = queue
+            .pop_ready(Duration::from_secs(30), Duration::ZERO)
+            .expect("other peer token must survive purge");
+        assert_eq!(second.relay_token, "other-peer-token");
+        assert!(queue
+            .pop_ready(Duration::from_secs(30), Duration::ZERO)
+            .is_none());
     }
 }

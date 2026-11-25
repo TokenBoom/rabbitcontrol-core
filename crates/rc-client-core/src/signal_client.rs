@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -50,7 +50,7 @@ const STABLE_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
 /// 建连与首包注册握手超时。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 读循环空闲检查粒度（用于响应 `stop()`、心跳、失活超时并最小化 TLS 写端等待）。
-const READ_POLL_TIMEOUT: Duration = Duration::from_millis(50);
+const READ_POLL_TIMEOUT: Duration = Duration::from_millis(15);
 /// 已读到半帧后允许补齐整帧的上限时间。
 const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// 断线重连退避序列（1s -> 2s -> 5s -> 10s 上限）。
@@ -311,16 +311,38 @@ struct PendingConnect {
 
 type SharedTlsStream = Arc<Mutex<Option<Box<StreamOwned<ClientConnection, TcpStream>>>>>;
 
+struct WriterWaitingGuard<'a>(&'a AtomicUsize);
+
+impl<'a> WriterWaitingGuard<'a> {
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Release);
+        Self(counter)
+    }
+}
+
+impl Drop for WriterWaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 enum SignalWriter {
     Plain(TcpStream),
-    Tls(SharedTlsStream),
+    Tls {
+        stream: SharedTlsStream,
+        writer_waiting: Arc<AtomicUsize>,
+    },
 }
 
 impl SignalWriter {
     fn write_msg(&mut self, msg: &OutgoingSignalMsg) -> Result<(), String> {
         match self {
             Self::Plain(stream) => write_signal_frame(stream, msg),
-            Self::Tls(shared_tls) => {
+            Self::Tls {
+                stream: shared_tls,
+                writer_waiting,
+            } => {
+                let _wait_guard = WriterWaitingGuard::enter(writer_waiting);
                 let mut guard = shared_tls.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(tls) = guard.as_mut() else {
                     return Err("信令 TLS 连接已关闭".to_string());
@@ -341,7 +363,9 @@ impl SignalWriter {
             Self::Plain(s) => {
                 let _ = s.shutdown(Shutdown::Both);
             }
-            Self::Tls(shared_tls) => {
+            Self::Tls {
+                stream: shared_tls, ..
+            } => {
                 let mut guard = shared_tls.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(tls) = guard.take() {
                     let _ = tls.sock.shutdown(Shutdown::Both);
@@ -1375,14 +1399,24 @@ fn complete_tls_handshake(
 
 enum SignalReader {
     Plain(TcpStream),
-    Tls(SharedTlsStream),
+    Tls {
+        stream: SharedTlsStream,
+        writer_waiting: Arc<AtomicUsize>,
+    },
 }
 
 impl SignalReader {
     fn read_frame(&mut self, stop_flag: &AtomicBool) -> FrameRead {
         match self {
             Self::Plain(stream) => read_signal_frame_from_io(stream, stop_flag),
-            Self::Tls(shared_tls) => {
+            Self::Tls {
+                stream: shared_tls,
+                writer_waiting,
+            } => {
+                // 若写线程正排队等待发送信令请求（如 `request_connect`），短暂让出避免非公平互斥锁饥饿。
+                if writer_waiting.load(Ordering::Acquire) > 0 {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 let mut guard = shared_tls.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(tls) = guard.as_mut() else {
                     return FrameRead::Eof;
@@ -1483,9 +1517,16 @@ fn run_single_connection(
             conn,
             tcp_for_tls,
         )))));
+        let writer_waiting = Arc::new(AtomicUsize::new(0));
         (
-            SignalReader::Tls(Arc::clone(&shared_tls)),
-            SignalWriter::Tls(shared_tls),
+            SignalReader::Tls {
+                stream: Arc::clone(&shared_tls),
+                writer_waiting: Arc::clone(&writer_waiting),
+            },
+            SignalWriter::Tls {
+                stream: shared_tls,
+                writer_waiting,
+            },
         )
     } else {
         let writer_clone = match stream.try_clone() {
@@ -1532,9 +1573,11 @@ fn run_single_connection(
                 Ok(mut w_clone) => write_signal_frame_plain(&mut w_clone, &reg_msg),
                 Err(e) => Err(format!("克隆信令写流失败：{e}")),
             },
-            SignalWriter::Tls(_) => unreachable!(),
+            SignalWriter::Tls { .. } => unreachable!(),
         },
-        SignalReader::Tls(shared_tls) => {
+        SignalReader::Tls {
+            stream: shared_tls, ..
+        } => {
             let mut guard = shared_tls.lock().unwrap_or_else(|e| e.into_inner());
             match guard.as_mut() {
                 Some(tls) => write_signal_frame_tls(tls, &reg_msg),

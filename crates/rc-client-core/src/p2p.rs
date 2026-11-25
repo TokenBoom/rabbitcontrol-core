@@ -865,7 +865,7 @@ pub fn attempt_p2p_quic_client_mtls(
         .map_err(|e| format!("创建 P2P QUIC Client mTLS 端点失败：{e}"))?;
         let transport = endpoint
             .connect_mtls_cancelable(peer_addr, mtls_cfg, "", quic_timeout, cancel)
-            .map_err(|e| format!("P2P QUIC Client mTLS 握手失败：{e}"))?;
+            .map_err(|e| format!("P2P QUIC Client 握手失败：{e}"))?;
         Ok(finalize_p2p_connection(
             endpoint,
             transport,

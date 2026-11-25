@@ -2450,10 +2450,10 @@ fn connect_any_with_deadline(
     }
     match last_err {
         Some(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
-            Err(Error::Timeout(total_timeout))
+            Err(Error::Network("connect relay tcp timed out".to_string()))
         }
         Some(err) => Err(Error::Network(format!("connect relay failed: {err}"))),
-        None if timed_out_any => Err(Error::Timeout(total_timeout)),
+        None if timed_out_any => Err(Error::Network("connect relay tcp timed out".to_string())),
         None => Err(Error::Network("no relay addresses to connect".to_string())),
     }
 }
