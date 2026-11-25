@@ -90,6 +90,10 @@ pub struct PipelineConfig {
     /// 设值后，平台采集后端（如 macOS SCK）的 `CapturedFrame::timestamp` 将以
     /// 同一原点换算，保证 `Captured` 与管线会话时钟零偏移同轴。
     pub clock_origin_us: Option<u64>,
+    /// 视频编解码器（默认 `Codec::H264`；支持时可切换为 `Codec::Hevc`）。
+    pub codec: rc_encode::Codec,
+    /// 是否启用异步解码/上屏工作线程（解耦 QUIC 接收线程与解码/Metal 上屏耗时；默认 `false` 保持单测确定性）。
+    pub async_decode: bool,
     /// 媒体分片预算（字节）：[`HostPipeline`](host::HostPipeline) 调
     /// [`split_frame`](rc_proto::split_frame) 时单片载荷的上限。
     ///
@@ -116,6 +120,8 @@ impl Default for PipelineConfig {
             trace_capacity: 4096,
             diff: DiffMode::TrustPlatform,
             clock_origin_us: None,
+            codec: rc_encode::Codec::H264,
+            async_decode: false,
             max_packet_payload: MAX_PAYLOAD,
         }
     }
@@ -129,6 +135,11 @@ pub trait PlatformMediaProvider: Send + Sync {
     /// 读取与平台硬件采集时间戳同域的单调主机时钟（微秒）。
     fn host_clock_us(&self) -> Option<u64> {
         None
+    }
+
+    /// 当前平台硬件编解码后端是否支持 HEVC（H.265）低延迟路径。
+    fn supports_hevc(&self) -> bool {
+        false
     }
 
     /// 提升当前工作线程（采集 / 编码）至平台低延迟实时 QoS。
@@ -381,10 +392,17 @@ pub fn select_all(
     ))
 }
 
+/// 查询已注册平台后端是否支持 HEVC（H.265）硬件编解码。
+pub fn platform_supports_hevc() -> bool {
+    PLATFORM_MEDIA_PROVIDER
+        .get()
+        .is_some_and(|provider| provider.supports_hevc())
+}
+
 /// 由 [`PipelineConfig`] 构造低延迟编码器标准配置（零 B 帧、按需 IDR、`Fastest` 预设）。
 pub fn default_encoder_config(cfg: &PipelineConfig) -> EncoderConfig {
     EncoderConfig {
-        codec: rc_encode::Codec::H264,
+        codec: cfg.codec,
         resolution: cfg.resolution,
         fps: cfg.fps,
         bitrate_bps: cfg.bitrate_bps,

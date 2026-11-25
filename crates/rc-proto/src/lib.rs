@@ -65,6 +65,8 @@ impl HeaderFlags {
     pub const HAS_DIRTY: u8 = 0b0000_0100;
     /// bit3: 本包是 FEC 冗余包（不是数据包）
     pub const PARITY: u8 = 0b0000_1000;
+    /// bit4: 该帧码流采用 HEVC（H.265）编码（未置位时默认 H.264）。
+    pub const HEVC: u8 = 0b0001_0000;
 
     /// 空标志。
     pub const fn empty() -> Self {
@@ -99,6 +101,11 @@ impl HeaderFlags {
     /// 是否为 FEC 冗余包。
     pub const fn is_parity(self) -> bool {
         self.has(Self::PARITY)
+    }
+
+    /// 是否采用 HEVC（H.265）编码。
+    pub const fn is_hevc(self) -> bool {
+        self.has(Self::HEVC)
     }
 
     /// 由 `FrameKind` 构造。
@@ -316,6 +323,30 @@ pub fn split_frame(
     payload: &[u8],
     max_payload: usize,
 ) -> Vec<Vec<u8>> {
+    split_frame_with_flags(
+        frame_seq,
+        kind,
+        HeaderFlags::empty(),
+        capture_ts,
+        encode_done_ts,
+        fec_group,
+        payload,
+        max_payload,
+    )
+}
+
+/// 把一个完整帧负载切分成多个数据报（头 + 负载），并按需附加额外的 [`HeaderFlags`]（如 [`HeaderFlags::HEVC`]）。
+#[allow(clippy::too_many_arguments)]
+pub fn split_frame_with_flags(
+    frame_seq: FrameSeq,
+    kind: FrameKind,
+    extra_flags: HeaderFlags,
+    capture_ts: Timestamp,
+    encode_done_ts: Timestamp,
+    fec_group: u16,
+    payload: &[u8],
+    max_payload: usize,
+) -> Vec<Vec<u8>> {
     assert!(max_payload > 0 && max_payload <= MAX_PAYLOAD);
 
     let chunks: Vec<&[u8]> = if payload.is_empty() {
@@ -332,7 +363,7 @@ pub fn split_frame(
     let mut out = Vec::with_capacity(packet_cnt);
     for (i, chunk) in chunks.iter().enumerate() {
         let is_last = i == packet_cnt - 1;
-        let mut flags = HeaderFlags::from_kind(kind);
+        let mut flags = HeaderFlags(HeaderFlags::from_kind(kind).0 | extra_flags.0);
         if is_last {
             flags.set(HeaderFlags::LAST);
         }
@@ -611,5 +642,20 @@ mod tests {
         assert!(idr.is_idr());
         let p = HeaderFlags::from_kind(FrameKind::P);
         assert!(!p.is_idr());
+
+        let dgrams = split_frame_with_flags(
+            FrameSeq(7),
+            FrameKind::Idr,
+            HeaderFlags(HeaderFlags::HEVC),
+            Timestamp(10),
+            Timestamp(20),
+            0,
+            &[1, 2, 3, 4],
+            1200,
+        );
+        let (hdr, body) = MediaHeader::parse_datagram(&dgrams[0]).unwrap();
+        assert!(hdr.is_idr());
+        assert!(hdr.flags.is_hevc());
+        assert_eq!(body, &[1, 2, 3, 4]);
     }
 }

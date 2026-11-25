@@ -115,6 +115,9 @@ pub trait Transport: Send {
 
     /// 网络统计（用于拥塞控制与诊断）。
     fn stats(&self) -> NetStats;
+
+    /// 动态调整媒体发包 pacing 上限（bps；`0` 表示不限速；不支持 pacing 的实现可忽略）。
+    fn set_pacing_rate(&mut self, _bps: u64) {}
 }
 
 /// 从传输层收到的事件。

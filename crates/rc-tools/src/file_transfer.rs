@@ -129,6 +129,27 @@ pub enum FileEvent {
         /// 错误信息（成功时为 `None`）。
         error: Option<String>,
     },
+    /// 远端删除文件或目录结果。
+    DeleteResult {
+        /// 被删除的目标路径。
+        path: String,
+        /// 是否删除成功。
+        ok: bool,
+        /// 错误信息（成功时为 `None`）。
+        error: Option<String>,
+    },
+    /// 远端重命名文件或目录结果。
+    RenameResult {
+        /// 原路径。
+        path: String,
+        /// 成功后的新路径（失败时为 `None`）。
+        #[serde(rename = "newPath")]
+        new_path: Option<String>,
+        /// 是否重命名成功。
+        ok: bool,
+        /// 错误信息（成功时为 `None`）。
+        error: Option<String>,
+    },
     /// 传输任务状态或进度更新。
     TransferUpdated(TransferItem),
 }
@@ -161,6 +182,38 @@ pub enum FileWireMsg {
     MkdirResp {
         /// 目录完整路径。
         path: String,
+        /// 是否成功。
+        ok: bool,
+        /// 错误信息。
+        error: Option<String>,
+    },
+    /// 请求删除远端指定文件或目录。
+    Delete {
+        /// 目标路径。
+        path: String,
+    },
+    /// 远端删除响应。
+    DeleteResp {
+        /// 目标路径。
+        path: String,
+        /// 是否成功。
+        ok: bool,
+        /// 错误信息。
+        error: Option<String>,
+    },
+    /// 请求重命名远端指定文件或目录（仅改单段名称）。
+    Rename {
+        /// 原路径。
+        path: String,
+        /// 新名称（单段合法名称）。
+        new_name: String,
+    },
+    /// 远端重命名响应。
+    RenameResp {
+        /// 原路径。
+        path: String,
+        /// 成功后的新路径（失败时为 `None`）。
+        new_path: Option<String>,
         /// 是否成功。
         ok: bool,
         /// 错误信息。
@@ -270,6 +323,24 @@ enum ControlPayload {
         ok: bool,
         error: Option<String>,
     },
+    Delete {
+        path: String,
+    },
+    DeleteResp {
+        path: String,
+        ok: bool,
+        error: Option<String>,
+    },
+    Rename {
+        path: String,
+        new_name: String,
+    },
+    RenameResp {
+        path: String,
+        new_path: Option<String>,
+        ok: bool,
+        error: Option<String>,
+    },
     UploadStart {
         id: u64,
         remote_dir: String,
@@ -338,6 +409,27 @@ impl FileWireMsg {
                     },
                     FileWireMsg::MkdirResp { path, ok, error } => ControlPayload::MkdirResp {
                         path: path.clone(),
+                        ok: *ok,
+                        error: error.clone(),
+                    },
+                    FileWireMsg::Delete { path } => ControlPayload::Delete { path: path.clone() },
+                    FileWireMsg::DeleteResp { path, ok, error } => ControlPayload::DeleteResp {
+                        path: path.clone(),
+                        ok: *ok,
+                        error: error.clone(),
+                    },
+                    FileWireMsg::Rename { path, new_name } => ControlPayload::Rename {
+                        path: path.clone(),
+                        new_name: new_name.clone(),
+                    },
+                    FileWireMsg::RenameResp {
+                        path,
+                        new_path,
+                        ok,
+                        error,
+                    } => ControlPayload::RenameResp {
+                        path: path.clone(),
+                        new_path: new_path.clone(),
                         ok: *ok,
                         error: error.clone(),
                     },
@@ -444,6 +536,24 @@ impl FileWireMsg {
                     ControlPayload::MkdirResp { path, ok, error } => {
                         FileWireMsg::MkdirResp { path, ok, error }
                     }
+                    ControlPayload::Delete { path } => FileWireMsg::Delete { path },
+                    ControlPayload::DeleteResp { path, ok, error } => {
+                        FileWireMsg::DeleteResp { path, ok, error }
+                    }
+                    ControlPayload::Rename { path, new_name } => {
+                        FileWireMsg::Rename { path, new_name }
+                    }
+                    ControlPayload::RenameResp {
+                        path,
+                        new_path,
+                        ok,
+                        error,
+                    } => FileWireMsg::RenameResp {
+                        path,
+                        new_path,
+                        ok,
+                        error,
+                    },
                     ControlPayload::UploadStart {
                         id,
                         remote_dir,
@@ -726,6 +836,62 @@ pub fn create_local_dir(parent: &str, name: &str) -> Result<String, String> {
     Ok(target.to_string_lossy().into_owned())
 }
 
+/// 安全删除本地指定文件或目录：
+/// - 拒绝空路径、主目录根目录 `~` 及文件系统根目录（`/` 或盘符根目录）；
+/// - 使用 `symlink_metadata` 识别符号链接，仅删除链接本身而不递归删除其指向的外部目录。
+pub fn delete_local_path(path: &str) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "~" || trimmed == "." || trimmed == ".." {
+        return Err("删除路径不能为空或根目录".to_string());
+    }
+    let target = expand_tilde(trimmed);
+    if target.parent().is_none() || target.file_name().is_none() {
+        return Err("禁止删除文件系统根目录".to_string());
+    }
+    let meta = fs::symlink_metadata(&target)
+        .map_err(|e| format!("无法访问目标 '{}': {e}", target.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        fs::remove_file(&target).map_err(|e| format!("删除文件 '{}' 失败：{e}", target.display()))
+    } else {
+        let canon = fs::canonicalize(&target)
+            .map_err(|e| format!("解析目录 '{}' 失败：{e}", target.display()))?;
+        if canon.parent().is_none() || canon == default_home_dir() {
+            return Err("禁止删除根目录或当前用户主目录".to_string());
+        }
+        fs::remove_dir_all(&target)
+            .map_err(|e| format!("删除目录 '{}' 失败：{e}", target.display()))
+    }
+}
+
+/// 安全重命名本地文件或目录（仅允许修改同级单段文件名，严禁路径穿越与覆盖已有条目）。
+pub fn rename_local_path(path: &str, new_name: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "~" || trimmed == "." || trimmed == ".." {
+        return Err("重命名路径不能为空或根目录".to_string());
+    }
+    let valid_name = validate_single_name(new_name)?;
+    let target = expand_tilde(trimmed);
+    let _meta = fs::symlink_metadata(&target)
+        .map_err(|e| format!("无法访问目标 '{}': {e}", target.display()))?;
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| "禁止重命名文件系统根目录".to_string())?;
+    let old_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "原路径缺少有效名称".to_string())?;
+    if old_name == valid_name {
+        return Ok(target.to_string_lossy().into_owned());
+    }
+    let dest = parent.join(valid_name);
+    if !old_name.eq_ignore_ascii_case(valid_name) && fs::symlink_metadata(&dest).is_ok() {
+        return Err(format!("目标名称「{valid_name}」已存在"));
+    }
+    fs::rename(&target, &dest).map_err(|e| format!("重命名失败：{e}"))?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
 fn part_file_path(dir: &Path, id: u64) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -891,6 +1057,40 @@ impl FileHostEngine {
                     });
                 }
             },
+            FileWireMsg::Delete { path } => match delete_local_path(&path) {
+                Ok(()) => {
+                    self.enqueue_critical(&FileWireMsg::DeleteResp {
+                        path,
+                        ok: true,
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    self.enqueue_critical(&FileWireMsg::DeleteResp {
+                        path,
+                        ok: false,
+                        error: Some(err),
+                    });
+                }
+            },
+            FileWireMsg::Rename { path, new_name } => match rename_local_path(&path, &new_name) {
+                Ok(new_path) => {
+                    self.enqueue_critical(&FileWireMsg::RenameResp {
+                        path,
+                        new_path: Some(new_path),
+                        ok: true,
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    self.enqueue_critical(&FileWireMsg::RenameResp {
+                        path,
+                        new_path: None,
+                        ok: false,
+                        error: Some(err),
+                    });
+                }
+            },
             FileWireMsg::UploadStart {
                 id,
                 remote_dir,
@@ -914,6 +1114,8 @@ impl FileHostEngine {
             // Host 忽略客户端侧专用响应帧。
             FileWireMsg::ListDirResp { .. }
             | FileWireMsg::MkdirResp { .. }
+            | FileWireMsg::DeleteResp { .. }
+            | FileWireMsg::RenameResp { .. }
             | FileWireMsg::UploadAck { .. }
             | FileWireMsg::UploadDone { .. }
             | FileWireMsg::DownloadMeta { .. }
@@ -1389,6 +1591,16 @@ impl FileClientEngine {
         self.enqueue(&FileWireMsg::Mkdir { parent, name });
     }
 
+    /// 请求删除远端文件或目录。
+    pub fn request_delete(&mut self, path: String) {
+        self.enqueue(&FileWireMsg::Delete { path });
+    }
+
+    /// 请求重命名远端文件或目录（`new_name` 为单个新文件名/目录名）。
+    pub fn request_rename(&mut self, path: String, new_name: String) {
+        self.enqueue(&FileWireMsg::Rename { path, new_name });
+    }
+
     fn prune_finished_history(&mut self) {
         let finished_ids: Vec<u64> = self
             .transfers
@@ -1596,6 +1808,22 @@ impl FileClientEngine {
             FileWireMsg::MkdirResp { path, ok, error } => {
                 events.push(FileEvent::MkdirResult { path, ok, error });
             }
+            FileWireMsg::DeleteResp { path, ok, error } => {
+                events.push(FileEvent::DeleteResult { path, ok, error });
+            }
+            FileWireMsg::RenameResp {
+                path,
+                new_path,
+                ok,
+                error,
+            } => {
+                events.push(FileEvent::RenameResult {
+                    path,
+                    new_path,
+                    ok,
+                    error,
+                });
+            }
             FileWireMsg::UploadAck { id, ok, error } => {
                 let is_active_upload = self.uploads.contains_key(&id)
                     && matches!(
@@ -1684,6 +1912,8 @@ impl FileClientEngine {
             // Client 忽略主机侧专用请求帧。
             FileWireMsg::ListDir { .. }
             | FileWireMsg::Mkdir { .. }
+            | FileWireMsg::Delete { .. }
+            | FileWireMsg::Rename { .. }
             | FileWireMsg::UploadStart { .. }
             | FileWireMsg::UploadChunk { .. }
             | FileWireMsg::UploadFinish { .. }
@@ -2294,5 +2524,77 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let parsed: FileEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn local_and_remote_delete_and_rename_enforce_safety() {
+        let base = std::env::temp_dir().join(format!("rc-file-del-ren-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let work = base.join("work");
+        let outside = base.join("outside");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let file_a = work.join("alpha.txt");
+        let outside_file = outside.join("keep.txt");
+        fs::write(&file_a, b"hello").unwrap();
+        fs::write(&outside_file, b"keep").unwrap();
+
+        #[cfg(unix)]
+        {
+            let link_to_outside = work.join("out-link");
+            std::os::unix::fs::symlink(&outside, &link_to_outside).unwrap();
+            // Deleting symlink removes only link, never target dir or outside_file!
+            delete_local_path(link_to_outside.to_str().unwrap()).unwrap();
+            assert!(!link_to_outside.exists());
+            assert!(outside_file.exists());
+        }
+
+        // Root & traversal rejection
+        assert!(delete_local_path("/").is_err());
+        assert!(rename_local_path(file_a.to_str().unwrap(), "../escape").is_err());
+
+        // Remote client <-> host roundtrip for rename + delete
+        let mut client = FileClientEngine::new();
+        let mut host = FileHostEngine::new();
+        client.request_rename(file_a.to_str().unwrap().to_string(), "beta.txt".to_string());
+        for frame in client.poll_outgoing(8) {
+            host.handle_incoming(&frame);
+        }
+        let mut events = Vec::new();
+        for frame in host.poll_outgoing(8) {
+            events.extend(client.handle_incoming(&frame));
+        }
+        let renamed_path = match &events[0] {
+            FileEvent::RenameResult {
+                ok: true,
+                new_path: Some(p),
+                ..
+            } => p.clone(),
+            other => panic!("expected RenameResult ok, got {other:?}"),
+        };
+        assert!(Path::new(&renamed_path).exists());
+        assert!(!file_a.exists());
+
+        // Reject overwriting another existing file
+        let existing = work.join("occupied.txt");
+        fs::write(&existing, b"x").unwrap();
+        assert!(rename_local_path(&renamed_path, "occupied.txt").is_err());
+
+        // Remote delete
+        client.request_delete(renamed_path.clone());
+        for frame in client.poll_outgoing(8) {
+            host.handle_incoming(&frame);
+        }
+        let mut del_events = Vec::new();
+        for frame in host.poll_outgoing(8) {
+            del_events.extend(client.handle_incoming(&frame));
+        }
+        match &del_events[0] {
+            FileEvent::DeleteResult { ok: true, .. } => {}
+            other => panic!("expected DeleteResult ok, got {other:?}"),
+        }
+        assert!(!Path::new(&renamed_path).exists());
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

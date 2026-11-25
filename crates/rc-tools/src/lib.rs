@@ -1,6 +1,7 @@
 //! RabbitControl 远控外围工具引擎 crate：
 //!
 //! - [`file_transfer`]：W2 双向文件传输引擎（本地/远端目录浏览、创建目录、分块流式上传与下载、`.rcpart` 原子落盘）。
+//! - [`fonts`]：跨平台系统字体安全扫描与 `.ttc`/`.otc` 单面提取，供远程终端本机/远端字体选择使用。
 //! - [`terminal`]（及 Unix 底层 [`pty_unix`]）：W3 真实 PTY 远程终端引擎（多标签并发 Shell、窗口尺寸同步、优雅退出回收）。
 //! - [`portmap`]：W4 TCP 端口映射引擎（本地端口监听、隧道多路复用代理、实时流量统计）。
 //!
@@ -12,15 +13,20 @@
 #![deny(unsafe_code)]
 
 pub mod file_transfer;
+pub mod fonts;
 pub mod portmap;
 #[cfg(unix)]
 pub mod pty_unix;
 pub mod terminal;
 
 pub use file_transfer::{
-    create_local_dir, default_home_dir, list_local_dir, FileClientEngine, FileEntry, FileEvent,
-    FileHostEngine, FileWireMsg, TransferDirection, TransferItem, TransferStatus, FILE_CHUNK_SIZE,
-    MAX_FILE_WIRE_FRAME_BYTES,
+    create_local_dir, default_home_dir, delete_local_path, list_local_dir, rename_local_path,
+    FileClientEngine, FileEntry, FileEvent, FileHostEngine, FileWireMsg, TransferDirection,
+    TransferItem, TransferStatus, FILE_CHUNK_SIZE, MAX_FILE_WIRE_FRAME_BYTES,
+};
+pub use fonts::{
+    default_font_roots, extract_ttc_face, list_local_fonts, FontCatalog, TerminalFontInfo,
+    MAX_FONT_CATALOG_ENTRIES, MAX_REMOTE_FONT_BYTES,
 };
 pub use portmap::{
     PortMapClientEngine, PortMapHostEngine, PortMapRuleSnapshot, PortMapStatus, PortMapWireMsg,

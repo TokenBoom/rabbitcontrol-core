@@ -205,6 +205,7 @@ fn pcfg() -> PipelineConfig {
         diff: DiffMode::TrustPlatform,
         clock_origin_us: None,
         max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+        ..PipelineConfig::default()
     }
 }
 

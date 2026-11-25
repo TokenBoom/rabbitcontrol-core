@@ -29,14 +29,21 @@ pub const DEFAULT_FPS: u32 = 144;
 /// 允许的码率下限（1 Mbps）。
 pub const MIN_BITRATE_BPS: u32 = 1_000_000;
 
-/// 允许的码率上限（60 Mbps）。
-pub const MAX_BITRATE_BPS: u32 = 60_000_000;
+/// 允许的码率上限（150 Mbps，支撑 4K@120 / 2K@240 / 1K@380 高帧率流）。
+pub const MAX_BITRATE_BPS: u32 = 150_000_000;
 
 /// 允许的帧率下限（15 fps）。
 pub const MIN_FPS: u32 = 15;
 
-/// 允许的帧率上限（240 fps）。
-pub const MAX_FPS: u32 = 240;
+/// 允许的帧率上限（380 fps，覆盖 1K@380 / 2K@240 / 4K@120 目标矩阵）。
+pub const MAX_FPS: u32 = 380;
+
+/// 远程终端默认字体大小（px）。
+pub const DEFAULT_TERMINAL_FONT_SIZE: u16 = 13;
+/// 远程终端允许的最小字体大小（px）。
+pub const MIN_TERMINAL_FONT_SIZE: u16 = 10;
+/// 远程终端允许的最大字体大小（px）。
+pub const MAX_TERMINAL_FONT_SIZE: u16 = 28;
 
 /// 允许的最小自定义分辨率宽度（像素）。
 pub const MIN_RESOLUTION_WIDTH: u32 = 320;
@@ -132,6 +139,18 @@ pub struct AppPrefs {
     /// 关闭主窗口时是否隐藏到系统菜单栏而非直接退出程序（默认 `true`）。
     #[serde(default = "default_close_to_tray")]
     pub close_to_tray: bool,
+    /// W3 远程终端字体来源（`"default"` | `"local"` | `"remote"`）。
+    #[serde(default = "default_terminal_font_source")]
+    pub terminal_font_source: String,
+    /// W3 远程终端选中的字体家族名称（`None` 表示使用内置默认等宽字体）。
+    #[serde(default)]
+    pub terminal_font_family: Option<String>,
+    /// W3 远程终端选中的字体不透明 ID（用于从远程主机按 ID 拉取并缓存字体）。
+    #[serde(default)]
+    pub terminal_font_id: Option<String>,
+    /// W3 远程终端字体大小（px，范围 `10..=28`，默认 `13`）。
+    #[serde(default = "default_terminal_font_size")]
+    pub terminal_font_size: u16,
     /// 按设备标识索引的历史连接与壁纸快照映射。
     #[serde(default)]
     pub device_snapshots: BTreeMap<String, DeviceSnapshotRecord>,
@@ -164,6 +183,14 @@ fn default_close_to_tray() -> bool {
     true
 }
 
+fn default_terminal_font_source() -> String {
+    "default".to_string()
+}
+
+fn default_terminal_font_size() -> u16 {
+    DEFAULT_TERMINAL_FONT_SIZE
+}
+
 impl Default for AppPrefs {
     fn default() -> Self {
         Self {
@@ -179,10 +206,48 @@ impl Default for AppPrefs {
             default_encrypt_connection: DEFAULT_ENCRYPT_CONNECTION,
             show_lan_devices: false,
             close_to_tray: true,
+            terminal_font_source: default_terminal_font_source(),
+            terminal_font_family: None,
+            terminal_font_id: None,
+            terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
             device_snapshots: BTreeMap::new(),
             saved_portmaps: BTreeMap::new(),
         }
     }
+}
+
+/// W3 远程终端字体偏好的增量更新补丁（经 Tauri IPC 反序列化）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TerminalPrefsPatch {
+    /// 字体来源（`"default"` | `"local"` | `"remote"`）。
+    pub terminal_font_source: Option<String>,
+    /// 字体家族名称（传空串或 `clear_font == Some(true)` 清空为默认）。
+    pub terminal_font_family: Option<String>,
+    /// 远程/本地字体不透明 ID。
+    pub terminal_font_id: Option<String>,
+    /// 为 `Some(true)` 时重置字体为默认等宽字体。
+    pub clear_font: Option<bool>,
+    /// 字号（px，范围 `10..=28`）。
+    pub terminal_font_size: Option<u16>,
+}
+
+/// 按目标分辨率与帧率计算 `"auto"` 档位的推荐目标码率（bps），支撑 1080p60 到 4K@120 / 2K@240 / 1K@380。
+pub fn recommended_auto_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
+    let pixel_rate =
+        u64::from(width.max(640)) * u64::from(height.max(360)) * u64::from(fps.max(15));
+    let bps = if pixel_rate >= 700_000_000 {
+        120_000_000
+    } else if pixel_rate >= 450_000_000 {
+        80_000_000
+    } else if pixel_rate >= 250_000_000 {
+        50_000_000
+    } else if pixel_rate >= 150_000_000 {
+        30_000_000
+    } else {
+        14_000_000
+    };
+    bps.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
 }
 
 /// 安全、连接加密与设备可见性偏好的增量更新补丁（经 Tauri IPC 反序列化）。
@@ -224,7 +289,28 @@ pub struct StreamPrefsPatch {
 }
 
 fn is_valid_bitrate_preset(preset: &str) -> bool {
-    matches!(preset, "auto" | "30m" | "14m" | "8m")
+    matches!(
+        preset,
+        "auto" | "150m" | "100m" | "60m" | "30m" | "14m" | "8m"
+    )
+}
+
+fn is_valid_terminal_font_source(src: &str) -> bool {
+    matches!(src, "default" | "local" | "remote")
+}
+
+fn sanitize_font_label(raw: Option<String>, max_chars: usize) -> Result<Option<String>, String> {
+    let Some(val) = raw else {
+        return Ok(None);
+    };
+    let trimmed = val.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > max_chars || trimmed.chars().any(char::is_control) {
+        return Err(format!("字体配置包含非法控制字符或超过 {max_chars} 个字符"));
+    }
+    Ok(Some(trimmed))
 }
 
 impl AppPrefs {
@@ -335,6 +421,58 @@ impl AppPrefs {
         Ok(())
     }
 
+    /// 校验并原子应用 W3 远程终端字体与字号偏好。
+    pub fn apply_terminal_patch(&mut self, patch: TerminalPrefsPatch) -> Result<(), String> {
+        if let Some(ref src) = patch.terminal_font_source {
+            if !is_valid_terminal_font_source(src) {
+                return Err(format!(
+                    "无效终端字体来源：{src:?}（允许 default / local / remote）"
+                ));
+            }
+        }
+        if let Some(sz) = patch.terminal_font_size {
+            if !(MIN_TERMINAL_FONT_SIZE..=MAX_TERMINAL_FONT_SIZE).contains(&sz) {
+                return Err(format!(
+                    "终端字号超出允许范围：{sz}（允许 {MIN_TERMINAL_FONT_SIZE}..={MAX_TERMINAL_FONT_SIZE}）"
+                ));
+            }
+        }
+        let next_family = if patch.clear_font.unwrap_or(false) {
+            Some(None)
+        } else {
+            match patch.terminal_font_family {
+                Some(v) => Some(sanitize_font_label(Some(v), 128)?),
+                None => None,
+            }
+        };
+        let next_id = if patch.clear_font.unwrap_or(false) {
+            Some(None)
+        } else {
+            match patch.terminal_font_id {
+                Some(v) => Some(sanitize_font_label(Some(v), 64)?),
+                None => None,
+            }
+        };
+
+        if let Some(src) = patch.terminal_font_source {
+            self.terminal_font_source = src;
+        }
+        if let Some(fam) = next_family {
+            self.terminal_font_family = fam;
+        }
+        if let Some(id) = next_id {
+            self.terminal_font_id = id;
+        }
+        if self.terminal_font_source == "default" {
+            self.terminal_font_family = None;
+            self.terminal_font_id = None;
+        }
+        if let Some(sz) = patch.terminal_font_size {
+            self.terminal_font_size = sz;
+        }
+        Ok(())
+    }
+
     /// 导出包含内联 Data URL 的设备快照视图列表。
     pub fn snapshot_views(&self, wallpapers_dir: &Path) -> Vec<DeviceSnapshotView> {
         self.device_snapshots
@@ -423,6 +561,18 @@ fn sanitize_prefs(prefs: &mut AppPrefs) {
     }
     if !(MIN_FPS..=MAX_FPS).contains(&prefs.fps) {
         prefs.fps = DEFAULT_FPS;
+    }
+    if !is_valid_terminal_font_source(&prefs.terminal_font_source) {
+        prefs.terminal_font_source = default_terminal_font_source();
+    }
+    if !(MIN_TERMINAL_FONT_SIZE..=MAX_TERMINAL_FONT_SIZE).contains(&prefs.terminal_font_size) {
+        prefs.terminal_font_size = DEFAULT_TERMINAL_FONT_SIZE;
+    }
+    if let Ok(clean_fam) = sanitize_font_label(prefs.terminal_font_family.take(), 128) {
+        prefs.terminal_font_family = clean_fam;
+    }
+    if let Ok(clean_id) = sanitize_font_label(prefs.terminal_font_id.take(), 64) {
+        prefs.terminal_font_id = clean_id;
     }
     let valid_res = matches!(
         (prefs.resolution_width, prefs.resolution_height),
@@ -709,7 +859,7 @@ mod tests {
         let snapshot_before = prefs.clone();
         for bad in [
             StreamPrefsPatch {
-                bitrate_preset: Some("100m".to_string()),
+                bitrate_preset: Some("999m".to_string()),
                 fps: Some(60),
                 ..Default::default()
             },
@@ -718,7 +868,7 @@ mod tests {
                 ..Default::default()
             },
             StreamPrefsPatch {
-                bitrate_bps: Some(60_000_001),
+                bitrate_bps: Some(150_000_001),
                 ..Default::default()
             },
             StreamPrefsPatch {
@@ -726,7 +876,7 @@ mod tests {
                 ..Default::default()
             },
             StreamPrefsPatch {
-                fps: Some(241),
+                fps: Some(381),
                 ..Default::default()
             },
             StreamPrefsPatch {
@@ -776,6 +926,7 @@ mod tests {
             close_to_tray: false,
             device_snapshots: BTreeMap::new(),
             saved_portmaps: BTreeMap::new(),
+            ..AppPrefs::default()
         };
         prefs.device_snapshots.insert(
             "604928235".to_string(),

@@ -38,6 +38,9 @@ pub struct Pacer {
     next_release: Option<Instant>,
 }
 
+/// pacer 排队包数上限，避免带宽骤降时排队延迟无界膨胀（按 MTU≈1200B 约 ≤2.4 MiB）。
+pub const MAX_PACER_QUEUE_PACKETS: usize = 2048;
+
 impl Pacer {
     /// 以初始速率构造。
     pub fn new(initial_rate_bps: u64) -> Self {
@@ -52,8 +55,13 @@ impl Pacer {
     /// 入队一个待发送的包。
     ///
     /// 入队不判速率——速率只影响 [`Self::poll`] 的放行节奏。
-    /// 队列深度由上层（调度器的 ≤2 帧在途预算）间接约束。
+    /// 当队列达到 [`MAX_PACER_QUEUE_PACKETS`] 时淘汰队头最旧包，防止拥塞下排队延迟无限堆积。
     pub fn enqueue(&mut self, data: Vec<u8>) {
+        while self.queue.len() >= MAX_PACER_QUEUE_PACKETS {
+            if let Some(old) = self.queue.pop_front() {
+                self.queued_bytes = self.queued_bytes.saturating_sub(old.len());
+            }
+        }
         self.queued_bytes += data.len();
         self.queue.push_back(data);
     }

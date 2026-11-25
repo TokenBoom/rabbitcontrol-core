@@ -76,9 +76,9 @@ pub const QUIC_OVERHEAD: usize = 48;
 /// 默认路径 MTU 预算（字节）。1200 是 QUIC 保证不分片的最小值。
 pub const DEFAULT_MTU: usize = 1200;
 
-/// pacing 初始速率（bps）。M3 之前不做自定义拥塞控制，这个值只用于
-/// 削平突发；之后由拥塞控制经 [`QuicTransport::set_pacing_rate`] 驱动。
-pub const DEFAULT_INITIAL_PACING_BPS: u64 = 50_000_000;
+/// pacing 初始速率（bps）。默认 250 Mbps，支撑 4K@120 / 2K@240 / 1K@380 高刷高码率突发，
+/// 之后由拥塞控制或会话层经 [`QuicTransport::set_pacing_rate`] 驱动。
+pub const DEFAULT_INITIAL_PACING_BPS: u64 = 250_000_000;
 
 /// ALPN 协议标识。两端不一致则握手失败（防误连）。
 pub const ALPN: &[u8] = b"rabbitcontrol/1";
@@ -90,8 +90,9 @@ pub const ALPN: &[u8] = b"rabbitcontrol/1";
 /// 这是独立流之上的叠加优化：不设它，独立流本身也已消除队头阻塞。
 pub const URGENT_STREAM_PRIORITY: i32 = 1;
 
-/// datagram 收发缓冲（字节）。非 0 = 启用 datagram（坑 1）。
-const DATAGRAM_BUFFER_BYTES: usize = 1024 * 1024;
+/// datagram 收发缓冲（字节）。4 MiB 支撑高分辨率 IDR 突发，非 0 = 启用 datagram（坑 1）。
+const DATAGRAM_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const UDP_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// 空闲超时。迁移 / 对端卡顿期间靠 keep-alive 维持（N9）。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -306,6 +307,9 @@ impl QuicEndpoint {
         socket
             .set_nonblocking(true)
             .map_err(|e| Error::Network(format!("set_nonblocking: {e}")))?;
+        let sock_ref = socket2::SockRef::from(&socket);
+        let _ = sock_ref.set_send_buffer_size(UDP_SOCKET_BUFFER_BYTES);
+        let _ = sock_ref.set_recv_buffer_size(UDP_SOCKET_BUFFER_BYTES);
 
         let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
@@ -1352,6 +1356,10 @@ impl Transport for QuicTransport {
             bytes_recv: self.shared.recv_bytes.load(Ordering::Relaxed),
         }
     }
+
+    fn set_pacing_rate(&mut self, bps: u64) {
+        QuicTransport::set_pacing_rate(self, bps);
+    }
 }
 
 impl Drop for QuicTransport {
@@ -1589,7 +1597,7 @@ fn pacer_worker(shared: Arc<Shared>) {
         let wait = match p.next_release_at() {
             Some(t) => t
                 .saturating_duration_since(Instant::now())
-                .max(Duration::from_micros(50)),
+                .max(Duration::from_micros(20)),
             None => WORKER_IDLE_WAIT,
         };
         drop(shared.pacer_cv.wait_timeout(p, wait).expect("pacer cv"));

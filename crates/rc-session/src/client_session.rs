@@ -2766,6 +2766,7 @@ mod tests {
             clock_origin_us: None,
             // 控制端不分片（split_frame 只在被控端），模板默认值即可。
             max_packet_payload: rc_proto::MAX_PAYLOAD,
+            ..PipelineConfig::default()
         }
     }
 

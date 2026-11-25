@@ -275,6 +275,8 @@ pub struct HostSession {
     frame_seq_offset: u64,
     /// 本会话已发出的最高线上 `frame_seq`（用于热切换时推算下一代 `frame_seq_offset`）。
     last_sent_frame_seq: Option<u64>,
+    /// 本会话当前生效的视频编码器（初始跟随 `cfg.pipeline.codec`，每次全新会话落成时复位）。
+    active_codec: rc_encode::Codec,
 }
 
 impl Drop for HostSession {
@@ -306,6 +308,7 @@ impl HostSession {
             mtu: cfg.mtu,
         };
         let endpoint = QuicEndpoint::new(&net, &identity)?;
+        let active_codec = cfg.pipeline.codec;
         Ok(Self {
             cfg,
             endpoint: Some(endpoint),
@@ -353,6 +356,7 @@ impl HostSession {
             preserve_caps_aspect: false,
             frame_seq_offset: 0,
             last_sent_frame_seq: None,
+            active_codec,
         })
     }
 
@@ -370,6 +374,7 @@ impl HostSession {
             .replay_cache
             .clone()
             .unwrap_or_else(|| Arc::new(Mutex::new(OwnerReplayCache::default())));
+        let active_codec = cfg.pipeline.codec;
         Ok(Self {
             cfg,
             endpoint: None,
@@ -417,6 +422,7 @@ impl HostSession {
             preserve_caps_aspect: false,
             frame_seq_offset: 0,
             last_sent_frame_seq: None,
+            active_codec,
         })
     }
 
@@ -1057,11 +1063,20 @@ impl HostSession {
         self.audio_rx.drain(..).collect()
     }
 
+    /// 在握手前刷新被控端当前显示器的逻辑分辨率能力（防止空闲监听期切换外接屏/分辨率后使用陈旧能力）。
+    pub fn update_caps_resolution(&mut self, width: u32, height: u32) {
+        if width >= 2 && height >= 2 {
+            let even = rc_types::Resolution::new(width, height).to_even();
+            self.cfg.caps.width = even.width;
+            self.cfg.caps.height = even.height;
+        }
+    }
+
     /// 在不断开会话的前提下热切换采集/编码流的分辨率与帧率。
     ///
     /// 仅 [`SessionState::Streaming`] 允许调用：
     /// - 目标 `(width, height)` 夹紧至 `[320..=max_w, 240..=max_h]` 并向下取偶，
-    ///   其中 `max_w/max_h` 取 `max_resolution`（默认 `self.cfg.caps`），封顶 `3840×2160`；
+    ///   其中 `max_w/max_h` 取 `max_resolution`（默认 `self.cfg.caps`），封顶 `5120×2880`；
     /// - 目标 `fps` 夹紧至 `1..=self.cfg.caps.fps`（`None` 或 `Some(0)` 保持当前帧率）；
     /// - 若与当前 `negotiated` 完全一致，直接返回 `Ok(cur)`（幂等空操作，不重建管线）；
     /// - 否则按 S6 停机红线（`stop_capture` → 排空 → `shutdown`）拆除旧管线、推进线上
@@ -1074,6 +1089,19 @@ impl HostSession {
         height: u32,
         fps: Option<u32>,
         max_resolution: Option<rc_types::Resolution>,
+    ) -> Result<SessionParams> {
+        self.reconfigure_stream_with_codec(width, height, fps, max_resolution, None)
+    }
+
+    /// 实时热切换被控端视频流分辨率、帧率及可选编解码器（仅 `Streaming` 态可用），
+    /// 保持控制连接/工具流与输入通道不断线，按 S6 顺序重建采集/编码管线后发送首帧 IDR。
+    pub fn reconfigure_stream_with_codec(
+        &mut self,
+        width: u32,
+        height: u32,
+        fps: Option<u32>,
+        max_resolution: Option<rc_types::Resolution>,
+        codec: Option<rc_encode::Codec>,
     ) -> Result<SessionParams> {
         match self.state {
             SessionState::Streaming => {}
@@ -1090,8 +1118,8 @@ impl HostSession {
         let max_res = max_resolution.unwrap_or_else(|| {
             rc_types::Resolution::new(self.cfg.caps.width, self.cfg.caps.height)
         });
-        let max_w = max_res.width.clamp(2, 3840) & !1;
-        let max_h = max_res.height.clamp(2, 2160) & !1;
+        let max_w = max_res.width.clamp(2, 5120) & !1;
+        let max_h = max_res.height.clamp(2, 2880) & !1;
         let min_w = 320u32.min(max_w);
         let min_h = 240u32.min(max_h);
 
@@ -1106,8 +1134,13 @@ impl HostSession {
             Some(f) if f > 0 => f.clamp(1, max_fps),
             _ => cur.fps.clamp(1, max_fps),
         };
+        let target_codec = codec.unwrap_or(self.active_codec);
 
-        if target_w == cur.width && target_h == cur.height && target_fps == cur.fps {
+        if target_w == cur.width
+            && target_h == cur.height
+            && target_fps == cur.fps
+            && target_codec == self.active_codec
+        {
             return Ok(cur);
         }
 
@@ -1124,6 +1157,7 @@ impl HostSession {
         pcfg.resolution = rc_types::Resolution::new(target_w, target_h);
         pcfg.fps = target_fps;
         pcfg.bitrate_bps = target_bitrate;
+        pcfg.codec = target_codec;
         pcfg.max_packet_payload = rc_net::quic::max_media_payload(self.cfg.mtu);
         pcfg.validate()?;
 
@@ -1138,6 +1172,11 @@ impl HostSession {
         };
         pipeline.set_clock(Arc::clone(&self.clock));
         pipeline.request_idr();
+        self.active_codec = target_codec;
+        let pacing_bps = u64::from(target_bitrate).saturating_mul(2).max(200_000_000);
+        if let Some(t) = self.transport.as_mut() {
+            t.set_pacing_rate(pacing_bps);
+        }
 
         // 防御性守卫：若自定义测试工厂在重建时重置了时钟零点，避免 wrapping_sub 误触发刷新。
         let now = (self.clock)();
@@ -2069,6 +2108,12 @@ impl HostSession {
             auth_status: AuthStatus::Ok,
             host_flags,
         });
+        let pacing_bps = u64::from(granted.bitrate_bps)
+            .saturating_mul(2)
+            .max(200_000_000);
+        if let Some(t) = self.transport.as_mut() {
+            t.set_pacing_rate(pacing_bps);
+        }
         self.send_control(&welcome)?;
 
         self.pipeline = Some(pipeline);
@@ -2088,6 +2133,7 @@ impl HostSession {
         // 发现 7：不复用上一会话的 SetBitrate 记账——current_bitrate
         // 归 None（回落到本会话协商值；resume 路径不经此处，计数延续）。
         self.current_bitrate = None;
+        self.active_codec = self.cfg.pipeline.codec;
         // 发现 8：全新会话（非 resume）关键批计数归零——client 侧同一
         // session_id 换新后计数也从 1 起，两侧 InputAck `key_batch_seq`
         // 口径对齐；resume 路径不经此处，计数延续。
@@ -2245,6 +2291,10 @@ impl HostSession {
         })?;
         pipeline.set_bitrate(bps)?;
         self.current_bitrate = Some(bps);
+        let pacing_bps = u64::from(bps).saturating_mul(2).max(200_000_000);
+        if let Some(t) = self.transport.as_mut() {
+            t.set_pacing_rate(pacing_bps);
+        }
         eprintln!("rc-session host: SetBitrate {bps}bps (reason={reason}) 已下发编码线程");
         Ok(())
     }
@@ -2675,18 +2725,23 @@ fn fit_even_preserving_aspect(
 }
 
 /// 把 client 请求参数逐字段 min 夹紧到 host 能力，分辨率过 `to_even`（S2）；
+/// 当 `requested` 为 `0×0` 时表示「按被控端当前分辨率建立首帧协商」（直接采用 `caps` 宽高）。
 /// 当 `preserve_caps_aspect == true` 时在夹紧包络内保持 `caps` 的宽高比。
 fn clamp_params_with_aspect(
     requested: &SessionParams,
     caps: &SessionParams,
     preserve_caps_aspect: bool,
 ) -> SessionParams {
-    let max_w = requested.width.min(caps.width);
-    let max_h = requested.height.min(caps.height);
-    let res = if preserve_caps_aspect {
-        fit_even_preserving_aspect(max_w, max_h, caps.width, caps.height)
+    let res = if requested.width == 0 && requested.height == 0 {
+        rc_types::Resolution::new(caps.width, caps.height).to_even()
     } else {
-        rc_types::Resolution::new(max_w, max_h).to_even()
+        let max_w = requested.width.min(caps.width);
+        let max_h = requested.height.min(caps.height);
+        if preserve_caps_aspect {
+            fit_even_preserving_aspect(max_w, max_h, caps.width, caps.height)
+        } else {
+            rc_types::Resolution::new(max_w, max_h).to_even()
+        }
     };
     SessionParams {
         width: res.width,
@@ -2801,6 +2856,7 @@ mod tests {
             clock_origin_us: None,
             // 模板取默认预算；真 QUIC 路径由 expect_hello 按 N2 覆盖为 1120。
             max_packet_payload: rc_proto::MAX_PAYLOAD,
+            ..PipelineConfig::default()
         }
     }
 
@@ -2997,6 +3053,7 @@ mod tests {
             clock_origin_us: None,
             // 模板取默认预算；握手时由 expect_hello 按 N2 覆盖。
             max_packet_payload: rc_proto::MAX_PAYLOAD,
+            ..PipelineConfig::default()
         };
         let mut mock = MockTransport::new();
         mock.deliver_reliable(&hello_msg(cfg.caps, proto::AuthMethod::None));
@@ -5800,5 +5857,45 @@ mod tests {
         assert!(!session.has_pending_pipeline_work());
         session.set_injector_screen_size(1800, 1169);
         assert_eq!(*sizes.lock().unwrap(), vec![(1800, 1169)]);
+    }
+
+    #[test]
+    fn zero_requested_resolution_negotiates_host_current_caps() {
+        for (w, h) in [(3440, 1440), (3840, 2160), (1512, 982)] {
+            let caps = SessionParams {
+                width: w,
+                height: h,
+                fps: 120,
+                bitrate_bps: 40_000_000,
+            };
+            let req = SessionParams {
+                width: 0,
+                height: 0,
+                fps: 120,
+                bitrate_bps: 40_000_000,
+            };
+            let granted = clamp_params_with_aspect(&req, &caps, true);
+            assert_eq!(granted.width, w & !1);
+            assert_eq!(granted.height, h & !1);
+        }
+
+        // Single-zero degenerate dimension must still remain 0 and be rejected by handshake.
+        let caps = SessionParams {
+            width: 3440,
+            height: 1440,
+            fps: 120,
+            bitrate_bps: 40_000_000,
+        };
+        let bad = clamp_params_with_aspect(
+            &SessionParams {
+                width: 0,
+                height: 1080,
+                fps: 120,
+                bitrate_bps: 40_000_000,
+            },
+            &caps,
+            true,
+        );
+        assert_eq!(bad.width, 0);
     }
 }

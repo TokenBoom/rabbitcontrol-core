@@ -40,6 +40,7 @@ fn test_pipeline_cfg() -> rc_pipeline::PipelineConfig {
         diff: rc_pipeline::DiffMode::TrustPlatform,
         clock_origin_us: None,
         max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+        ..rc_pipeline::PipelineConfig::default()
     }
 }
 
@@ -479,7 +480,7 @@ fn live_display_reconfigure_updates_resolution_fps_and_keeps_streaming() {
     cfg.bitrate_bps = 12_000_000;
     let session = SessionHandle::spawn(cfg);
 
-    // 1) 握手入流后应立刻收到初始 DisplayConfig（含 144fps 上限与原生预设）及 fps > 0 的 HUD
+    // 1) 握手入流后应立刻收到初始 DisplayConfig（含 380fps 上限与原生预设）及 fps > 0 的 HUD
     let initial = collect_until(&session, Duration::from_secs(6), |list| {
         let got_cfg = list
             .iter()
@@ -498,12 +499,12 @@ fn live_display_reconfigure_updates_resolution_fps_and_keeps_streaming() {
                 fps: 60,
                 native_width: 1920,
                 native_height: 1080,
-                max_fps: 144,
+                max_fps: 380,
                 presets,
             } if presets.iter().any(|p| p.is_native && p.width == 1920 && p.height == 1080)
                 && presets.iter().any(|p| p.width == 1280 && p.height == 720)
         )),
-        "入流后应收到 1920x1080@60 (max_fps=144) 初始 DisplayConfig，实际：{initial:?}"
+        "入流后应收到 1920x1080@60 (max_fps=380) 初始 DisplayConfig，实际：{initial:?}"
     );
 
     // 2) 会话中热切换到 1280x720@120fps
@@ -543,7 +544,7 @@ fn live_display_reconfigure_updates_resolution_fps_and_keeps_streaming() {
                 fps: 120,
                 native_width: 1920,
                 native_height: 1080,
-                max_fps: 144,
+                max_fps: 380,
                 ..
             }
         )),

@@ -159,8 +159,8 @@ impl Default for UiSessionConfig {
             connect_addr: SocketAddr::from(([127, 0, 0, 1], 9901)),
             password: None,
             watch_only: false,
-            width: 1920,
-            height: 1080,
+            width: 0,
+            height: 0,
             fps: 60,
             bitrate_bps: 14_000_000,
             prefer_hardware: false,
@@ -862,6 +862,15 @@ enum FileWorkerCmd {
         name: String,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    DeleteRemote {
+        path: String,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+    RenameRemote {
+        path: String,
+        new_name: String,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     StartUpload {
         local_path: String,
         remote_dir: String,
@@ -963,6 +972,20 @@ impl FileClientWorker {
                                 reply,
                             }) => {
                                 engine.request_mkdir(parent, name);
+                                did_work = true;
+                                let _ = reply.send(Ok(()));
+                            }
+                            Ok(FileWorkerCmd::DeleteRemote { path, reply }) => {
+                                engine.request_delete(path);
+                                did_work = true;
+                                let _ = reply.send(Ok(()));
+                            }
+                            Ok(FileWorkerCmd::RenameRemote {
+                                path,
+                                new_name,
+                                reply,
+                            }) => {
+                                engine.request_rename(path, new_name);
                                 did_work = true;
                                 let _ = reply.send(Ok(()));
                             }
@@ -1208,6 +1231,23 @@ impl ToolClientHandle {
         })
     }
 
+    /// 请求删除远端文件或目录（结果通过 `file://event` 推送）。
+    pub fn file_delete_remote(&self, path: String) -> Result<(), String> {
+        self.ensure_running()?;
+        self.file
+            .send_cmd(|reply| FileWorkerCmd::DeleteRemote { path, reply })
+    }
+
+    /// 请求重命名远端文件或目录（结果通过 `file://event` 推送）。
+    pub fn file_rename_remote(&self, path: String, new_name: String) -> Result<(), String> {
+        self.ensure_running()?;
+        self.file.send_cmd(|reply| FileWorkerCmd::RenameRemote {
+            path,
+            new_name,
+            reply,
+        })
+    }
+
     /// 发起本地文件上传到远端目录，返回传输任务 ID（磁盘 I/O 在专用文件工作线程执行，不触碰 `tools_hub` 锁）。
     pub fn file_upload(&self, local_path: &str, remote_dir: &str) -> Result<u64, String> {
         self.ensure_running()?;
@@ -1357,6 +1397,37 @@ impl ToolClientHandle {
         }
         hub.terminal.rename(term_id, valid_name);
         Ok(())
+    }
+
+    /// 请求被控端枚举其系统已安装字体列表（结果通过 `terminal://event` 的 `fontList` 推送）。
+    pub fn terminal_list_remote_fonts(&self) -> Result<(), String> {
+        self.ensure_running()?;
+        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        if !hub.terminal.can_enqueue() {
+            return Err("终端控制队列繁忙，请稍后重试".to_string());
+        }
+        hub.terminal.request_list_fonts();
+        Ok(())
+    }
+
+    /// 请求从被控端拉取指定 `font_id` 的字体字节流（完成后通过 `fontReady` 事件通知）。
+    pub fn terminal_fetch_remote_font(&self, font_id: String) -> Result<u32, String> {
+        self.ensure_running()?;
+        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        if !hub.terminal.can_enqueue() {
+            return Err("终端控制队列繁忙，请稍后重试".to_string());
+        }
+        hub.terminal.request_fetch_font(font_id)
+    }
+
+    /// 读取已缓存到本地会话中的远程字体二进制数据。
+    pub fn terminal_get_cached_remote_font(&self, font_id: &str) -> Result<Vec<u8>, String> {
+        self.ensure_running()?;
+        let hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        hub.terminal
+            .get_cached_font(font_id)
+            .map(|bytes| bytes.to_vec())
+            .ok_or_else(|| "远程字体尚未下载完成或已被淘汰".to_string())
     }
 
     /// 查询指定 `term_id` 是否仍属于当前会话的活跃终端。
@@ -2214,7 +2285,10 @@ fn run_session_thread(
         watch_only,
     });
 
-    let resolution = Resolution::new(cfg.width.max(1), cfg.height.max(1));
+    let resolution = Resolution::new(
+        if cfg.width == 0 { 1920 } else { cfg.width },
+        if cfg.height == 0 { 1080 } else { cfg.height },
+    );
     let pipeline = PipelineConfig {
         resolution,
         fps: cfg.fps.max(1),
@@ -2224,15 +2298,17 @@ fn run_session_thread(
         trace_capacity: 4096,
         diff: DiffMode::TrustPlatform,
         clock_origin_us: None,
+        async_decode: cfg.prefer_hardware,
         max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+        ..PipelineConfig::default()
     };
     let session_id = derive_session_id();
     let mut client_cfg = ClientSessionConfig {
         peer_addr: cfg.connect_addr,
         mtu: rc_session::DEFAULT_SESSION_MTU,
         requested: SessionParams {
-            width: resolution.width,
-            height: resolution.height,
+            width: cfg.width,
+            height: cfg.height,
             fps: cfg.fps.max(1),
             bitrate_bps: cfg.bitrate_bps.max(1),
         },
@@ -2723,6 +2799,13 @@ fn run_session_thread(
     let mut pending_term_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_portmap_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_display_tx: VecDeque<Vec<u8>> = VecDeque::new();
+    if cfg.prefer_hardware && is_hardware_decoder && rc_pipeline::platform_supports_hevc() {
+        if let Some(payload) = display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetCodec {
+            codec: "hevc".to_string(),
+        }) {
+            pending_display_tx.push_back(payload);
+        }
+    }
     let mut hud_width = negotiated.width;
     let mut hud_height = negotiated.height;
 
@@ -3379,7 +3462,9 @@ fn handle_display_ctrl_msg(
                 None
             }
         }
-        DisplayControlMsg::SetStream { .. } | DisplayControlMsg::LockScreen => None,
+        DisplayControlMsg::SetStream { .. }
+        | DisplayControlMsg::LockScreen
+        | DisplayControlMsg::SetCodec { .. } => None,
     }
 }
 

@@ -25,6 +25,7 @@ fn cfg() -> PipelineConfig {
         clock_origin_us: None,
         // M1 兼容性锁定：默认预算（1200）。
         max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+        ..PipelineConfig::default()
     }
 }
 

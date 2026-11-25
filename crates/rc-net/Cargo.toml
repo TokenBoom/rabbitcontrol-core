@@ -21,6 +21,8 @@ rustls-pemfile = "2"
 ring = "0.17"
 # quinn 的 send_datagram 直接吃 bytes::Bytes，需要显式依赖来命名该类型
 bytes = "1"
+# 调优 UDP 内核收发缓冲（4 MiB）以避免 4K@120 / 2K@240 突发丢包
+socket2 = "0.6"
 
 [dev-dependencies]
 # 集成测试里的丢包注入用与 rc-loopback DamageInjector 相同的 StdRng 语义

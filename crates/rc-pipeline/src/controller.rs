@@ -8,12 +8,15 @@
 //!   兜底，`unfinished == 0`。
 
 use crate::{select_all, PipelineConfig};
-use rc_decode::{DecodeOutput, DecodedFrame, Decoder};
+use rc_decode::{DecodeOutput, Decoder};
 use rc_proto::{MediaHeader, HEADER_LEN};
 use rc_render::Renderer;
 use rc_trace::{Mark, Outcome, TraceCollector};
 use rc_types::{Error, FrameKind, FrameSeq, Result, Timestamp};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 /// 重组中的帧。
 struct Partial {
@@ -25,13 +28,57 @@ struct Partial {
     #[allow(dead_code)]
     encode_done_ts: Timestamp,
     kind: FrameKind,
+    is_hevc: bool,
+}
+
+type ClockSlot = Arc<Mutex<Option<Arc<dyn Fn() -> u32 + Send + Sync>>>>;
+
+struct PendingAsyncFrame {
+    seq: FrameSeq,
+    payload_all: Vec<u8>,
+    capture_ts: Timestamp,
+    received_ts: Timestamp,
+    kind: FrameKind,
+    is_hevc: bool,
+}
+
+enum AsyncFrameOutcome {
+    Finished {
+        seq: FrameSeq,
+        capture_ts: Timestamp,
+        received_ts: Timestamp,
+        decoded_ts: Option<Timestamp>,
+        presented_ts: Option<Timestamp>,
+        outcome: Outcome,
+    },
+}
+
+#[derive(Default)]
+struct AsyncSharedState {
+    completed: VecDeque<AsyncFrameOutcome>,
+    fatal_error: Option<Error>,
+}
+
+enum ControllerExecMode {
+    Sync {
+        decoder: Box<dyn Decoder>,
+        renderer: Box<dyn Renderer>,
+        active_codec: rc_encode::Codec,
+    },
+    Async {
+        slot: Arc<(Mutex<Option<PendingAsyncFrame>>, Condvar)>,
+        stop: Arc<AtomicBool>,
+        shared: Arc<Mutex<AsyncSharedState>>,
+        need_keyframe: Arc<AtomicBool>,
+        displayed: Arc<AtomicU64>,
+        worker: Option<JoinHandle<()>>,
+    },
 }
 
 /// 控制端管线。
 pub struct ControllerPipeline {
     cfg: PipelineConfig,
-    decoder: Box<dyn Decoder>,
-    renderer: Box<dyn Renderer>,
+    mode: ControllerExecMode,
     trace: TraceCollector,
     /// 重组表（按帧序号有序，便于「新帧到达后清理旧残帧」）。
     partials: BTreeMap<FrameSeq, Partial>,
@@ -47,7 +94,7 @@ pub struct ControllerPipeline {
     /// 返回后读本时钟打点，而不是信任后端内部时钟——假后端各持独立
     /// 逻辑时钟，真后端的时间基准也不保证与会话同轴。`None` 时退化为
     /// 调用方传入的 `now_us`（decode/present 段退化为 0，诚实可解释）。
-    clock: Option<std::sync::Arc<dyn Fn() -> u32 + Send + Sync>>,
+    clock: ClockSlot,
 }
 
 /// 重组表的容量上限（对应 TASK.md 铁律 1：任意并发重组帧上限 = 2，与
@@ -55,8 +102,47 @@ pub struct ControllerPipeline {
 /// `LostInNetwork`，禁止为了减少丢帧而调大。
 const MAX_PARTIALS: usize = 2;
 
-/// 解码 deadline 余量（微秒）：M1 无真实预算协商，给单帧解码的保守上限。
+/// 常规单帧解码 deadline 余量（微秒）。
 const DECODE_BUDGET_US: u32 = 3_000;
+/// 高分屏（>2.6M 像素）或 IDR 帧解码 deadline 余量（微秒）。
+const HIGH_RES_DECODE_BUDGET_US: u32 = 10_000;
+
+fn frame_decode_budget_us(cfg: &PipelineConfig, kind: FrameKind) -> u32 {
+    let pixels = u64::from(cfg.resolution.width) * u64::from(cfg.resolution.height);
+    if pixels > 2_600_000 || kind == FrameKind::Idr {
+        HIGH_RES_DECODE_BUDGET_US
+    } else {
+        DECODE_BUDGET_US
+    }
+}
+
+fn read_clock(clock: &ClockSlot, fallback_us: u32) -> Timestamp {
+    let guard = clock.lock().unwrap_or_else(|e| e.into_inner());
+    Timestamp(guard.as_ref().map_or(fallback_us, |c| c()))
+}
+
+fn maybe_swap_decoder_for_codec(
+    cfg: &PipelineConfig,
+    active_codec: &mut rc_encode::Codec,
+    decoder: &mut Box<dyn Decoder>,
+    is_hevc: bool,
+) {
+    let target = if is_hevc {
+        rc_encode::Codec::Hevc
+    } else {
+        rc_encode::Codec::H264
+    };
+    if target == *active_codec || !cfg.prefer_hardware {
+        return;
+    }
+    let mut next_cfg = cfg.clone();
+    next_cfg.codec = target;
+    if let Ok((new_dec, _)) = crate::select_decoder_labeled(&next_cfg) {
+        let _ = decoder.flush();
+        *decoder = new_dec;
+        *active_codec = target;
+    }
+}
 
 impl ControllerPipeline {
     /// 用工厂后端创建（auto 模式）。
@@ -73,36 +159,233 @@ impl ControllerPipeline {
     /// 注入指定后端（测试 / 会话层显式控制）。
     pub fn with_backends(
         cfg: PipelineConfig,
-        decoder: Box<dyn Decoder>,
-        renderer: Box<dyn Renderer>,
+        mut decoder: Box<dyn Decoder>,
+        mut renderer: Box<dyn Renderer>,
     ) -> Result<Self> {
         cfg.validate()?;
+        let trace = TraceCollector::new(cfg.trace_capacity);
+        let clock: ClockSlot = Arc::new(Mutex::new(None));
+        let active_codec = cfg.codec;
+        let mode = if cfg.async_decode {
+            let slot = Arc::new((Mutex::new(None::<PendingAsyncFrame>), Condvar::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let shared = Arc::new(Mutex::new(AsyncSharedState::default()));
+            let need_keyframe = Arc::new(AtomicBool::new(false));
+            let displayed = Arc::new(AtomicU64::new(0));
+
+            let slot_w = Arc::clone(&slot);
+            let stop_w = Arc::clone(&stop);
+            let shared_w = Arc::clone(&shared);
+            let need_kf_w = Arc::clone(&need_keyframe);
+            let disp_w = Arc::clone(&displayed);
+            let clock_w = Arc::clone(&clock);
+            let cfg_w = cfg.clone();
+            let mut active_codec_w = active_codec;
+
+            let worker = std::thread::Builder::new()
+                .name("rc-ctrl-decode".into())
+                .spawn(move || {
+                    crate::promote_current_thread_qos();
+                    loop {
+                        let pending = {
+                            let (lock, cv) = &*slot_w;
+                            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(frame) = guard.take() {
+                                    break Some(frame);
+                                }
+                                if stop_w.load(Ordering::Acquire) {
+                                    break None;
+                                }
+                                guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        let Some(frame) = pending else {
+                            break;
+                        };
+                        maybe_swap_decoder_for_codec(
+                            &cfg_w,
+                            &mut active_codec_w,
+                            &mut decoder,
+                            frame.is_hevc,
+                        );
+                        let now_us = read_clock(&clock_w, frame.received_ts.0).0;
+                        let budget = frame_decode_budget_us(&cfg_w, frame.kind);
+                        let res = decoder.decode(
+                            &frame.payload_all,
+                            frame.kind,
+                            Timestamp(now_us.saturating_add(budget)),
+                        );
+                        match res {
+                            Ok(DecodeOutput::NeedKeyframe) => {
+                                need_kf_w.store(true, Ordering::Release);
+                                let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+                                s.completed.push_back(AsyncFrameOutcome::Finished {
+                                    seq: frame.seq,
+                                    capture_ts: frame.capture_ts,
+                                    received_ts: frame.received_ts,
+                                    decoded_ts: None,
+                                    presented_ts: None,
+                                    outcome: Outcome::DecodeError,
+                                });
+                            }
+                            Ok(DecodeOutput::Nothing) => {
+                                let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+                                s.completed.push_back(AsyncFrameOutcome::Finished {
+                                    seq: frame.seq,
+                                    capture_ts: frame.capture_ts,
+                                    received_ts: frame.received_ts,
+                                    decoded_ts: None,
+                                    presented_ts: None,
+                                    outcome: Outcome::DecodeError,
+                                });
+                            }
+                            Ok(DecodeOutput::Frame(decoded)) => {
+                                let decoded_ts = read_clock(&clock_w, now_us);
+                                let presented = renderer.present(decoded);
+                                let presented_ts = read_clock(&clock_w, now_us);
+                                match presented {
+                                    Ok(_) => {
+                                        disp_w.fetch_add(1, Ordering::Relaxed);
+                                        if decoder.needs_keyframe() {
+                                            need_kf_w.store(true, Ordering::Release);
+                                        }
+                                        let mut s =
+                                            shared_w.lock().unwrap_or_else(|e| e.into_inner());
+                                        s.completed.push_back(AsyncFrameOutcome::Finished {
+                                            seq: frame.seq,
+                                            capture_ts: frame.capture_ts,
+                                            received_ts: frame.received_ts,
+                                            decoded_ts: Some(decoded_ts),
+                                            presented_ts: Some(presented_ts),
+                                            outcome: Outcome::Displayed,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let fatal = e.is_fatal();
+                                        let mut s =
+                                            shared_w.lock().unwrap_or_else(|e| e.into_inner());
+                                        s.completed.push_back(AsyncFrameOutcome::Finished {
+                                            seq: frame.seq,
+                                            capture_ts: frame.capture_ts,
+                                            received_ts: frame.received_ts,
+                                            decoded_ts: Some(decoded_ts),
+                                            presented_ts: None,
+                                            outcome: Outcome::DecodeError,
+                                        });
+                                        if fatal {
+                                            s.fatal_error = Some(e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let fatal = e.is_fatal();
+                                if decoder.needs_keyframe() {
+                                    need_kf_w.store(true, Ordering::Release);
+                                }
+                                let mut s = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+                                s.completed.push_back(AsyncFrameOutcome::Finished {
+                                    seq: frame.seq,
+                                    capture_ts: frame.capture_ts,
+                                    received_ts: frame.received_ts,
+                                    decoded_ts: None,
+                                    presented_ts: None,
+                                    outcome: Outcome::DecodeError,
+                                });
+                                if fatal {
+                                    s.fatal_error = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = decoder.flush();
+                })
+                .map_err(|e| Error::InvalidConfig(format!("spawn ctrl decode thread: {e}")))?;
+
+            ControllerExecMode::Async {
+                slot,
+                stop,
+                shared,
+                need_keyframe,
+                displayed,
+                worker: Some(worker),
+            }
+        } else {
+            ControllerExecMode::Sync {
+                decoder,
+                renderer,
+                active_codec,
+            }
+        };
+
         Ok(Self {
-            trace: TraceCollector::new(cfg.trace_capacity),
-            decoder,
-            renderer,
+            trace,
+            mode,
             cfg,
             partials: BTreeMap::new(),
             highest_delivered: None,
             highest_evicted: None,
             need_keyframe: false,
             displayed: 0,
-            clock: None,
+            clock,
         })
     }
 
     /// 注入会话时钟（微秒，与帧 `timestamp` 同基准）。见字段文档。
     pub fn set_clock(&mut self, clock: std::sync::Arc<dyn Fn() -> u32 + Send + Sync>) {
-        self.clock = Some(clock);
+        *self.clock.lock().unwrap_or_else(|e| e.into_inner()) = Some(clock);
     }
 
-    /// 读会话时钟；未注入时退化为调用方给的 `now_us`。
-    fn now(&self, fallback_us: u32) -> Timestamp {
-        Timestamp(self.clock.as_ref().map_or(fallback_us, |c| c()))
+    fn drain_async_completions(&mut self) -> Result<bool> {
+        let (pending_outcomes, fatal) = match &self.mode {
+            ControllerExecMode::Sync { .. } => return Ok(false),
+            ControllerExecMode::Async { shared, .. } => {
+                let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+                let items: Vec<AsyncFrameOutcome> = s.completed.drain(..).collect();
+                let fatal = s.fatal_error.take();
+                (items, fatal)
+            }
+        };
+        let mut presented_any = false;
+        for item in pending_outcomes {
+            match item {
+                AsyncFrameOutcome::Finished {
+                    seq,
+                    capture_ts,
+                    received_ts,
+                    decoded_ts,
+                    presented_ts,
+                    outcome,
+                } => {
+                    let slot = self.trace.begin(seq);
+                    slot.mark(Mark::Captured, capture_ts);
+                    slot.mark(Mark::Received, received_ts);
+                    if let Some(d) = decoded_ts {
+                        slot.mark(Mark::Decoded, d);
+                    }
+                    if let Some(p) = presented_ts {
+                        slot.mark(Mark::Presented, p);
+                    }
+                    slot.finish(outcome);
+                    if outcome == Outcome::Displayed {
+                        self.displayed += 1;
+                        presented_any = true;
+                    }
+                }
+            }
+        }
+        if let Some(err) = fatal {
+            return Err(err);
+        }
+        Ok(presented_any)
     }
 
     /// 投入一个收到的数据报。返回 `Ok(true)` 表示有新帧上屏。
     pub fn push_datagram(&mut self, data: &[u8], now_us: u32) -> Result<bool> {
+        let mut presented_now = self.drain_async_completions()?;
         let (header, payload) = MediaHeader::parse_datagram(data)?;
         let seq = header.frame_seq;
         let idx = header.packet_idx;
@@ -111,13 +394,13 @@ impl ControllerPipeline {
         // 直接丢弃，不复活已判 LostInNetwork 的帧（若尚未入 trace 则补记 LostInNetwork）。
         if let Some(hi) = self.highest_delivered {
             if seq <= hi {
-                return Ok(false);
+                return Ok(presented_now);
             }
         }
         if let Some(ev) = self.highest_evicted {
             if seq <= ev {
                 self.mark_lost(seq, header.capture_ts);
-                return Ok(false);
+                return Ok(presented_now);
             }
         }
 
@@ -133,6 +416,7 @@ impl ControllerPipeline {
                 } else {
                     FrameKind::P
                 },
+                is_hevc: header.flags.is_hevc(),
             });
             if idx >= partial.cnt {
                 return Err(Error::Protocol {
@@ -150,14 +434,14 @@ impl ControllerPipeline {
         self.evict_stale(seq);
 
         if received < cnt {
-            return Ok(false); // P6：缺包不交付
+            return Ok(presented_now); // P6：缺包不交付
         }
 
         // 凑齐：按 packet_idx 拼接（坑 4）。remove 拿所有权。
         // 若本帧在容量裁剪中被当作最旧残帧淘汰（例如已有 2 个更新残帧在途时
         // 来了更旧的单包帧），evict_stale 已记 LostInNetwork，直接返回即可。
         let Some(partial) = self.partials.remove(&seq) else {
-            return Ok(false);
+            return Ok(presented_now);
         };
         let mut payload_all = Vec::with_capacity(
             partial
@@ -171,40 +455,102 @@ impl ControllerPipeline {
         }
         let capture_ts = partial.capture_ts;
         let kind = partial.kind;
+        let is_hevc = partial.is_hevc;
         self.highest_delivered = Some(seq);
 
-        let slot = self.trace.begin(seq);
-        slot.mark(Mark::Captured, capture_ts);
-        slot.mark(Mark::Received, Timestamp(now_us));
+        match &mut self.mode {
+            ControllerExecMode::Sync {
+                decoder,
+                renderer,
+                active_codec,
+            } => {
+                let slot = self.trace.begin(seq);
+                slot.mark(Mark::Captured, capture_ts);
+                slot.mark(Mark::Received, Timestamp(now_us));
 
-        // 解码。
-        match self.decoder.decode(
-            &payload_all,
-            kind,
-            Timestamp(now_us.saturating_add(DECODE_BUDGET_US)),
-        ) {
-            Ok(DecodeOutput::NeedKeyframe) => {
-                self.need_keyframe = true;
-                if let Some(f) = self.trace.get_mut(seq) {
-                    f.finish(Outcome::DecodeError);
+                maybe_swap_decoder_for_codec(&self.cfg, active_codec, decoder, is_hevc);
+                let budget = frame_decode_budget_us(&self.cfg, kind);
+                match decoder.decode(&payload_all, kind, Timestamp(now_us.saturating_add(budget))) {
+                    Ok(DecodeOutput::NeedKeyframe) => {
+                        self.need_keyframe = true;
+                        if let Some(f) = self.trace.get_mut(seq) {
+                            f.finish(Outcome::DecodeError);
+                        }
+                        Ok(false)
+                    }
+                    Ok(DecodeOutput::Nothing) => {
+                        if let Some(f) = self.trace.get_mut(seq) {
+                            f.finish(Outcome::DecodeError);
+                        }
+                        Ok(false)
+                    }
+                    Ok(DecodeOutput::Frame(decoded)) => {
+                        let decoded_at = read_clock(&self.clock, now_us);
+                        let presented = renderer.present(decoded);
+                        let presented_at = read_clock(&self.clock, now_us);
+                        presented?;
+                        if let Some(f) = self.trace.get_mut(seq) {
+                            f.mark(Mark::Decoded, decoded_at);
+                            f.mark(Mark::Presented, presented_at);
+                            f.finish(Outcome::Displayed);
+                        }
+                        self.displayed += 1;
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        if let Some(f) = self.trace.get_mut(seq) {
+                            f.finish(Outcome::DecodeError);
+                        }
+                        if e.is_fatal() {
+                            return Err(e);
+                        }
+                        Ok(false)
+                    }
                 }
-                Ok(false)
             }
-            Ok(DecodeOutput::Nothing) => {
-                if let Some(f) = self.trace.get_mut(seq) {
-                    f.finish(Outcome::DecodeError);
+            ControllerExecMode::Async { slot, .. } => {
+                let received_ts = Timestamp(now_us);
+                let incoming = PendingAsyncFrame {
+                    seq,
+                    payload_all,
+                    capture_ts,
+                    received_ts,
+                    kind,
+                    is_hevc,
+                };
+                let dropped_frame = {
+                    let (lock, cv) = &**slot;
+                    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let dropped = match guard.take() {
+                        Some(prev) if prev.kind == FrameKind::Idr && kind != FrameKind::Idr => {
+                            *guard = Some(prev);
+                            Some((seq, capture_ts, received_ts))
+                        }
+                        Some(prev) => {
+                            *guard = Some(incoming);
+                            Some((prev.seq, prev.capture_ts, prev.received_ts))
+                        }
+                        None => {
+                            *guard = Some(incoming);
+                            None
+                        }
+                    };
+                    cv.notify_one();
+                    dropped
+                };
+                if let Some((d_seq, d_cap, d_recv)) = dropped_frame {
+                    let f = self.trace.begin(d_seq);
+                    f.mark(Mark::Captured, d_cap);
+                    f.mark(Mark::Received, d_recv);
+                    f.finish(Outcome::DroppedStale);
+                    if kind != FrameKind::Idr {
+                        self.need_keyframe = true;
+                    }
                 }
-                Ok(false)
-            }
-            Ok(DecodeOutput::Frame(decoded)) => self.decode_ok(seq, decoded, now_us),
-            Err(e) => {
-                if let Some(f) = self.trace.get_mut(seq) {
-                    f.finish(Outcome::DecodeError);
+                if self.drain_async_completions()? {
+                    presented_now = true;
                 }
-                if e.is_fatal() {
-                    return Err(e);
-                }
-                Ok(false) // P7 对称：单帧解码失败不终止
+                Ok(presented_now)
             }
         }
     }
@@ -212,9 +558,20 @@ impl ControllerPipeline {
     /// 是否需要向对端请求关键帧（取走即清「请求」标志；参考链是否恢复
     /// 由解码器自己跟踪，解出 IDR 前它会让本标志再次置位）。
     pub fn take_keyframe_request(&mut self) -> bool {
-        let kf = self.need_keyframe || self.decoder.needs_keyframe();
-        self.need_keyframe = false;
-        kf
+        let _ = self.drain_async_completions();
+        match &self.mode {
+            ControllerExecMode::Sync { decoder, .. } => {
+                let kf = self.need_keyframe || decoder.needs_keyframe();
+                self.need_keyframe = false;
+                kf
+            }
+            ControllerExecMode::Async { need_keyframe, .. } => {
+                let async_kf = need_keyframe.swap(false, Ordering::AcqRel);
+                let kf = self.need_keyframe || async_kf;
+                self.need_keyframe = false;
+                kf
+            }
+        }
     }
 
     /// 帧时间线（本端半场：Received→Presented + 传输/解码结局）。
@@ -224,13 +581,45 @@ impl ControllerPipeline {
 
     /// 已上屏帧数。
     pub fn displayed(&self) -> u64 {
-        self.displayed
+        match &self.mode {
+            ControllerExecMode::Sync { .. } => self.displayed,
+            ControllerExecMode::Async { displayed, .. } => {
+                self.displayed.max(displayed.load(Ordering::Relaxed))
+            }
+        }
     }
 
     /// 会话收尾：在途残帧判 `LostInNetwork`，冲刷解码器。
     pub fn shutdown(&mut self) {
         self.finish_in_flight();
-        let _ = self.decoder.flush();
+        match &mut self.mode {
+            ControllerExecMode::Sync { decoder, .. } => {
+                let _ = decoder.flush();
+            }
+            ControllerExecMode::Async {
+                slot, stop, worker, ..
+            } => {
+                stop.store(true, Ordering::Release);
+                {
+                    let (_, cv) = &**slot;
+                    cv.notify_all();
+                }
+                if let Some(handle) = worker.take() {
+                    let _ = handle.join();
+                }
+                let leftover = {
+                    let (lock, _) = &**slot;
+                    lock.lock().unwrap_or_else(|e| e.into_inner()).take()
+                };
+                if let Some(p) = leftover {
+                    let f = self.trace.begin(p.seq);
+                    f.mark(Mark::Captured, p.capture_ts);
+                    f.mark(Mark::Received, p.received_ts);
+                    f.finish(Outcome::DroppedStale);
+                }
+                let _ = self.drain_async_completions();
+            }
+        }
     }
 
     /// 把仍在重组表的残帧全部判 `LostInNetwork`（截断兜底，保证
@@ -246,23 +635,6 @@ impl ControllerPipeline {
             f.mark(Mark::Received, Timestamp(p.capture_ts.0));
             f.finish(Outcome::LostInNetwork);
         }
-    }
-
-    fn decode_ok(&mut self, seq: FrameSeq, decoded: DecodedFrame, now_us: u32) -> Result<bool> {
-        // 解码同步完成：操作返回后读会话时钟打点。
-        let decoded_at = self.now(now_us);
-        let presented = self.renderer.present(decoded);
-        // D8：present 返回后打点。渲染器返回的 Timestamp 只是参考值，
-        // 管线统一用会话时钟（见 `clock` 字段文档）。
-        let presented_at = self.now(now_us);
-        presented?;
-        if let Some(f) = self.trace.get_mut(seq) {
-            f.mark(Mark::Decoded, decoded_at);
-            f.mark(Mark::Presented, presented_at);
-            f.finish(Outcome::Displayed);
-        }
-        self.displayed += 1;
-        Ok(true)
     }
 
     /// 新帧 `upto` 到达后，序号更小的残帧永远凑不齐：判 LostInNetwork。
@@ -297,6 +669,24 @@ impl ControllerPipeline {
     /// 配置引用（会话层取分辨率/容量等）。
     pub fn config(&self) -> &PipelineConfig {
         &self.cfg
+    }
+}
+
+impl Drop for ControllerPipeline {
+    fn drop(&mut self) {
+        if let ControllerExecMode::Async {
+            slot, stop, worker, ..
+        } = &mut self.mode
+        {
+            stop.store(true, Ordering::Release);
+            {
+                let (_, cv) = &**slot;
+                cv.notify_all();
+            }
+            if let Some(handle) = worker.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 

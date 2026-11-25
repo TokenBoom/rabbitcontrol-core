@@ -441,6 +441,7 @@ fn measure_e2e_session(
         diff: DiffMode::TrustPlatform,
         clock_origin_us: None,
         max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+        ..PipelineConfig::default()
     };
     let host_cfg = HostSessionConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),

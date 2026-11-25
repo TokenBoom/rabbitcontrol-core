@@ -578,11 +578,16 @@ impl ConnectionApprover for UiApprover {
                     .remote_addr_override
                     .clone()
                     .unwrap_or_else(|| req.remote_addr.to_string());
+                let requested_res = if req.requested.width == 0 && req.requested.height == 0 {
+                    "本机当前分辨率".to_string()
+                } else {
+                    format!("{}x{}", req.requested.width, req.requested.height)
+                };
                 Some(HostApprovalPrompt {
                     generation: guard.generation,
                     session_id: req.session_id,
                     remote_addr,
-                    requested_res: format!("{}x{}", req.requested.width, req.requested.height),
+                    requested_res,
                     requested_fps: req.requested.fps,
                     password_verified: req.password_verified,
                 })
@@ -704,19 +709,20 @@ fn default_host_session_config(
     let caps = SessionParams {
         width: cap_w,
         height: cap_h,
-        fps: 144,
-        bitrate_bps: 40_000_000,
+        fps: 380,
+        bitrate_bps: 150_000_000,
     };
     let pipeline = PipelineConfig {
         resolution: hw_display_res.unwrap_or_else(|| Resolution::new(1920, 1080)),
         fps: 144,
-        bitrate_bps: 20_000_000,
+        bitrate_bps: 40_000_000,
         prefer_hardware,
         target_latency_us: 22_000,
         trace_capacity: 4096,
         diff: DiffMode::TrustPlatform,
         clock_origin_us: None,
         max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+        ..PipelineConfig::default()
     };
     let cfg = HostSessionConfig {
         listen_addr,
@@ -761,28 +767,28 @@ fn make_host_pipeline_factory(
             if prefer_hardware {
                 let mut hw_cfg = pcfg.clone();
                 hw_cfg.prefer_hardware = true;
-                // 高分辨率（> ~2.6M 像素，如 3K/4K Retina 3024×1964）在 Apple Silicon VideoToolbox
-                // RealTime 模式下超过 60fps 会触发硬件过载丢帧；自动将编码器期望帧率收敛到 ≤60fps，
-                // 1080p/1512×982/2K 等常规档位仍保持 120–144fps 满帧穿透。
-                let pixels =
-                    u64::from(hw_cfg.resolution.width) * u64::from(hw_cfg.resolution.height);
-                if pixels > 2_600_000 && hw_cfg.fps > 60 {
-                    hw_cfg.fps = 60;
-                }
                 let existing_host_us = match existing_origin {
                     ClockOrigin::HostClock(o) => Some(o),
                     _ => None,
                 };
-                let first_try = real_host_stack(&hw_cfg, existing_host_us);
-                let final_try = match first_try {
-                    Ok(ok) => Ok(ok),
-                    Err(_) if hw_cfg.fps > 60 => {
-                        let mut fallback_60 = hw_cfg.clone();
-                        fallback_60.fps = 60;
-                        real_host_stack(&fallback_60, existing_host_us)
+                let mut final_try = real_host_stack(&hw_cfg, existing_host_us);
+                if final_try.is_err() {
+                    for fb_fps in [240u32, 144, 120, 60] {
+                        if fb_fps < hw_cfg.fps {
+                            let mut fb_cfg = hw_cfg.clone();
+                            fb_cfg.fps = fb_fps;
+                            final_try = real_host_stack(&fb_cfg, existing_host_us);
+                            if final_try.is_ok() {
+                                break;
+                            }
+                        }
                     }
-                    Err(err) => Err(err),
-                };
+                }
+                if final_try.is_err() && hw_cfg.codec == rc_encode::Codec::Hevc {
+                    let mut h264_cfg = hw_cfg.clone();
+                    h264_cfg.codec = rc_encode::Codec::H264;
+                    final_try = real_host_stack(&h264_cfg, existing_host_us);
+                }
                 match final_try {
                     Ok((p, l, origin_us)) => {
                         *backend_label.lock().unwrap_or_else(|e| e.into_inner()) = l;
@@ -2221,6 +2227,34 @@ fn drive_ui_host_session_inner(
                                                 prefer_hardware,
                                             );
                                         }
+                                        Some(DisplayControlMsg::SetCodec { codec }) => {
+                                            let target_codec = if codec.eq_ignore_ascii_case("hevc")
+                                                && rc_pipeline::platform_supports_hevc()
+                                            {
+                                                Some(rc_encode::Codec::Hevc)
+                                            } else if codec.eq_ignore_ascii_case("h264") {
+                                                Some(rc_encode::Codec::H264)
+                                            } else {
+                                                None
+                                            };
+                                            if let (Some(c), Some(cur)) =
+                                                (target_codec, host.negotiated())
+                                            {
+                                                if let Err(err) = host
+                                                    .reconfigure_stream_with_codec(
+                                                        cur.width,
+                                                        cur.height,
+                                                        Some(cur.fps),
+                                                        Some(session_max_res),
+                                                        Some(c),
+                                                    )
+                                                {
+                                                    eprintln!(
+                                                        "[rc-ui-host] 热切换编解码器 ({c:?}) 失败（保持当前管线）: {err}"
+                                                    );
+                                                }
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -3239,7 +3273,12 @@ fn run_host_worker(
                         // 密码或鉴权配置在等待期间被刷新：重建 HostSession 使新配置对下一次握手生效。
                         break false;
                     }
-                    // 每轮 accept 分片前重锚 Pending 墙钟，确保审批超时从连接接入时起算。
+                    // 每轮 accept 分片前重锚 Pending 墙钟并刷新当前显示器分辨率能力，避免外接屏/分辨率切换后使用陈旧 caps。
+                    if opts.prefer_hardware {
+                        if let Some(live_res) = host_hardware_display_caps(true) {
+                            host.update_caps_resolution(live_res.width, live_res.height);
+                        }
+                    }
                     *clock_origin.lock().unwrap_or_else(|e| e.into_inner()) =
                         ClockOrigin::Pending(Instant::now());
 
@@ -3716,6 +3755,7 @@ mod tests {
                     diff: DiffMode::TrustPlatform,
                     clock_origin_us: None,
                     max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+                    ..PipelineConfig::default()
                 },
                 handshake_timeout: Duration::from_secs(5),
                 injector: Box::new(RecordingInjector::new()),

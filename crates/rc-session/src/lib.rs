@@ -198,6 +198,7 @@ mod tool_audio_pair_tests {
             diff: rc_pipeline::DiffMode::TrustPlatform,
             clock_origin_us: None,
             max_packet_payload: rc_proto::MAX_PAYLOAD,
+            ..PipelineConfig::default()
         }
     }
 

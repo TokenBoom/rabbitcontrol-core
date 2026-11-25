@@ -62,6 +62,7 @@ fn pcfg() -> PipelineConfig {
         //（max_media_payload(DEFAULT_MTU)）——大帧多包分片的数据报必须
         // 装进 rc-net 的 N2 预算，否则 send_datagram 拒收（T18 空档）。
         max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+        ..PipelineConfig::default()
     }
 }
 

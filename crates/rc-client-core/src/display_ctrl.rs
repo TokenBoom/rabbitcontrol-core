@@ -11,11 +11,11 @@
 /// `TOOL_CHANNEL_DISPLAY_CTRL` 单条 JSON 载荷的最大允许字节数（96 KiB，支撑桌面壁纸与能力通告）。
 pub const MAX_DISPLAY_CTRL_BYTES: usize = 96 * 1024;
 
-/// 热切换流分辨率允许的最大宽度上限（4K UHD）。
-pub const MAX_STREAM_WIDTH: u32 = 3840;
+/// 热切换流分辨率允许的最大宽度上限（5K / 超宽屏）。
+pub const MAX_STREAM_WIDTH: u32 = 5120;
 
-/// 热切换流分辨率允许的最大高度上限（4K UHD）。
-pub const MAX_STREAM_HEIGHT: u32 = 2160;
+/// 热切换流分辨率允许的最大高度上限（2880）。
+pub const MAX_STREAM_HEIGHT: u32 = 2880;
 
 /// 降采样预设保留的最小宽度（像素）。
 const MIN_PRESET_WIDTH: u32 = 640;
@@ -76,6 +76,11 @@ pub enum DisplayControlMsg {
         height: u32,
         /// 目标帧率（fps；`0` 表示保持当前帧率）。
         fps: u32,
+    },
+    /// 控制端 → 被控端：请求切换或协商视频编解码器（如 `"hevc"` / `"h264"`）。
+    SetCodec {
+        /// 目标编解码器名称（`"hevc"` 或 `"h264"`）。
+        codec: String,
     },
     /// 被控端 → 控制端：推送当前桌面壁纸缩略图（JPEG/PNG Base64）。
     Wallpaper {
@@ -416,27 +421,42 @@ mod tests {
 
     #[test]
     fn presets_for_5k_imac_capped_at_4k() {
-        // 无论上界传入 3840x2160 还是 5120x2880，均封顶 3840x2160
-        for (max_w, max_h) in [(3840, 2160), (5120, 2880)] {
-            let presets = build_resolution_presets(2560, 1440, max_w, max_h);
-            assert_presets_valid(&presets, 2560, 1440);
+        // 3840x2160 上界封顶 4K；5120x2880 及更高上界放开至 5K 物理上界
+        let presets_4k = build_resolution_presets(2560, 1440, 3840, 2160);
+        assert_presets_valid(&presets_4k, 2560, 1440);
+        let dims_4k: Vec<(u32, u32, bool)> = presets_4k
+            .iter()
+            .map(|p| (p.width, p.height, p.is_native))
+            .collect();
+        assert_eq!(
+            dims_4k,
+            vec![
+                (3840, 2160, false),
+                (2560, 1440, true),
+                (1920, 1080, false),
+                (1600, 900, false),
+                (1280, 720, false),
+                (960, 540, false),
+            ]
+        );
 
-            let dims: Vec<(u32, u32, bool)> = presets
-                .iter()
-                .map(|p| (p.width, p.height, p.is_native))
-                .collect();
-            assert_eq!(
-                dims,
-                vec![
-                    (3840, 2160, false),
-                    (2560, 1440, true),
-                    (1920, 1080, false),
-                    (1600, 900, false),
-                    (1280, 720, false),
-                    (960, 540, false),
-                ]
-            );
-        }
+        let presets_5k = build_resolution_presets(2560, 1440, 7680, 4320);
+        assert_presets_valid(&presets_5k, 2560, 1440);
+        let dims_5k: Vec<(u32, u32, bool)> = presets_5k
+            .iter()
+            .map(|p| (p.width, p.height, p.is_native))
+            .collect();
+        assert_eq!(
+            dims_5k,
+            vec![
+                (5120, 2880, false),
+                (2560, 1440, true),
+                (1920, 1080, false),
+                (1600, 900, false),
+                (1280, 720, false),
+                (960, 540, false),
+            ]
+        );
     }
 
     #[test]
@@ -555,8 +575,8 @@ mod tests {
             (1662, 1080)
         );
         assert_eq!(
-            fit_target_preserving_aspect(5120, 2880, 2560, 1440, 5120, 2880),
-            (3840, 2160)
+            fit_target_preserving_aspect(7680, 4320, 2560, 1440, 7680, 4320),
+            (5120, 2880)
         );
         assert_eq!(
             fit_target_preserving_aspect(1280, 720, 1920, 1080, 3840, 2160),

@@ -40,6 +40,7 @@ fn cfg(max_packet_payload: usize) -> PipelineConfig {
         diff: DiffMode::TrustPlatform,
         clock_origin_us: None,
         max_packet_payload,
+        ..PipelineConfig::default()
     }
 }
 

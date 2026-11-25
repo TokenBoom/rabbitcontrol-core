@@ -49,6 +49,7 @@ fn pcfg() -> PipelineConfig {
         clock_origin_us: None,
         // 模板默认预算；真 QUIC 路径由 host 侧 expect_hello 按 N2 覆盖。
         max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+        ..PipelineConfig::default()
     }
 }
 

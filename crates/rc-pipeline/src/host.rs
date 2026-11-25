@@ -26,7 +26,7 @@
 use crate::{select_all, DiffMode, PipelineConfig};
 use rc_capture::{CaptureBackend, CapturedFrame, FrameTexture};
 use rc_diff::{DiffResult, TileDiff};
-use rc_proto::{split_frame, MediaHeader};
+use rc_proto::{split_frame_with_flags, HeaderFlags, MediaHeader};
 use rc_sched::{Decision, DropReason, Scheduler, SchedulerConfig, SchedulerStats};
 use rc_trace::{Mark, Outcome, TraceCollector};
 use rc_types::{Error, FrameKind, Result, Timestamp};
@@ -169,9 +169,11 @@ fn run_pipelined_encode_loop(
     enc_cmd_rx: &Receiver<EncCmd>,
     enc_flag: &AtomicBool,
     enc_wake: &(Mutex<u64>, Condvar),
+    max_in_flight: usize,
 ) {
+    let cap = max_in_flight.clamp(1, 4);
     let mut in_vt = 0usize;
-    let mut pending: VecDeque<(u64, Timestamp)> = VecDeque::with_capacity(2);
+    let mut pending: VecDeque<(u64, Timestamp)> = VecDeque::with_capacity(cap);
     let mut req_disconnected = false;
 
     while !enc_flag.load(Ordering::Relaxed) && !req_disconnected {
@@ -196,8 +198,8 @@ fn run_pipelined_encode_loop(
             did_work = true;
         }
 
-        // 3) 补满最多 2 帧在途编码（铁律 1）。
-        while in_vt < 2 {
+        // 3) 补满最多 `cap` 帧在途编码（铁律 1；高刷模式适度流水化重叠编码耗时）。
+        while in_vt < cap {
             match req_rx.try_recv() {
                 Ok(slot) => {
                     if let Some(r) = slot.lock().expect("req lock").take() {
@@ -225,10 +227,11 @@ fn run_pipelined_encode_loop(
         // 4) 本轮未产生有效进展时再阻塞等待，避免空转。
         if !did_work && !req_disconnected {
             if in_vt > 0 {
-                let wait = if in_vt == 1 {
-                    Duration::from_millis(1)
+                // 当尚有空闲槽位时用 250µs 短等，避免 240/380fps 新帧在 req_rx 上被 1ms+ 定时器合并耽误。
+                let wait = if in_vt < cap {
+                    Duration::from_micros(250)
                 } else {
-                    Duration::from_millis(5)
+                    Duration::from_millis(2)
                 };
                 if let Some(false) = handle_pipelined_recv(
                     encoder.recv_encoded(wait),
@@ -282,7 +285,7 @@ fn run_pipelined_encode_loop(
             }
         }
         let mut req_empty = req_disconnected;
-        while in_vt < 2 && !req_empty {
+        while in_vt < cap && !req_empty {
             match req_rx.try_recv() {
                 Ok(slot) => {
                     if let Some(r) = slot.lock().expect("req lock").take() {
@@ -421,15 +424,17 @@ impl HostPipeline {
         pace_capture: bool,
     ) -> Result<Self> {
         cfg.validate()?;
+        let max_in_flight = if cfg.fps > 240 {
+            4usize
+        } else if cfg.fps > 120 {
+            3usize
+        } else {
+            2usize
+        };
         let sched_cfg = SchedulerConfig {
-            // 铁律 1（Q3）：编码在途上限。真机数据（1080p60，SCK 源 ~70fps 供给）：
-            // - =1：P50 13.87ms 更低，但 60s 长测里预算丢帧 842 次，displayed
-            //   掉到 56.7fps < 58（帧率下限是硬门槛，短测 6s 看不出）；
-            // - =2：P50 14.27ms / P99 28.28ms / 72.3fps / 0 预算丢帧 ——
-            //   双达标且帧率有余量。VT 是异步会话，在途 2 能重叠提交/完成
-            //   开销（假串行编码器的「在途 2 = 白等一个周期」不适用于它）。
-            // 总深度 = 交接 1 + 在途 2；各队列均 ≤2（Q3 按队列计）。
-            max_in_flight: 2,
+            // 铁律 1（Q3）：<=120fps 严格维持在途上限 2；>120 / >240fps 适度放宽到 3 / 4，
+            // 避免 240/380fps 下利特尔法则被单/双槽阻塞，同时总排队仍严格有界。
+            max_in_flight,
             target_latency_us: cfg.target_latency_us,
             ..SchedulerConfig::default()
         };
@@ -550,8 +555,8 @@ impl HostPipeline {
         // 时只释放自己的槽位，受害帧的编码请求仍占物理槽位直到完成。
         // 余量不足会让后续合法提交 try_send 假满（受害帧完成时由
         // `on_encoded == false` 识别并丢弃产出）。
-        let (req_tx, req_rx) = sync_channel::<Mutex<Option<EncodeReq>>>(4);
-        let (done_tx, done_rx) = sync_channel::<EncodeDone>(8);
+        let (req_tx, req_rx) = sync_channel::<Mutex<Option<EncodeReq>>>(max_in_flight + 2);
+        let (done_tx, done_rx) = sync_channel::<EncodeDone>(max_in_flight * 2 + 4);
         // 命令通道（M2-10）：有界容量 8——满即向上报错而不无界堆积，
         // 对齐 rc-net URGENT_QUEUE_CAPACITY 的有界通道纪律。
         let (enc_cmd_tx, enc_cmd_rx) = sync_channel::<EncCmd>(8);
@@ -571,6 +576,7 @@ impl HostPipeline {
                         &enc_cmd_rx,
                         &enc_flag,
                         &enc_wake,
+                        max_in_flight,
                     );
                     return;
                 }
@@ -708,9 +714,15 @@ impl HostPipeline {
                         self.no_idr_yet = false;
                         self.pending_idr = false;
                     }
-                    let datagrams = split_frame(
+                    let extra_flags = if self.cfg.codec == rc_encode::Codec::Hevc {
+                        HeaderFlags(HeaderFlags::HEVC)
+                    } else {
+                        HeaderFlags::empty()
+                    };
+                    let datagrams = split_frame_with_flags(
                         seq,
                         frame.kind,
+                        extra_flags,
                         capture_ts,
                         encode_done_ts,
                         self.fec_group,

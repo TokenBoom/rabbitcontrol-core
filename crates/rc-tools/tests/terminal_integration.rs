@@ -72,7 +72,9 @@ fn real_unix_pty_echo_resize_and_exit_zero() {
                 }
                 TerminalEvent::SessionList { .. }
                 | TerminalEvent::Attached { .. }
-                | TerminalEvent::Renamed { .. } => {}
+                | TerminalEvent::Renamed { .. }
+                | TerminalEvent::FontList { .. }
+                | TerminalEvent::FontReady { .. } => {}
             }
         }
         if exit_code.is_none() {

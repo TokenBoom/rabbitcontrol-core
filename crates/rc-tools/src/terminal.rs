@@ -7,11 +7,13 @@
 #![deny(unsafe_code)]
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{mpsc, Arc};
 #[cfg(unix)]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fonts::{FontCatalog, TerminalFontInfo, MAX_REMOTE_FONT_BYTES};
 #[cfg(unix)]
 use crate::pty_unix::PtyProcess;
 
@@ -38,7 +40,12 @@ const MAX_DEFERRED_CTRL_FRAMES: usize = 32;
 const FRAME_KIND_CONTROL: u8 = 1;
 const FRAME_KIND_INPUT: u8 = 2;
 const FRAME_KIND_OUTPUT: u8 = 3;
+/// 远程字体分块二进制帧类型标识。
+pub const FRAME_KIND_FONT_CHUNK: u8 = 4;
 const FRAME_PREFIX_LEN: usize = 5;
+const MAX_FONT_CHUNKS_PER_POLL: usize = 4;
+const MAX_CLIENT_CACHED_FONTS: usize = 4;
+const MAX_CLIENT_FONT_CACHE_BYTES: usize = 40 * 1024 * 1024;
 
 #[cfg(unix)]
 const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -202,6 +209,51 @@ pub enum TerminalWireMsg {
         /// 退出码。
         code: i32,
     },
+    /// 客户端请求枚举被控端系统字体列表。
+    ListFonts,
+    /// 被控端返回系统字体列表。
+    ListFontsResp {
+        /// 字体元数据列表（等宽优先）。
+        fonts: Vec<TerminalFontInfo>,
+    },
+    /// 客户端按不透明 `font_id` 请求下载被控端字体。
+    FetchFont {
+        /// 客户端请求序号。
+        req_id: u32,
+        /// 不透明字体标识。
+        font_id: String,
+    },
+    /// 被控端返回字体传输元数据。
+    FetchFontMeta {
+        /// 请求序号。
+        req_id: u32,
+        /// 字体标识。
+        font_id: String,
+        /// 字体家族名。
+        family: String,
+        /// 提取后的格式（`ttf` / `otf` / `woff2`）。
+        format: String,
+        /// 提取后的总字节数。
+        total_bytes: u64,
+        /// 是否允许继续传输。
+        ok: bool,
+        /// 错误信息（失败时填充）。
+        error: Option<String>,
+    },
+    /// 被控端分块传输的字体二进制片段。
+    FetchFontChunk {
+        /// 请求序号。
+        req_id: u32,
+        /// 当前分块在字体字节流中的偏移量。
+        offset: u64,
+        /// 原始二进制数据（`<= 32 KiB`）。
+        data: Vec<u8>,
+    },
+    /// 被控端通知字体分块全部发送完成。
+    FetchFontFinish {
+        /// 请求序号。
+        req_id: u32,
+    },
 }
 
 fn default_attach_true() -> bool {
@@ -274,11 +326,37 @@ enum TermControlPayload {
         term_id: u32,
         code: i32,
     },
+    ListFonts,
+    ListFontsResp {
+        fonts: Vec<TerminalFontInfo>,
+    },
+    FetchFont {
+        req_id: u32,
+        font_id: String,
+    },
+    FetchFontMeta {
+        req_id: u32,
+        font_id: String,
+        family: String,
+        format: String,
+        total_bytes: u64,
+        ok: bool,
+        error: Option<String>,
+    },
+    FetchFontFinish {
+        req_id: u32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TermDataHeader {
     term_id: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TermFontChunkHeader {
+    req_id: u32,
+    offset: u64,
 }
 
 impl TerminalWireMsg {
@@ -291,6 +369,12 @@ impl TerminalWireMsg {
             TerminalWireMsg::Output { term_id, data } => {
                 encode_data_frame(FRAME_KIND_OUTPUT, *term_id, data)
             }
+            TerminalWireMsg::FetchFontChunk {
+                req_id,
+                offset,
+                data,
+            } => encode_font_chunk_frame(*req_id, *offset, data),
+            TerminalWireMsg::ListFontsResp { fonts } => encode_list_fonts_resp(fonts),
             other => {
                 let ctrl = match other {
                     TerminalWireMsg::Open {
@@ -383,7 +467,37 @@ impl TerminalWireMsg {
                         term_id: *term_id,
                         code: *code,
                     },
-                    TerminalWireMsg::Input { .. } | TerminalWireMsg::Output { .. } => {
+                    TerminalWireMsg::ListFonts => TermControlPayload::ListFonts,
+                    TerminalWireMsg::FetchFont { req_id, font_id } => {
+                        TermControlPayload::FetchFont {
+                            req_id: *req_id,
+                            font_id: font_id.clone(),
+                        }
+                    }
+                    TerminalWireMsg::FetchFontMeta {
+                        req_id,
+                        font_id,
+                        family,
+                        format,
+                        total_bytes,
+                        ok,
+                        error,
+                    } => TermControlPayload::FetchFontMeta {
+                        req_id: *req_id,
+                        font_id: font_id.clone(),
+                        family: family.clone(),
+                        format: format.clone(),
+                        total_bytes: *total_bytes,
+                        ok: *ok,
+                        error: error.clone(),
+                    },
+                    TerminalWireMsg::FetchFontFinish { req_id } => {
+                        TermControlPayload::FetchFontFinish { req_id: *req_id }
+                    }
+                    TerminalWireMsg::Input { .. }
+                    | TerminalWireMsg::Output { .. }
+                    | TerminalWireMsg::FetchFontChunk { .. }
+                    | TerminalWireMsg::ListFontsResp { .. } => {
                         unreachable!()
                     }
                 };
@@ -511,6 +625,33 @@ impl TerminalWireMsg {
                     TermControlPayload::Exited { term_id, code } => {
                         TerminalWireMsg::Exited { term_id, code }
                     }
+                    TermControlPayload::ListFonts => TerminalWireMsg::ListFonts,
+                    TermControlPayload::ListFontsResp { fonts } => {
+                        TerminalWireMsg::ListFontsResp { fonts }
+                    }
+                    TermControlPayload::FetchFont { req_id, font_id } => {
+                        TerminalWireMsg::FetchFont { req_id, font_id }
+                    }
+                    TermControlPayload::FetchFontMeta {
+                        req_id,
+                        font_id,
+                        family,
+                        format,
+                        total_bytes,
+                        ok,
+                        error,
+                    } => TerminalWireMsg::FetchFontMeta {
+                        req_id,
+                        font_id,
+                        family,
+                        format,
+                        total_bytes,
+                        ok,
+                        error,
+                    },
+                    TermControlPayload::FetchFontFinish { req_id } => {
+                        TerminalWireMsg::FetchFontFinish { req_id }
+                    }
                 })
             }
             FRAME_KIND_INPUT => {
@@ -526,6 +667,15 @@ impl TerminalWireMsg {
                     .map_err(|e| format!("invalid terminal output header: {e}"))?;
                 Ok(TerminalWireMsg::Output {
                     term_id: hdr.term_id,
+                    data: raw_bytes.to_vec(),
+                })
+            }
+            FRAME_KIND_FONT_CHUNK => {
+                let hdr: TermFontChunkHeader = serde_json::from_slice(hdr_bytes)
+                    .map_err(|e| format!("invalid terminal font chunk header: {e}"))?;
+                Ok(TerminalWireMsg::FetchFontChunk {
+                    req_id: hdr.req_id,
+                    offset: hdr.offset,
                     data: raw_bytes.to_vec(),
                 })
             }
@@ -566,6 +716,48 @@ fn encode_data_frame(kind: u8, term_id: u32, data: &[u8]) -> Result<Vec<u8>, Str
     Ok(out)
 }
 
+fn encode_font_chunk_frame(req_id: u32, offset: u64, data: &[u8]) -> Result<Vec<u8>, String> {
+    let header = serde_json::to_vec(&TermFontChunkHeader { req_id, offset })
+        .map_err(|e| format!("serialize font chunk header failed: {e}"))?;
+    let total = FRAME_PREFIX_LEN + header.len() + data.len();
+    if total > MAX_TERMINAL_WIRE_FRAME_BYTES {
+        return Err(format!(
+            "terminal font chunk frame too large ({total} > {MAX_TERMINAL_WIRE_FRAME_BYTES})"
+        ));
+    }
+    let mut out = Vec::with_capacity(total);
+    out.push(FRAME_KIND_FONT_CHUNK);
+    out.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(data);
+    Ok(out)
+}
+
+fn encode_list_fonts_resp(fonts: &[TerminalFontInfo]) -> Result<Vec<u8>, String> {
+    let payload = TermControlPayload::ListFontsResp {
+        fonts: fonts.to_vec(),
+    };
+    if let Ok(frame) = encode_control_frame(&payload) {
+        return Ok(frame);
+    }
+    let mut lo = 0usize;
+    let mut hi = fonts.len();
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let candidate = TermControlPayload::ListFontsResp {
+            fonts: fonts[..mid].to_vec(),
+        };
+        if encode_control_frame(&candidate).is_ok() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    encode_control_frame(&TermControlPayload::ListFontsResp {
+        fonts: fonts[..lo].to_vec(),
+    })
+}
+
 /// 终端客户端面向 UI 产出的事件。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -574,6 +766,28 @@ pub enum TerminalEvent {
     SessionList {
         /// 活跃终端会话快照（按创建顺序排序）。
         sessions: Vec<TerminalSessionInfo>,
+    },
+    /// 远端主机已安装的字体列表。
+    FontList {
+        /// 字体列表（等宽优先）。
+        fonts: Vec<TerminalFontInfo>,
+    },
+    /// 远端字体下载并缓存就绪通知（成功后客户端可通过 `fontId` 读取缓存字节）。
+    FontReady {
+        /// 请求序号。
+        #[serde(rename = "reqId")]
+        req_id: u32,
+        /// 字体标识。
+        #[serde(rename = "fontId")]
+        font_id: String,
+        /// 字体家族名。
+        family: String,
+        /// 字体格式（`ttf` / `otf` / `woff2`）。
+        format: String,
+        /// 是否就绪成功。
+        ok: bool,
+        /// 错误详情（失败时填充）。
+        error: Option<String>,
     },
     /// 远端终端会话打开结果。
     Opened {
@@ -719,6 +933,21 @@ fn current_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+enum HostFontJob {
+    CatalogScanned(Arc<FontCatalog>),
+    FontLoaded {
+        req_id: u32,
+        font_id: String,
+        result: Result<(TerminalFontInfo, String, Vec<u8>), String>,
+    },
+}
+
+struct HostFontStream {
+    req_id: u32,
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
 /// 被控端（Host）远程终端引擎，最多同时托管 [`MAX_CONCURRENT_TERMINALS`]（8）个真实 PTY。
 ///
 /// 支持后台保活运行、断线脱离与重附着回放（每会话 [`MAX_TERMINAL_SCROLLBACK_BYTES`] 有界滚动缓冲）；
@@ -726,6 +955,13 @@ fn current_unix_secs() -> u64 {
 pub struct TerminalHostEngine {
     outgoing: VecDeque<Vec<u8>>,
     deferred_ctrl: VecDeque<Vec<u8>>,
+    font_catalog: Option<Arc<FontCatalog>>,
+    font_scan_in_flight: bool,
+    list_fonts_pending: bool,
+    latest_font_req_id: Option<u32>,
+    active_font_stream: Option<HostFontStream>,
+    font_jobs_tx: mpsc::Sender<HostFontJob>,
+    font_jobs_rx: mpsc::Receiver<HostFontJob>,
     #[cfg(unix)]
     next_term_id: u32,
     #[cfg(unix)]
@@ -745,15 +981,28 @@ impl Default for TerminalHostEngine {
 impl TerminalHostEngine {
     /// 创建新的被控端远程终端引擎。
     pub fn new() -> Self {
+        let (font_jobs_tx, font_jobs_rx) = mpsc::channel();
         Self {
             outgoing: VecDeque::new(),
             deferred_ctrl: VecDeque::new(),
+            font_catalog: None,
+            font_scan_in_flight: false,
+            list_fonts_pending: false,
+            latest_font_req_id: None,
+            active_font_stream: None,
+            font_jobs_tx,
+            font_jobs_rx,
             #[cfg(unix)]
             next_term_id: 1,
             #[cfg(unix)]
             next_session_seq: 1,
             sessions: BTreeMap::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_font_catalog_for_test(&mut self, cat: FontCatalog) {
+        self.font_catalog = Some(Arc::new(cat));
     }
 
     /// 返回当前活跃的 PTY 会话数。
@@ -827,6 +1076,154 @@ impl TerminalHostEngine {
         }
         self.outgoing.clear();
         self.deferred_ctrl.clear();
+        self.active_font_stream = None;
+    }
+
+    fn handle_list_fonts(&mut self) {
+        if let Some(cat) = &self.font_catalog {
+            let fonts = cat.list();
+            self.enqueue_reliable_ctrl(&TerminalWireMsg::ListFontsResp { fonts });
+            return;
+        }
+        self.list_fonts_pending = true;
+        if self.font_scan_in_flight {
+            return;
+        }
+        self.font_scan_in_flight = true;
+        let tx = self.font_jobs_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("rc-term-font-scan".to_string())
+            .spawn(move || {
+                let cat = Arc::new(FontCatalog::scan_system());
+                let _ = tx.send(HostFontJob::CatalogScanned(cat));
+            });
+    }
+
+    fn handle_fetch_font(&mut self, req_id: u32, font_id: String) {
+        if font_id.trim().is_empty() || font_id.len() > 64 {
+            self.enqueue_reliable_ctrl(&TerminalWireMsg::FetchFontMeta {
+                req_id,
+                font_id,
+                family: String::new(),
+                format: String::new(),
+                total_bytes: 0,
+                ok: false,
+                error: Some("非法的字体标识".to_string()),
+            });
+            return;
+        }
+        self.latest_font_req_id = Some(req_id);
+        self.active_font_stream = None;
+        let tx = self.font_jobs_tx.clone();
+        let cached = self.font_catalog.clone();
+        let _ = std::thread::Builder::new()
+            .name("rc-term-font-load".to_string())
+            .spawn(move || {
+                let cat = match cached {
+                    Some(c) => c,
+                    None => {
+                        let scanned = Arc::new(FontCatalog::scan_system());
+                        let _ = tx.send(HostFontJob::CatalogScanned(scanned.clone()));
+                        scanned
+                    }
+                };
+                let result = cat.load_font_bytes(&font_id);
+                let _ = tx.send(HostFontJob::FontLoaded {
+                    req_id,
+                    font_id,
+                    result,
+                });
+            });
+    }
+
+    fn drain_font_jobs_and_stream(&mut self) {
+        while let Ok(job) = self.font_jobs_rx.try_recv() {
+            match job {
+                HostFontJob::CatalogScanned(cat) => {
+                    self.font_scan_in_flight = false;
+                    self.font_catalog = Some(cat.clone());
+                    if self.list_fonts_pending {
+                        self.list_fonts_pending = false;
+                        self.enqueue_reliable_ctrl(&TerminalWireMsg::ListFontsResp {
+                            fonts: cat.list(),
+                        });
+                    }
+                }
+                HostFontJob::FontLoaded {
+                    req_id,
+                    font_id,
+                    result,
+                } => {
+                    if self.latest_font_req_id != Some(req_id) {
+                        continue;
+                    }
+                    match result {
+                        Ok((info, format, bytes)) => {
+                            let total_bytes = bytes.len() as u64;
+                            self.enqueue_reliable_ctrl(&TerminalWireMsg::FetchFontMeta {
+                                req_id,
+                                font_id,
+                                family: info.family,
+                                format,
+                                total_bytes,
+                                ok: true,
+                                error: None,
+                            });
+                            self.active_font_stream = Some(HostFontStream {
+                                req_id,
+                                bytes,
+                                offset: 0,
+                            });
+                        }
+                        Err(err) => {
+                            self.enqueue_reliable_ctrl(&TerminalWireMsg::FetchFontMeta {
+                                req_id,
+                                font_id,
+                                family: String::new(),
+                                format: String::new(),
+                                total_bytes: 0,
+                                ok: false,
+                                error: Some(err),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // 仅在出站队列半满以下时推送字体分块，确保 PTY 实时输出与控制消息不被阻塞。
+        let mut chunks_sent = 0usize;
+        while chunks_sent < MAX_FONT_CHUNKS_PER_POLL
+            && self.outgoing.len() < MAX_TERMINAL_OUTGOING_FRAMES / 2
+        {
+            let Some(mut stream) = self.active_font_stream.take() else {
+                break;
+            };
+            let total_len = stream.bytes.len();
+            let req_id = stream.req_id;
+            if stream.offset >= total_len {
+                self.enqueue_reliable_ctrl(&TerminalWireMsg::FetchFontFinish { req_id });
+                break;
+            }
+            let end = stream
+                .offset
+                .saturating_add(TERMINAL_DATA_CHUNK_SIZE)
+                .min(total_len);
+            let chunk_offset = stream.offset as u64;
+            let data = stream.bytes[stream.offset..end].to_vec();
+            stream.offset = end;
+            self.enqueue(&TerminalWireMsg::FetchFontChunk {
+                req_id,
+                offset: chunk_offset,
+                data,
+            });
+            chunks_sent += 1;
+            if end >= total_len {
+                self.enqueue_reliable_ctrl(&TerminalWireMsg::FetchFontFinish { req_id });
+                break;
+            }
+            self.active_font_stream = Some(stream);
+        }
     }
 
     fn enqueue(&mut self, msg: &TerminalWireMsg) {
@@ -911,6 +1308,12 @@ impl TerminalHostEngine {
             }
             TerminalWireMsg::List => {
                 self.handle_list();
+            }
+            TerminalWireMsg::ListFonts => {
+                self.handle_list_fonts();
+            }
+            TerminalWireMsg::FetchFont { req_id, font_id } => {
+                self.handle_fetch_font(req_id, font_id);
             }
             TerminalWireMsg::Attach {
                 term_id,
@@ -1024,7 +1427,11 @@ impl TerminalHostEngine {
             | TerminalWireMsg::Attached { .. }
             | TerminalWireMsg::Renamed { .. }
             | TerminalWireMsg::Output { .. }
-            | TerminalWireMsg::Exited { .. } => {}
+            | TerminalWireMsg::Exited { .. }
+            | TerminalWireMsg::ListFontsResp { .. }
+            | TerminalWireMsg::FetchFontMeta { .. }
+            | TerminalWireMsg::FetchFontChunk { .. }
+            | TerminalWireMsg::FetchFontFinish { .. } => {}
         }
     }
 
@@ -1378,6 +1785,9 @@ impl TerminalHostEngine {
             }
         }
 
+        self.flush_deferred_ctrl();
+        self.drain_font_jobs_and_stream();
+
         let mut out =
             Vec::with_capacity(max_frames.min(self.outgoing.len() + self.deferred_ctrl.len()));
         while out.len() < max_frames {
@@ -1449,11 +1859,26 @@ fn decode_utf8_streaming(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
     out
 }
 
+struct ClientFontFetch {
+    req_id: u32,
+    font_id: String,
+    family: String,
+    format: String,
+    total_bytes: usize,
+    buf: Vec<u8>,
+}
+
 /// 控制端（Client）远程终端引擎。
 pub struct TerminalClientEngine {
     next_term_id: u32,
+    next_font_req_id: u32,
+    latest_font_req_id: Option<u32>,
     outgoing: VecDeque<Vec<u8>>,
     utf8_carry: HashMap<u32, Vec<u8>>,
+    pending_font_fetch: Option<ClientFontFetch>,
+    cached_fonts: HashMap<String, Vec<u8>>,
+    cached_font_order: VecDeque<String>,
+    cached_font_bytes: usize,
 }
 
 impl Default for TerminalClientEngine {
@@ -1467,8 +1892,14 @@ impl TerminalClientEngine {
     pub fn new() -> Self {
         Self {
             next_term_id: 1,
+            next_font_req_id: 1,
+            latest_font_req_id: None,
             outgoing: VecDeque::new(),
             utf8_carry: HashMap::new(),
+            pending_font_fetch: None,
+            cached_fonts: HashMap::new(),
+            cached_font_order: VecDeque::new(),
+            cached_font_bytes: 0,
         }
     }
 
@@ -1581,6 +2012,56 @@ impl TerminalClientEngine {
         self.enqueue(&TerminalWireMsg::Close { term_id });
     }
 
+    /// 请求枚举被控端系统已安装的字体列表。
+    pub fn request_list_fonts(&mut self) {
+        self.enqueue(&TerminalWireMsg::ListFonts);
+    }
+
+    /// 请求从被控端拉取指定 `font_id` 的字体二进制数据（用于渲染远程专属字体），返回请求序号。
+    pub fn request_fetch_font(&mut self, font_id: String) -> Result<u32, String> {
+        let trimmed = font_id.trim();
+        if trimmed.is_empty() || trimmed.len() > 64 {
+            return Err("非法的远程字体标识".to_string());
+        }
+        let req_id = self.next_font_req_id.max(1);
+        self.next_font_req_id = req_id.saturating_add(1).max(1);
+        self.latest_font_req_id = Some(req_id);
+        self.pending_font_fetch = None;
+        self.enqueue(&TerminalWireMsg::FetchFont {
+            req_id,
+            font_id: trimmed.to_string(),
+        });
+        Ok(req_id)
+    }
+
+    /// 读取控制端已缓存完成的远程字体二进制内容。
+    pub fn get_cached_font(&self, font_id: &str) -> Option<&[u8]> {
+        self.cached_fonts.get(font_id).map(Vec::as_slice)
+    }
+
+    fn insert_cached_font(&mut self, font_id: String, bytes: Vec<u8>) {
+        if bytes.len() > MAX_CLIENT_FONT_CACHE_BYTES {
+            return;
+        }
+        if let Some(old) = self.cached_fonts.remove(&font_id) {
+            self.cached_font_bytes = self.cached_font_bytes.saturating_sub(old.len());
+            self.cached_font_order.retain(|k| k != &font_id);
+        }
+        while !self.cached_font_order.is_empty()
+            && (self.cached_fonts.len() >= MAX_CLIENT_CACHED_FONTS
+                || self.cached_font_bytes + bytes.len() > MAX_CLIENT_FONT_CACHE_BYTES)
+        {
+            if let Some(oldest) = self.cached_font_order.pop_front() {
+                if let Some(evicted) = self.cached_fonts.remove(&oldest) {
+                    self.cached_font_bytes = self.cached_font_bytes.saturating_sub(evicted.len());
+                }
+            }
+        }
+        self.cached_font_bytes = self.cached_font_bytes.saturating_add(bytes.len());
+        self.cached_font_order.push_back(font_id.clone());
+        self.cached_fonts.insert(font_id, bytes);
+    }
+
     /// 处理一条来自被控端的线帧，返回面向 UI 的事件列表。
     pub fn handle_incoming(&mut self, frame: &[u8]) -> Vec<TerminalEvent> {
         let msg = match TerminalWireMsg::decode(frame) {
@@ -1666,6 +2147,106 @@ impl TerminalClientEngine {
                 self.utf8_carry.remove(&term_id);
                 events.push(TerminalEvent::Exited { term_id, code });
             }
+            TerminalWireMsg::ListFontsResp { fonts } => {
+                events.push(TerminalEvent::FontList { fonts });
+            }
+            TerminalWireMsg::FetchFontMeta {
+                req_id,
+                font_id,
+                family,
+                format,
+                total_bytes,
+                ok,
+                error,
+            } => {
+                if self.latest_font_req_id != Some(req_id) {
+                    return events;
+                }
+                if !ok || total_bytes == 0 || total_bytes > MAX_REMOTE_FONT_BYTES {
+                    self.pending_font_fetch = None;
+                    events.push(TerminalEvent::FontReady {
+                        req_id,
+                        font_id,
+                        family,
+                        format,
+                        ok: false,
+                        error: error.or_else(|| Some("远程字体大小或元数据无效".to_string())),
+                    });
+                } else {
+                    let cap = (total_bytes as usize).min(1024 * 1024);
+                    self.pending_font_fetch = Some(ClientFontFetch {
+                        req_id,
+                        font_id,
+                        family,
+                        format,
+                        total_bytes: total_bytes as usize,
+                        buf: Vec::with_capacity(cap),
+                    });
+                }
+            }
+            TerminalWireMsg::FetchFontChunk {
+                req_id,
+                offset,
+                data,
+            } => {
+                let mut failed: Option<(String, String, String, String)> = None;
+                if let Some(pending) = self.pending_font_fetch.as_mut() {
+                    if pending.req_id == req_id {
+                        let expected = pending.buf.len() as u64;
+                        let new_len = pending.buf.len().saturating_add(data.len());
+                        if offset != expected || new_len > pending.total_bytes {
+                            failed = Some((
+                                pending.font_id.clone(),
+                                pending.family.clone(),
+                                pending.format.clone(),
+                                "远程字体分块偏移或大小校验失败".to_string(),
+                            ));
+                        } else {
+                            pending.buf.extend_from_slice(&data);
+                        }
+                    }
+                }
+                if let Some((font_id, family, format, err)) = failed {
+                    self.pending_font_fetch = None;
+                    events.push(TerminalEvent::FontReady {
+                        req_id,
+                        font_id,
+                        family,
+                        format,
+                        ok: false,
+                        error: Some(err),
+                    });
+                }
+            }
+            TerminalWireMsg::FetchFontFinish { req_id } => {
+                if let Some(pending) = self.pending_font_fetch.take() {
+                    if pending.req_id != req_id {
+                        self.pending_font_fetch = Some(pending);
+                    } else if pending.buf.len() == pending.total_bytes {
+                        let font_id = pending.font_id.clone();
+                        let family = pending.family.clone();
+                        let format = pending.format.clone();
+                        self.insert_cached_font(pending.font_id, pending.buf);
+                        events.push(TerminalEvent::FontReady {
+                            req_id,
+                            font_id,
+                            family,
+                            format,
+                            ok: true,
+                            error: None,
+                        });
+                    } else {
+                        events.push(TerminalEvent::FontReady {
+                            req_id,
+                            font_id: pending.font_id,
+                            family: pending.family,
+                            format: pending.format,
+                            ok: false,
+                            error: Some("远程字体分块接收不完整".to_string()),
+                        });
+                    }
+                }
+            }
             // Client 忽略主机侧专用上行帧。
             TerminalWireMsg::Open { .. }
             | TerminalWireMsg::List
@@ -1674,7 +2255,9 @@ impl TerminalClientEngine {
             | TerminalWireMsg::Rename { .. }
             | TerminalWireMsg::Input { .. }
             | TerminalWireMsg::Resize { .. }
-            | TerminalWireMsg::Close { .. } => {}
+            | TerminalWireMsg::Close { .. }
+            | TerminalWireMsg::ListFonts
+            | TerminalWireMsg::FetchFont { .. } => {}
         }
         events
     }
@@ -2167,5 +2750,108 @@ mod tests {
         .unwrap();
         host.handle_incoming(&leaked_attempt);
         assert_eq!(host.active_count(), 0);
+    }
+
+    #[test]
+    fn terminal_remote_font_list_and_chunked_fetch_roundtrip() {
+        let base = std::env::temp_dir().join(format!("rc-term-font-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Build > 32 KiB valid SFNT font (extra padding inside `post` table) so chunking triggers.
+        let family = "RemoteMonoTest";
+        let mut family_u16 = Vec::new();
+        for u in family.encode_utf16() {
+            family_u16.extend_from_slice(&u.to_be_bytes());
+        }
+        let mut name_tbl = Vec::new();
+        name_tbl.extend_from_slice(&0u16.to_be_bytes());
+        name_tbl.extend_from_slice(&1u16.to_be_bytes());
+        name_tbl.extend_from_slice(&18u16.to_be_bytes());
+        name_tbl.extend_from_slice(&3u16.to_be_bytes());
+        name_tbl.extend_from_slice(&1u16.to_be_bytes());
+        name_tbl.extend_from_slice(&0x0409u16.to_be_bytes());
+        name_tbl.extend_from_slice(&1u16.to_be_bytes());
+        name_tbl.extend_from_slice(&(family_u16.len() as u16).to_be_bytes());
+        name_tbl.extend_from_slice(&0u16.to_be_bytes());
+        name_tbl.extend_from_slice(&family_u16);
+
+        let mut post_tbl = vec![0u8; 40 * 1024];
+        post_tbl[12..16].copy_from_slice(&1u32.to_be_bytes());
+
+        let name_off = 12 + 2 * 16;
+        let name_pad = (name_tbl.len() + 3) & !3;
+        let post_off = name_off + name_pad;
+        let mut sfnt = Vec::new();
+        sfnt.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        sfnt.extend_from_slice(&2u16.to_be_bytes());
+        sfnt.extend_from_slice(&32u16.to_be_bytes());
+        sfnt.extend_from_slice(&1u16.to_be_bytes());
+        sfnt.extend_from_slice(&0u16.to_be_bytes());
+        sfnt.extend_from_slice(b"name");
+        sfnt.extend_from_slice(&0u32.to_be_bytes());
+        sfnt.extend_from_slice(&(name_off as u32).to_be_bytes());
+        sfnt.extend_from_slice(&(name_tbl.len() as u32).to_be_bytes());
+        sfnt.extend_from_slice(b"post");
+        sfnt.extend_from_slice(&0u32.to_be_bytes());
+        sfnt.extend_from_slice(&(post_off as u32).to_be_bytes());
+        sfnt.extend_from_slice(&(post_tbl.len() as u32).to_be_bytes());
+        sfnt.extend_from_slice(&name_tbl);
+        sfnt.resize(post_off, 0);
+        sfnt.extend_from_slice(&post_tbl);
+        std::fs::write(base.join("RemoteMonoTest.ttf"), &sfnt).unwrap();
+
+        let catalog = FontCatalog::scan_roots(std::slice::from_ref(&base));
+        assert_eq!(catalog.list().len(), 1);
+        let font_id = catalog.list()[0].id.clone();
+
+        let mut host = TerminalHostEngine::new();
+        host.set_font_catalog_for_test(catalog);
+        let mut client = TerminalClientEngine::new();
+
+        client.request_list_fonts();
+        for f in client.poll_outgoing(4) {
+            host.handle_incoming(&f);
+        }
+        let mut list_events = Vec::new();
+        for f in host.poll_outgoing(8) {
+            list_events.extend(client.handle_incoming(&f));
+        }
+        assert!(matches!(
+            list_events.first(),
+            Some(TerminalEvent::FontList { fonts }) if fonts.len() == 1 && fonts[0].family == family
+        ));
+
+        let req_id = client.request_fetch_font(font_id.clone()).unwrap();
+        for f in client.poll_outgoing(4) {
+            host.handle_incoming(&f);
+        }
+
+        let mut ready = false;
+        for _ in 0..50 {
+            for f in host.poll_outgoing(16) {
+                for ev in client.handle_incoming(&f) {
+                    if let TerminalEvent::FontReady {
+                        req_id: ev_req,
+                        ok,
+                        error,
+                        ..
+                    } = ev
+                    {
+                        assert_eq!(ev_req, req_id);
+                        assert!(ok, "fetch font failed: {error:?}");
+                        ready = true;
+                    }
+                }
+            }
+            if ready {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready, "expected FontReady event");
+        assert_eq!(client.get_cached_font(&font_id), Some(sfnt.as_slice()));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
