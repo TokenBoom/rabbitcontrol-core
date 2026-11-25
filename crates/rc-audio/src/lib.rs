@@ -19,6 +19,67 @@ pub use codec::{
     FRAME_DURATION_MS, SAMPLES_PER_CHANNEL_20MS,
 };
 
+/// 静音判定默认绝对采样幅值阈值（16-bit PCM；`<= 2` 过滤量化底噪而不吞任何可闻尾音）。
+pub const DEFAULT_SILENCE_THRESHOLD: i16 = 2;
+
+/// 静音抑制（DTX）默认拖尾保持帧数（10 帧 × 20 ms = 200 ms，保护混响与淡出尾音不被生硬截断）。
+pub const DEFAULT_SILENCE_HANGOVER_FRAMES: u32 = 10;
+
+/// 判断一帧线性 PCM16 采样是否全部处于静音阈值内（无溢出处理 `i16::MIN`）。
+#[must_use]
+pub fn is_pcm_silent(samples: &[i16], threshold: i16) -> bool {
+    let limit = i32::from(threshold).abs();
+    samples.iter().all(|&s| i32::from(s).abs() <= limit)
+}
+
+/// 发送侧音频静音抑制门控（DTX）：有声时立即放行，转入静音后保留若干拖尾帧再暂停发送，
+/// 避免空闲桌面持续消耗 ~384–410 Kbps 传输纯零静音包。
+#[derive(Debug, Clone)]
+pub struct AudioSilenceGate {
+    threshold: i16,
+    hangover_frames: u32,
+    remaining_hangover: u32,
+}
+
+impl Default for AudioSilenceGate {
+    fn default() -> Self {
+        Self::new(DEFAULT_SILENCE_THRESHOLD, DEFAULT_SILENCE_HANGOVER_FRAMES)
+    }
+}
+
+impl AudioSilenceGate {
+    /// 以指定幅值阈值与拖尾帧数构造静音门控。
+    #[must_use]
+    pub const fn new(threshold: i16, hangover_frames: u32) -> Self {
+        Self {
+            threshold,
+            hangover_frames,
+            remaining_hangover: 0,
+        }
+    }
+
+    /// 重置门控状态（例如取消静音或重建音频采集时调用）。
+    pub fn reset(&mut self) {
+        self.remaining_hangover = 0;
+    }
+
+    /// 判断本帧是否需要编码发送：`false` 表示处于静音抑制期，可直接跳过编码与发送。
+    pub fn should_transmit(&mut self, samples: &[i16]) -> bool {
+        if samples.is_empty() {
+            return false;
+        }
+        if !is_pcm_silent(samples, self.threshold) {
+            self.remaining_hangover = self.hangover_frames;
+            return true;
+        }
+        if self.remaining_hangover > 0 {
+            self.remaining_hangover -= 1;
+            return true;
+        }
+        false
+    }
+}
+
 /// 单帧线性 PCM16 音频数据（单声道或交错立体声）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PcmFrame {
@@ -398,5 +459,33 @@ mod tests {
         );
         capture.stop();
         player.stop();
+    }
+
+    #[test]
+    fn audio_silence_gate_suppresses_idle_after_hangover_and_wakes_immediately() {
+        assert!(is_pcm_silent(&[], DEFAULT_SILENCE_THRESHOLD));
+        assert!(is_pcm_silent(&[0, 1, -2, 2, -1], DEFAULT_SILENCE_THRESHOLD));
+        assert!(!is_pcm_silent(&[0, 3, 0], DEFAULT_SILENCE_THRESHOLD));
+        assert!(!is_pcm_silent(&[i16::MIN], DEFAULT_SILENCE_THRESHOLD));
+
+        let mut gate = AudioSilenceGate::new(2, 3);
+        // 初始即为静音：立即抑制，不发送任何零静音包
+        assert!(!gate.should_transmit(&[0, 0, 1, -1]));
+        assert!(!gate.should_transmit(&[]));
+
+        // 首帧有声信号：零延迟立即放行并装填 3 帧拖尾
+        assert!(gate.should_transmit(&[0, 250, -180, 0]));
+        // 随后 3 帧静音拖尾保护淡出
+        assert!(gate.should_transmit(&[0, 0, 0, 0]));
+        assert!(gate.should_transmit(&[1, -1, 0, 0]));
+        assert!(gate.should_transmit(&[2, -2, 0, 0]));
+        // 第 4 帧起进入 DTX 静音抑制
+        assert!(!gate.should_transmit(&[0, 0, 0, 0]));
+        assert!(!gate.should_transmit(&[0, 0, 0, 0]));
+
+        // 再次出现声响立即唤醒；reset 立即清空拖尾
+        assert!(gate.should_transmit(&[0, -100]));
+        gate.reset();
+        assert!(!gate.should_transmit(&[0, 0]));
     }
 }
