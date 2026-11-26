@@ -177,6 +177,7 @@ impl ServerConfig {
             device_id,
             device_id_formatted,
             error_message: None,
+            ui_error: None,
             signal_addr: self.signal_addr(),
             relay_addr: self.relay_addr(),
             revision: next_status_revision(),
@@ -218,6 +219,9 @@ pub struct ServerStatusSnapshot {
     pub device_id_formatted: Option<String>,
     /// 最近一次错误说明（正常时为 `None`）。
     pub error_message: Option<String>,
+    /// 最近一次错误的结构化 UI 模型（正常时为 `None`，向下兼容旧端 JSON）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_error: Option<crate::ui_error::UiError>,
     /// 实际使用的信令端点地址（如 `"172.16.1.2:21116"`）。
     pub signal_addr: Option<String>,
     /// 实际使用的中继端点地址（如 `"172.16.1.2:21117"`）。
@@ -816,6 +820,7 @@ mod tests {
             device_id: Some("604928235".to_string()),
             device_id_formatted: Some("604 928 235".to_string()),
             error_message: None,
+            ui_error: None,
             signal_addr: Some("172.16.1.2:21116".to_string()),
             relay_addr: Some("172.16.1.2:21117".to_string()),
             revision: rev,

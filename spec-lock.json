@@ -1,0 +1,12 @@
+{
+  "spec_repo": "TokenBoom/rabbitcontrol-spec",
+  "spec_version": "1.0.0",
+  "files": [
+    {
+      "artifact": "rust-core",
+      "source": "dist/rust-core/error_catalog.rs",
+      "target": "crates/rc-client-core/src/generated/error_catalog.rs",
+      "sha256": "ac6e97dbb662c589733911a70a5ac46c13e157609e61b2d49e1e1b1b63dc31eb"
+    }
+  ]
+}

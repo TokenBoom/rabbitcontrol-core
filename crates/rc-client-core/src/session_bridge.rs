@@ -37,9 +37,9 @@ use rc_session::dev_cert::{dev_server_cert_pem, DEV_CERT_PEM, DEV_KEY_PEM, DEV_S
 use rc_session::proto::{BitrateReason, ByeReason, ControlMessage, SessionParams};
 use rc_session::{
     AudioFramePacket, ClientAuthConfig, ClientSession, ClientSessionConfig, ClipboardBackend,
-    ReconnectOutcome, SessionClock, SessionState, AUDIO_CODEC_IMA_ADPCM, AUDIO_CODEC_PCM16,
-    TOOL_CHANNEL_AUDIO_CTRL, TOOL_CHANNEL_DISPLAY_CTRL, TOOL_CHANNEL_FILE, TOOL_CHANNEL_PORTMAP,
-    TOOL_CHANNEL_TERMINAL,
+    ReconnectOutcome, SessionClock, SessionState, ToolPermissions, AUDIO_CODEC_IMA_ADPCM,
+    AUDIO_CODEC_PCM16, TOOL_CHANNEL_AUDIO_CTRL, TOOL_CHANNEL_DISPLAY_CTRL, TOOL_CHANNEL_FILE,
+    TOOL_CHANNEL_PORTMAP, TOOL_CHANNEL_TERMINAL,
 };
 use rc_tools::{
     validate_terminal_name, FileClientEngine, FileEvent, PortMapClientEngine, PortMapRuleSnapshot,
@@ -61,6 +61,7 @@ use crate::relay_transport::{
     E2eeRelayTransport, RelayE2eeMode, RelayRole, RelayShutdownHandle, TcpRelayTransport,
 };
 use crate::signal_client::ConnectGrant;
+use crate::ui_error::UiError;
 
 /// 命令通道容量上限（T21 U6 / 铁律 1 UI 侧延伸）。
 pub const COMMAND_CHANNEL_CAP: usize = 64;
@@ -102,6 +103,28 @@ const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
 const UPLOAD_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 /// W4 端口映射统计快照比对间隔。
 const PORTMAP_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
+/// 控制端本地前置权限拦截推送 `SessionUpdate::ToolPermissionDenied` 的单通道最小节流间隔（1s）。
+const LOCAL_TOOL_DENIED_THROTTLE: Duration = Duration::from_secs(1);
+
+fn serialize_tool_permissions<S>(perms: &ToolPermissions, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    #[derive(serde::Serialize)]
+    struct ToolPermissionsWire {
+        allow_file_transfer: bool,
+        allow_terminal: bool,
+        allow_port_map: bool,
+    }
+    serde::Serialize::serialize(
+        &ToolPermissionsWire {
+            allow_file_transfer: perms.allow_file_transfer,
+            allow_terminal: perms.allow_terminal,
+            allow_port_map: perms.allow_port_map,
+        },
+        serializer,
+    )
+}
 
 fn default_true() -> bool {
     true
@@ -433,6 +456,15 @@ pub enum SessionUpdate {
         /// 当前生效帧率（fps）。
         fps: u32,
     },
+    /// 被控端下发的当前会话工具通道权限集合变更通知。
+    ToolPermissionsUpdated(#[serde(serialize_with = "serialize_tool_permissions")] ToolPermissions),
+    /// 控制端前置拦截或收到被控端回传的工具权限拒绝通知（携带结构化 `tool.forbidden` [`UiError`]）。
+    ToolPermissionDenied {
+        /// 被拒绝的工具复用子通道号（如 `TOOL_CHANNEL_FILE`）。
+        channel: u8,
+        /// 结构化用户可读错误模型（错误码为 `tool.forbidden`）。
+        ui_error: UiError,
+    },
     /// 会话结束（正常 `Bye` / 对端断开 / 驱动错误 / 线程 panic）。
     Ended {
         /// 人类可读的结束原因。
@@ -440,6 +472,9 @@ pub enum SessionUpdate {
         /// 是否属于可由上层自动触发无感重连恢复的意外断网/链路中断终态。
         #[serde(default)]
         recoverable: bool,
+        /// 结构化用户可读错误模型（可选，向下兼容旧端 JSON）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui_error: Option<UiError>,
     },
 }
 
@@ -1048,6 +1083,7 @@ struct FileClientWorker {
     wire_out_rx: Option<mpsc::Receiver<Vec<u8>>>,
     cmd_tx: mpsc::SyncSender<FileWorkerCmd>,
     stop: Arc<AtomicBool>,
+    abort_reason: Arc<Mutex<Option<String>>>,
     wake: WorkerWake,
     cached_transfers: Arc<Mutex<Vec<TransferItem>>>,
     thread: Option<JoinHandle<()>>,
@@ -1060,10 +1096,12 @@ impl FileClientWorker {
         let (wire_out_tx, wire_out_rx) = mpsc::sync_channel::<Vec<u8>>(FILE_CLIENT_WORKER_CHAN_CAP);
         let cached_transfers = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let abort_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let wake = WorkerWake::new();
 
         let t_cached = Arc::clone(&cached_transfers);
         let t_stop = Arc::clone(&stop);
+        let t_abort_reason = Arc::clone(&abort_reason);
         let t_wake = wake.clone();
 
         let handle = thread::Builder::new()
@@ -1080,6 +1118,22 @@ impl FileClientWorker {
                     let wake_seq = t_wake.seq();
                     let mut did_work = false;
                     let mut transfers_dirty = false;
+
+                    // 0) 权限热撤销中止信号优先于一切线帧收发：立即清理 `.rcpart`、释放文件句柄、
+                    //    排空残留入站帧、清空出站待发队列并向 UI 推送失败态，杜绝僵尸 Active 任务。
+                    if let Some(reason) = t_abort_reason
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
+                        pending_out.clear();
+                        while wire_in_rx.try_recv().is_ok() {}
+                        for ev in engine.abort_all_active(&reason) {
+                            file_events.push_drop_oldest(ev);
+                        }
+                        *t_cached.lock().unwrap_or_else(|e| e.into_inner()) = engine.transfers();
+                        did_work = true;
+                    }
 
                     // 1) 优先排空所有就绪的控制命令（不被下载数据块饿死）。
                     loop {
@@ -1262,11 +1316,21 @@ impl FileClientWorker {
             wire_out_rx: Some(wire_out_rx),
             cmd_tx,
             stop,
+            abort_reason,
             wake,
             cached_transfers,
             thread: Some(handle),
         };
         (worker, client_handle)
+    }
+
+    /// 立即中止所有在途上传/下载任务、清理 `.rcpart` 并丢弃已排队的出站线帧（非阻塞，不受命令队列背压影响）。
+    fn abort_all_active(&self, reason: impl Into<String>) {
+        *self.abort_reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.into());
+        if let Some(rx) = self.wire_out_rx.as_ref() {
+            while rx.try_recv().is_ok() {}
+        }
+        self.wake.notify();
     }
 
     fn try_send_incoming(&self, frame: Vec<u8>) -> Result<(), mpsc::TrySendError<Vec<u8>>> {
@@ -1326,6 +1390,8 @@ pub struct ToolClientHandle {
     file: FileClientHandle,
     portmap_latest: Arc<Mutex<Option<Vec<PortMapRuleSnapshot>>>>,
     running: Arc<AtomicBool>,
+    tool_permissions: Arc<Mutex<ToolPermissions>>,
+    update_tx: Arc<BoundedUpdateQueue>,
 }
 
 impl ToolClientHandle {
@@ -1337,9 +1403,30 @@ impl ToolClientHandle {
         }
     }
 
+    fn ensure_tool_allowed(&self, channel: u8) -> Result<(), String> {
+        let perms = *self
+            .tool_permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if perms.allows_channel(channel) {
+            Ok(())
+        } else {
+            let ui_error = crate::ui_error::tool_forbidden_ui_error(
+                channel,
+                crate::ui_error::current_platform(),
+                None,
+            );
+            let msg = ui_error.message.clone();
+            self.update_tx
+                .push(SessionUpdate::ToolPermissionDenied { channel, ui_error });
+            Err(msg)
+        }
+    }
+
     /// 请求列举远端目录（结果通过 `file://event` 推送，在专用文件工作线程执行）。
     pub fn file_list_remote(&self, path: Option<String>) -> Result<(), String> {
         self.ensure_running()?;
+        self.ensure_tool_allowed(TOOL_CHANNEL_FILE)?;
         self.file
             .send_cmd(|reply| FileWorkerCmd::ListRemote { path, reply })
     }
@@ -1347,6 +1434,7 @@ impl ToolClientHandle {
     /// 请求在远端创建目录（结果通过 `file://event` 推送，在专用文件工作线程执行）。
     pub fn file_mkdir_remote(&self, parent: String, name: String) -> Result<(), String> {
         self.ensure_running()?;
+        self.ensure_tool_allowed(TOOL_CHANNEL_FILE)?;
         self.file.send_cmd(|reply| FileWorkerCmd::MkdirRemote {
             parent,
             name,
@@ -1357,6 +1445,7 @@ impl ToolClientHandle {
     /// 请求删除远端文件或目录（结果通过 `file://event` 推送）。
     pub fn file_delete_remote(&self, path: String) -> Result<(), String> {
         self.ensure_running()?;
+        self.ensure_tool_allowed(TOOL_CHANNEL_FILE)?;
         self.file
             .send_cmd(|reply| FileWorkerCmd::DeleteRemote { path, reply })
     }
@@ -1364,6 +1453,7 @@ impl ToolClientHandle {
     /// 请求重命名远端文件或目录（结果通过 `file://event` 推送）。
     pub fn file_rename_remote(&self, path: String, new_name: String) -> Result<(), String> {
         self.ensure_running()?;
+        self.ensure_tool_allowed(TOOL_CHANNEL_FILE)?;
         self.file.send_cmd(|reply| FileWorkerCmd::RenameRemote {
             path,
             new_name,
@@ -1374,6 +1464,7 @@ impl ToolClientHandle {
     /// 发起本地文件上传到远端目录，返回传输任务 ID（磁盘 I/O 在专用文件工作线程执行，不触碰 `tools_hub` 锁）。
     pub fn file_upload(&self, local_path: &str, remote_dir: &str) -> Result<u64, String> {
         self.ensure_running()?;
+        self.ensure_tool_allowed(TOOL_CHANNEL_FILE)?;
         let local_path = local_path.to_string();
         let remote_dir = remote_dir.to_string();
         self.file.send_cmd(|reply| FileWorkerCmd::StartUpload {
@@ -1386,6 +1477,7 @@ impl ToolClientHandle {
     /// 发起远端文件下载到本地目录，返回传输任务 ID（磁盘 I/O 在专用文件工作线程执行，不触碰 `tools_hub` 锁）。
     pub fn file_download(&self, remote_path: &str, local_dir: &str) -> Result<u64, String> {
         self.ensure_running()?;
+        self.ensure_tool_allowed(TOOL_CHANNEL_FILE)?;
         let remote_path = remote_path.to_string();
         let local_dir = local_dir.to_string();
         self.file.send_cmd(|reply| FileWorkerCmd::StartDownload {
@@ -1875,6 +1967,7 @@ pub struct SessionHandle {
     relay_interrupt: Arc<Mutex<Option<ActiveRelayInterrupt>>>,
     running: Arc<AtomicBool>,
     watch_only: Arc<AtomicBool>,
+    tool_permissions: Arc<Mutex<ToolPermissions>>,
     encrypt_connection: bool,
     base_config: UiSessionConfig,
     layer_lease: Arc<Mutex<Option<LayerLease>>>,
@@ -1912,6 +2005,7 @@ impl SessionHandle {
         let layer_lease = Arc::new(Mutex::new(None));
         let upgrade_surface = Arc::new(Mutex::new(preallocated_surface));
         let watch_only = Arc::new(AtomicBool::new(cfg.watch_only));
+        let tool_permissions = Arc::new(Mutex::new(ToolPermissions::all_allowed()));
         let encrypt_connection = cfg.encrypt_connection;
         let base_config = cfg.clone();
 
@@ -1927,6 +2021,7 @@ impl SessionHandle {
         let t_relay_interrupt = Arc::clone(&relay_interrupt);
         let t_running = Arc::clone(&running);
         let t_watch_only = Arc::clone(&watch_only);
+        let t_tool_permissions = Arc::clone(&tool_permissions);
         let t_layer = Arc::clone(&layer_lease);
         let t_upgrade_surface = Arc::clone(&upgrade_surface);
 
@@ -1953,6 +2048,7 @@ impl SessionHandle {
                         Arc::clone(&t_terminal_events),
                         t_portmap_latest,
                         t_watch_only,
+                        t_tool_permissions,
                     )
                 }));
                 let end = match res {
@@ -1972,9 +2068,14 @@ impl SessionHandle {
                         reason: end.reason.clone(),
                     });
                 }
+                let ui_error = Some(crate::ui_error::classify_session_reason(
+                    &end.reason,
+                    crate::ui_error::current_platform(),
+                ));
                 t_update.push(SessionUpdate::Ended {
                     reason: end.reason,
                     recoverable: end.recoverable,
+                    ui_error,
                 });
             })
             .expect("spawn rc-ui-session thread");
@@ -1994,6 +2095,7 @@ impl SessionHandle {
             relay_interrupt,
             running,
             watch_only,
+            tool_permissions,
             encrypt_connection,
             base_config,
             layer_lease,
@@ -2100,6 +2202,8 @@ impl SessionHandle {
             file: self.file_handle.clone(),
             portmap_latest: Arc::clone(&self.portmap_latest),
             running: Arc::clone(&self.running),
+            tool_permissions: Arc::clone(&self.tool_permissions),
+            update_tx: Arc::clone(&self.update_rx),
         }
     }
 
@@ -2124,6 +2228,14 @@ impl SessionHandle {
     /// 会话线程是否仍在运行。
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
+    }
+
+    /// 查询当前被控端通告的生效工具通道权限（默认兼容旧端全允许）。
+    pub fn tool_permissions(&self) -> ToolPermissions {
+        *self
+            .tool_permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// 当前会话是否开启了双向 mTLS / E2EE 加密连接模式。
@@ -2784,6 +2896,7 @@ fn run_session_thread(
     terminal_events: Arc<BoundedQueue<TerminalEvent>>,
     portmap_latest: Arc<Mutex<Option<Vec<PortMapRuleSnapshot>>>>,
     watch_only: Arc<AtomicBool>,
+    tool_permissions: Arc<Mutex<ToolPermissions>>,
 ) -> Result<SessionEnd, SessionEnd> {
     let _relay_guard = RelayInterruptSlotGuard {
         slot: &relay_interrupt,
@@ -3553,6 +3666,8 @@ fn run_session_thread(
     let mut update_relay = crate::updater::ControllerUpdateRelay::new();
     let mut awaiting_host_relay_finish = false;
     let mut active_update_request_id: u64 = 0;
+    let mut peer_tool_perms = ToolPermissions::all_allowed();
+    let mut last_local_tool_denied: [Option<Instant>; 8] = [None; 8];
 
     while client.state() != SessionState::Closed {
         // 1) 处理来自 UI 的控制命令。
@@ -3972,6 +4087,26 @@ fn run_session_thread(
                                         awaiting_host_relay_finish = false;
                                     }
                                 }
+                                DisplayControlMsg::ToolPermissionsState {
+                                    allow_file_transfer,
+                                    allow_terminal,
+                                    allow_port_map,
+                                } => {
+                                    peer_tool_perms = ToolPermissions {
+                                        allow_file_transfer: *allow_file_transfer,
+                                        allow_terminal: *allow_terminal,
+                                        allow_port_map: *allow_port_map,
+                                    };
+                                    *tool_permissions.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        peer_tool_perms;
+                                    if !peer_tool_perms.allow_file_transfer {
+                                        pending_file_in.clear();
+                                        pending_file_tx.clear();
+                                        file_worker.abort_all_active(
+                                            "目标设备已禁用文件传输权限，当前传输已中止",
+                                        );
+                                    }
+                                }
                                 _ => {}
                             }
                             if !suppress_update_emit {
@@ -4008,25 +4143,32 @@ fn run_session_thread(
                     }
                 }
 
-                // H12：非阻塞冲刷入站文件帧至专用文件工作线程（满载时留待下拍重试，零丢帧）。
-                while let Some(front) = pending_file_in.front() {
-                    match file_worker.try_send_incoming(front.clone()) {
-                        Ok(()) => {
-                            pending_file_in.pop_front();
-                            tools_busy = true;
-                        }
-                        Err(mpsc::TrySendError::Full(_)) => break,
-                        Err(mpsc::TrySendError::Disconnected(_)) => {
-                            pending_file_in.clear();
-                            break;
+                // H12：非阻塞冲刷入站文件帧至专用文件工作线程（满载时留待下拍重试，零丢帧；权限被禁时立即清空）。
+                if peer_tool_perms.allow_file_transfer {
+                    while let Some(front) = pending_file_in.front() {
+                        match file_worker.try_send_incoming(front.clone()) {
+                            Ok(()) => {
+                                pending_file_in.pop_front();
+                                tools_busy = true;
+                            }
+                            Err(mpsc::TrySendError::Full(_)) => break,
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                pending_file_in.clear();
+                                break;
+                            }
                         }
                     }
+                } else {
+                    pending_file_in.clear();
                 }
 
-                // H12：在 `tools_hub.lock()` 之外非阻塞拉取文件工作线程产出的出站线帧。
-                let file_out = if poll_file {
+                // H12：在 `tools_hub.lock()` 之外非阻塞拉取文件工作线程产出的出站线帧（权限被禁时跳过拉取并清空队列，防止空读刷屏）。
+                let file_out = if poll_file && peer_tool_perms.allow_file_transfer {
                     file_worker.try_recv_outgoing(MAX_TOOL_FRAMES_PER_TICK)
                 } else {
+                    if !peer_tool_perms.allow_file_transfer {
+                        pending_file_tx.clear();
+                    }
                     Vec::new()
                 };
 
@@ -4091,19 +4233,51 @@ fn run_session_thread(
                             tools_busy = true;
                         }
                     }
-                    if flush_pending_tool_queue(&mut pending_file_tx, |frame| {
-                        client.send_tool_message(TOOL_CHANNEL_FILE, frame)
-                    }) {
+                    let mut gate_or_flush = |channel: u8, queue: &mut VecDeque<Vec<u8>>| -> bool {
+                        if !peer_tool_perms.allows_channel(channel) {
+                            if !queue.is_empty() {
+                                queue.clear();
+                                let now_denied = Instant::now();
+                                let idx = usize::from(channel);
+                                let should_emit = if idx < last_local_tool_denied.len() {
+                                    match last_local_tool_denied[idx] {
+                                        None => true,
+                                        Some(prev) => {
+                                            now_denied.saturating_duration_since(prev)
+                                                >= LOCAL_TOOL_DENIED_THROTTLE
+                                        }
+                                    }
+                                } else {
+                                    true
+                                };
+                                if should_emit {
+                                    if idx < last_local_tool_denied.len() {
+                                        last_local_tool_denied[idx] = Some(now_denied);
+                                    }
+                                    update_tx.push(SessionUpdate::ToolPermissionDenied {
+                                        channel,
+                                        ui_error: crate::ui_error::tool_forbidden_ui_error(
+                                            channel,
+                                            crate::ui_error::current_platform(),
+                                            None,
+                                        ),
+                                    });
+                                }
+                            }
+                            false
+                        } else {
+                            flush_pending_tool_queue(queue, |frame| {
+                                client.send_tool_message(channel, frame)
+                            })
+                        }
+                    };
+                    if gate_or_flush(TOOL_CHANNEL_FILE, &mut pending_file_tx) {
                         tools_busy = true;
                     }
-                    if flush_pending_tool_queue(&mut pending_term_tx, |frame| {
-                        client.send_tool_message(TOOL_CHANNEL_TERMINAL, frame)
-                    }) {
+                    if gate_or_flush(TOOL_CHANNEL_TERMINAL, &mut pending_term_tx) {
                         tools_busy = true;
                     }
-                    if flush_pending_tool_queue(&mut pending_portmap_tx, |frame| {
-                        client.send_tool_message(TOOL_CHANNEL_PORTMAP, frame)
-                    }) {
+                    if gate_or_flush(TOOL_CHANNEL_PORTMAP, &mut pending_portmap_tx) {
                         tools_busy = true;
                     }
                     let update_tx_budget = crate::updater::UPDATE_RELAY_WINDOW_CHUNKS
@@ -4354,6 +4528,12 @@ fn run_session_thread(
                         // 重连恢复（`Resumed` 丢失在途 QUIC Stream A 分块）或重建（`Rebuilt`）后均需中止进行中的安装包中转，
                         // 避免主机接收线程死等丢失分块或控制器卡在 92%；重建时另外重新协商 HEVC。
                         let was_relaying = update_relay.is_active() || awaiting_host_relay_finish;
+                        if matches!(outcome, ReconnectOutcome::Rebuilt) {
+                            peer_tool_perms = ToolPermissions::all_allowed();
+                            *tool_permissions.lock().unwrap_or_else(|e| e.into_inner()) =
+                                peer_tool_perms;
+                            last_local_tool_denied = [None; 8];
+                        }
                         if matches!(outcome, ReconnectOutcome::Rebuilt) || was_relaying {
                             awaiting_host_relay_finish = false;
                             update_relay.cancel_active_relay();
@@ -4901,6 +5081,25 @@ fn handle_display_ctrl_msg(
             capture_suspended,
         }),
         DisplayControlMsg::MediaState { paused } => Some(SessionUpdate::MediaState { paused }),
+        DisplayControlMsg::ToolPermissionsState {
+            allow_file_transfer,
+            allow_terminal,
+            allow_port_map,
+        } => Some(SessionUpdate::ToolPermissionsUpdated(ToolPermissions {
+            allow_file_transfer,
+            allow_terminal,
+            allow_port_map,
+        })),
+        DisplayControlMsg::ToolPermissionDenied { channel, reason } => {
+            Some(SessionUpdate::ToolPermissionDenied {
+                channel,
+                ui_error: crate::ui_error::tool_forbidden_ui_error(
+                    channel,
+                    crate::ui_error::current_platform(),
+                    reason,
+                ),
+            })
+        }
         DisplayControlMsg::SetStream { .. }
         | DisplayControlMsg::LockScreen
         | DisplayControlMsg::SetCodec { .. }
@@ -5138,6 +5337,8 @@ mod tests {
             file: file_handle,
             portmap_latest: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(true)),
+            tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
+            update_tx: Arc::new(BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP)),
         };
 
         assert!(handle.active_terminal_ids().is_empty());
@@ -5181,6 +5382,8 @@ mod tests {
             file: file_handle,
             portmap_latest: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(true)),
+            tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
+            update_tx: Arc::new(BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP)),
         };
 
         assert_eq!(
@@ -5250,6 +5453,8 @@ mod tests {
             file: file_handle,
             portmap_latest: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(true)),
+            tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
+            update_tx: Arc::new(BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP)),
         };
 
         // 1) Failed terminal_open cleans up pre-inserted active & attached IDs.
@@ -5366,6 +5571,8 @@ mod tests {
             file: file_handle,
             portmap_latest: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(true)),
+            tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
+            update_tx: Arc::new(BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP)),
         };
 
         // Pre-insert an existing live session, then saturate the client outgoing queue.
@@ -5494,6 +5701,8 @@ mod tests {
             file: file_handle,
             portmap_latest: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(true)),
+            tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
+            update_tx: Arc::new(BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP)),
         };
 
         // 即使外部正持有 tools_hub 锁，文件上传与传输列表查询也绝不阻塞（证明文件引擎完全脱离 tools_hub）。
@@ -6067,6 +6276,7 @@ mod tests {
             if let Some(SessionUpdate::Ended {
                 reason,
                 recoverable,
+                ..
             }) = session.try_recv_update()
             {
                 ended = Some((reason, recoverable));
@@ -6340,6 +6550,7 @@ mod tests {
             relay_interrupt: Arc::new(Mutex::new(None)),
             running: Arc::clone(&running),
             watch_only: Arc::new(AtomicBool::new(false)),
+            tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
             encrypt_connection: false,
             base_config: UiSessionConfig::default(),
             layer_lease: Arc::new(Mutex::new(None)),
@@ -6497,6 +6708,7 @@ mod tests {
         let ended_json = serde_json::to_value(SessionUpdate::Ended {
             reason: "局域网连接已断开".to_string(),
             recoverable: true,
+            ui_error: None,
         })
         .expect("serialize Ended");
         assert_eq!(ended_json["kind"], "ended");
@@ -6882,6 +7094,7 @@ mod tests {
             ))))),
             running: Arc::clone(&running),
             watch_only: Arc::new(AtomicBool::new(false)),
+            tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
             encrypt_connection: false,
             base_config: UiSessionConfig::default(),
             layer_lease: Arc::new(Mutex::new(None)),
@@ -6938,6 +7151,7 @@ mod tests {
             ))))),
             running: Arc::clone(&running2),
             watch_only: Arc::new(AtomicBool::new(false)),
+            tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
             encrypt_connection: false,
             base_config: UiSessionConfig::default(),
             layer_lease: Arc::new(Mutex::new(None)),
@@ -7412,6 +7626,7 @@ mod tests {
                 if let Some(SessionUpdate::Ended {
                     reason,
                     recoverable,
+                    ..
                 }) = session.try_recv_update()
                 {
                     ended = Some((reason, recoverable));
@@ -7955,5 +8170,215 @@ mod tests {
             Some("TCP Relay"),
             "controller must fall back to Tier 3 TCP Relay after pre-Welcome blackhole timeout"
         );
+    }
+
+    #[test]
+    fn tool_permissions_state_pre_send_gate_and_remote_denied_emit_structured_ui_error() {
+        // 1) handle_display_ctrl_msg 正确映射 ToolPermissionsState 与 ToolPermissionDenied -> UiError(tool.forbidden)。
+        let mut w = 1280;
+        let mut h = 720;
+        let perms_upd = handle_display_ctrl_msg(
+            DisplayControlMsg::ToolPermissionsState {
+                allow_file_transfer: false,
+                allow_terminal: true,
+                allow_port_map: true,
+            },
+            &mut w,
+            &mut h,
+            false,
+        );
+        assert_eq!(
+            perms_upd,
+            Some(SessionUpdate::ToolPermissionsUpdated(ToolPermissions {
+                allow_file_transfer: false,
+                allow_terminal: true,
+                allow_port_map: true,
+            }))
+        );
+        let perms_json = serde_json::to_value(perms_upd.unwrap()).expect("serialize perms upd");
+        assert_eq!(perms_json["kind"], "tool_permissions_updated");
+        assert_eq!(perms_json["data"]["allow_file_transfer"], false);
+
+        let denied_upd = handle_display_ctrl_msg(
+            DisplayControlMsg::ToolPermissionDenied {
+                channel: TOOL_CHANNEL_FILE,
+                reason: Some("remote host denied".to_string()),
+            },
+            &mut w,
+            &mut h,
+            false,
+        );
+        match denied_upd {
+            Some(SessionUpdate::ToolPermissionDenied { channel, ui_error }) => {
+                assert_eq!(channel, TOOL_CHANNEL_FILE);
+                assert_eq!(ui_error.code, crate::ui_error::codes::TOOL_FORBIDDEN);
+                assert!(ui_error.message.contains("文件传输"));
+                assert_eq!(ui_error.detail.as_deref(), Some("remote host denied"));
+            }
+            other => panic!("expected ToolPermissionDenied, got {other:?}"),
+        }
+
+        // 2) 端到端 HostHandle + SessionHandle：非 Owner 被控端关闭协助文件传输 + 运行期热开关不中断会话。
+        let mut host = crate::host_bridge::HostHandle::spawn(crate::host_bridge::UiHostConfig {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            allow_assist_file_transfer: false,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            ..crate::host_bridge::UiHostConfig::default()
+        })
+        .expect("spawn host");
+        let host_addr = host.listen_addr();
+
+        let session = SessionHandle::spawn(UiSessionConfig {
+            connect_addr: host_addr,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            width: 320,
+            height: 240,
+            fps: 30,
+            ..UiSessionConfig::default()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut saw_initial_denied_perm = false;
+        while Instant::now() < deadline {
+            while let Some(upd) = session.try_recv_update() {
+                if let SessionUpdate::ToolPermissionsUpdated(p) = upd {
+                    if !p.allow_file_transfer && p.allow_terminal && p.allow_port_map {
+                        saw_initial_denied_perm = true;
+                    }
+                }
+            }
+            if saw_initial_denied_perm {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_initial_denied_perm,
+            "controller must receive ToolPermissionsUpdated(allow_file_transfer=false)"
+        );
+        assert!(!session.tool_permissions().allow_file_transfer);
+
+        // 控制端尝试发起文件列表与上传请求 -> ToolClientHandle 入口前置拦截，返回 Err、不创建僵尸 Active 任务，
+        // 并输出结构化 UiError(tool.forbidden)。
+        let list_err = session
+            .tools()
+            .file_list_remote(None)
+            .expect_err("file_list_remote must be blocked when allow_file_transfer=false");
+        assert!(list_err.contains("文件传输"), "unexpected err: {list_err}");
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rc-session-tool-gate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let sample_file = tmp_dir.join("blocked_upload.bin");
+        std::fs::write(&sample_file, vec![0x11u8; 4096]).unwrap();
+
+        let upload_err = session
+            .tools()
+            .file_upload(sample_file.to_str().unwrap(), tmp_dir.to_str().unwrap())
+            .expect_err("file_upload must be blocked at ToolClientHandle before opening file");
+        assert!(upload_err.contains("文件传输"));
+        assert!(
+            session.tools().file_list_transfers().is_empty(),
+            "blocked file_upload must never leave a zombie Active transfer entry"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut denied_err: Option<UiError> = None;
+        while Instant::now() < deadline {
+            while let Some(upd) = session.try_recv_update() {
+                if let SessionUpdate::ToolPermissionDenied { channel, ui_error } = upd {
+                    if channel == TOOL_CHANNEL_FILE {
+                        denied_err = Some(ui_error);
+                    }
+                }
+            }
+            if denied_err.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let ui_err = denied_err.expect("controller must emit ToolPermissionDenied for FILE");
+        assert_eq!(ui_err.code, crate::ui_error::codes::TOOL_FORBIDDEN);
+        assert!(ui_err.message.contains("文件传输"));
+
+        // 被控端运行期热开启再热关闭 allow_assist_file_transfer，会话保持存活且控制端实时同步。
+        host.set_allow_assist_file_transfer(true);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_reenabled = false;
+        while Instant::now() < deadline {
+            while let Some(upd) = session.try_recv_update() {
+                if let SessionUpdate::ToolPermissionsUpdated(p) = upd {
+                    if p.allow_file_transfer {
+                        saw_reenabled = true;
+                    }
+                }
+            }
+            if saw_reenabled {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_reenabled && session.is_running() && session.tool_permissions().allow_file_transfer,
+            "hot-enabling allow_assist_file_transfer must sync without disconnecting"
+        );
+
+        // 验证 FileClientWorker::abort_all_active 能立即中止在途传输并推 Failed 事件（无僵尸 Active）。
+        let file_events = Arc::new(BoundedQueue::new(32));
+        let (mut worker, fhandle) = FileClientWorker::spawn(Arc::clone(&file_events));
+        let tid = fhandle
+            .send_cmd(|reply| FileWorkerCmd::StartUpload {
+                local_path: sample_file.to_string_lossy().to_string(),
+                remote_dir: tmp_dir.to_string_lossy().to_string(),
+                reply,
+            })
+            .expect("start_upload on worker");
+        assert!(fhandle
+            .cached_transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.id == tid && t.status == TransferStatus::Active));
+        worker.abort_all_active("host revoked file transfer");
+        let abort_deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_failed_ev = false;
+        while Instant::now() < abort_deadline && !saw_failed_ev {
+            while let Some(ev) = file_events.try_pop() {
+                if let FileEvent::TransferUpdated(item) = ev {
+                    if item.id == tid && item.status == TransferStatus::Failed {
+                        saw_failed_ev = true;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            saw_failed_ev,
+            "FileClientWorker::abort_all_active must emit TransferUpdated(Failed)"
+        );
+        assert!(
+            fhandle
+                .cached_transfers
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|t| t.status != TransferStatus::Active),
+            "no zombie Active transfers may remain after abort_all_active"
+        );
+        worker.shutdown();
+
+        session.send(SessionCommand::Disconnect);
+        session.join();
+        host.stop();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

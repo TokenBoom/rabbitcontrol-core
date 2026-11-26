@@ -548,6 +548,7 @@ fn snapshots_same_payload(a: &ServerStatusSnapshot, b: &ServerStatusSnapshot) ->
         && a.device_id == b.device_id
         && a.device_id_formatted == b.device_id_formatted
         && a.error_message == b.error_message
+        && a.ui_error == b.ui_error
         && a.signal_addr == b.signal_addr
         && a.relay_addr == b.relay_addr
 }
@@ -1269,6 +1270,7 @@ impl SignalClientHandle {
                 device_id,
                 device_id_formatted,
                 error_message: None,
+                ui_error: None,
                 signal_addr: cfg.signal_addr(),
                 relay_addr: cfg.relay_addr(),
                 revision: next_status_revision(),
@@ -2565,6 +2567,7 @@ fn run_single_connection(
             device_id: Some(assigned_id.clone()),
             device_id_formatted: Some(formatted_id),
             error_message: None,
+            ui_error: None,
             signal_addr: Some(default_signal_addr.to_string()),
             relay_addr: Some(effective_relay_addr.clone()),
             revision: 0,
@@ -3172,6 +3175,9 @@ fn build_snapshot(
     relay_addr: Option<String>,
 ) -> ServerStatusSnapshot {
     let device_id_formatted = device_id.as_deref().map(format_device_id);
+    let ui_error = error_message.as_deref().map(|msg| {
+        crate::ui_error::classify_signal_error(msg, crate::ui_error::current_platform())
+    });
     ServerStatusSnapshot {
         enabled: cfg.enabled,
         server_host: cfg.server_host.clone(),
@@ -3181,6 +3187,7 @@ fn build_snapshot(
         device_id,
         device_id_formatted,
         error_message,
+        ui_error,
         signal_addr,
         relay_addr,
         revision: 0,

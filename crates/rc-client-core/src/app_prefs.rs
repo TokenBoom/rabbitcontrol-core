@@ -159,6 +159,9 @@ pub struct AppPrefs {
     /// 是否开启「允许其他设备远控本机」（默认 `false`）。
     #[serde(default)]
     pub allow_remote_assist: bool,
+    /// 他人远程协助本机时是否允许文件互传（默认 `true` 兼容存量用户；同账号本人自控始终豁免）。
+    #[serde(default = "default_allow_assist_file_transfer")]
+    pub allow_assist_file_transfer: bool,
     /// 自定义访问验证码（`None` = 临时验证码模式；`Some("")` = 无密码；`Some(pw)` = 自定义密码）。
     #[serde(default)]
     pub custom_host_password: Option<String>,
@@ -261,6 +264,10 @@ fn default_upnp_enabled() -> bool {
     true
 }
 
+fn default_allow_assist_file_transfer() -> bool {
+    true
+}
+
 fn default_privacy_mode() -> String {
     "off".to_string()
 }
@@ -317,6 +324,7 @@ impl Default for AppPrefs {
     fn default() -> Self {
         Self {
             allow_remote_assist: false,
+            allow_assist_file_transfer: default_allow_assist_file_transfer(),
             custom_host_password: None,
             bitrate_preset: default_bitrate_preset(),
             bitrate_bps: DEFAULT_BITRATE_BPS,
@@ -1993,6 +2001,31 @@ mod tests {
             assert!(!reloaded.upnp_enabled);
         }
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allow_assist_file_transfer_defaults_true_and_roundtrips() {
+        let def = AppPrefs::default();
+        assert!(def.allow_assist_file_transfer);
+        let json_val = serde_json::to_value(&def).unwrap();
+        assert_eq!(json_val["allowAssistFileTransfer"], true);
+
+        // 旧版 prefs.json 缺少 allowAssistFileTransfer 时默认兼容为 true。
+        let legacy: AppPrefs = serde_json::from_str(r#"{"allowRemoteAssist":true}"#)
+            .expect("legacy prefs without allowAssistFileTransfer");
+        assert!(legacy.allow_assist_file_transfer);
+
+        let dir = temp_test_dir("assist-file-transfer");
+        let path = dir.join("prefs.json");
+        fs::create_dir_all(&dir).unwrap();
+        let custom = AppPrefs {
+            allow_assist_file_transfer: false,
+            ..AppPrefs::default()
+        };
+        save_to_path(&path, &custom).unwrap();
+        let reloaded = load_from_path(&path);
+        assert!(!reloaded.allow_assist_file_transfer);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -129,6 +129,7 @@ fn paired_sessions(
             pace_capture: true, // 假后端必须节流（坑 4）
             auth: rc_session::HostAuthConfig::default(),
             approver: Box::new(rc_session::AutoApprover),
+            tool_permissions: rc_session::ToolPermissions::all_allowed(),
         },
         Box::new(ta),
         Box::new(

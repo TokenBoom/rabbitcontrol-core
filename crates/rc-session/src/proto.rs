@@ -80,6 +80,53 @@ pub const TOOL_CHANNEL_DISPLAY_CTRL: u8 = 5;
 /// 工具复用单条载荷最大字节数（256 KiB）。
 pub const MAX_TOOL_PAYLOAD_BYTES: usize = 256 * 1024;
 
+/// 被控端工具复用通道的按操作类型权限位。
+///
+/// 仅门控用户级工具通道（[`TOOL_CHANNEL_FILE`]、[`TOOL_CHANNEL_TERMINAL`]、
+/// [`TOOL_CHANNEL_PORTMAP`]）；[`TOOL_CHANNEL_AUDIO_CTRL`] 与
+/// [`TOOL_CHANNEL_DISPLAY_CTRL`] 等内部控制通道始终放行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolPermissions {
+    /// 是否允许控制端使用 W2 文件传输通道（[`TOOL_CHANNEL_FILE`]）。
+    pub allow_file_transfer: bool,
+    /// 是否允许控制端使用 W3 远程终端通道（[`TOOL_CHANNEL_TERMINAL`]）。
+    pub allow_terminal: bool,
+    /// 是否允许控制端使用 W4 端口映射通道（[`TOOL_CHANNEL_PORTMAP`]）。
+    pub allow_port_map: bool,
+}
+
+impl Default for ToolPermissions {
+    fn default() -> Self {
+        Self::all_allowed()
+    }
+}
+
+impl ToolPermissions {
+    /// 全部工具通道均允许（默认兼容值，亦用于同账号本人自控会话）。
+    pub const fn all_allowed() -> Self {
+        Self {
+            allow_file_transfer: true,
+            allow_terminal: true,
+            allow_port_map: true,
+        }
+    }
+
+    /// 判定指定工具复用子通道是否允许通过。
+    ///
+    /// - `TOOL_CHANNEL_FILE` → `self.allow_file_transfer`
+    /// - `TOOL_CHANNEL_TERMINAL` → `self.allow_terminal`
+    /// - `TOOL_CHANNEL_PORTMAP` → `self.allow_port_map`
+    /// - `TOOL_CHANNEL_AUDIO_CTRL` / `TOOL_CHANNEL_DISPLAY_CTRL` 及其他控制通道 → 始终 `true`
+    pub const fn allows_channel(self, channel: u8) -> bool {
+        match channel {
+            TOOL_CHANNEL_FILE => self.allow_file_transfer,
+            TOOL_CHANNEL_TERMINAL => self.allow_terminal,
+            TOOL_CHANNEL_PORTMAP => self.allow_port_map,
+            _ => true,
+        }
+    }
+}
+
 /// 音频编解码标识：16 位有符号小端 PCM。
 pub const AUDIO_CODEC_PCM16: u8 = 0;
 /// 音频编解码标识：IMA-ADPCM。

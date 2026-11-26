@@ -478,6 +478,7 @@ mod quic_session_auth {
                 pace_capture: true,
                 auth,
                 approver,
+                tool_permissions: rc_session::ToolPermissions::all_allowed(),
             },
             SERVER_CERT_PEM,
             SERVER_KEY_PEM,

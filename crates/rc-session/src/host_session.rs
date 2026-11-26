@@ -51,7 +51,7 @@ use crate::clipboard::{
 };
 use crate::proto::{
     AudioFramePacket, AuthStatus, ByeReason, ControlMessage, Hello, HostFlags, SessionParams,
-    Welcome,
+    ToolPermissions, Welcome,
 };
 use crate::reconnect::{
     ReconnectConfig, ReconnectRequest, ReconnectStats, ResumeWindow, DEFAULT_RESUME_TTL,
@@ -84,6 +84,8 @@ const DETACHED_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
 const DETACHED_POLL_SLICE: Duration = Duration::from_millis(2);
 /// 工具复用接收队列有界容量上限（可靠通道绝不静默丢帧，满时返回协议错误）。
 const MAX_PENDING_TOOL_MESSAGES: usize = 2048;
+/// 被权限硬门控拦截的工具通道通知记录上限（有界丢最旧，防刷爆内存）。
+const MAX_REJECTED_TOOL_CHANNELS: usize = 64;
 /// 音频帧接收队列有界容量上限（低延迟优先，满时丢弃最旧帧）。
 const MAX_PENDING_AUDIO_FRAMES: usize = 32;
 
@@ -115,6 +117,8 @@ pub struct HostSessionConfig {
     /// T19：连接审批人（全项目唯一审批挂点，默认 [`AutoApprover`]；
     /// T22 托盘弹窗从此处注入）。
     pub approver: Box<dyn ConnectionApprover>,
+    /// 被控端工具复用通道按操作类型权限位（默认全允许保持兼容）。
+    pub tool_permissions: ToolPermissions,
 }
 
 impl HostSessionConfig {
@@ -134,6 +138,7 @@ impl HostSessionConfig {
             pace_capture: false,
             auth: HostAuthConfig::default(),
             approver: Box::new(AutoApprover),
+            tool_permissions: ToolPermissions::all_allowed(),
         }
     }
 }
@@ -275,6 +280,10 @@ pub struct HostSession {
     // ── 工具复用（0x10）与音频帧（0x11）有界接收队列 ──
     /// 工具复用消息接收队列（FILE/TERMINAL/PORTMAP，上限 [`MAX_PENDING_TOOL_MESSAGES`]）。
     tool_rx: VecDeque<(u8, Vec<u8>)>,
+    /// 当前会话生效的工具通道权限位（被控端会话层硬门控）。
+    tool_permissions: ToolPermissions,
+    /// 被硬门控拦截的工具通道号记录（有界容量 [`MAX_REJECTED_TOOL_CHANNELS`]，供上层按通道节流回传拒绝通知）。
+    rejected_tool_channels: VecDeque<u8>,
     /// 音频控制子通道（`TOOL_CHANNEL_AUDIO_CTRL`）独立最新值槽位（不被批量数据挤占）。
     audio_ctrl_rx: Option<Vec<u8>>,
     /// 工具复用接收队列满时触发协议错误的溢出计数。
@@ -344,6 +353,7 @@ impl HostSession {
         let target_shows_cursor = cfg.pipeline.shows_cursor;
         let live_display_id = cfg.pipeline.display_id;
         let live_shows_cursor = cfg.pipeline.shows_cursor;
+        let tool_permissions = cfg.tool_permissions;
         Ok(Self {
             cfg,
             endpoint: Some(endpoint),
@@ -388,6 +398,8 @@ impl HostSession {
             clipboard: None,
             clipboard_received_while_disabled: 0,
             tool_rx: VecDeque::new(),
+            tool_permissions,
+            rejected_tool_channels: VecDeque::new(),
             audio_ctrl_rx: None,
             tool_rx_overflow_dropped: 0,
             audio_rx: VecDeque::new(),
@@ -424,6 +436,7 @@ impl HostSession {
         let target_shows_cursor = cfg.pipeline.shows_cursor;
         let live_display_id = cfg.pipeline.display_id;
         let live_shows_cursor = cfg.pipeline.shows_cursor;
+        let tool_permissions = cfg.tool_permissions;
         Ok(Self {
             cfg,
             endpoint: None,
@@ -468,6 +481,8 @@ impl HostSession {
             clipboard: None,
             clipboard_received_while_disabled: 0,
             tool_rx: VecDeque::new(),
+            tool_permissions,
+            rejected_tool_channels: VecDeque::new(),
             audio_ctrl_rx: None,
             tool_rx_overflow_dropped: 0,
             audio_rx: VecDeque::new(),
@@ -1155,6 +1170,25 @@ impl HostSession {
         self.tool_rx_overflow_dropped
     }
 
+    /// 查询当前会话生效的工具通道权限集合。
+    pub fn tool_permissions(&self) -> ToolPermissions {
+        self.tool_permissions
+    }
+
+    /// 运行期热更新当前会话的工具通道权限集合（不中断会话）。
+    ///
+    /// 若某工具子通道权限被撤销，同步清理接收队列中尚未排空的对应通道残留帧，
+    /// 防止已入队但未消费的帧在权限关闭后继续漏入上层引擎。
+    pub fn set_tool_permissions(&mut self, perms: ToolPermissions) {
+        self.tool_permissions = perms;
+        self.tool_rx.retain(|(ch, _)| perms.allows_channel(*ch));
+    }
+
+    /// 排空自上次调用以来被会话层权限硬门控拦截的工具子通道号列表。
+    pub fn drain_rejected_tool_channels(&mut self) -> Vec<u8> {
+        self.rejected_tool_channels.drain(..).collect()
+    }
+
     /// 发送一帧音频数据包（0x11，经 Stream A reliable 控制流写出）。
     ///
     /// 仅 [`SessionState::Streaming`] 允许调用；校验采样率、声道数、编解码与大小上限。
@@ -1794,6 +1828,7 @@ impl HostSession {
         self.rstats.disconnects += 1;
         self.transport = None; // 死连接即弃（Drop 关闭）；重连用新 transport
         self.tool_rx.clear();
+        self.rejected_tool_channels.clear();
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
         self.last_client_rx_us = None;
@@ -2065,6 +2100,7 @@ impl HostSession {
             // H6：resume 命中重置剪贴板纪元态，避免沿用断线前的基线与回声状态。
             self.reset_clipboard_epoch();
             self.tool_rx.clear();
+            self.rejected_tool_channels.clear();
             self.audio_ctrl_rx = None;
             self.audio_rx.clear();
             self.last_client_rx_us = Some(now_us);
@@ -2129,6 +2165,7 @@ impl HostSession {
         self.refresh_base_us = Some(now_us as u32);
         self.rstats.refreshes += 1;
         self.tool_rx.clear();
+        self.rejected_tool_channels.clear();
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
         self.last_client_rx_us = None;
@@ -2613,6 +2650,7 @@ impl HostSession {
         // H6：新会话落成重置剪贴板纪元态（避免跨纪元时钟归零卡死节流窗口）。
         self.reset_clipboard_epoch();
         self.tool_rx.clear();
+        self.rejected_tool_channels.clear();
         self.audio_ctrl_rx = None;
         self.tool_rx_overflow_dropped = 0;
         self.audio_rx.clear();
@@ -2628,6 +2666,7 @@ impl HostSession {
         self.detached_candidate_deadline_us = None;
         self.last_client_rx_us = None;
         self.tool_rx.clear();
+        self.rejected_tool_channels.clear();
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
         if self.state != SessionState::Closed {
@@ -2713,9 +2752,17 @@ impl HostSession {
                 }
                 Ok(ControlFlow::Handled)
             }
-            // 0x10 ToolChannel → `TOOL_CHANNEL_AUDIO_CTRL` 独立最新值隔离；其余可靠子通道入
+            // 0x10 ToolChannel → 先执行被控端会话层权限硬门控（拦截不入队列且有界记录）；
+            // 放行后 `TOOL_CHANNEL_AUDIO_CTRL` 独立最新值隔离；其余可靠子通道入
             // 有界接收队列（上限 MAX_PENDING_TOOL_MESSAGES），满时绝不静默丢帧，返回协议错误。
             ControlMessage::ToolChannel { channel, payload } => {
+                if !self.tool_permissions.allows_channel(channel) {
+                    if self.rejected_tool_channels.len() >= MAX_REJECTED_TOOL_CHANNELS {
+                        self.rejected_tool_channels.pop_front();
+                    }
+                    self.rejected_tool_channels.push_back(channel);
+                    return Ok(ControlFlow::Handled);
+                }
                 if channel == crate::proto::TOOL_CHANNEL_AUDIO_CTRL {
                     self.audio_ctrl_rx = Some(payload);
                     Ok(ControlFlow::Handled)
@@ -2944,6 +2991,7 @@ impl HostSession {
             }
         }
         self.tool_rx.clear();
+        self.rejected_tool_channels.clear();
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
         self.last_client_rx_us = None;
@@ -2956,6 +3004,7 @@ impl HostSession {
     /// S6 停机红线的管线拆除段（同时清空工具/音频接收队列；幂等）。
     fn teardown_pipeline(&mut self) {
         self.tool_rx.clear();
+        self.rejected_tool_channels.clear();
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
         self.teardown_pipeline_only();
@@ -3393,6 +3442,7 @@ mod tests {
             pace_capture: true, // 假后端必须节流（坑 4）
             auth: HostAuthConfig::default(),
             approver: Box::new(AutoApprover),
+            tool_permissions: ToolPermissions::all_allowed(),
         }
     }
 

@@ -75,6 +75,7 @@ fn spawn_inprocess_host(
             pace_capture: true,
             auth: rc_session::HostAuthConfig::default(),
             approver: Box::new(rc_session::AutoApprover),
+            tool_permissions: rc_session::ToolPermissions::all_allowed(),
         },
         DEV_CERT_PEM,
         DEV_KEY_PEM,

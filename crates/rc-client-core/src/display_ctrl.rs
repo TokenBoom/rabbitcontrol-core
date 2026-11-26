@@ -145,6 +145,10 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
+fn default_true_bool() -> bool {
+    true
+}
+
 /// 一条可供前端分辨率菜单展示的等比分辨率预设。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DisplayPreset {
@@ -441,6 +445,26 @@ pub enum DisplayControlMsg {
         /// 当前媒体管线是否处于暂停状态。
         #[serde(default)]
         paused: bool,
+    },
+    /// 被控端 → 控制端：通告当前会话生效的工具通道权限（W2 文件传输 / W3 终端 / W4 端口映射）。
+    ToolPermissionsState {
+        /// 是否允许使用 W2 文件传输通道。
+        #[serde(default = "default_true_bool")]
+        allow_file_transfer: bool,
+        /// 是否允许使用 W3 远程终端通道。
+        #[serde(default = "default_true_bool")]
+        allow_terminal: bool,
+        /// 是否允许使用 W4 端口映射通道。
+        #[serde(default = "default_true_bool")]
+        allow_port_map: bool,
+    },
+    /// 被控端 → 控制端：通知对端某工具复用子通道请求因权限策略被拒绝。
+    ToolPermissionDenied {
+        /// 被拒绝的工具复用子通道号（例如 `TOOL_CHANNEL_FILE`）。
+        channel: u8,
+        /// 可选补充原因说明。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 
@@ -1445,5 +1469,52 @@ mod tests {
             decode_display_ctrl(br#"{"kind":"legacy_unknown_v2"}"#),
             None
         );
+    }
+
+    #[test]
+    fn tool_permissions_state_and_denied_json_roundtrip() {
+        let perms = DisplayControlMsg::ToolPermissionsState {
+            allow_file_transfer: false,
+            allow_terminal: true,
+            allow_port_map: true,
+        };
+        let encoded = encode_display_ctrl(&perms).expect("encode tool_permissions_state");
+        let val: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(val["kind"], "tool_permissions_state");
+        assert_eq!(val["allow_file_transfer"], false);
+        assert_eq!(val["allow_terminal"], true);
+        assert_eq!(val["allow_port_map"], true);
+        assert_eq!(decode_display_ctrl(&encoded), Some(perms));
+
+        // 缺省字段默认按 true 解码以保证前向兼容。
+        assert_eq!(
+            decode_display_ctrl(br#"{"kind":"tool_permissions_state"}"#),
+            Some(DisplayControlMsg::ToolPermissionsState {
+                allow_file_transfer: true,
+                allow_terminal: true,
+                allow_port_map: true,
+            })
+        );
+
+        let denied = DisplayControlMsg::ToolPermissionDenied {
+            channel: rc_session::TOOL_CHANNEL_FILE,
+            reason: Some("file transfer disabled".to_string()),
+        };
+        let encoded_denied = encode_display_ctrl(&denied).expect("encode tool_permission_denied");
+        let val_denied: serde_json::Value = serde_json::from_slice(&encoded_denied).unwrap();
+        assert_eq!(val_denied["kind"], "tool_permission_denied");
+        assert_eq!(val_denied["channel"], rc_session::TOOL_CHANNEL_FILE);
+        assert_eq!(val_denied["reason"], "file transfer disabled");
+        assert_eq!(decode_display_ctrl(&encoded_denied), Some(denied));
+
+        let denied_no_reason = DisplayControlMsg::ToolPermissionDenied {
+            channel: rc_session::TOOL_CHANNEL_FILE,
+            reason: None,
+        };
+        let encoded_min =
+            encode_display_ctrl(&denied_no_reason).expect("encode denied without reason");
+        let val_min: serde_json::Value = serde_json::from_slice(&encoded_min).unwrap();
+        assert!(val_min.get("reason").is_none());
+        assert_eq!(decode_display_ctrl(&encoded_min), Some(denied_no_reason));
     }
 }

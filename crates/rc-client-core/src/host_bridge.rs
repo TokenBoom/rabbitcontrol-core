@@ -162,6 +162,8 @@ pub struct UiHostConfig {
     pub forbid_passwordless_auto_approve: bool,
     /// 可选 W2 文件传输默认接收目录（`None` 时沿用宿主默认主目录）。
     pub file_transfer_dir: Option<PathBuf>,
+    /// 他人远程协助本机时是否允许使用 W2 文件传输通道（默认 `true`；同账号本人 `OwnerTicket` 自控始终豁免）。
+    pub allow_assist_file_transfer: bool,
 }
 
 impl Default for UiHostConfig {
@@ -183,6 +185,7 @@ impl Default for UiHostConfig {
             accept_mtls_lan: false,
             forbid_passwordless_auto_approve: false,
             file_transfer_dir: None,
+            allow_assist_file_transfer: true,
         }
     }
 }
@@ -205,6 +208,10 @@ impl fmt::Debug for UiHostConfig {
             .field("has_mtls_config", &self.mtls_config.is_some())
             .field("accept_mtls_lan", &self.accept_mtls_lan)
             .field("file_transfer_dir", &self.file_transfer_dir)
+            .field(
+                "allow_assist_file_transfer",
+                &self.allow_assist_file_transfer,
+            )
             .finish()
     }
 }
@@ -274,7 +281,22 @@ pub enum HostUpdate {
     Error {
         /// 错误描述。
         message: String,
+        /// 结构化用户可读错误模型（可选，向下兼容旧端 JSON）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui_error: Option<crate::ui_error::UiError>,
     },
+}
+
+impl HostUpdate {
+    /// 构造带自动归因 [`crate::ui_error::UiError`] 的 [`HostUpdate::Error`]。
+    pub fn error(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let ui_error = Some(crate::ui_error::classify_host_error(
+            &message,
+            crate::ui_error::current_platform(),
+        ));
+        Self::Error { message, ui_error }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1157,6 +1179,7 @@ fn default_host_session_config(
             ..HostAuthConfig::default()
         },
         approver,
+        tool_permissions: rc_session::ToolPermissions::all_allowed(),
     };
     (cfg, preserve_aspect)
 }
@@ -1236,7 +1259,7 @@ fn make_host_pipeline_factory(
                             let message = format!("硬件分辨率/帧率热切换失败：{err}");
                             eprintln!("[rc-ui-host] {message}");
                             if hw_cfg.codec != rc_encode::Codec::Hevc {
-                                updates.push(HostUpdate::Error { message });
+                                updates.push(HostUpdate::error(message));
                             }
                             return Err(err);
                         }
@@ -1248,7 +1271,7 @@ fn make_host_pipeline_factory(
                             "硬件屏幕采集/编码初始化失败（请确认已授予屏幕/录制权限），已降级为测试后端：{err}"
                         );
                         eprintln!("[rc-ui-host] {message}");
-                        updates.push(HostUpdate::Error { message });
+                        updates.push(HostUpdate::error(message));
 
                         hardware_video_active.store(false, Ordering::Release);
                         *backend_label.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -1633,6 +1656,35 @@ fn format_display_addr(actual: SocketAddr) -> String {
 // HostHandle（公开 API）
 // ─────────────────────────────────────────────────────────────────
 
+/// 被控端向控制端回传 `ToolPermissionDenied` 的单通道最小节流间隔（1s）。
+const TOOL_PERMISSION_DENIED_THROTTLE: Duration = Duration::from_secs(1);
+
+/// 按会话归属（是否通过 Ed25519 PoP `OwnerTicket` 自控认证）与远程协助文件开关计算生效工具权限。
+///
+/// 安全红线：仅 `is_owner_session == true` 豁免保持全开；所有非 Owner 会话均受 `allow_assist_file_transfer` 门控。
+fn compute_effective_tool_permissions(
+    is_owner_session: bool,
+    allow_assist_file_transfer: bool,
+) -> rc_session::ToolPermissions {
+    if is_owner_session {
+        rc_session::ToolPermissions::all_allowed()
+    } else {
+        rc_session::ToolPermissions {
+            allow_file_transfer: allow_assist_file_transfer,
+            allow_terminal: true,
+            allow_port_map: true,
+        }
+    }
+}
+
+fn encode_tool_permissions_state(perms: rc_session::ToolPermissions) -> Option<Vec<u8>> {
+    display_ctrl::encode_display_ctrl(&DisplayControlMsg::ToolPermissionsState {
+        allow_file_transfer: perms.allow_file_transfer,
+        allow_terminal: perms.allow_terminal,
+        allow_port_map: perms.allow_port_map,
+    })
+}
+
 /// UI 侧被控端服务句柄：管理单会话循环工作线程、审批桥与优雅停机。
 pub struct HostHandle {
     listen_addr: Arc<Mutex<SocketAddr>>,
@@ -1650,6 +1702,7 @@ pub struct HostHandle {
     running: Arc<AtomicBool>,
     lock_screen_count: Arc<AtomicU64>,
     file_transfer_dir: SharedFileTransferDir,
+    allow_assist_file_transfer: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -1707,6 +1760,7 @@ impl HostHandle {
         let lock_screen_count = Arc::new(AtomicU64::new(0));
         let file_transfer_dir: SharedFileTransferDir =
             Arc::new(RwLock::new(cfg.file_transfer_dir.clone()));
+        let allow_assist_file_transfer = Arc::new(AtomicBool::new(cfg.allow_assist_file_transfer));
 
         let make_approver = |require: bool, ui: &UiApprover| -> Box<dyn ConnectionApprover> {
             if require {
@@ -1833,6 +1887,7 @@ impl HostHandle {
             audio_enabled: cfg.audio_enabled,
             forbid_passwordless_auto_approve: cfg.forbid_passwordless_auto_approve,
             ephemeral_listen_port: cfg.listen_addr.port() == 0,
+            allow_assist_file_transfer: Arc::clone(&allow_assist_file_transfer),
         };
 
         let t_updates = Arc::clone(&updates);
@@ -1880,9 +1935,7 @@ impl HostHandle {
                     )
                 }));
                 if res.is_err() {
-                    t_updates.push(HostUpdate::Error {
-                        message: "被控端工作线程异常退出".to_string(),
-                    });
+                    t_updates.push(HostUpdate::error("被控端工作线程异常退出"));
                 }
                 // M8：先清除 running 标记再推送 Stopped，消除轮询器读到 Stopped 时 is_running 仍为 true 的竞态。
                 t_running.store(false, Ordering::Release);
@@ -1906,6 +1959,7 @@ impl HostHandle {
             running,
             lock_screen_count,
             file_transfer_dir,
+            allow_assist_file_transfer,
             thread: Some(handle),
         })
     }
@@ -2021,6 +2075,19 @@ impl HostHandle {
         *guard = dir;
     }
 
+    /// 运行期热更新「他人远程协助时是否允许文件传输」（即时对当前活跃非 Owner 会话及后续会话生效，不中断会话）。
+    ///
+    /// 同账号本人通过 Ed25519 PoP `OwnerTicket` 建立的自控会话始终豁免保持全开。
+    pub fn set_allow_assist_file_transfer(&self, allowed: bool) {
+        self.allow_assist_file_transfer
+            .store(allowed, Ordering::Release);
+    }
+
+    /// 查询当前「他人远程协助时是否允许文件传输」配置开关。
+    pub fn allow_assist_file_transfer(&self) -> bool {
+        self.allow_assist_file_transfer.load(Ordering::Acquire)
+    }
+
     /// 主动断开当前已连接的控制端会话（触发优雅 `Bye` / 中继即时断流，被控端继续等待新连接）。
     pub fn disconnect_client(&self) {
         self.disconnect_flag.store(true, Ordering::Release);
@@ -2072,7 +2139,7 @@ impl Drop for HostHandle {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct HostWorkerOptions {
     approval_timeout_us: u64,
     prefer_hardware: bool,
@@ -2081,6 +2148,7 @@ struct HostWorkerOptions {
     audio_enabled: bool,
     forbid_passwordless_auto_approve: bool,
     ephemeral_listen_port: bool,
+    allow_assist_file_transfer: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2361,10 +2429,12 @@ fn flush_tool_channel_with_retry<E>(
 
 /// Host 侧专用文件传输工作线程（H12）：将 `list_local_dir` / `write_all` / `sync_all` (`F_FULLFSYNC`)
 /// 与 `fs::rename` 全部移出 60fps 视频采集/编码主线程，出入站均采用有界通道（容量 64），
-/// 会话结束析构时自动关闭通道并回收线程，确保 `FileHostEngine::drop` 及时清理未完成 `.rcpart`。
+/// 会话结束或权限热关闭析构时立即置位 `cancel`、丢弃 `in_rx` 缓冲帧并回收线程，确保 `FileHostEngine::drop`
+/// 及时清理未完成 `.rcpart` 且绝不继续写盘或 `fs::rename` 落盘。
 struct FileHostWorker {
     in_tx: Option<mpsc::SyncSender<Vec<u8>>>,
     out_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    cancel: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -2372,6 +2442,8 @@ impl FileHostWorker {
     fn spawn(default_receive_dir: SharedFileTransferDir) -> Self {
         let (in_tx, in_rx) = mpsc::sync_channel::<Vec<u8>>(FILE_HOST_WORKER_CHAN_CAP);
         let (out_tx, out_rx) = mpsc::sync_channel::<Vec<u8>>(FILE_HOST_WORKER_CHAN_CAP);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let t_cancel = Arc::clone(&cancel);
         let handle = thread::Builder::new()
             .name("rc-file-host-worker".to_string())
             .spawn(move || {
@@ -2396,12 +2468,22 @@ impl FileHostWorker {
                     };
 
                 loop {
+                    if t_cancel.load(Ordering::Acquire) {
+                        return;
+                    }
                     let mut did_work = false;
 
                     // 1) 每轮最多先处理 MAX_TOOL_FRAMES_PER_TICK 条入站线帧，避免饿死出站 ACK/Cancel。
+                    //    每次消费前均复查 cancel，防止 Drop 关闭发送端后仍排空 in_rx 缓冲的 UploadChunk/UploadFinish 写盘落盘。
                     for _ in 0..MAX_TOOL_FRAMES_PER_TICK {
+                        if t_cancel.load(Ordering::Acquire) {
+                            return;
+                        }
                         match in_rx.try_recv() {
                             Ok(payload) => {
+                                if t_cancel.load(Ordering::Acquire) {
+                                    return;
+                                }
                                 sync_receive_dir(
                                     &default_receive_dir,
                                     &mut applied_dir,
@@ -2413,6 +2495,10 @@ impl FileHostWorker {
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => return,
                         }
+                    }
+
+                    if t_cancel.load(Ordering::Acquire) {
+                        return;
                     }
 
                     // 2) 待发送缓冲为空时从引擎拉取一批出站线帧。
@@ -2427,6 +2513,9 @@ impl FileHostWorker {
                     // 3) 非阻塞投递至有界出站通道；满载时暂停投递并继续监听入站 Cancel。
                     let mut out_full = false;
                     while let Some(front) = pending_out.front() {
+                        if t_cancel.load(Ordering::Acquire) {
+                            return;
+                        }
                         match out_tx.try_send(front.clone()) {
                             Ok(()) => {
                                 pending_out.pop_front();
@@ -2446,6 +2535,9 @@ impl FileHostWorker {
                     if out_full {
                         match in_rx.recv_timeout(Duration::from_millis(2)) {
                             Ok(payload) => {
+                                if t_cancel.load(Ordering::Acquire) {
+                                    return;
+                                }
                                 sync_receive_dir(
                                     &default_receive_dir,
                                     &mut applied_dir,
@@ -2459,6 +2551,9 @@ impl FileHostWorker {
                     } else if !did_work && !has_more_work {
                         match in_rx.recv() {
                             Ok(payload) => {
+                                if t_cancel.load(Ordering::Acquire) {
+                                    return;
+                                }
                                 sync_receive_dir(
                                     &default_receive_dir,
                                     &mut applied_dir,
@@ -2476,6 +2571,7 @@ impl FileHostWorker {
         Self {
             in_tx: Some(in_tx),
             out_rx: Some(out_rx),
+            cancel,
             thread: Some(handle),
         }
     }
@@ -2504,6 +2600,7 @@ impl FileHostWorker {
 
 impl Drop for FileHostWorker {
     fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
         self.in_tx.take();
         self.out_rx.take();
         if let Some(handle) = self.thread.take() {
@@ -2833,6 +2930,7 @@ fn drive_ui_host_session(
     let mut owner_terminals = PersistentOwnerTerminals::new();
     let wake_guard: SharedWakeGuard = Arc::new(Mutex::new(None));
     let file_transfer_dir: SharedFileTransferDir = Arc::new(RwLock::new(None));
+    let allow_assist_file_transfer = AtomicBool::new(true);
     drive_ui_host_session_inner(
         host,
         clock,
@@ -2854,6 +2952,7 @@ fn drive_ui_host_session(
         &mut owner_terminals,
         wake_guard,
         file_transfer_dir,
+        &allow_assist_file_transfer,
         None,
         None,
         Instant::now(),
@@ -3008,6 +3107,7 @@ fn drive_ui_host_session_inner(
     owner_terminals: &mut PersistentOwnerTerminals,
     wake_guard: SharedWakeGuard,
     file_transfer_dir: SharedFileTransferDir,
+    allow_assist_file_transfer: &AtomicBool,
     incoming_relay: Option<&Arc<BoundedRelayIncomingQueue>>,
     active_peer_id: Option<&str>,
     session_started_at: Instant,
@@ -3034,6 +3134,7 @@ fn drive_ui_host_session_inner(
         owner_terminals,
         wake_guard,
         file_transfer_dir,
+        allow_assist_file_transfer,
         incoming_relay,
         active_peer_id,
         session_started_at,
@@ -3062,6 +3163,7 @@ fn drive_ui_host_session_with_audio(
     owner_terminals: &mut PersistentOwnerTerminals,
     wake_guard: SharedWakeGuard,
     file_transfer_dir: SharedFileTransferDir,
+    allow_assist_file_transfer: &AtomicBool,
     incoming_relay: Option<&Arc<BoundedRelayIncomingQueue>>,
     active_peer_id: Option<&str>,
     mut session_started_at: Instant,
@@ -3129,8 +3231,17 @@ fn drive_ui_host_session_with_audio(
     let mut last_reported_screen_state: Option<(bool, bool)> = None;
     let mut last_screen_state_check = Instant::now();
     let mut mid_session_wake = MidSessionWakeDriver::new();
+    let mut current_tool_perms = compute_effective_tool_permissions(
+        host.authenticated_owner().is_some(),
+        allow_assist_file_transfer.load(Ordering::Acquire),
+    );
+    host.set_tool_permissions(current_tool_perms);
+    let mut last_tool_denied_sent: [Option<Instant>; 8] = [None; 8];
 
     if host.state() == SessionState::Streaming {
+        if let Some(perm_payload) = encode_tool_permissions_state(current_tool_perms) {
+            pending_display_tx.push_back(perm_payload);
+        }
         let presets = build_hardware_display_presets(
             prefer_hardware,
             hardware_video_active,
@@ -3185,6 +3296,26 @@ fn drive_ui_host_session_with_audio(
     {
         match host.state() {
             SessionState::Streaming => {
+                // 运行期工具通道权限热更新（不中断会话；撤销文件传输权限时立即中止在途传输并丢弃待投递帧）。
+                let desired_tool_perms = compute_effective_tool_permissions(
+                    host.authenticated_owner().is_some(),
+                    allow_assist_file_transfer.load(Ordering::Acquire),
+                );
+                if desired_tool_perms != current_tool_perms {
+                    let file_revoked = current_tool_perms.allow_file_transfer
+                        && !desired_tool_perms.allow_file_transfer;
+                    current_tool_perms = desired_tool_perms;
+                    host.set_tool_permissions(current_tool_perms);
+                    if file_revoked {
+                        pending_file_in.clear();
+                        pending_file_tx.clear();
+                        file_worker = FileHostWorker::spawn(Arc::clone(&file_transfer_dir));
+                    }
+                    if let Some(perm_payload) = encode_tool_permissions_state(current_tool_perms) {
+                        pending_display_tx.push_back(perm_payload);
+                    }
+                }
+
                 let poll_budget = if last_busy || host.has_pending_pipeline_work() {
                     Duration::ZERO
                 } else {
@@ -3274,10 +3405,52 @@ fn drive_ui_host_session_with_audio(
 
                         // 2) 工具复用通道入站分发（W2 文件异步交由专用工作线程 / W3 终端 / W4 端口映射 / 音频控制）。
                         let incoming_tools = host.drain_tool_messages();
-                        let mut tools_busy = !incoming_tools.is_empty();
+                        let rejected_channels = host.drain_rejected_tool_channels();
+                        let mut tools_busy =
+                            !incoming_tools.is_empty() || !rejected_channels.is_empty();
+                        if !rejected_channels.is_empty() {
+                            let now_denied = Instant::now();
+                            for ch in rejected_channels {
+                                let idx = usize::from(ch);
+                                let should_send = if idx < last_tool_denied_sent.len() {
+                                    match last_tool_denied_sent[idx] {
+                                        None => true,
+                                        Some(prev) => {
+                                            now_denied.saturating_duration_since(prev)
+                                                >= TOOL_PERMISSION_DENIED_THROTTLE
+                                        }
+                                    }
+                                } else {
+                                    true
+                                };
+                                if should_send {
+                                    if idx < last_tool_denied_sent.len() {
+                                        last_tool_denied_sent[idx] = Some(now_denied);
+                                    }
+                                    if let Some(denied_payload) = display_ctrl::encode_display_ctrl(
+                                        &DisplayControlMsg::ToolPermissionDenied {
+                                            channel: ch,
+                                            reason: Some(format!(
+                                                "被控端已禁止本次远程协助使用{}",
+                                                crate::ui_error::tool_channel_name_zh(ch)
+                                            )),
+                                        },
+                                    ) {
+                                        pending_display_tx.push_back(denied_payload);
+                                    }
+                                }
+                            }
+                            while pending_display_tx.len() > 64 {
+                                pending_display_tx.pop_front();
+                            }
+                        }
                         for (channel, payload) in incoming_tools {
                             match channel {
-                                TOOL_CHANNEL_FILE => pending_file_in.push_back(payload),
+                                TOOL_CHANNEL_FILE => {
+                                    if current_tool_perms.allow_file_transfer {
+                                        pending_file_in.push_back(payload);
+                                    }
+                                }
                                 TOOL_CHANNEL_TERMINAL => {
                                     if use_owner_terminals {
                                         owner_terminals.engine.handle_incoming(&payload);
@@ -4597,18 +4770,22 @@ fn drive_ui_host_session_with_audio(
                         }
 
                         // H12：非阻塞冲刷入站文件帧至 `rc-file-host-worker` 有界通道（满载时留待下拍重试，零丢帧）。
-                        while let Some(front) = pending_file_in.front() {
-                            match file_worker.try_send_incoming(front.clone()) {
-                                Ok(()) => {
-                                    pending_file_in.pop_front();
-                                    tools_busy = true;
-                                }
-                                Err(mpsc::TrySendError::Full(_)) => break,
-                                Err(mpsc::TrySendError::Disconnected(_)) => {
-                                    pending_file_in.clear();
-                                    break;
+                        if current_tool_perms.allow_file_transfer {
+                            while let Some(front) = pending_file_in.front() {
+                                match file_worker.try_send_incoming(front.clone()) {
+                                    Ok(()) => {
+                                        pending_file_in.pop_front();
+                                        tools_busy = true;
+                                    }
+                                    Err(mpsc::TrySendError::Full(_)) => break,
+                                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                                        pending_file_in.clear();
+                                        break;
+                                    }
                                 }
                             }
+                        } else {
+                            pending_file_in.clear();
                         }
 
                         // 2.5) 接收后台唤醒结果并节流巡检被控端锁屏与采集挂起态（250ms）：
@@ -4653,13 +4830,17 @@ fn drive_ui_host_session_with_audio(
                         }
 
                         // 3) 工具复用通道出站节流泵（每引擎单拍最多 8 帧 + 背压重试队列，零丢块且不饿死视频/输入）。
-                        if flush_tool_channel_with_retry(
-                            &mut pending_file_tx,
-                            MAX_TOOL_FRAMES_PER_TICK,
-                            |n| file_worker.try_recv_outgoing(n),
-                            |frame| host.send_tool_message(TOOL_CHANNEL_FILE, frame),
-                        ) {
-                            tools_busy = true;
+                        if current_tool_perms.allow_file_transfer {
+                            if flush_tool_channel_with_retry(
+                                &mut pending_file_tx,
+                                MAX_TOOL_FRAMES_PER_TICK,
+                                |n| file_worker.try_recv_outgoing(n),
+                                |frame| host.send_tool_message(TOOL_CHANNEL_FILE, frame),
+                            ) {
+                                tools_busy = true;
+                            }
+                        } else {
+                            pending_file_tx.clear();
                         }
                         if flush_tool_channel_with_retry(
                             &mut pending_term_tx,
@@ -4930,6 +5111,21 @@ fn drive_ui_host_session_with_audio(
                         }
                         last_reported_screen_state = Some(resumed_screen_state);
                         last_screen_state_check = Instant::now();
+                        current_tool_perms = compute_effective_tool_permissions(
+                            host.authenticated_owner().is_some(),
+                            allow_assist_file_transfer.load(Ordering::Acquire),
+                        );
+                        host.set_tool_permissions(current_tool_perms);
+                        if !current_tool_perms.allow_file_transfer {
+                            pending_file_in.clear();
+                            pending_file_tx.clear();
+                            file_worker = FileHostWorker::spawn(Arc::clone(&file_transfer_dir));
+                        }
+                        if let Some(perm_payload) =
+                            encode_tool_permissions_state(current_tool_perms)
+                        {
+                            pending_display_tx.push_back(perm_payload);
+                        }
                         emit_peer_connected(host, &host.peer_addr().to_string(), updates);
                     }
                     Ok(DetachOutcome::Replaced) => {
@@ -5049,6 +5245,17 @@ fn drive_ui_host_session_with_audio(
                         }
                         last_reported_screen_state = Some(replaced_screen_state);
                         last_screen_state_check = Instant::now();
+                        current_tool_perms = compute_effective_tool_permissions(
+                            host.authenticated_owner().is_some(),
+                            allow_assist_file_transfer.load(Ordering::Acquire),
+                        );
+                        host.set_tool_permissions(current_tool_perms);
+                        last_tool_denied_sent = [None; 8];
+                        if let Some(perm_payload) =
+                            encode_tool_permissions_state(current_tool_perms)
+                        {
+                            pending_display_tx.push_back(perm_payload);
+                        }
                         file_worker = FileHostWorker::spawn(Arc::clone(&file_transfer_dir));
                         if use_owner_terminals {
                             owner_terminals.detach_all();
@@ -5201,7 +5408,7 @@ fn build_and_handshake_transport(
     transport_kind: HostTransportKind,
     peer_label: &str,
     actual_addr: SocketAddr,
-    opts: HostWorkerOptions,
+    opts: &HostWorkerOptions,
     updates: &Arc<BoundedHostUpdateQueue>,
     approver: &UiApprover,
     password_state: &Mutex<PasswordState>,
@@ -5257,7 +5464,7 @@ fn build_and_handshake_transport(
         Err(e) => {
             approver.set_remote_addr_override(None);
             if !stop_flag.load(Ordering::Acquire) {
-                updates.push(HostUpdate::Error { message: e });
+                updates.push(HostUpdate::error(e));
             }
             return HandshakeTransportOutcome::BuildError;
         }
@@ -5329,9 +5536,10 @@ fn dial_relay_for_incoming(
                             require_e2ee,
                             true,
                         );
-                        updates.push(HostUpdate::Error {
-                            message: format!("{friendly} ({})", incoming.peer_id),
-                        });
+                        updates.push(HostUpdate::error(format!(
+                            "{friendly} ({})",
+                            incoming.peer_id
+                        )));
                     }
                     return None;
                 }
@@ -5351,9 +5559,10 @@ fn dial_relay_for_incoming(
                     disconnect_flag.store(false, Ordering::Release);
                     if !stop_flag.load(Ordering::Acquire) && !session_cancel.load(Ordering::Acquire)
                     {
-                        updates.push(HostUpdate::Error {
-                            message: format!("中继通道连接失败 ({}): {e}", incoming.peer_id),
-                        });
+                        updates.push(HostUpdate::error(format!(
+                            "中继通道连接失败 ({}): {e}",
+                            incoming.peer_id
+                        )));
                     }
                     return None;
                 }
@@ -5392,7 +5601,7 @@ fn serve_relay_incoming(
     incoming_relay: &Arc<BoundedRelayIncomingQueue>,
     actual_addr: SocketAddr,
     display_addr: &str,
-    opts: HostWorkerOptions,
+    opts: &HostWorkerOptions,
     updates: &Arc<BoundedHostUpdateQueue>,
     approver: &UiApprover,
     password_state: &Mutex<PasswordState>,
@@ -5445,20 +5654,19 @@ fn serve_relay_incoming(
                 {
                     Ok(cfg) => Some(cfg),
                     Err(e) => {
-                        updates.push(HostUpdate::Error {
-                            message: format!("mTLS 配置无效 ({}): {e}", incoming.peer_id),
-                        });
+                        updates.push(HostUpdate::error(format!(
+                            "mTLS 配置无效 ({}): {e}",
+                            incoming.peer_id
+                        )));
                         return;
                     }
                 }
             }
             None => {
-                updates.push(HostUpdate::Error {
-                    message: format!(
-                        "已开启加密连接但缺少 mTLS 设备证书，已拒绝入站会话 ({})",
-                        incoming.peer_id
-                    ),
-                });
+                updates.push(HostUpdate::error(format!(
+                    "已开启加密连接但缺少 mTLS 设备证书，已拒绝入站会话 ({})",
+                    incoming.peer_id
+                )));
                 return;
             }
         }
@@ -5647,6 +5855,7 @@ fn serve_relay_incoming(
         owner_terminals,
         wake_guard,
         Arc::clone(file_transfer_dir),
+        &opts.allow_assist_file_transfer,
         Some(incoming_relay),
         Some(incoming.peer_id.as_str()),
         Instant::now(),
@@ -5925,7 +6134,7 @@ fn run_host_worker(
                         }
                         None => {
                             if !stop_flag.load(Ordering::Acquire) {
-                                updates.push(HostUpdate::Error { message: last_err });
+                                updates.push(HostUpdate::error(last_err));
                             }
                             break;
                         }
@@ -5960,7 +6169,7 @@ fn run_host_worker(
                             &incoming_relay,
                             actual_addr,
                             &display_addr,
-                            opts,
+                            &opts,
                             &updates,
                             &approver,
                             &password_state,
@@ -6060,6 +6269,7 @@ fn run_host_worker(
                     &mut owner_terminals,
                     wake_guard,
                     Arc::clone(&file_transfer_dir),
+                    &opts.allow_assist_file_transfer,
                     Some(&incoming_relay),
                     initial_lan_peer_did.as_deref(),
                     session_started_at,
@@ -6107,12 +6317,10 @@ fn run_host_worker(
                     if let Some(incoming) =
                         incoming_relay.pop_ready(RELAY_INCOMING_TTL, Duration::from_millis(180))
                     {
-                        updates.push(HostUpdate::Error {
-                            message: format!(
-                                "已开启加密连接但缺少 mTLS 设备证书，已拒绝入站会话 ({})",
-                                incoming.peer_id
-                            ),
-                        });
+                        updates.push(HostUpdate::error(format!(
+                            "已开启加密连接但缺少 mTLS 设备证书，已拒绝入站会话 ({})",
+                            incoming.peer_id
+                        )));
                         incoming_relay.purge_expired(RELAY_INCOMING_TTL);
                         continue;
                     }
@@ -6137,7 +6345,7 @@ fn run_host_worker(
                             &incoming_relay,
                             actual_addr,
                             &display_addr,
-                            opts,
+                            &opts,
                             &updates,
                             &approver,
                             &password_state,
@@ -6186,7 +6394,7 @@ fn run_host_worker(
                                 HostTransportKind::MtlsLan,
                                 &peer_label,
                                 actual_addr,
-                                opts,
+                                &opts,
                                 &updates,
                                 &approver,
                                 &password_state,
@@ -6233,6 +6441,7 @@ fn run_host_worker(
                                         &mut owner_terminals,
                                         wake_guard,
                                         Arc::clone(&file_transfer_dir),
+                                        &opts.allow_assist_file_transfer,
                                         Some(&incoming_relay),
                                         mtls_peer_did.as_deref(),
                                         session_started_at,
@@ -6554,6 +6763,7 @@ mod tests {
                 pace_capture: false,
                 auth: HostAuthConfig::default(),
                 approver: Box::new(AutoApprover),
+                tool_permissions: rc_session::ToolPermissions::all_allowed(),
             };
             let mut host = HostSession::with_parts(
                 cfg,
@@ -7766,6 +7976,7 @@ mod tests {
             pace_capture: false,
             auth: HostAuthConfig::default(),
             approver: Box::new(AutoApprover),
+            tool_permissions: rc_session::ToolPermissions::all_allowed(),
         };
         let mut host = HostSession::with_parts(
             cfg,
@@ -7875,6 +8086,7 @@ mod tests {
             let mut owner_terms = PersistentOwnerTerminals::new();
             let wake_guard: SharedWakeGuard = Arc::new(Mutex::new(None));
             let ft_dir: SharedFileTransferDir = Arc::new(RwLock::new(None));
+            let allow_assist_ft = AtomicBool::new(true);
             let outcome = drive_ui_host_session_with_audio(
                 &mut host,
                 &t_clock,
@@ -7895,6 +8107,7 @@ mod tests {
                 &mut owner_terms,
                 wake_guard,
                 ft_dir,
+                &allow_assist_ft,
                 None,
                 None,
                 Instant::now(),
@@ -8106,6 +8319,7 @@ mod tests {
             &mut PersistentOwnerTerminals::new(),
             Arc::new(Mutex::new(None)),
             Arc::new(RwLock::new(None)),
+            &AtomicBool::new(true),
             Some(&t_q),
             Some("peer-a"),
             started,
@@ -8176,6 +8390,7 @@ mod tests {
                 &mut PersistentOwnerTerminals::new(),
                 Arc::new(Mutex::new(None)),
                 Arc::new(RwLock::new(None)),
+                &AtomicBool::new(true),
                 None,
                 None,
                 Instant::now(),
@@ -8420,6 +8635,7 @@ mod tests {
                 &mut PersistentOwnerTerminals::new(),
                 Arc::new(Mutex::new(None)),
                 Arc::new(RwLock::new(None)),
+                &AtomicBool::new(true),
                 Some(&t_q),
                 Some("peer-a"),
                 started,
@@ -8651,6 +8867,7 @@ mod tests {
                 &mut PersistentOwnerTerminals::new(),
                 Arc::new(Mutex::new(None)),
                 Arc::new(RwLock::new(None)),
+                &AtomicBool::new(true),
                 None,
                 None,
                 Instant::now(),
@@ -8760,6 +8977,7 @@ mod tests {
             &mut PersistentOwnerTerminals::new(),
             Arc::new(Mutex::new(None)),
             Arc::new(RwLock::new(None)),
+            &AtomicBool::new(true),
             None,
             None,
             Instant::now(),
@@ -9002,5 +9220,472 @@ mod tests {
             t0.elapsed() < Duration::from_millis(50),
             "sleep_cancelable must exit immediately when stop_flag is set"
         );
+    }
+
+    #[test]
+    fn tool_permissions_owner_exempt_vs_non_owner_and_runtime_hot_toggle() {
+        // 1) 纯归属判定红线：仅 Owner 会话（authenticated_owner().is_some()）豁免保持全开；
+        //    非 Owner 会话严格受 allow_assist_file_transfer 门控。
+        assert_eq!(
+            compute_effective_tool_permissions(true, false),
+            rc_session::ToolPermissions::all_allowed()
+        );
+        assert_eq!(
+            compute_effective_tool_permissions(true, true),
+            rc_session::ToolPermissions::all_allowed()
+        );
+        assert_eq!(
+            compute_effective_tool_permissions(false, true),
+            rc_session::ToolPermissions::all_allowed()
+        );
+        assert_eq!(
+            compute_effective_tool_permissions(false, false),
+            rc_session::ToolPermissions {
+                allow_file_transfer: false,
+                allow_terminal: true,
+                allow_port_map: true,
+            }
+        );
+
+        // 2) 非 Owner 串流会话：初始允许 -> 运行期热关闭（不断会话）-> 立即推 ToolPermissionsState(false)
+        //    -> 控制端绕过前置拦截直接发 TOOL_CHANNEL_FILE 帧 -> 被控端硬拦截并节流回传 ToolPermissionDenied。
+        let clock: SessionClock = Arc::new(|| 10_000);
+        let (mut host, in_tx, out_rx, _out_dgrams) =
+            build_streaming_channel_host(Arc::clone(&clock));
+        assert!(host.authenticated_owner().is_none());
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let allow_assist_ft = Arc::new(AtomicBool::new(true));
+        let t_stop = Arc::clone(&stop_flag);
+        let t_allow_ft = Arc::clone(&allow_assist_ft);
+        let t_clock = Arc::clone(&clock);
+        let driver = thread::spawn(move || {
+            drive_ui_host_session_inner(
+                &mut host,
+                &t_clock,
+                None,
+                &BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP),
+                &AtomicU64::new(0),
+                0,
+                &AtomicU64::new(0),
+                0,
+                &AtomicBool::new(false),
+                &t_stop,
+                &AtomicU8::new(ByeReason::Normal as u8),
+                HostTransportKind::Lan,
+                false,
+                false,
+                false,
+                &AtomicU64::new(0),
+                None,
+                &mut PersistentOwnerTerminals::new(),
+                Arc::new(Mutex::new(None)),
+                Arc::new(RwLock::new(None)),
+                &t_allow_ft,
+                None,
+                None,
+                Instant::now(),
+            )
+        });
+
+        let init_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::ToolPermissionsState {
+                    allow_file_transfer: true,
+                    allow_terminal: true,
+                    allow_port_map: true,
+                }
+            )
+        });
+        assert!(
+            init_msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::ToolPermissionsState {
+                    allow_file_transfer: true,
+                    ..
+                }
+            )),
+            "entering Streaming must push initial ToolPermissionsState(true): {init_msgs:?}"
+        );
+
+        // 运行期热关闭协助文件传输，会话不中断且立即推送 ToolPermissionsState(false)。
+        allow_assist_ft.store(false, Ordering::Release);
+        let revoked_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::ToolPermissionsState {
+                    allow_file_transfer: false,
+                    allow_terminal: true,
+                    allow_port_map: true,
+                }
+            )
+        });
+        assert!(
+            revoked_msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::ToolPermissionsState {
+                    allow_file_transfer: false,
+                    ..
+                }
+            )),
+            "hot toggle to false must immediately push ToolPermissionsState(false): {revoked_msgs:?}"
+        );
+        assert!(
+            !driver.is_finished(),
+            "toggling allow_assist_file_transfer must not terminate active session"
+        );
+
+        // 模拟绕过控制端拦截的恶意/旧版客户端直发 TOOL_CHANNEL_FILE 帧。
+        let mut wire_file = Vec::new();
+        rc_session::proto::ControlMessage::ToolChannel {
+            channel: TOOL_CHANNEL_FILE,
+            payload: b"bypass-attempt".to_vec(),
+        }
+        .encode(&mut wire_file);
+        in_tx
+            .send(NetEvent::Reliable(wire_file))
+            .expect("inject file frame");
+
+        let denied_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::ToolPermissionDenied {
+                    channel: TOOL_CHANNEL_FILE,
+                    ..
+                }
+            )
+        });
+        assert!(
+            denied_msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::ToolPermissionDenied {
+                    channel: TOOL_CHANNEL_FILE,
+                    ..
+                }
+            )),
+            "host must hard-reject TOOL_CHANNEL_FILE and reply ToolPermissionDenied: {denied_msgs:?}"
+        );
+
+        stop_flag.store(true, Ordering::Release);
+        let _ = driver.join().expect("join driver");
+    }
+
+    #[test]
+    fn file_host_worker_cancel_on_drop_discards_buffered_upload_frames_and_cleans_rcpart() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-host-file-cancel-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let recv_dir: SharedFileTransferDir = Arc::new(RwLock::new(Some(base.clone())));
+
+        // 场景 A：cancel 置位时，即便 in_rx 中已有完整 UploadStart + UploadChunk + UploadFinish 缓冲帧，
+        // Drop 也不得继续消费写盘或 fs::rename 落盘最终文件。
+        let worker_a = FileHostWorker::spawn(Arc::clone(&recv_dir));
+        worker_a.cancel.store(true, Ordering::Release);
+        let start = rc_tools::FileWireMsg::UploadStart {
+            id: 701,
+            remote_dir: base.to_string_lossy().to_string(),
+            file_name: "must_not_exist.bin".to_string(),
+            total_bytes: 8,
+        }
+        .encode()
+        .unwrap();
+        let chunk = rc_tools::FileWireMsg::UploadChunk {
+            id: 701,
+            offset: 0,
+            data: b"12345678".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        let finish = rc_tools::FileWireMsg::UploadFinish { id: 701 }
+            .encode()
+            .unwrap();
+        let _ = worker_a.try_send_incoming(start);
+        let _ = worker_a.try_send_incoming(chunk);
+        let _ = worker_a.try_send_incoming(finish);
+        drop(worker_a);
+        assert!(
+            !base.join("must_not_exist.bin").exists(),
+            "cancelled FileHostWorker::drop must not process buffered UploadFinish into final file"
+        );
+
+        // 场景 B：进行中上传已创建 `.rcpart`，Drop 时立即回收并清理 `.rcpart` 不留残留。
+        let worker_b = FileHostWorker::spawn(Arc::clone(&recv_dir));
+        let start_b = rc_tools::FileWireMsg::UploadStart {
+            id: 702,
+            remote_dir: base.to_string_lossy().to_string(),
+            file_name: "partial.bin".to_string(),
+            total_bytes: 1024,
+        }
+        .encode()
+        .unwrap();
+        let chunk_b = rc_tools::FileWireMsg::UploadChunk {
+            id: 702,
+            offset: 0,
+            data: vec![0x55u8; 64],
+        }
+        .encode()
+        .unwrap();
+        worker_b.try_send_incoming(start_b).unwrap();
+        worker_b.try_send_incoming(chunk_b).unwrap();
+        // 等待 UploadAck 确认 UploadStart + UploadChunk 已在 worker 线程处理并生成 `.rcpart`。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_ack = false;
+        while Instant::now() < deadline && !saw_ack {
+            if !worker_b.try_recv_outgoing(8).is_empty() {
+                saw_ack = true;
+            } else {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(saw_ack, "expected UploadAck before simulating hot revoke");
+        drop(worker_b);
+        assert!(!base.join("partial.bin").exists());
+        let lingering_parts: Vec<_> = std::fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".rcpart"))
+            .collect();
+        assert!(
+            lingering_parts.is_empty(),
+            "dropping FileHostWorker must clean up in-flight .rcpart: {lingering_parts:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn detached_resume_revokes_file_transfer_and_clears_pending_file_state() {
+        use rc_session::auth::ClientAuthConfig;
+        use rc_session::{ClientSession, ClientSessionConfig, ReconnectConfig};
+
+        struct EmptyInput;
+        impl rc_input::InputCapture for EmptyInput {
+            fn next_events(
+                &mut self,
+                _timeout: Duration,
+            ) -> rc_types::Result<Vec<rc_input::InputEvent>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let updates = Arc::new(BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP));
+        let owner_replay = Arc::new(Mutex::new(rc_session::OwnerReplayCache::new()));
+        let BuiltUiHost {
+            mut host,
+            clock,
+            clock_anchor,
+            ..
+        } = build_host_session(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            None,
+            rc_session::auth::DEFAULT_AUTH_TIMEOUT_US,
+            false,
+            false,
+            true,
+            true,
+            None,
+            owner_replay,
+            Box::new(AutoApprover),
+            Arc::clone(&updates),
+        )
+        .expect("build_host_session");
+        host.set_reconnect(ReconnectConfig {
+            resume_ttl: Duration::from_secs(6),
+            ..ReconnectConfig::default()
+        })
+        .expect("set_reconnect");
+        let addr = host.local_addr().expect("local_addr");
+
+        let allow_assist_ft = Arc::new(AtomicBool::new(true));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let t_allow = Arc::clone(&allow_assist_ft);
+        let t_stop = Arc::clone(&stop_flag);
+        let t_updates = Arc::clone(&updates);
+        let t_anchor = clock_anchor.clone();
+        let host_thread = thread::spawn(move || {
+            t_anchor.reset_pending();
+            host.accept_and_handshake(Duration::from_secs(5))
+                .expect("accept_and_handshake");
+            drive_ui_host_session_inner(
+                &mut host,
+                &clock,
+                Some(&t_anchor),
+                &t_updates,
+                &AtomicU64::new(0),
+                0,
+                &AtomicU64::new(0),
+                0,
+                &AtomicBool::new(false),
+                &t_stop,
+                &AtomicU8::new(ByeReason::Normal as u8),
+                HostTransportKind::Lan,
+                false,
+                false,
+                false,
+                &AtomicU64::new(0),
+                None,
+                &mut PersistentOwnerTerminals::new(),
+                Arc::new(Mutex::new(None)),
+                Arc::new(RwLock::new(None)),
+                &t_allow,
+                None,
+                None,
+                Instant::now(),
+            )
+        });
+
+        // 1) 建立非 Owner 会话（初始 allow_file_transfer == true）。
+        let mut ccfg = ClientSessionConfig::new(
+            addr,
+            SessionParams {
+                width: 64,
+                height: 64,
+                fps: 30,
+                bitrate_bps: 1_000_000,
+            },
+            7788,
+            Box::new(EmptyInput),
+        );
+        ccfg.handshake_timeout = Duration::from_secs(3);
+        ccfg.connect_timeout = Duration::from_secs(3);
+        ccfg.auth = ClientAuthConfig::default();
+        let cclock: SessionClock = Arc::new(|| 0);
+        let mut client1 = ClientSession::new(
+            ccfg,
+            DEV_CERT_PEM,
+            DEV_KEY_PEM,
+            DEV_CERT_PEM,
+            "rabbitcontrol",
+            Arc::clone(&cclock),
+        )
+        .expect("client1 new");
+        client1.connect_and_handshake().expect("client1 handshake");
+
+        // 等待初始 ToolPermissionsState(true)。
+        let mut saw_true = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !saw_true {
+            let _ = client1.tick(Duration::from_millis(10), Instant::now());
+            for (ch, payload) in client1.drain_tool_messages() {
+                if ch == TOOL_CHANNEL_DISPLAY_CTRL
+                    && matches!(
+                        display_ctrl::decode_display_ctrl(&payload),
+                        Some(DisplayControlMsg::ToolPermissionsState {
+                            allow_file_transfer: true,
+                            ..
+                        })
+                    )
+                {
+                    saw_true = true;
+                }
+            }
+        }
+        assert!(saw_true, "expected initial ToolPermissionsState(true)");
+
+        // 2) 模拟意外断网（直接 drop client1 不发 Bye）使 host 进入 Detached，期间将开关置 false。
+        drop(client1);
+        thread::sleep(Duration::from_millis(80));
+        allow_assist_ft.store(false, Ordering::Release);
+
+        // 3) 以同一 session_id 发起 ReconnectRequest 命中 DetachOutcome::Resumed：
+        //    必须立即收到 ToolPermissionsState(false)，且发送 TOOL_CHANNEL_FILE 帧必须被拦截并回传 ToolPermissionDenied。
+        let dev_id = rc_net::quic::Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM).unwrap();
+        let ep = rc_net::quic::QuicEndpoint::new(
+            &NetConfig::new(Role::Controller, "127.0.0.1:0".parse().unwrap()),
+            &dev_id,
+        )
+        .expect("reconnect ep");
+        let server_certs = rc_net::quic::Identity::certs_from_pem(DEV_CERT_PEM).unwrap();
+        let mut t2 = ep
+            .connect(addr, &server_certs, "rabbitcontrol", Duration::from_secs(3))
+            .expect("reconnect connect");
+        let mut req_buf = Vec::new();
+        rc_session::proto::ControlMessage::ReconnectRequest {
+            session_id: 7788,
+            resume: true,
+        }
+        .encode(&mut req_buf);
+        t2.send_reliable(&req_buf).expect("send reconnect req");
+
+        let mut saw_resumed_welcome = false;
+        let mut saw_revoked_state = false;
+        let mut saw_file_denied = false;
+        let mut sent_probe_file = false;
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline
+            && !(saw_resumed_welcome && saw_revoked_state && saw_file_denied)
+        {
+            if let Ok(evs) = t2.poll(Duration::from_millis(20)) {
+                for ev in evs {
+                    if let NetEvent::Reliable(raw) = ev {
+                        match rc_session::proto::ControlMessage::decode(&raw) {
+                            Ok(rc_session::proto::ControlMessage::Welcome(w))
+                                if w.host_flags.resume_accepted() =>
+                            {
+                                saw_resumed_welcome = true;
+                            }
+                            Ok(rc_session::proto::ControlMessage::ToolChannel {
+                                channel: TOOL_CHANNEL_DISPLAY_CTRL,
+                                payload,
+                            }) => match display_ctrl::decode_display_ctrl(&payload) {
+                                Some(DisplayControlMsg::ToolPermissionsState {
+                                    allow_file_transfer: false,
+                                    ..
+                                }) => {
+                                    saw_revoked_state = true;
+                                    if !sent_probe_file {
+                                        sent_probe_file = true;
+                                        let mut file_wire = Vec::new();
+                                        rc_session::proto::ControlMessage::ToolChannel {
+                                            channel: TOOL_CHANNEL_FILE,
+                                            payload: b"post-resume-file".to_vec(),
+                                        }
+                                        .encode(&mut file_wire);
+                                        let _ = t2.send_reliable(&file_wire);
+                                    }
+                                }
+                                Some(DisplayControlMsg::ToolPermissionDenied {
+                                    channel: TOOL_CHANNEL_FILE,
+                                    ..
+                                }) => {
+                                    saw_file_denied = true;
+                                }
+                                _ => {}
+                            },
+                            Ok(rc_session::proto::ControlMessage::ToolChannel {
+                                channel: TOOL_CHANNEL_FILE,
+                                ..
+                            }) => {
+                                panic!("host must not emit TOOL_CHANNEL_FILE after resume revoke");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_resumed_welcome,
+            "reconnect must hit DetachOutcome::Resumed"
+        );
+        assert!(
+            saw_revoked_state,
+            "DetachOutcome::Resumed must immediately push ToolPermissionsState(false)"
+        );
+        assert!(
+            saw_file_denied,
+            "post-resume TOOL_CHANNEL_FILE must be hard-rejected with ToolPermissionDenied"
+        );
+
+        stop_flag.store(true, Ordering::Release);
+        drop(t2);
+        drop(ep);
+        let _ = host_thread.join().expect("join host_thread");
     }
 }

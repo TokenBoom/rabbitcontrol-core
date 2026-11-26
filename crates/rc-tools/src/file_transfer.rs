@@ -1826,6 +1826,37 @@ impl FileClientEngine {
         }
     }
 
+    /// 立即中止全部进行中的上传与下载任务（用于被控端权限撤销/热关闭场景）。
+    ///
+    /// - 将所有 `Active` 任务置为 `Failed` 并写入 `reason`；
+    /// - 立即关闭全部本地上传/下载文件句柄并清理未完成的 `.rcpart` 临时文件；
+    /// - 清空待发线帧队列（不再向已被禁用的通道发送 `CancelTransfer`），返回需推送给 UI 的状态更新事件。
+    pub fn abort_all_active(&mut self, reason: &str) -> Vec<FileEvent> {
+        let mut events = Vec::new();
+        let mut aborted_any = false;
+        for item in self.transfers.values_mut() {
+            if item.status == TransferStatus::Active {
+                item.status = TransferStatus::Failed;
+                item.error = Some(reason.to_string());
+                events.push(FileEvent::TransferUpdated(item.clone()));
+                aborted_any = true;
+            }
+        }
+        self.uploads.clear();
+        for (_, dl) in std::mem::take(&mut self.downloads) {
+            drop(dl.file);
+            if let Some(part) = dl.part_path {
+                let _ = fs::remove_file(part);
+            }
+        }
+        self.outgoing.clear();
+        self.local_events.clear();
+        if aborted_any {
+            self.prune_finished_history();
+        }
+        events
+    }
+
     /// 清除所有已结束（Done / Failed / Cancelled）的传输记录。
     pub fn clear_finished(&mut self) {
         self.transfers
@@ -2797,6 +2828,84 @@ mod tests {
                 other => panic!("expected rejected UploadAck, got {other:?}"),
             }
         }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn client_abort_all_active_cleans_rcpart_releases_handles_and_clears_outgoing() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-tools-abort-all-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let src_dir = base.join("src");
+        let dst_dir = base.join("dst");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dst_dir).unwrap();
+        let src_file = src_dir.join("sample.bin");
+        fs::write(&src_file, vec![0xABu8; 4096]).unwrap();
+
+        let mut client = FileClientEngine::new();
+        let up_id = client
+            .start_upload(src_file.to_str().unwrap(), dst_dir.to_str().unwrap())
+            .expect("start_upload");
+        let dl_id = client
+            .start_download(src_file.to_str().unwrap(), dst_dir.to_str().unwrap())
+            .expect("start_download");
+
+        // 模拟远端下发 DownloadMeta + 首块数据，在 dst_dir 创建真实的 `.rcpart` 临时文件。
+        let meta = FileWireMsg::DownloadMeta {
+            id: dl_id,
+            file_name: "sample.bin".to_string(),
+            total_bytes: 4096,
+            ok: true,
+            error: None,
+        }
+        .encode()
+        .unwrap();
+        let chunk = FileWireMsg::DownloadChunk {
+            id: dl_id,
+            offset: 0,
+            data: vec![0xCDu8; 512],
+        }
+        .encode()
+        .unwrap();
+        let _ = client.handle_incoming(&meta);
+        let _ = client.handle_incoming(&chunk);
+        let part_files_before: Vec<_> = fs::read_dir(&dst_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".rcpart"))
+            .collect();
+        assert_eq!(
+            part_files_before.len(),
+            1,
+            "download must have created an in-flight .rcpart file"
+        );
+
+        let evs = client.abort_all_active("permission revoked");
+        assert_eq!(evs.len(), 2, "both upload and download must emit Failed");
+        for item in client.transfers() {
+            assert!(item.id == up_id || item.id == dl_id);
+            assert_eq!(item.status, TransferStatus::Failed);
+            assert_eq!(item.error.as_deref(), Some("permission revoked"));
+        }
+        assert!(
+            client.poll_outgoing(16).is_empty(),
+            "abort_all_active must clear outgoing queue without sending CancelTransfer"
+        );
+        let part_files_after: Vec<_> = fs::read_dir(&dst_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".rcpart"))
+            .collect();
+        assert!(
+            part_files_after.is_empty(),
+            "abort_all_active must delete in-flight .rcpart temp files"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

@@ -68,8 +68,8 @@ pub use host_session::{
     DetachOutcome, HostRunSummary, HostSession, HostSessionConfig, HostTickReport,
 };
 pub use proto::{
-    AudioFramePacket, AuthMethod, ControlMessage, AUDIO_CODEC_IMA_ADPCM, AUDIO_CODEC_PCM16,
-    MAX_AUDIO_FRAME_BYTES, MAX_AUDIO_SAMPLE_RATE, MAX_OWNER_SIGNATURE_LEN,
+    AudioFramePacket, AuthMethod, ControlMessage, ToolPermissions, AUDIO_CODEC_IMA_ADPCM,
+    AUDIO_CODEC_PCM16, MAX_AUDIO_FRAME_BYTES, MAX_AUDIO_SAMPLE_RATE, MAX_OWNER_SIGNATURE_LEN,
     MAX_OWNER_TICKET_PAYLOAD_LEN, MAX_TOOL_PAYLOAD_BYTES, MIN_AUDIO_SAMPLE_RATE,
     TOOL_CHANNEL_AUDIO_CTRL, TOOL_CHANNEL_DISPLAY_CTRL, TOOL_CHANNEL_FILE, TOOL_CHANNEL_PORTMAP,
     TOOL_CHANNEL_TERMINAL, TYPE_OWNER_AUTH_RESPONSE,
@@ -768,5 +768,99 @@ mod tool_audio_pair_tests {
             client.drain_tool_messages().is_empty(),
             "client tool_rx and audio_ctrl_rx must be cleared on disconnect"
         );
+    }
+
+    #[test]
+    fn host_session_hard_gates_forbidden_tool_channels_and_bounds_rejected_queue() {
+        use crate::ToolPermissions;
+
+        let default_perms = ToolPermissions::default();
+        assert_eq!(default_perms, ToolPermissions::all_allowed());
+        assert!(default_perms.allows_channel(TOOL_CHANNEL_FILE));
+        assert!(default_perms.allows_channel(TOOL_CHANNEL_TERMINAL));
+        assert!(default_perms.allows_channel(TOOL_CHANNEL_PORTMAP));
+        assert!(default_perms.allows_channel(TOOL_CHANNEL_AUDIO_CTRL));
+        assert!(default_perms.allows_channel(TOOL_CHANNEL_DISPLAY_CTRL));
+
+        let no_file = ToolPermissions {
+            allow_file_transfer: false,
+            allow_terminal: true,
+            allow_port_map: true,
+        };
+        assert!(!no_file.allows_channel(TOOL_CHANNEL_FILE));
+        assert!(no_file.allows_channel(TOOL_CHANNEL_TERMINAL));
+        assert!(no_file.allows_channel(TOOL_CHANNEL_PORTMAP));
+        assert!(no_file.allows_channel(TOOL_CHANNEL_AUDIO_CTRL));
+        assert!(no_file.allows_channel(TOOL_CHANNEL_DISPLAY_CTRL));
+
+        let (mut host, mut client, _host_handle, _client_handle) = handshaken_pair();
+        assert_eq!(host.tool_permissions(), ToolPermissions::all_allowed());
+
+        // 1) 运行期关闭 FILE 权限：FILE 帧在会话层直接拦截丢弃不入 tool_rx，记录至 rejected_tool_channels，
+        //    其余通道（TERMINAL / PORTMAP / AUDIO_CTRL / DISPLAY_CTRL）保持放行且不断会话。
+        host.set_tool_permissions(no_file);
+        assert_eq!(host.tool_permissions(), no_file);
+
+        client
+            .send_tool_message(TOOL_CHANNEL_FILE, b"blocked-file-1".to_vec())
+            .expect("client send blocked file");
+        client
+            .send_tool_message(TOOL_CHANNEL_TERMINAL, b"allowed-term".to_vec())
+            .expect("client send allowed terminal");
+        client
+            .send_tool_message(TOOL_CHANNEL_PORTMAP, b"allowed-pm".to_vec())
+            .expect("client send allowed portmap");
+        client
+            .send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, b"allowed-disp".to_vec())
+            .expect("client send allowed display");
+        client
+            .send_tool_message(TOOL_CHANNEL_AUDIO_CTRL, b"allowed-audio".to_vec())
+            .expect("client send allowed audio");
+
+        host.tick(Duration::ZERO).expect("host tick under gate");
+        assert_eq!(host.state(), SessionState::Streaming);
+
+        let drained = host.drain_tool_messages();
+        assert!(
+            drained.iter().all(|(ch, _)| *ch != TOOL_CHANNEL_FILE),
+            "forbidden TOOL_CHANNEL_FILE must not enter tool_rx: {drained:?}"
+        );
+        assert_eq!(drained.len(), 4);
+        assert_eq!(host.drain_rejected_tool_channels(), vec![TOOL_CHANNEL_FILE]);
+        assert!(host.drain_rejected_tool_channels().is_empty());
+
+        // 2) 洪泛 120 条被禁通道帧：rejected_tool_channels 有界封顶 64 且绝不触发 tool_rx 溢出拆会话。
+        for i in 0..120u32 {
+            client
+                .send_tool_message(TOOL_CHANNEL_FILE, i.to_le_bytes().to_vec())
+                .expect("send flood");
+        }
+        host.tick(Duration::ZERO)
+            .expect("flood on forbidden channel must not kill session");
+        assert_eq!(host.state(), SessionState::Streaming);
+        assert_eq!(host.tool_rx_overflow_dropped(), 0);
+        assert!(host.drain_tool_messages().is_empty());
+        let rejected_flood = host.drain_rejected_tool_channels();
+        assert_eq!(rejected_flood.len(), 64);
+        assert!(rejected_flood.iter().all(|&ch| ch == TOOL_CHANNEL_FILE));
+
+        // 3) 已入队但尚未排空的 FILE 帧在热撤销权限时应同步清除，防残留泄漏。
+        host.set_tool_permissions(ToolPermissions::all_allowed());
+        client
+            .send_tool_message(TOOL_CHANNEL_FILE, b"queued-before-revoke".to_vec())
+            .expect("send queued file");
+        client
+            .send_tool_message(TOOL_CHANNEL_TERMINAL, b"stay-queued".to_vec())
+            .expect("send queued term");
+        host.tick(Duration::ZERO).expect("host tick queued");
+        host.set_tool_permissions(no_file);
+        let after_revoke = host.drain_tool_messages();
+        assert_eq!(
+            after_revoke,
+            vec![(TOOL_CHANNEL_TERMINAL, b"stay-queued".to_vec())]
+        );
+
+        host.close(crate::proto::ByeReason::Normal).unwrap();
+        client.close(crate::proto::ByeReason::Normal).unwrap();
     }
 }

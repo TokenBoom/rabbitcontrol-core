@@ -1427,3 +1427,187 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
     owner4.join();
     host.stop();
 }
+
+#[test]
+fn owner_session_exempt_from_assist_file_transfer_gate_while_password_assist_is_blocked() {
+    let rng = SystemRandom::new();
+    let auth_srv_pk8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let auth_srv_kp = Ed25519KeyPair::from_pkcs8(auth_srv_pk8.as_ref()).unwrap();
+    let auth_srv_pub_hex = hex_lower(auth_srv_kp.public_key().as_ref());
+
+    let caller_pk8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let caller_kp = Ed25519KeyPair::from_pkcs8(caller_pk8.as_ref()).unwrap();
+    let caller_pub_hex = hex_lower(caller_kp.public_key().as_ref());
+
+    let verifier = Arc::new(
+        RcOwnerTicketVerifier::new(
+            &auth_srv_pub_hex,
+            "owner-uid-ft".to_string(),
+            "200000009".to_string(),
+        )
+        .unwrap(),
+    );
+
+    let mut host = HostHandle::spawn(UiHostConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        password: Some("ASSISTPASS".to_string()),
+        require_approval: false,
+        auto_accept_with_password: true,
+        allow_remote_assist: true,
+        allow_assist_file_transfer: false,
+        owner_verifier: Some(
+            Arc::clone(&verifier) as Arc<dyn rc_session::auth::OwnerTicketVerifier>
+        ),
+        clipboard_enabled: false,
+        audio_enabled: false,
+        prefer_hardware: false,
+        ..UiHostConfig::default()
+    })
+    .expect("spawn host with allow_assist_file_transfer=false");
+    let host_addr = host.listen_addr();
+
+    // 1) OwnerTicket PoP 会话：即便 allow_assist_file_transfer == false，仍豁免保持文件传输全开。
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut grant = OwnerGrantPayload {
+        ticket_id: "aa".repeat(16),
+        user_id: "owner-uid-ft".to_string(),
+        caller_device_id: "100000009".to_string(),
+        caller_pubkey_hex: caller_pub_hex,
+        target_device_id: "200000009".to_string(),
+        session_id: "owner-ft-exempt".to_string(),
+        expires_at_unix_sec: now_unix + 300,
+        signature_hex: String::new(),
+    };
+    let sign_msg = owner_grant_signing_message(&grant).unwrap();
+    grant.signature_hex = hex_lower(auth_srv_kp.sign(&sign_msg).as_ref());
+    let signer: Arc<dyn OwnerTicketSigner> =
+        Arc::new(RcOwnerTicketSigner::new(grant.clone(), caller_pk8.as_ref().to_vec()).unwrap());
+
+    let owner = SessionHandle::spawn(UiSessionConfig {
+        connect_addr: host_addr,
+        password: None,
+        width: 64,
+        height: 64,
+        fps: 30,
+        bitrate_bps: 2_000_000,
+        prefer_hardware: false,
+        clipboard_enabled: false,
+        audio_enabled: false,
+        encrypt_connection: false,
+        owner_grant: Some(grant),
+        owner_signer: Some(signer),
+        ..UiSessionConfig::default()
+    });
+    let owner_updates = collect_client_until(&owner, Duration::from_secs(8), |us| {
+        us.iter().any(|u| {
+            matches!(
+                u,
+                SessionUpdate::ToolPermissionsUpdated(p) if p.allow_file_transfer
+            )
+        })
+    });
+    assert!(
+        owner_updates.iter().any(|u| matches!(
+            u,
+            SessionUpdate::ToolPermissionsUpdated(p) if p.allow_file_transfer
+        )),
+        "OwnerTicket PoP session must remain exempt with allow_file_transfer=true: {owner_updates:?}"
+    );
+    assert!(owner.tool_permissions().allow_file_transfer);
+
+    // Owner 实际发起远程目录列举应正常收到 DirList 响应（未被门控拦截）。
+    owner
+        .tools()
+        .file_list_remote(None)
+        .expect("owner file_list_remote");
+    let mut owner_got_dir = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !owner_got_dir {
+        while let Some(ev) = owner.try_recv_file_event() {
+            if matches!(ev, rc_tools::FileEvent::RemoteDir { error: None, .. }) {
+                owner_got_dir = true;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        owner_got_dir,
+        "OwnerTicket PoP session must complete file_list_remote even when allow_assist_file_transfer=false"
+    );
+
+    while host.try_recv_update().is_some() {}
+    owner.send(SessionCommand::Disconnect);
+    owner.join();
+    let _ = collect_host_until(&host, Duration::from_secs(6), |us| {
+        us.iter().any(|u| matches!(u, HostUpdate::Listening { .. }))
+    });
+
+    // 2) 非 Owner 密码协助会话：同一台被控端必须按 allow_assist_file_transfer=false 禁止文件传输并回报 tool.forbidden。
+    let assist = SessionHandle::spawn(UiSessionConfig {
+        connect_addr: host_addr,
+        password: Some("ASSISTPASS".to_string()),
+        width: 64,
+        height: 64,
+        fps: 30,
+        bitrate_bps: 2_000_000,
+        prefer_hardware: false,
+        clipboard_enabled: false,
+        audio_enabled: false,
+        encrypt_connection: false,
+        ..UiSessionConfig::default()
+    });
+    let assist_updates = collect_client_until(&assist, Duration::from_secs(8), |us| {
+        us.iter().any(|u| {
+            matches!(
+                u,
+                SessionUpdate::ToolPermissionsUpdated(p) if !p.allow_file_transfer
+            )
+        })
+    });
+    assert!(
+        assist_updates.iter().any(|u| matches!(
+            u,
+            SessionUpdate::ToolPermissionsUpdated(p) if !p.allow_file_transfer
+        )),
+        "password assist session must receive allow_file_transfer=false: {assist_updates:?}"
+    );
+    assert!(!assist.tool_permissions().allow_file_transfer);
+
+    let assist_err = assist
+        .tools()
+        .file_list_remote(None)
+        .expect_err("password assist file_list_remote must be pre-gated with Err");
+    assert!(
+        assist_err.contains("文件传输"),
+        "pre-gate error must mention 文件传输, got: {assist_err}"
+    );
+    let denied_updates = collect_client_until(&assist, Duration::from_secs(5), |us| {
+        us.iter().any(|u| {
+            matches!(
+                u,
+                SessionUpdate::ToolPermissionDenied {
+                    channel: rc_session::TOOL_CHANNEL_FILE,
+                    ..
+                }
+            )
+        })
+    });
+    assert!(
+        denied_updates.iter().any(|u| matches!(
+            u,
+            SessionUpdate::ToolPermissionDenied {
+                channel: rc_session::TOOL_CHANNEL_FILE,
+                ui_error,
+            } if ui_error.code == rc_client_core::ui_error::codes::TOOL_FORBIDDEN
+                && ui_error.message.contains("文件传输")
+        )),
+        "password assist file_list_remote must emit structured tool.forbidden UiError: {denied_updates:?}"
+    );
+
+    assist.send(SessionCommand::Disconnect);
+    assist.join();
+    host.stop();
+}

@@ -147,6 +147,7 @@ fn new_host(clock: &SessionClock, origin: OriginSlot) -> HostSession {
             pace_capture: true, // 工厂假后端必须节流（坑 4）
             auth: rc_session::HostAuthConfig::default(),
             approver: Box::new(rc_session::AutoApprover),
+            tool_permissions: rc_session::ToolPermissions::all_allowed(),
         },
         SERVER_CERT_PEM,
         SERVER_KEY_PEM,

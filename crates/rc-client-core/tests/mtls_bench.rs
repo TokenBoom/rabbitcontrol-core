@@ -458,6 +458,7 @@ fn measure_e2e_session(
         pace_capture: true,
         auth: HostAuthConfig::default(),
         approver: Box::new(AutoApprover),
+        tool_permissions: rc_session::ToolPermissions::all_allowed(),
     };
     let capture = FakeBackend::new(FakeBackendConfig {
         display: DisplayInfo {

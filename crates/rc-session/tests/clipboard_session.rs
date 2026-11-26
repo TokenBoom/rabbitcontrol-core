@@ -313,6 +313,7 @@ impl Fixture {
                 pace_capture: true,
                 auth: rc_session::HostAuthConfig::default(),
                 approver: Box::new(rc_session::AutoApprover),
+                tool_permissions: rc_session::ToolPermissions::all_allowed(),
             },
             Box::new(ta),
             fake_capture(),

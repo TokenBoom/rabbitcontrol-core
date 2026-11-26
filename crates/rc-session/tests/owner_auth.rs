@@ -1024,6 +1024,7 @@ fn quic_localhost_owner_ticket_streams_frames_without_password_or_approval() {
             approver: Box::new(SpyDenyApprover {
                 submit_called: Arc::clone(&submit_called),
             }),
+            tool_permissions: rc_session::ToolPermissions::all_allowed(),
         },
         SERVER_CERT_PEM,
         SERVER_KEY_PEM,
