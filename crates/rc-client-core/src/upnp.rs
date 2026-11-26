@@ -1719,6 +1719,11 @@ mod tests {
             while !stop_http.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // macOS/BSD 上 accept() 会继承非阻塞监听套接字的 O_NONBLOCK，
+                        // 必须切回阻塞模式并设置超时，否则首次读到 WouldBlock 会立即丢弃连接触发 RST。
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                         hits_http.fetch_add(1, Ordering::SeqCst);
                         let Some(req) = read_http_request(&mut stream) else {
                             continue;
@@ -1850,6 +1855,8 @@ mod tests {
                                 let _ = stream.write_all(resp.as_bytes());
                             }
                         }
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
