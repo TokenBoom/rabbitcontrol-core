@@ -147,6 +147,12 @@ pub struct DeviceStatusEvent {
     pub alias: String,
     /// 操作系统名称。
     pub os: String,
+    /// 设备应用版本号（旧服务端未推送时为空串）。
+    #[serde(default)]
+    pub app_version: String,
+    /// 设备 CPU 架构（旧服务端未推送时为空串）。
+    #[serde(default)]
+    pub arch: String,
     /// 是否允许他人远程协助。
     pub allow_remote_assist: bool,
 }
@@ -195,6 +201,10 @@ enum OutgoingSignalMsg {
         device_key: String,
         hostname: String,
         os: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        app_version: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        arch: String,
         device_group: String,
         lan_addrs: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,6 +252,10 @@ enum IncomingSignalMsg {
         alias: String,
         #[serde(default)]
         os: String,
+        #[serde(default)]
+        app_version: String,
+        #[serde(default)]
+        arch: String,
         #[serde(default)]
         allow_remote_assist: bool,
     },
@@ -1597,6 +1611,8 @@ fn run_single_connection(
         device_key: cfg.device_key.clone(),
         hostname: clean_hostname,
         os: std::env::consts::OS.to_string(),
+        app_version: crate::platform::current_app_version(),
+        arch: crate::platform::current_app_arch().to_string(),
         device_group: "default".to_string(),
         lan_addrs: Vec::new(),
         access_token,
@@ -1897,6 +1913,8 @@ fn handle_incoming_message(
             hostname,
             alias,
             os,
+            app_version,
+            arch,
             allow_remote_assist,
         } => {
             shared.push_device_status(DeviceStatusEvent {
@@ -1905,6 +1923,8 @@ fn handle_incoming_message(
                 hostname,
                 alias,
                 os,
+                app_version,
+                arch,
                 allow_remote_assist,
             });
             IncomingAction::Continue

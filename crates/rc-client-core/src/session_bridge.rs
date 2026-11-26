@@ -373,6 +373,10 @@ pub enum SessionUpdate {
         /// 错误原因。
         message: String,
     },
+    /// 被控端上报的版本号、架构、更新能力与同账号自控状态。
+    HostVersion(crate::updater::RemoteHostVersion),
+    /// 远端更新或控制端中转推送的实时进度快照。
+    RemoteUpdateStatus(crate::updater::UpdateProgress),
     /// 当收到对端 `ByeReason::SessionSwitching` 时先推送 `SessionSwitching` 通知前端自动短延迟重连。
     SessionSwitching {
         /// 人类可读的切换提示。
@@ -1973,6 +1977,24 @@ impl SessionHandle {
         self.display_ctrl_tx.push_drop_oldest(msg);
     }
 
+    /// 经控制端用户显式确认后，下发被控端远程更新请求并武装中转兜底参数。
+    pub fn trigger_remote_update(&self, req: crate::updater::RemoteUpdateRequest) {
+        self.send_display_ctrl(DisplayControlMsg::UpdateTrigger {
+            target_version: req.target_version,
+            download_url: req.download_url,
+            expected_sha256: req.expected_sha256,
+            asset_name: req.asset_name,
+            mirror_url: req.mirror_url,
+            relay_fallback_allowed: req.relay_fallback_allowed,
+            request_id: 0,
+        });
+    }
+
+    /// 取消当前正在进行的远程更新或中转推送。
+    pub fn cancel_remote_update(&self) {
+        self.send_display_ctrl(DisplayControlMsg::UpdateCancel);
+    }
+
     /// 动态切换当前会话的只读观看模式标记（供 `set_session_watch_only` 同步控制输入通道与采集器）。
     pub fn set_watch_only(&self, enabled: bool) {
         self.watch_only.store(enabled, Ordering::Release);
@@ -3015,6 +3037,7 @@ fn run_session_thread(
     let mut pending_term_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_portmap_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_display_tx: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut pending_update_tx: VecDeque<(bool, Vec<u8>)> = VecDeque::new();
     let client_supports_hevc =
         cfg.prefer_hardware && is_hardware_decoder && rc_pipeline::platform_supports_hevc();
     let mut active_codec = StreamCodec::H264;
@@ -3040,6 +3063,9 @@ fn run_session_thread(
     let mut epoch_sid = session_id;
     let mut disconnect_requested = false;
     let mut end_reason = "会话已结束".to_string();
+    let mut update_relay = crate::updater::ControllerUpdateRelay::new();
+    let mut awaiting_host_relay_finish = false;
+    let mut active_update_request_id: u64 = 0;
 
     while client.state() != SessionState::Closed {
         // 1) 处理来自 UI 的控制命令。
@@ -3150,12 +3176,59 @@ fn run_session_thread(
             }
         }
         if client.state() == SessionState::Streaming {
-            for dmsg in display_ctrl_rx.drain_all() {
-                if let Some(payload) = display_ctrl::encode_display_ctrl(&dmsg) {
-                    while pending_display_tx.len() >= COMMAND_CHANNEL_CAP {
-                        pending_display_tx.pop_front();
+            for mut dmsg in display_ctrl_rx.drain_all() {
+                let mut is_update_trigger = false;
+                match &mut dmsg {
+                    DisplayControlMsg::UpdateTrigger {
+                        target_version,
+                        download_url,
+                        expected_sha256,
+                        asset_name,
+                        mirror_url,
+                        relay_fallback_allowed,
+                        request_id,
+                    } => {
+                        active_update_request_id = active_update_request_id.wrapping_add(1);
+                        if active_update_request_id == 0 {
+                            active_update_request_id = 1;
+                        }
+                        *request_id = active_update_request_id;
+                        is_update_trigger = true;
+                        awaiting_host_relay_finish = false;
+                        update_relay.arm_confirmed_request(crate::updater::RemoteUpdateRequest {
+                            target_version: target_version.clone(),
+                            download_url: download_url.clone(),
+                            expected_sha256: expected_sha256.clone(),
+                            asset_name: asset_name.clone(),
+                            mirror_url: mirror_url.clone(),
+                            relay_fallback_allowed: *relay_fallback_allowed,
+                        });
                     }
-                    pending_display_tx.push_back(payload);
+                    DisplayControlMsg::UpdateCancel => {
+                        awaiting_host_relay_finish = false;
+                        update_relay.cancel_active_relay();
+                        pending_update_tx.clear();
+                    }
+                    _ => {}
+                }
+                let is_update_msg = matches!(
+                    &dmsg,
+                    DisplayControlMsg::UpdateTrigger { .. }
+                        | DisplayControlMsg::UpdateCancel
+                        | DisplayControlMsg::UpdateChunkBegin { .. }
+                        | DisplayControlMsg::UpdateChunkData { .. }
+                        | DisplayControlMsg::UpdateChunkEnd
+                        | DisplayControlMsg::UpdateChunkAbort { .. }
+                );
+                if let Some(payload) = display_ctrl::encode_display_ctrl(&dmsg) {
+                    if is_update_msg {
+                        pending_update_tx.push_back((is_update_trigger, payload));
+                    } else {
+                        while pending_display_tx.len() >= COMMAND_CHANNEL_CAP {
+                            pending_display_tx.pop_front();
+                        }
+                        pending_display_tx.push_back(payload);
+                    }
                 }
             }
         }
@@ -3275,31 +3348,90 @@ fn run_session_thread(
                         pending_file_in.push_back(payload);
                     } else if channel == TOOL_CHANNEL_DISPLAY_CTRL {
                         if let Some(msg) = display_ctrl::decode_display_ctrl(&payload) {
-                            if let Some(upd) = handle_display_ctrl_msg(
-                                msg,
-                                &mut hud_width,
-                                &mut hud_height,
-                                client_supports_hevc,
-                            ) {
-                                if let SessionUpdate::DisplayConfig {
-                                    fps,
-                                    ref codec,
-                                    ref supported_codecs,
-                                    ..
-                                } = upd
-                                {
-                                    if fps > 0 {
-                                        current_fps = fps;
-                                    }
-                                    let reported_codec =
-                                        codec.as_deref().and_then(StreamCodec::parse_lossy);
-                                    active_codec = reported_codec.unwrap_or(StreamCodec::H264);
-                                    host_supports_hevc = supported_codecs.iter().any(|c| {
-                                        StreamCodec::parse_lossy(c) == Some(StreamCodec::Hevc)
-                                    }) || reported_codec
-                                        == Some(StreamCodec::Hevc);
+                            let mut suppress_update_emit = false;
+                            match &msg {
+                                DisplayControlMsg::UpdateChunkAck { next_offset } => {
+                                    update_relay.on_chunk_ack(*next_offset);
                                 }
-                                update_tx.push(upd);
+                                DisplayControlMsg::UpdateStatus {
+                                    stage,
+                                    need_controller_relay,
+                                    request_id,
+                                    ..
+                                } => {
+                                    let has_unsent_trigger =
+                                        pending_update_tx.iter().any(|(is_trig, _)| *is_trig);
+                                    let stale_request =
+                                        *request_id != 0 && *request_id != active_update_request_id;
+                                    let stale_for_unsent_trigger = has_unsent_trigger
+                                        && (matches!(
+                                            stage,
+                                            crate::updater::UpdateStage::Failed
+                                                | crate::updater::UpdateStage::Succeeded
+                                                | crate::updater::UpdateStage::Restarting
+                                        ) || (matches!(
+                                            stage,
+                                            crate::updater::UpdateStage::Relaying
+                                        ) && *need_controller_relay));
+
+                                    if stale_request || stale_for_unsent_trigger {
+                                        // 跨重试/跨 RTT/背压未发出新 Trigger 前到达的旧任务状态一律静默忽略。
+                                        suppress_update_emit = true;
+                                    } else if matches!(stage, crate::updater::UpdateStage::Relaying)
+                                        && !*need_controller_relay
+                                    {
+                                        // 中转推送进度与本地失败均由控制端统一上报，无条件抑制主机侧
+                                        // `Relaying(need_controller_relay=false)` 帧，杜绝进度回跳及覆盖本地 Failed。
+                                        suppress_update_emit = true;
+                                    } else if matches!(stage, crate::updater::UpdateStage::Relaying)
+                                        && *need_controller_relay
+                                    {
+                                        update_relay.maybe_start_relay_for_host_request();
+                                        if update_relay.is_active() {
+                                            awaiting_host_relay_finish = true;
+                                        }
+                                    } else if matches!(
+                                        stage,
+                                        crate::updater::UpdateStage::Failed
+                                            | crate::updater::UpdateStage::Succeeded
+                                            | crate::updater::UpdateStage::Restarting
+                                    ) {
+                                        awaiting_host_relay_finish = false;
+                                        update_relay.cancel_active_relay();
+                                        pending_update_tx.clear();
+                                    } else {
+                                        awaiting_host_relay_finish = false;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            if !suppress_update_emit {
+                                if let Some(upd) = handle_display_ctrl_msg(
+                                    msg,
+                                    &mut hud_width,
+                                    &mut hud_height,
+                                    client_supports_hevc,
+                                ) {
+                                    if let SessionUpdate::DisplayConfig {
+                                        fps,
+                                        ref codec,
+                                        ref supported_codecs,
+                                        ..
+                                    } = upd
+                                    {
+                                        if fps > 0 {
+                                            current_fps = fps;
+                                        }
+                                        let reported_codec =
+                                            codec.as_deref().and_then(StreamCodec::parse_lossy);
+                                        active_codec = reported_codec.unwrap_or(StreamCodec::H264);
+                                        host_supports_hevc = supported_codecs.iter().any(|c| {
+                                            StreamCodec::parse_lossy(c) == Some(StreamCodec::Hevc)
+                                        }) || reported_codec
+                                            == Some(StreamCodec::Hevc);
+                                    }
+                                    update_tx.push(upd);
+                                }
                             }
                         }
                     } else {
@@ -3405,12 +3537,49 @@ fn run_session_thread(
                     }) {
                         tools_busy = true;
                     }
+                    let update_tx_budget = crate::updater::UPDATE_RELAY_WINDOW_CHUNKS
+                        .saturating_sub(pending_update_tx.len());
+                    if update_tx_budget > 0 {
+                        let (relay_msgs, relay_progs) = update_relay.poll_bounded(update_tx_budget);
+                        for rmsg in relay_msgs {
+                            if let Some(payload) = display_ctrl::encode_display_ctrl(&rmsg) {
+                                pending_update_tx.push_back((false, payload));
+                                tools_busy = true;
+                            }
+                        }
+                        for rprog in relay_progs {
+                            if matches!(
+                                rprog.stage,
+                                crate::updater::UpdateStage::Failed
+                                    | crate::updater::UpdateStage::Succeeded
+                                    | crate::updater::UpdateStage::Restarting
+                            ) {
+                                awaiting_host_relay_finish = false;
+                            }
+                            update_tx.push(SessionUpdate::RemoteUpdateStatus(rprog));
+                        }
+                    }
                     if flush_pending_tool_queue_checked(
                         &mut pending_display_tx,
                         |frame| client.send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, frame),
                         |e| matches!(e, rc_types::Error::InvalidConfig(_)),
                     ) {
                         tools_busy = true;
+                    }
+                    for _ in 0..MAX_TOOL_FRAMES_PER_TICK {
+                        let Some((_, frame)) = pending_update_tx.front() else {
+                            break;
+                        };
+                        match client.send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, frame.clone()) {
+                            Ok(()) => {
+                                pending_update_tx.pop_front();
+                                tools_busy = true;
+                            }
+                            Err(rc_types::Error::InvalidConfig(_)) => {
+                                pending_update_tx.pop_front();
+                            }
+                            Err(_) => break,
+                        }
                     }
                 }
                 for ev in new_term_events {
@@ -3513,7 +3682,33 @@ fn run_session_thread(
                         if audio_muted {
                             pending_audio_ctrl = Some(encode_audio_ctrl_muted(true));
                         }
-                        // 全新重建后被控端回到默认 H.264，若未手动锁定 H.264 且支持 HEVC，重新协商 HEVC。
+                        // 重连恢复（`Resumed` 丢失在途 QUIC Stream A 分块）或重建（`Rebuilt`）后均需中止进行中的安装包中转，
+                        // 避免主机接收线程死等丢失分块或控制器卡在 92%；重建时另外重新协商 HEVC。
+                        let was_relaying = update_relay.is_active() || awaiting_host_relay_finish;
+                        if matches!(outcome, ReconnectOutcome::Rebuilt) || was_relaying {
+                            awaiting_host_relay_finish = false;
+                            update_relay.cancel_active_relay();
+                            pending_update_tx.clear();
+                            if was_relaying {
+                                let msg_text = if matches!(outcome, ReconnectOutcome::Rebuilt) {
+                                    "会话已重建，安装包中转已中断，请重试"
+                                } else {
+                                    "连接短暂中断，安装包中转已中断，请重试"
+                                };
+                                update_tx.push(SessionUpdate::RemoteUpdateStatus(
+                                    crate::updater::UpdateProgress {
+                                        stage: crate::updater::UpdateStage::Failed,
+                                        progress_pct: 0,
+                                        downloaded_bytes: 0,
+                                        total_bytes: 0,
+                                        target_version: String::new(),
+                                        message: msg_text.to_string(),
+                                        need_controller_relay: false,
+                                        error: Some(msg_text.to_string()),
+                                    },
+                                ));
+                            }
+                        }
                         if matches!(outcome, ReconnectOutcome::Rebuilt)
                             && client_supports_hevc
                             && user_pinned_codec != Some(StreamCodec::H264)
@@ -3846,6 +4041,45 @@ fn handle_display_ctrl_msg(
         DisplayControlMsg::VirtualDisplayError { message } => {
             Some(SessionUpdate::VirtualDisplayError { message })
         }
+        DisplayControlMsg::HostVersionInfo {
+            version,
+            arch,
+            os,
+            update_capable,
+            is_owner_session,
+            service_installed,
+        } => Some(SessionUpdate::HostVersion(
+            crate::updater::RemoteHostVersion {
+                version,
+                arch,
+                os,
+                update_capable,
+                is_owner_session,
+                service_installed,
+            },
+        )),
+        DisplayControlMsg::UpdateStatus {
+            stage,
+            progress_pct,
+            downloaded_bytes,
+            total_bytes,
+            target_version,
+            message,
+            need_controller_relay,
+            error,
+            request_id: _,
+        } => Some(SessionUpdate::RemoteUpdateStatus(
+            crate::updater::UpdateProgress {
+                stage,
+                progress_pct,
+                downloaded_bytes,
+                total_bytes,
+                target_version,
+                message,
+                need_controller_relay,
+                error,
+            },
+        )),
         DisplayControlMsg::SetStream { .. }
         | DisplayControlMsg::LockScreen
         | DisplayControlMsg::SetCodec { .. }
@@ -3853,6 +4087,13 @@ fn handle_display_ctrl_msg(
         | DisplayControlMsg::SetHostMute { .. }
         | DisplayControlMsg::SetMouseMode { .. }
         | DisplayControlMsg::ListDisplays
+        | DisplayControlMsg::UpdateTrigger { .. }
+        | DisplayControlMsg::UpdateCancel
+        | DisplayControlMsg::UpdateChunkBegin { .. }
+        | DisplayControlMsg::UpdateChunkData { .. }
+        | DisplayControlMsg::UpdateChunkAck { .. }
+        | DisplayControlMsg::UpdateChunkEnd
+        | DisplayControlMsg::UpdateChunkAbort { .. }
         | DisplayControlMsg::SwitchDisplay { .. }
         | DisplayControlMsg::CreateVirtualDisplay { .. }
         | DisplayControlMsg::RemoveVirtualDisplay { .. } => None,

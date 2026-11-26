@@ -259,6 +259,12 @@ pub struct RegisterRequest {
     /// 可选操作系统名称。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
+    /// 可选应用版本号。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    /// 可选 CPU 架构。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
     /// 可选设备 Ed25519 公钥 hex。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_pubkey: Option<String>,
@@ -280,6 +286,12 @@ pub struct LoginRequest {
     /// 可选操作系统名称。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
+    /// 可选应用版本号。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    /// 可选 CPU 架构。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
     /// 可选设备 Ed25519 公钥 hex。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_pubkey: Option<String>,
@@ -296,6 +308,12 @@ pub struct BindDeviceRequest {
     /// 可选操作系统名称。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
+    /// 可选应用版本号。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    /// 可选 CPU 架构。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
     /// 可选设备别名。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
@@ -321,6 +339,12 @@ pub struct MyDeviceInfo {
     /// 操作系统。
     #[serde(default)]
     pub os: String,
+    /// 应用版本号（旧服务端未返回时为空串）。
+    #[serde(default)]
+    pub app_version: String,
+    /// CPU 架构（旧服务端未返回时为空串）。
+    #[serde(default)]
+    pub arch: String,
     /// 用户自定义设备别名。
     #[serde(default)]
     pub alias: String,
@@ -1415,6 +1439,8 @@ impl AuthSessionManager {
             device_key: Some(cfg.device_key.clone()),
             hostname: hostname.map(str::to_string),
             os: os.map(str::to_string),
+            app_version: Some(crate::platform::current_app_version()),
+            arch: Some(crate::platform::current_app_arch().to_string()),
             device_pubkey: Some(pubkey_hex),
         };
         let resp = client.login(&req)?;
@@ -1449,6 +1475,8 @@ impl AuthSessionManager {
             device_key: Some(cfg.device_key.clone()),
             hostname: hostname.map(str::to_string),
             os: os.map(str::to_string),
+            app_version: Some(crate::platform::current_app_version()),
+            arch: Some(crate::platform::current_app_arch().to_string()),
             device_pubkey: Some(pubkey_hex),
         };
         let resp = client.register(&req)?;

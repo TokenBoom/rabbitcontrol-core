@@ -199,6 +199,9 @@ pub struct AppPrefs {
     /// 外设：鼠标模式（`"smart"` | `"remote"` | `"local"`，默认 `"smart"`）。
     #[serde(default = "default_mouse_mode")]
     pub mouse_mode: String,
+    /// 可选应用更新镜像加速前缀（空串表示直连 GitHub Releases；非空时必须为 `https://`）。
+    #[serde(default)]
+    pub update_mirror_url: String,
 }
 
 fn default_privacy_mode() -> String {
@@ -285,6 +288,7 @@ impl Default for AppPrefs {
             send_system_shortcuts: default_send_system_shortcuts(),
             shortcut_exceptions: Vec::new(),
             mouse_mode: default_mouse_mode(),
+            update_mirror_url: String::new(),
         }
     }
 }
@@ -798,6 +802,12 @@ impl AppPrefs {
         Ok(())
     }
 
+    /// 校验并更新可选的更新下载镜像加速前缀（空串表示直连 GitHub Releases）。
+    pub fn apply_update_mirror_url(&mut self, mirror_url: &str) -> Result<(), String> {
+        self.update_mirror_url = crate::updater::sanitize_update_mirror_url(mirror_url)?;
+        Ok(())
+    }
+
     /// 读取自定义隐私屏保图片的 `data:image/...;base64,...` 预览 URL。
     pub fn privacy_custom_data_url(&self, dir: &Path) -> Option<String> {
         let name = self.privacy_custom_image.as_deref()?;
@@ -977,6 +987,8 @@ fn sanitize_prefs(prefs: &mut AppPrefs) {
     if !matches!(prefs.mouse_mode.as_str(), "smart" | "remote" | "local") {
         prefs.mouse_mode = default_mouse_mode();
     }
+    prefs.update_mirror_url =
+        crate::updater::sanitize_update_mirror_url(&prefs.update_mirror_url).unwrap_or_default();
     let mut clean_exc = Vec::with_capacity(prefs.shortcut_exceptions.len().min(32));
     for item in &prefs.shortcut_exceptions {
         let t = item.trim();

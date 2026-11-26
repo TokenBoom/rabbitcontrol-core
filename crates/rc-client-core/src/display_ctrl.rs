@@ -141,6 +141,10 @@ impl Default for HighRefreshAdvisory {
     }
 }
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 /// 一条可供前端分辨率菜单展示的等比分辨率预设。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DisplayPreset {
@@ -316,6 +320,106 @@ pub enum DisplayControlMsg {
     VirtualDisplayError {
         /// 人类可读错误原因。
         message: String,
+    },
+    /// 被控端 → 控制端：上报当前应用版本、架构、更新能力与是否为同账号自控会话。
+    HostVersionInfo {
+        /// 当前应用版本号（如 `"0.1.9"`）。
+        version: String,
+        /// 当前 CPU 架构（如 `"arm64"` / `"x86_64"`）。
+        arch: String,
+        /// 当前操作系统（如 `"macos"`）。
+        os: String,
+        /// 是否具备自更新能力。
+        #[serde(default)]
+        update_capable: bool,
+        /// 当前会话是否经 `OwnerTicket` 验证为同账号本人自控（仅 `true` 允许远程更新）。
+        #[serde(default)]
+        is_owner_session: bool,
+        /// 是否已安装系统级后台服务（安装时支持免密替换与重启）。
+        #[serde(default)]
+        service_installed: bool,
+    },
+    /// 控制端 → 被控端：经控制端用户确认后，触发被控端执行远程更新（仅同账号本人自控放行）。
+    UpdateTrigger {
+        /// 目标版本号（如 `"0.1.10"`）。
+        target_version: String,
+        /// 原始 `https://` 安装包下载地址。
+        download_url: String,
+        /// 预期 64 位小写 SHA-256 摘要。
+        expected_sha256: String,
+        /// 安全文件名（如 `"RabbitControl-0.1.10-arm64.dmg"`）。
+        asset_name: String,
+        /// 可选镜像加速前缀。
+        #[serde(default)]
+        mirror_url: String,
+        /// 被控端直连下载失败时是否允许回退至控制端中转推送安装包。
+        #[serde(default)]
+        relay_fallback_allowed: bool,
+        /// 控制端单调递增的更新请求编号（`0` 表示兼容旧端未携带），用于隔离跨重试/跨 RTT 的陈旧状态回声。
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        request_id: u64,
+    },
+    /// 控制端 → 被控端：取消正在进行的远程更新下载或中转。
+    UpdateCancel,
+    /// 被控端 → 控制端：上报远程更新的实时阶段、进度或错误（以及是否请求控制端中转推送）。
+    UpdateStatus {
+        /// 当前更新阶段。
+        stage: crate::updater::UpdateStage,
+        /// 进度百分比（`0..=100`）。
+        #[serde(default)]
+        progress_pct: u8,
+        /// 已下载/已接收字节数。
+        #[serde(default)]
+        downloaded_bytes: u64,
+        /// 总字节数。
+        #[serde(default)]
+        total_bytes: u64,
+        /// 目标版本号。
+        #[serde(default)]
+        target_version: String,
+        /// 可读状态说明。
+        #[serde(default)]
+        message: String,
+        /// 为 `true` 时表示被控端直连下载失败，请求控制端代为下载并推送 DMG 分块。
+        #[serde(default)]
+        need_controller_relay: bool,
+        /// 失败时的错误原因。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// 回显对应 `UpdateTrigger.request_id`（`0` 表示旧端或无特定请求上下文）。
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        request_id: u64,
+    },
+    /// 控制端 → 被控端：开始中转推送校验后的安装包分块。
+    UpdateChunkBegin {
+        /// 目标版本号。
+        target_version: String,
+        /// 安全文件名。
+        asset_name: String,
+        /// 总字节大小（必须 `1..=MAX_UPDATE_PACKAGE_BYTES`）。
+        total_bytes: u64,
+        /// 预期 64 位小写 SHA-256 摘要。
+        expected_sha256: String,
+    },
+    /// 控制端 → 被控端：中转推送单个安装包数据块（Base64，单块原始 ≤ 64 KiB）。
+    UpdateChunkData {
+        /// 当前分块在安装包中的字节偏移量（严格单调顺序写入）。
+        offset: u64,
+        /// Base64 编码的原始分块字节。
+        data_base64: String,
+    },
+    /// 被控端 → 控制端：确认已落盘至 `next_offset`，驱动滑动窗口流控。
+    UpdateChunkAck {
+        /// 下一个期望接收的字节偏移量。
+        next_offset: u64,
+    },
+    /// 控制端 → 被控端：安装包全部分块推送完成，请求校验 SHA-256 与签名并安装。
+    UpdateChunkEnd,
+    /// 控制端 → 被控端：中止中转推送并清理临时文件。
+    UpdateChunkAbort {
+        /// 中止原因说明。
+        #[serde(default)]
+        reason: String,
     },
 }
 

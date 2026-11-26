@@ -8,6 +8,8 @@
 
 use std::any::Any;
 use std::fmt;
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -206,13 +208,134 @@ pub trait ClientPlatformHooks: Send + Sync {
     ) -> Result<HardwareRendererOutput, String> {
         Err("hardware renderer is not registered on this platform".to_string())
     }
+
+    /// 返回当前运行应用的语义版本号（如 `"0.1.9"`）。
+    fn current_app_version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// 返回当前运行应用的规范化 CPU 架构（如 `"arm64"` / `"x86_64"`）。
+    fn current_app_arch(&self) -> &'static str {
+        if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            std::env::consts::ARCH
+        }
+    }
+
+    /// 当前宿主平台是否支持自动下载并应用更新包。
+    fn can_self_update(&self) -> bool {
+        false
+    }
+
+    /// 当前宿主是否已安装系统级后台服务（用于判断是否可免密重启更新）。
+    fn is_system_service_installed(&self) -> bool {
+        false
+    }
+
+    /// 拉取最新 Release 元数据与各架构资产的 SHA-256 校验值。
+    fn fetch_latest_release(
+        &self,
+        _mirror_url: &str,
+    ) -> Result<crate::updater::ReleaseInfo, String> {
+        Err("当前平台未注册更新检查实现".to_string())
+    }
+
+    /// 下载更新安装包至 `dest_path` 并校验其 SHA-256 摘要（支持取消与实时进度回调）。
+    fn download_update_package(
+        &self,
+        _url: &str,
+        _expected_sha256: &str,
+        _dest_path: &Path,
+        _cancel: &AtomicBool,
+        _on_progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), String> {
+        Err("当前平台未注册更新下载实现".to_string())
+    }
+
+    /// 校验并原子安装已验证的更新包（含代码签名校验、目录替换及可选重启）。
+    fn install_verified_update(
+        &self,
+        _package_path: &Path,
+        _expected_sha256: &str,
+        _restart_after: bool,
+        _is_remote_headless: bool,
+    ) -> Result<(), String> {
+        Err("当前平台未注册更新安装实现".to_string())
+    }
 }
 
 static PLATFORM_HOOKS: OnceLock<Arc<dyn ClientPlatformHooks>> = OnceLock::new();
+static UPDATE_HOOKS: OnceLock<Arc<dyn ClientUpdateHooks>> = OnceLock::new();
+
+/// 客户端自动更新与远程更新钩子接口（独立注册口，供宿主 App / 后台服务在不侵入硬件渲染钩子时注入）。
+///
+/// 未单独注册时，相关模块级包装函数会自动回退至 [`ClientPlatformHooks`] 的默认实现。
+pub trait ClientUpdateHooks: Send + Sync {
+    /// 返回当前运行应用的语义版本号（如 `"0.1.10"`）。
+    fn current_app_version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// 返回当前运行应用的规范化 CPU 架构（如 `"arm64"` / `"x86_64"`）。
+    fn current_app_arch(&self) -> &'static str {
+        if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            std::env::consts::ARCH
+        }
+    }
+
+    /// 当前宿主平台是否支持自动下载并应用更新包。
+    fn can_self_update(&self) -> bool {
+        false
+    }
+
+    /// 当前宿主是否已安装系统级后台服务（用于判断是否可免密重启更新）。
+    fn is_system_service_installed(&self) -> bool {
+        false
+    }
+
+    /// 拉取最新 Release 元数据与各架构资产的 SHA-256 校验值。
+    fn fetch_latest_release(
+        &self,
+        _mirror_url: &str,
+    ) -> Result<crate::updater::ReleaseInfo, String> {
+        Err("当前平台未注册更新检查实现".to_string())
+    }
+
+    /// 下载更新安装包至 `dest_path` 并校验其 SHA-256 摘要（支持取消与实时进度回调）。
+    fn download_update_package(
+        &self,
+        _url: &str,
+        _expected_sha256: &str,
+        _dest_path: &Path,
+        _cancel: &AtomicBool,
+        _on_progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), String> {
+        Err("当前平台未注册更新下载实现".to_string())
+    }
+
+    /// 校验并原子安装已验证的更新包（含代码签名校验、目录替换及可选重启）。
+    fn install_verified_update(
+        &self,
+        _package_path: &Path,
+        _expected_sha256: &str,
+        _restart_after: bool,
+        _is_remote_headless: bool,
+    ) -> Result<(), String> {
+        Err("当前平台未注册更新安装实现".to_string())
+    }
+}
 
 /// 注册当前进程的客户端原生平台钩子实现（仅首次调用生效）。
 pub fn register_platform_hooks(hooks: Arc<dyn ClientPlatformHooks>) -> bool {
     PLATFORM_HOOKS.set(hooks).is_ok()
+}
+
+/// 注册当前进程的客户端自动更新钩子实现（仅首次调用生效，优先于 [`ClientPlatformHooks`] 的默认更新方法）。
+pub fn register_update_hooks(hooks: Arc<dyn ClientUpdateHooks>) -> bool {
+    UPDATE_HOOKS.set(hooks).is_ok()
 }
 
 /// 提升当前线程 QoS（未注册钩子时无操作）。
@@ -365,5 +488,103 @@ pub fn create_hardware_renderer(
     match PLATFORM_HOOKS.get() {
         Some(h) => h.create_hardware_renderer(width, height, session_start, preallocated),
         None => Err("hardware renderer is not registered on this platform".to_string()),
+    }
+}
+
+/// 返回当前运行应用的语义版本号。
+pub fn current_app_version() -> String {
+    if let Some(u) = UPDATE_HOOKS.get() {
+        return u.current_app_version();
+    }
+    PLATFORM_HOOKS
+        .get()
+        .map(|h| h.current_app_version())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// 返回当前运行应用的规范化 CPU 架构。
+pub fn current_app_arch() -> &'static str {
+    if let Some(u) = UPDATE_HOOKS.get() {
+        return u.current_app_arch();
+    }
+    PLATFORM_HOOKS
+        .get()
+        .map(|h| h.current_app_arch())
+        .unwrap_or(if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            std::env::consts::ARCH
+        })
+}
+
+/// 返回当前平台是否支持自动更新。
+pub fn can_self_update() -> bool {
+    if let Some(u) = UPDATE_HOOKS.get() {
+        return u.can_self_update();
+    }
+    PLATFORM_HOOKS.get().is_some_and(|h| h.can_self_update())
+}
+
+/// 返回当前宿主是否已安装系统级后台服务。
+pub fn is_system_service_installed() -> bool {
+    if let Some(u) = UPDATE_HOOKS.get() {
+        return u.is_system_service_installed();
+    }
+    PLATFORM_HOOKS
+        .get()
+        .is_some_and(|h| h.is_system_service_installed())
+}
+
+/// 拉取最新 Release 信息与 SHA-256 校验值。
+pub fn fetch_latest_release(mirror_url: &str) -> Result<crate::updater::ReleaseInfo, String> {
+    if let Some(u) = UPDATE_HOOKS.get() {
+        return u.fetch_latest_release(mirror_url);
+    }
+    match PLATFORM_HOOKS.get() {
+        Some(h) => h.fetch_latest_release(mirror_url),
+        None => Err("当前平台未注册更新检查实现".to_string()),
+    }
+}
+
+/// 下载并校验更新安装包。
+pub fn download_update_package(
+    url: &str,
+    expected_sha256: &str,
+    dest_path: &Path,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), String> {
+    if let Some(u) = UPDATE_HOOKS.get() {
+        return u.download_update_package(url, expected_sha256, dest_path, cancel, on_progress);
+    }
+    match PLATFORM_HOOKS.get() {
+        Some(h) => h.download_update_package(url, expected_sha256, dest_path, cancel, on_progress),
+        None => Err("当前平台未注册更新下载实现".to_string()),
+    }
+}
+
+/// 校验签名并原子安装已验证的更新包。
+pub fn install_verified_update(
+    package_path: &Path,
+    expected_sha256: &str,
+    restart_after: bool,
+    is_remote_headless: bool,
+) -> Result<(), String> {
+    if let Some(u) = UPDATE_HOOKS.get() {
+        return u.install_verified_update(
+            package_path,
+            expected_sha256,
+            restart_after,
+            is_remote_headless,
+        );
+    }
+    match PLATFORM_HOOKS.get() {
+        Some(h) => h.install_verified_update(
+            package_path,
+            expected_sha256,
+            restart_after,
+            is_remote_headless,
+        ),
+        None => Err("当前平台未注册更新安装实现".to_string()),
     }
 }

@@ -2386,11 +2386,13 @@ fn drive_ui_host_session_inner(
         None => false,
     };
     let mut portmap_host = PortMapHostEngine::new();
+    let mut update_worker = crate::updater::HostUpdateWorker::new();
     let mut pending_file_in: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_file_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_term_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_portmap_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_display_tx: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut pending_update_tx = crate::updater::PendingUpdateTxQueue::new();
     let (mut session_native_res, mut session_max_res) =
         compute_host_display_bounds(host, prefer_hardware, hardware_video_active);
     let mut display_mode_session =
@@ -2429,6 +2431,10 @@ fn drive_ui_host_session_inner(
                 pending_display_tx.push_back(disp_payload);
             }
         }
+        let ver_msg = crate::updater::HostUpdateWorker::build_version_info_msg(
+            host.authenticated_owner().is_some(),
+        );
+        pending_update_tx.enqueue(&ver_msg, host.authenticated_owner().is_some());
     }
 
     // H13：仅当启用音频且硬件视频管线确实为真实 SCK+VT（未降级假栈）时，
@@ -3726,6 +3732,25 @@ fn drive_ui_host_session_inner(
                                                 pending_display_tx.push_back(dp);
                                             }
                                         }
+                                        Some(
+                                            upd_msg @ (DisplayControlMsg::UpdateTrigger { .. }
+                                            | DisplayControlMsg::UpdateCancel
+                                            | DisplayControlMsg::UpdateChunkBegin {
+                                                ..
+                                            }
+                                            | DisplayControlMsg::UpdateChunkData {
+                                                ..
+                                            }
+                                            | DisplayControlMsg::UpdateChunkEnd
+                                            | DisplayControlMsg::UpdateChunkAbort {
+                                                ..
+                                            }),
+                                        ) => {
+                                            update_worker.handle_message(
+                                                upd_msg,
+                                                host.authenticated_owner().is_some(),
+                                            );
+                                        }
                                         _ => {}
                                     }
                                     while pending_display_tx.len() > 64 {
@@ -3733,6 +3758,13 @@ fn drive_ui_host_session_inner(
                                     }
                                 }
                                 _ => {}
+                            }
+                        }
+
+                        let is_owner_for_update = host.authenticated_owner().is_some();
+                        for umsg in update_worker.poll_outgoing() {
+                            if pending_update_tx.enqueue(&umsg, is_owner_for_update) {
+                                tools_busy = true;
                             }
                         }
 
@@ -3794,11 +3826,19 @@ fn drive_ui_host_session_inner(
                         ) {
                             tools_busy = true;
                         }
+                        if pending_update_tx.flush(
+                            MAX_TOOL_FRAMES_PER_TICK,
+                            |frame| host.send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, frame),
+                            |e| matches!(e, rc_types::Error::InvalidConfig(_)),
+                        ) {
+                            tools_busy = true;
+                        }
 
                         // 4) 系统音频采集 → IMA-ADPCM 编码 → AudioFramePacket 发送。
-                        //    M9：当文件/端口映射通道存在背压待重试帧时，本拍跳过发送音频帧避免加剧 Stream A 拥塞。
-                        let stream_a_congested =
-                            !pending_file_tx.is_empty() || !pending_portmap_tx.is_empty();
+                        //    M9：当文件/端口映射/更新中转通道存在背压待重试帧时，本拍跳过发送音频帧避免加剧 Stream A 拥塞。
+                        let stream_a_congested = !pending_file_tx.is_empty()
+                            || !pending_portmap_tx.is_empty()
+                            || !pending_update_tx.is_empty();
                         let audio_busy = match audio_capture.as_mut() {
                             Some(cap) => pump_host_audio(
                                 host,
@@ -3821,12 +3861,14 @@ fn drive_ui_host_session_inner(
                             && host.state() == SessionState::Streaming
                             && host.has_pipeline()
                         {
-                            let wait_ms =
-                                if pending_file_in.is_empty() && pending_display_tx.is_empty() {
-                                    2
-                                } else {
-                                    1
-                                };
+                            let wait_ms = if pending_file_in.is_empty()
+                                && pending_display_tx.is_empty()
+                                && pending_update_tx.is_empty()
+                            {
+                                2
+                            } else {
+                                1
+                            };
                             host.pipeline().wait_event(Duration::from_millis(wait_ms));
                         }
                     }
@@ -3901,6 +3943,16 @@ fn drive_ui_host_session_inner(
                                 pending_display_tx.push_back(dp);
                             }
                         }
+                        if update_worker.has_active_or_pending_relay() {
+                            pending_update_tx.clear();
+                            update_worker.abort_relay_on_transport_resume(
+                                "连接短暂中断导致安装包中转中断，请重试",
+                            );
+                        }
+                        let ver_msg = crate::updater::HostUpdateWorker::build_version_info_msg(
+                            host.authenticated_owner().is_some(),
+                        );
+                        pending_update_tx.enqueue(&ver_msg, host.authenticated_owner().is_some());
                         emit_peer_connected(host, &host.peer_addr().to_string(), updates);
                     }
                     Ok(DetachOutcome::Replaced) => {
@@ -3944,6 +3996,7 @@ fn drive_ui_host_session_inner(
                         pending_term_tx.clear();
                         pending_portmap_tx.clear();
                         pending_display_tx.clear();
+                        pending_update_tx.clear();
                         (session_native_res, session_max_res) = compute_host_display_bounds(
                             host,
                             prefer_hardware,
@@ -3979,6 +4032,11 @@ fn drive_ui_host_session_inner(
                                 pending_display_tx.push_back(dp);
                             }
                         }
+                        update_worker.reset();
+                        let ver_msg = crate::updater::HostUpdateWorker::build_version_info_msg(
+                            host.authenticated_owner().is_some(),
+                        );
+                        pending_update_tx.enqueue(&ver_msg, host.authenticated_owner().is_some());
                         wallpaper_rx = if prefer_hardware && hardware_video_active {
                             Some(spawn_wallpaper_fetcher())
                         } else {

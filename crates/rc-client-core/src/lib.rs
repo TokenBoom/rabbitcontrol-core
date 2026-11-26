@@ -23,3 +23,4 @@ pub mod relay_transport;
 pub mod server_config;
 pub mod session_bridge;
 pub mod signal_client;
+pub mod updater;
