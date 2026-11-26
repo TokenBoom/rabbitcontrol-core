@@ -1393,10 +1393,16 @@ mod tests {
                 RefinementCapability::default(),
             )
         }));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while store.cached_snapshot().is_none() && Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (store.cached_snapshot().is_none() || store.is_probe_in_flight())
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(5));
         }
+        assert!(
+            !store.is_probe_in_flight(),
+            "background probe should finish disk flush within deadline"
+        );
         let fresh = store
             .cached_snapshot()
             .expect("background probe populates cache");
