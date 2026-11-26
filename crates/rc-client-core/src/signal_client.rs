@@ -4898,7 +4898,7 @@ mod tests {
                     }),
                 );
 
-                // Kick to trigger reconnect
+                // Kick to trigger reconnect; half-close write end and drain so Windows does not RST unread frames.
                 write_test_frame(
                     &mut s,
                     &serde_json::json!({
@@ -4906,6 +4906,10 @@ mod tests {
                         "reason": "server_shutdown"
                     }),
                 );
+                let _ = s.shutdown(Shutdown::Write);
+                let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
+                let mut sink = [0u8; 64];
+                while matches!(s.read(&mut sink), Ok(n) if n > 0) {}
             }
 
             // Round 2: reconnect Register must carry updated allow_remote_control=true & allow_remote_assist=true
@@ -5025,10 +5029,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let round2_registered = Arc::new(AtomicBool::new(false));
         let round2_registered_srv = Arc::clone(&round2_registered);
+        let (allow_kick_tx, allow_kick_rx) = mpsc::channel::<()>();
 
         let server_thread = thread::spawn(move || {
             // Round 1: client initially registers with allow_remote_control=true, allow_remote_assist=true.
-            // Server then pushes self DeviceStatusChanged (simulating REST PATCH disabling both) and kicks.
+            // Server then pushes self DeviceStatusChanged (simulating REST PATCH disabling both),
+            // waits until the client confirms receipt of both DeviceStatusChanged frames, and only then
+            // sends kicked + half-closes so Windows TCP does not RST away unread frames.
             {
                 let (mut s1, _) = listener.accept().unwrap();
                 let _ = s1.set_read_timeout(Some(Duration::from_secs(3)));
@@ -5078,6 +5085,10 @@ mod tests {
                     }),
                 );
 
+                allow_kick_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("client must receive self DeviceStatusChanged before Round 1 closes");
+
                 write_test_frame(
                     &mut s1,
                     &serde_json::json!({
@@ -5085,6 +5096,10 @@ mod tests {
                         "reason": "server_shutdown"
                     }),
                 );
+                let _ = s1.shutdown(Shutdown::Write);
+                let _ = s1.set_read_timeout(Some(Duration::from_secs(1)));
+                let mut sink = [0u8; 64];
+                while matches!(s1.read(&mut sink), Ok(n) if n > 0) {}
             }
 
             // Round 2: reconnect Register MUST send synced allow_remote_control=false & allow_remote_assist=false
@@ -5151,6 +5166,26 @@ mod tests {
             fast_timing,
             |_| {},
         );
+
+        // Wait until the client has processed both DeviceStatusChanged frames (including self) before letting Round 1 close.
+        let mut received = Vec::new();
+        let recv_deadline = Instant::now() + Duration::from_secs(5);
+        while received.len() < 2 && Instant::now() < recv_deadline {
+            if let Some(ev) = client.try_recv_device_status() {
+                received.push(ev);
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(
+            received.len(),
+            2,
+            "must receive both DeviceStatusChanged events"
+        );
+        assert_eq!(received[1].device_id, "555 666 777");
+        assert!(!received[1].allow_remote_control);
+        assert!(!received[1].allow_remote_assist);
+        allow_kick_tx.send(()).expect("signal server to kick");
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !round2_registered.load(Ordering::Acquire) && Instant::now() < deadline {
