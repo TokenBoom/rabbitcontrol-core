@@ -676,7 +676,7 @@ fn host_stop_with_session_switching_notifies_client() {
     assert!(
         ended.iter().any(|u| matches!(
             u,
-            SessionUpdate::Ended { reason } if reason == SESSION_SWITCHING_REASON
+            SessionUpdate::Ended { reason, .. } if reason == SESSION_SWITCHING_REASON
         )),
         "应以 SESSION_SWITCHING_REASON 结束当前会话，实际：{ended:?}"
     );

@@ -187,7 +187,7 @@ fn unified_host_rejects_wrong_password_without_approval_prompt() {
     let ended_reason = client_updates
         .iter()
         .find_map(|u| match u {
-            SessionUpdate::Ended { reason } => Some(reason.clone()),
+            SessionUpdate::Ended { reason, .. } => Some(reason.clone()),
             _ => None,
         })
         .expect("client should end with failure on wrong password");

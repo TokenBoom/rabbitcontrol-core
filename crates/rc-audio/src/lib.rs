@@ -106,6 +106,13 @@ pub trait AudioCapture: Send {
 
     /// 停止采集并释放底层资源（应支持幂等调用）。
     fn stop(&mut self);
+
+    /// 查询底层采集流是否已停止（例如显式调用 [`Self::stop`] 后或系统音频采集异常中断）。
+    ///
+    /// 默认返回 `false`，由具体后端按需覆写以支持上层检测采集掉线并重建。
+    fn is_stopped(&self) -> bool {
+        false
+    }
 }
 
 /// 跨平台音频播放接口（低延迟非阻塞推送式）。
@@ -212,6 +219,10 @@ impl AudioCapture for FakeAudioCapture {
 
     fn stop(&mut self) {
         self.stopped = true;
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped
     }
 }
 
@@ -371,8 +382,32 @@ mod tests {
         let mut cap2 = FakeAudioCapture::new();
         assert_eq!(cap2.try_recv_frame().expect("frame 0 repeat"), f0);
 
+        assert!(!cap.is_stopped());
         cap.stop();
+        assert!(cap.is_stopped());
         assert!(cap.try_recv_frame().is_none());
+    }
+
+    #[test]
+    fn audio_capture_is_stopped_defaults_to_false() {
+        struct MinimalCapture;
+        impl AudioCapture for MinimalCapture {
+            fn try_recv_frame(&mut self) -> Option<PcmFrame> {
+                None
+            }
+            fn sample_rate(&self) -> u32 {
+                DEFAULT_SAMPLE_RATE
+            }
+            fn channels(&self) -> u8 {
+                DEFAULT_CHANNELS
+            }
+            fn stop(&mut self) {}
+        }
+
+        let mut cap = MinimalCapture;
+        assert!(!cap.is_stopped());
+        cap.stop();
+        assert!(!cap.is_stopped());
     }
 
     #[test]

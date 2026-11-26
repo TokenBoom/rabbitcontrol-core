@@ -94,8 +94,8 @@ pub const URGENT_STREAM_PRIORITY: i32 = 1;
 const DATAGRAM_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const UDP_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
-/// 空闲超时。迁移 / 对端卡顿期间靠 keep-alive 维持（N9）。
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 空闲超时（10s）。配合 1s keep-alive 维持迁移/短暂抖动，同时在无声断网时快速收敛（N9）。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 发送线程空闲时的最长睡眠（有新包入队会被 condvar 唤醒）。
@@ -746,7 +746,7 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     tc.datagram_send_buffer_size(DATAGRAM_BUFFER_BYTES);
     tc.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
     tc.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(IDLE_TIMEOUT).expect("30s fits in VarInt idle timeout"),
+        quinn::IdleTimeout::try_from(IDLE_TIMEOUT).expect("10s fits in VarInt idle timeout"),
     ));
     Arc::new(tc)
 }

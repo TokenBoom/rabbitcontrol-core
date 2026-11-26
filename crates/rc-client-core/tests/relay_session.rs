@@ -1796,7 +1796,7 @@ fn host_stop_with_session_switching_over_tcp_relay_notifies_client() {
     assert!(
         ended.iter().any(|u| matches!(
             u,
-            SessionUpdate::Ended { reason } if reason == SESSION_SWITCHING_REASON
+            SessionUpdate::Ended { reason, .. } if reason == SESSION_SWITCHING_REASON
         )),
         "经 TCP 中继发送 ByeReason::SessionSwitching 必须以 SESSION_SWITCHING_REASON 结束，实际：{ended:?}"
     );

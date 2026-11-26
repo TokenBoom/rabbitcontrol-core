@@ -24,6 +24,7 @@ pub mod server_config;
 pub mod session_bridge;
 pub mod signal_client;
 pub mod updater;
+pub mod upnp;
 
 /// 根据操作系统名称推导缺省的「允许被远程控制」默认值（供老服务端未返回该字段时安全兜底）。
 ///

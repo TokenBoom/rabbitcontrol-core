@@ -86,6 +86,12 @@ const MAX_PENDING_TOOL_MESSAGES: usize = 2048;
 /// 音频帧接收队列有界容量上限（低延迟优先，满时丢弃最旧帧）。
 const MAX_PENDING_AUDIO_FRAMES: usize = 32;
 
+/// 被控端应用层客户端失活看门狗推荐超时（微秒）：8s 无任何对端可靠控制/输入消息即判为断链。
+///
+/// 控制端在静屏与纯工具模式下均每 1s 发送 `ProbePing` 心跳，8s 在容忍短暂抖动的同时
+/// 早于 QUIC 10s 空闲超时释放被控端会话。
+pub const HOST_CLIENT_IDLE_TIMEOUT_US: u64 = 8_000_000;
+
 /// 被控端会话配置。
 pub struct HostSessionConfig {
     /// 监听地址（`0.0.0.0:9901` / `127.0.0.1:0` 均可）。
@@ -291,6 +297,13 @@ pub struct HostSession {
     live_display_id: Option<u32>,
     /// 当前在线运行管线实际使用的光标采集开关（同上）。
     live_shows_cursor: bool,
+    /// 纯工具模式按需暂停媒体管线标记（`true` 时保持 `Streaming` 与控制/工具链路存活，零视频采集/编码）。
+    media_paused: bool,
+    /// 最近一次收到对端可靠控制或输入消息（或进入 `Streaming`/`Resumed`/`Replaced` 锚定）的会话钟时刻（微秒）。
+    last_client_rx_us: Option<u64>,
+    /// 应用层客户端失活看门狗超时阈值（微秒；`0` 表示默认禁用以兼容离线静默测试，
+    /// 上层经 [`HostSession::set_client_idle_timeout_us`] 传入 [`HOST_CLIENT_IDLE_TIMEOUT_US`] 启用）。
+    client_idle_timeout_us: u64,
 }
 
 impl Drop for HostSession {
@@ -301,6 +314,9 @@ impl Drop for HostSession {
 }
 
 impl HostSession {
+    /// 被控端应用层客户端失活看门狗推荐超时（微秒，8s；等价 [`HOST_CLIENT_IDLE_TIMEOUT_US`]）。
+    pub const CLIENT_IDLE_TIMEOUT_US: u64 = HOST_CLIENT_IDLE_TIMEOUT_US;
+
     /// 真网络构造：绑定 QUIC 端点（Init）。管线**此刻不建**——参数未裁定。
     /// `cert_pem`/`key_pem` 是本端服务证书（内部经 `rc_net::quic::Identity::from_pem`）。
     pub fn new(
@@ -382,6 +398,9 @@ impl HostSession {
             target_shows_cursor,
             live_display_id,
             live_shows_cursor,
+            media_paused: false,
+            last_client_rx_us: None,
+            client_idle_timeout_us: 0,
         })
     }
 
@@ -459,6 +478,9 @@ impl HostSession {
             target_shows_cursor,
             live_display_id,
             live_shows_cursor,
+            media_paused: false,
+            last_client_rx_us: None,
+            client_idle_timeout_us: 0,
         })
     }
 
@@ -733,6 +755,7 @@ impl HostSession {
             .as_mut()
             .expect("Streaming implies transport")
             .poll(effective_budget)?;
+        let rx_now_us = u64::from((self.clock)());
 
         let mut bye: Option<ByeReason> = None;
         let mut disconnected = false;
@@ -753,6 +776,7 @@ impl HostSession {
                     self.early_events_dropped += 1;
                 }
                 NetEvent::ReliableUrgent(msg) => {
+                    self.last_client_rx_us = Some(rx_now_us);
                     // 发现 6：该连接首条输入消息 = 对端已收到 Welcome 的
                     // 后续证据，消费饱和刷新 bit1 的待决态（消费点语义见
                     // `pending_epoch_reset` 字段文档）。
@@ -788,6 +812,7 @@ impl HostSession {
                     }
                 }
                 NetEvent::Reliable(msg) => {
+                    self.last_client_rx_us = Some(rx_now_us);
                     // 发现 6：同上——该连接首条控制消息即对端后续证据
                     //（消费先于分发：脏消息同样证明连接已被对端使用过）。
                     self.maybe_consume_epoch_reset();
@@ -820,35 +845,52 @@ impl HostSession {
         // 计数会被凭空吞掉（summary 的 events_injected 与实际不符）。
         self.events_injected_total += u64::try_from(report.events_injected).unwrap_or(u64::MAX);
 
-        // ② 管线一拍：产出的数据报当拍发完（S7）。
-        if !dirty && bye.is_none() && !disconnected {
-            let produced = match self.pipeline.as_mut() {
-                Some(p) => p.tick((self.clock)())?,
-                None => None,
-            };
-            if let Some(mut datagrams) = produced {
-                stamp_and_track_datagrams(
-                    &mut datagrams,
-                    self.frame_seq_offset,
-                    &mut self.last_sent_frame_seq,
-                );
-                if !datagrams.is_empty() {
-                    report.busy = true;
+        // 应用层客户端失活看门狗（时间注入）：本拍未收到对端可靠消息且距上次收包达到阈值 → 主动断链。
+        if !dirty && bye.is_none() && !disconnected && self.client_idle_timeout_us > 0 {
+            let idle_now_us = u64::from((self.clock)());
+            if let Some(last) = self.last_client_rx_us {
+                if idle_now_us < last {
+                    // 时钟回跳/重锚（或 32 位钟回绕）时重新锚定，防止 8s 看门狗因 saturating_sub 恒为 0 而失明。
+                    self.last_client_rx_us = Some(idle_now_us);
                 }
-                report.datagrams_sent = self.send_datagrams_best_effort(&datagrams);
-                // T16（W5）：IDR 帧编码完成送出数据报的同一拍发 IdrAck
-                //（reliable 流，一个跨多片的 IDR 只一条）——client 据此做
-                // 去抖与超时复核。连接已死时后续 ack 无处可去，停止。
-                for seq in crate::watchdog::idr_frame_seqs(&datagrams) {
-                    let mut buf = Vec::new();
-                    ControlMessage::IdrAck { frame_seq: seq.0 }.encode(&mut buf);
-                    match self.transport.as_mut() {
-                        Some(t) => {
-                            if t.send_reliable(&buf).is_err() {
-                                break; // 连接已死：后续 ack 无处可去
+            }
+            if self.idle_since_last_client_rx_us(idle_now_us) >= self.client_idle_timeout_us {
+                disconnected = true;
+                report.busy = true;
+            }
+        }
+
+        // ② 管线一拍：产出的数据报当拍发完（S7）；纯工具模式暂停期间跳过采集/编码。
+        if !dirty && bye.is_none() && !disconnected {
+            if !self.media_paused {
+                let produced = match self.pipeline.as_mut() {
+                    Some(p) => p.tick((self.clock)())?,
+                    None => None,
+                };
+                if let Some(mut datagrams) = produced {
+                    stamp_and_track_datagrams(
+                        &mut datagrams,
+                        self.frame_seq_offset,
+                        &mut self.last_sent_frame_seq,
+                    );
+                    if !datagrams.is_empty() {
+                        report.busy = true;
+                    }
+                    report.datagrams_sent = self.send_datagrams_best_effort(&datagrams);
+                    // T16（W5）：IDR 帧编码完成送出数据报的同一拍发 IdrAck
+                    //（reliable 流，一个跨多片的 IDR 只一条）——client 据此做
+                    // 去抖与超时复核。连接已死时后续 ack 无处可去，停止。
+                    for seq in crate::watchdog::idr_frame_seqs(&datagrams) {
+                        let mut buf = Vec::new();
+                        ControlMessage::IdrAck { frame_seq: seq.0 }.encode(&mut buf);
+                        match self.transport.as_mut() {
+                            Some(t) => {
+                                if t.send_reliable(&buf).is_err() {
+                                    break; // 连接已死：后续 ack 无处可去
+                                }
                             }
+                            None => break,
                         }
-                        None => break,
                     }
                 }
             }
@@ -1099,6 +1141,175 @@ impl HostSession {
         self.audio_rx.drain(..).collect()
     }
 
+    /// 当前媒体管线是否处于按需暂停状态（纯工具模式）。
+    pub fn is_media_paused(&self) -> bool {
+        self.media_paused
+    }
+
+    /// 按需暂停媒体管线（纯工具模式）：在 [`SessionState::Streaming`] 下幂等置位
+    /// `media_paused = true`，按 S6 停机红线排空并释放采集/编码管线，同时保持
+    /// `SessionState::Streaming` 与 `transport` 存活（`tick()` 仍正常处理可靠控制、
+    /// 工具通道与 `ProbePing`）。非 `Streaming` 态为空操作。
+    pub fn pause_media(&mut self) {
+        if self.state != SessionState::Streaming {
+            return;
+        }
+        self.media_paused = true;
+        if self.pipeline.is_some() {
+            self.teardown_pipeline_only();
+            if let Some(mut p) = self.pipeline.take() {
+                p.shutdown();
+            }
+            self.frame_seq_offset = self
+                .last_sent_frame_seq
+                .map_or(self.frame_seq_offset, |last| last.saturating_add(1));
+        }
+    }
+
+    /// 恢复媒体管线：在 [`SessionState::Streaming`] 下按当前协商参数热重建
+    /// `HostPipeline` 并触发首帧 IDR（若已有存活管线也触发一次 `request_idr()`），
+    /// 成功后置 `media_paused = false`。
+    pub fn resume_media(&mut self) -> Result<()> {
+        match self.state {
+            SessionState::Streaming => {}
+            other => {
+                return Err(Error::InvalidConfig(format!(
+                    "resume_media requires Streaming state, got {other:?}"
+                )))
+            }
+        }
+        if self.pipeline_alive {
+            if let Some(p) = self.pipeline.as_mut() {
+                self.media_paused = false;
+                p.request_idr();
+                return Ok(());
+            }
+        }
+        let cur = self.negotiated.ok_or_else(|| {
+            Error::InvalidConfig("resume_media requires negotiated session params".into())
+        })?;
+        let target_bitrate = self.current_bitrate.unwrap_or(cur.bitrate_bps);
+        let mut pcfg = self.cfg.pipeline.clone();
+        pcfg.resolution = rc_types::Resolution::new(cur.width, cur.height);
+        pcfg.fps = cur.fps;
+        pcfg.bitrate_bps = target_bitrate;
+        pcfg.codec = self.active_codec;
+        pcfg.display_id = self.target_display_id;
+        pcfg.shows_cursor = self.target_shows_cursor;
+        pcfg.max_packet_payload = rc_net::quic::max_media_payload(self.cfg.mtu);
+        pcfg.validate()?;
+
+        let build_pipeline =
+            |cfg: &PipelineConfig,
+             factory_for: &mut Option<PipelineFactoryFor>,
+             factory: &mut Option<Box<dyn FnMut() -> Result<HostPipeline> + Send>>,
+             pace_capture: bool|
+             -> Result<HostPipeline> {
+                if let Some(f) = factory_for.as_mut() {
+                    f(cfg)
+                } else if let Some(f) = factory.as_mut() {
+                    f()
+                } else {
+                    let capture = rc_pipeline::select_capture(cfg)?;
+                    let encoder = rc_pipeline::select_encoder(cfg)?;
+                    HostPipeline::with_backends_paced(cfg.clone(), capture, encoder, pace_capture)
+                }
+            };
+
+        let target_codec = self.active_codec;
+        let mut actual_codec = target_codec;
+        let mut pipeline = match build_pipeline(
+            &pcfg,
+            &mut self.pipeline_factory_for,
+            &mut self.pipeline_factory,
+            self.cfg.pace_capture,
+        ) {
+            Ok(p) => p,
+            Err(hevc_err) if target_codec == rc_encode::Codec::Hevc => {
+                let mut h264_cfg = pcfg.clone();
+                h264_cfg.codec = rc_encode::Codec::H264;
+                actual_codec = rc_encode::Codec::H264;
+                build_pipeline(
+                    &h264_cfg,
+                    &mut self.pipeline_factory_for,
+                    &mut self.pipeline_factory,
+                    self.cfg.pace_capture,
+                )
+                .map_err(|h264_err| {
+                    Error::Encoder(format!(
+                        "HEVC 恢复失败 ({hevc_err})；回退 H.264 亦失败 ({h264_err})"
+                    ))
+                })?
+            }
+            Err(e) => return Err(e),
+        };
+        pipeline.set_clock(Arc::clone(&self.clock));
+        pipeline.request_idr();
+        self.active_codec = actual_codec;
+        self.live_display_id = pcfg.display_id;
+        self.live_shows_cursor = pcfg.shows_cursor;
+        let pacing_bps = u64::from(target_bitrate).saturating_mul(2).max(200_000_000);
+        if let Some(t) = self.transport.as_mut() {
+            t.set_pacing_rate(pacing_bps);
+        }
+        let now = (self.clock)();
+        if let Some(base) = self.refresh_base_us {
+            // 仅在真正回跳重置（模差超过刷新阈值，非正常 u32 回绕）时重锚，保留合法回绕语义。
+            if now < base && u64::from(now.wrapping_sub(base)) >= self.reconnect.refresh_guard_us {
+                self.refresh_base_us = Some(now);
+            }
+        }
+        let now_u64 = u64::from(now);
+        if let Some(last) = self.last_client_rx_us {
+            if now_u64 < last {
+                self.last_client_rx_us = Some(now_u64);
+            }
+        }
+        self.pipeline = Some(pipeline);
+        self.pipeline_alive = true;
+        self.pipeline_generation += 1;
+        self.media_paused = false;
+        Ok(())
+    }
+
+    /// 是否处于时钟饱和刷新（`Bye(Refresh)`）待决态（尚未收到新纪元对端证据）。
+    ///
+    /// 供上层驱动器在 `Detached` 态区分「70 分钟纪元刷新」与普通断线：
+    /// 刷新待决期间不得销毁 `HostSession` 重建，否则新 `Welcome` 将丢失 `CLOCK_EPOCH_RESET` 标志位。
+    pub fn is_pending_epoch_reset(&self) -> bool {
+        self.pending_epoch_reset
+    }
+
+    /// 在驱动器重锚/归零会话钟后重置被控端客户端失活看门狗与饱和刷新基准。
+    pub fn reset_activity_clock(&mut self, now_us: u64) {
+        self.last_client_rx_us = if self.state == SessionState::Streaming {
+            Some(now_us)
+        } else {
+            None
+        };
+        self.refresh_base_us = Some(now_us as u32);
+    }
+
+    /// 设置应用层客户端失活看门狗超时阈值（微秒；默认 `0` 禁用以兼容离线静默单测，
+    /// 生产侧推荐传入 [`HOST_CLIENT_IDLE_TIMEOUT_US`] = 8s）。
+    pub fn set_client_idle_timeout_us(&mut self, timeout_us: u64) {
+        self.client_idle_timeout_us = timeout_us;
+    }
+
+    /// 查询当前配置的应用层客户端失活看门狗超时阈值（微秒；`0` 表示禁用）。
+    pub fn client_idle_timeout_us(&self) -> u64 {
+        self.client_idle_timeout_us
+    }
+
+    /// 返回自最近一次收到控制端可靠消息（或进入 `Streaming`/`Resumed`/`Replaced` 锚点）
+    /// 以来经过的微秒数（时间注入口径；未处于已锚定 `Streaming` 时返回 `0`）。
+    pub fn idle_since_last_client_rx_us(&self, now_us: u64) -> u64 {
+        match self.last_client_rx_us {
+            Some(last) => now_us.saturating_sub(last),
+            None => 0,
+        }
+    }
+
     /// 当前生效视频编码器（默认 `Codec::H264`，热切换后同步更新）。
     pub fn active_codec(&self) -> rc_encode::Codec {
         self.active_codec
@@ -1229,6 +1440,22 @@ impl HostSession {
         // 先校验目标配置再拆旧管线，避免非法参数把正在运行的流拆空。
         pcfg.validate()?;
 
+        // 若当前处于纯工具模式暂停态且无活动管线，仅更新协商参数与编码器目标，
+        // 保持零采集/编码直至控制端显式调用 `resume_media()`。
+        if self.media_paused && self.pipeline.is_none() {
+            let new_params = SessionParams {
+                width: target_w,
+                height: target_h,
+                fps: target_fps,
+                bitrate_bps: target_bitrate,
+            };
+            self.active_codec = target_codec;
+            self.live_display_id = pcfg.display_id;
+            self.live_shows_cursor = pcfg.shows_cursor;
+            self.negotiated = Some(new_params);
+            return Ok(new_params);
+        }
+
         let prev_codec = self.active_codec;
         let mut prev_pcfg = self.cfg.pipeline.clone();
         prev_pcfg.resolution = rc_types::Resolution::new(cur.width, cur.height);
@@ -1333,11 +1560,17 @@ impl HostSession {
             t.set_pacing_rate(pacing_bps);
         }
 
-        // 防御性守卫：若自定义测试工厂在重建时重置了时钟零点，避免 wrapping_sub 误触发刷新。
+        // 防御性守卫：仅在自定义工厂真正重置时钟零点（模差越过刷新守卫线，而非正常 u32 回绕）时重锚。
         let now = (self.clock)();
         if let Some(base) = self.refresh_base_us {
-            if now < base {
+            if now < base && u64::from(now.wrapping_sub(base)) >= self.reconnect.refresh_guard_us {
                 self.refresh_base_us = Some(now);
+            }
+        }
+        let now_u64 = u64::from(now);
+        if let Some(last) = self.last_client_rx_us {
+            if now_u64 < last {
+                self.last_client_rx_us = Some(now_u64);
             }
         }
 
@@ -1390,7 +1623,12 @@ impl HostSession {
         while !stop() && self.state != SessionState::Closed {
             match self.state {
                 SessionState::Streaming => {
-                    let r = self.tick(Duration::from_millis(1))?;
+                    let budget = if self.media_paused {
+                        Duration::from_millis(10)
+                    } else {
+                        Duration::from_millis(1)
+                    };
+                    let r = self.tick(budget)?;
                     if r.closed.is_some() {
                         break; // Bye 已在 tick 内完成停机
                     }
@@ -1516,6 +1754,7 @@ impl HostSession {
         self.tool_rx.clear();
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
+        self.last_client_rx_us = None;
         self.state = SessionState::Detached;
     }
 
@@ -1786,6 +2025,7 @@ impl HostSession {
             self.tool_rx.clear();
             self.audio_ctrl_rx = None;
             self.audio_rx.clear();
+            self.last_client_rx_us = Some(now_us);
         } else {
             // H1：未命中（含密码启用时的 resume 拒绝）绝不在全新 Hello 通过鉴权
             // 与审批前拆除保留管线——保持管线存活直到保持窗口 TTL 过期或认证通过。
@@ -1849,6 +2089,7 @@ impl HostSession {
         self.tool_rx.clear();
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
+        self.last_client_rx_us = None;
         self.state = SessionState::Detached;
         Ok(true)
     }
@@ -2333,6 +2574,8 @@ impl HostSession {
         self.audio_ctrl_rx = None;
         self.tool_rx_overflow_dropped = 0;
         self.audio_rx.clear();
+        self.media_paused = false;
+        self.last_client_rx_us = Some(u64::from((self.clock)()));
         Ok(())
     }
 
@@ -2341,6 +2584,7 @@ impl HostSession {
         self.cfg.approver.cancel();
         self.pending_auth = None;
         self.detached_candidate_deadline_us = None;
+        self.last_client_rx_us = None;
         self.tool_rx.clear();
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
@@ -2481,10 +2725,17 @@ impl HostSession {
     /// 记 stderr 摘要与统计，不影响行为。成功时会话侧记账
     /// （[`HostSession::current_bitrate_bps`]）。
     pub fn on_set_bitrate(&mut self, bps: u32, reason: u8) -> Result<()> {
-        let pipeline = self.pipeline.as_mut().ok_or_else(|| {
-            Error::InvalidConfig("on_set_bitrate requires an established pipeline".into())
-        })?;
-        pipeline.set_bitrate(bps)?;
+        if let Some(pipeline) = self.pipeline.as_mut() {
+            pipeline.set_bitrate(bps)?;
+        } else if self.media_paused {
+            if bps == 0 {
+                return Err(Error::InvalidConfig("bitrate must be > 0".into()));
+            }
+        } else {
+            return Err(Error::InvalidConfig(
+                "on_set_bitrate requires an established pipeline".into(),
+            ));
+        }
         self.current_bitrate = Some(bps);
         if reason == crate::proto::BitrateReason::Manual as u8 {
             self.last_manual_bitrate = Some(bps);
@@ -2653,6 +2904,7 @@ impl HostSession {
         self.tool_rx.clear();
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
+        self.last_client_rx_us = None;
         self.closed_reason = Some(reason);
         self.state = SessionState::Closed;
         // 断开连接：QuicTransport 的 Drop 关闭连接（尽力 Bye 已在前面发出）。
@@ -6166,5 +6418,215 @@ mod tests {
             !w.host_flags.resume_accepted(),
             "allow_owner_control=false 必须拒绝快速 resume"
         );
+    }
+
+    #[test]
+    fn host_pause_and_resume_media_keeps_control_alive_and_forces_idr() {
+        let (inj, _) = RecordingInjector::new();
+        let (mut host, mut handle) = handshaken(Box::new(inj), caps());
+        host.set_pipeline_factory(scripted_pipeline_factory());
+
+        assert!(!host.is_media_paused());
+        assert!(host.has_pipeline());
+        drive_until_datagram(&mut host, &handle, 400);
+        let dgs_before_pause = handle.datagrams_sent();
+        assert!(!dgs_before_pause.is_empty());
+        let max_seq_before = dgs_before_pause
+            .iter()
+            .filter_map(|d| {
+                rc_proto::MediaHeader::parse_datagram(d)
+                    .ok()
+                    .map(|(h, _)| h.frame_seq.0)
+            })
+            .max()
+            .expect("frame seq before pause");
+
+        // 暂停媒体（幂等）：销毁管线、保持 Streaming 与 transport 存活
+        host.pause_media();
+        host.pause_media();
+        assert!(host.is_media_paused());
+        assert!(!host.has_pipeline());
+        assert_eq!(host.state(), SessionState::Streaming);
+
+        let dgs_at_pause = handle.datagrams_sent().len();
+        // 暂停期间：零视频帧产出，但 ProbePing 与 ToolChannel 照常处理
+        handle.deliver_reliable(&ControlMessage::ProbePing {
+            probe_id: 11,
+            sender_clock_us: 123_456,
+        });
+        handle.deliver_reliable(
+            &ControlMessage::tool_channel(crate::proto::TOOL_CHANNEL_TERMINAL, b"ls\n".to_vec())
+                .unwrap(),
+        );
+        let r = host.tick(Duration::ZERO).expect("tick while media paused");
+        assert_eq!(r.datagrams_sent, 0);
+        assert_eq!(r.control_msgs_handled, 2);
+        assert_eq!(handle.datagrams_sent().len(), dgs_at_pause);
+        assert_eq!(
+            host.drain_tool_messages(),
+            vec![(crate::proto::TOOL_CHANNEL_TERMINAL, b"ls\n".to_vec())]
+        );
+        assert!(
+            handle.reliable_decoded().iter().any(|m| matches!(
+                m,
+                ControlMessage::ProbePong {
+                    probe_id: 11,
+                    echoed_clock_us: 123_456,
+                    ..
+                }
+            )),
+            "暂停期间 ProbePing 必须照常回复 ProbePong"
+        );
+
+        // 恢复媒体：热重建管线、生成代次 +1、立即产出新 IDR 且线上 frame_seq 严格递增
+        let gen_before = host.pipeline_generation();
+        host.resume_media().expect("resume_media");
+        assert!(!host.is_media_paused());
+        assert!(host.has_pipeline());
+        assert_eq!(host.pipeline_generation(), gen_before + 1);
+
+        let mut got_idr_after_resume = false;
+        for _ in 0..400 {
+            let _ = host.tick(Duration::ZERO).expect("tick after resume");
+            let all_dgs = handle.datagrams_sent();
+            if all_dgs.len() > dgs_at_pause {
+                let new_dgs = &all_dgs[dgs_at_pause..];
+                for d in new_dgs {
+                    if let Ok((h, _)) = rc_proto::MediaHeader::parse_datagram(d) {
+                        assert!(
+                            h.frame_seq.0 > max_seq_before,
+                            "恢复后 frame_seq({}) 必须严格大于暂停前({})",
+                            h.frame_seq.0,
+                            max_seq_before
+                        );
+                    }
+                }
+                if !crate::watchdog::idr_frame_seqs(new_dgs).is_empty() {
+                    got_idr_after_resume = true;
+                    break;
+                }
+            }
+            host.pipeline().wait_event(Duration::from_millis(5));
+        }
+        assert!(got_idr_after_resume, "resume_media 后必须产出首帧 IDR");
+        host.close(ByeReason::Normal).expect("close");
+    }
+
+    #[test]
+    fn host_client_idle_watchdog_disconnects_at_8s_and_static_screen_ping_survives() {
+        let (now, clock) = mutable_clock();
+        let (inj, _) = RecordingInjector::new();
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&hello_msg(caps(), proto::AuthMethod::None));
+        let mut handle = mock.clone();
+        let mut host = HostSession::with_parts(
+            host_cfg(Box::new(inj)),
+            Box::new(mock),
+            fake_capture(FakeContent::Static),
+            fake_encoder(),
+            clock,
+        )
+        .expect("with_parts");
+        host.set_client_idle_timeout_us(HOST_CLIENT_IDLE_TIMEOUT_US);
+        host.set_reconnect(ReconnectConfig {
+            resume_ttl: Duration::ZERO,
+            ..ReconnectConfig::default()
+        })
+        .expect("set_reconnect");
+        host.handshake().expect("handshake");
+        assert_eq!(host.state(), SessionState::Streaming);
+        assert_eq!(host.idle_since_last_client_rx_us(0), 0);
+
+        // 静屏 + 每 1s ProbePing 持续 15s：绝不误杀
+        for sec in 1..=15u64 {
+            let t = sec * 1_000_000;
+            *now.lock().unwrap() = t;
+            handle.deliver_reliable(&ControlMessage::ProbePing {
+                probe_id: sec as u32,
+                sender_clock_us: t,
+            });
+            host.tick(Duration::ZERO).expect("tick with 1s ping");
+            assert_eq!(host.state(), SessionState::Streaming);
+            assert_eq!(host.idle_since_last_client_rx_us(t), 0);
+        }
+
+        // 停止心跳：7.999999s 仍保持 Streaming
+        let base = 15_000_000u64;
+        *now.lock().unwrap() = base + HOST_CLIENT_IDLE_TIMEOUT_US - 1;
+        host.tick(Duration::ZERO).expect("tick just before 8s");
+        assert_eq!(host.state(), SessionState::Streaming);
+        assert_eq!(
+            host.idle_since_last_client_rx_us(base + HOST_CLIENT_IDLE_TIMEOUT_US - 1),
+            HOST_CLIENT_IDLE_TIMEOUT_US - 1
+        );
+
+        // 恰好满 8s：触发 on_disconnected → Detached；resume_ttl=0 时 tick_detached 立即拆管线
+        *now.lock().unwrap() = base + HOST_CLIENT_IDLE_TIMEOUT_US;
+        host.tick(Duration::ZERO).expect("tick at 8s");
+        assert_eq!(host.state(), SessionState::Detached);
+        assert_eq!(host.reconnect_stats().disconnects, 1);
+        assert_eq!(
+            host.tick_detached(base + HOST_CLIENT_IDLE_TIMEOUT_US)
+                .expect("tick_detached"),
+            DetachOutcome::TornDown
+        );
+        host.close(ByeReason::Normal).expect("close");
+    }
+
+    #[test]
+    fn host_epoch_reset_flag_and_activity_clock_reanchor_keep_watchdog_alive() {
+        let (now, clock) = mutable_clock();
+        let (inj, _) = RecordingInjector::new();
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&hello_msg(caps(), proto::AuthMethod::None));
+        let mut host = HostSession::with_parts(
+            host_cfg(Box::new(inj)),
+            Box::new(mock),
+            fake_capture(FakeContent::Static),
+            fake_encoder(),
+            clock,
+        )
+        .expect("with_parts");
+        host.set_client_idle_timeout_us(HOST_CLIENT_IDLE_TIMEOUT_US);
+        host.handshake().expect("handshake");
+        assert!(!host.is_pending_epoch_reset());
+
+        // 1) 70 分钟 Bye(Refresh) 进 Detached 时 is_pending_epoch_reset() 必须为 true。
+        let refresh_at = host.reconnect_config().refresh_guard_us;
+        *now.lock().unwrap() = refresh_at;
+        assert!(host.check_refresh(refresh_at).expect("check_refresh"));
+        assert_eq!(host.state(), SessionState::Detached);
+        assert!(host.is_pending_epoch_reset());
+
+        // 2) 新会话在旧纪元高时间戳下完成握手，驱动器随后归零时钟并调用 reset_activity_clock(0)：
+        //    8s 客户端失活看门狗必须在 8s 准确触发，不得因旧高时间戳失明。
+        let mut mock2 = MockTransport::new();
+        mock2.deliver_reliable(&hello_msg(caps(), proto::AuthMethod::None));
+        host.offer_transport(Box::new(mock2))
+            .expect("offer_transport");
+        assert_eq!(
+            host.tick_detached(refresh_at).expect("replaced"),
+            DetachOutcome::Replaced
+        );
+        assert_eq!(host.state(), SessionState::Streaming);
+        // Welcome 发出但未收到新连接首条客户端消息前，pending_epoch_reset 仍保持 true。
+        assert!(host.is_pending_epoch_reset());
+
+        *now.lock().unwrap() = 0;
+        host.reset_activity_clock(0);
+        assert_eq!(host.idle_since_last_client_rx_us(0), 0);
+
+        *now.lock().unwrap() = HOST_CLIENT_IDLE_TIMEOUT_US - 1;
+        host.tick(Duration::ZERO).expect("tick before 8s");
+        assert_eq!(host.state(), SessionState::Streaming);
+
+        *now.lock().unwrap() = HOST_CLIENT_IDLE_TIMEOUT_US;
+        host.tick(Duration::ZERO).expect("tick at 8s");
+        assert_eq!(
+            host.state(),
+            SessionState::Detached,
+            "reset_activity_clock 归零后 8s 看门狗必须正常触发"
+        );
+        host.close(ByeReason::Normal).expect("close");
     }
 }

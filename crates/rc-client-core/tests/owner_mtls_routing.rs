@@ -559,7 +559,7 @@ fn encrypt_connection_refuses_downgrade_on_missing_or_bad_cert() {
     });
     assert!(
         u2.iter()
-            .any(|u| matches!(u, SessionUpdate::Ended { reason } if reason.contains("mTLS") || reason.contains("证书"))),
+            .any(|u| matches!(u, SessionUpdate::Ended { reason, .. } if reason.contains("mTLS") || reason.contains("证书"))),
         "cert validation error must abort without fallback, got: {u2:?}"
     );
     s2.join();

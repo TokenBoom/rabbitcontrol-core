@@ -87,10 +87,10 @@ const RELAY_READ_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const HANDSHAKE_POLL_SLICE: Duration = Duration::from_millis(50);
 /// 多候选地址拨号时的单地址最小超时预算。
 const MIN_ADDR_TIMEOUT: Duration = Duration::from_millis(250);
-/// TCP Keepalive 空闲探测时间（30s）。
-const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
-/// TCP Keepalive 探测间隔（10s）。
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// TCP Keepalive 空闲探测时间（10s）。
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+/// TCP Keepalive 探测间隔（3s）。
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(3);
 /// 渐进式读帧的初始预分配上限（64 KiB），避免恶意/异常大长度头一次性分配 4 MiB。
 const INCREMENTAL_READ_INIT_CAP: usize = 64 * 1024;
 
@@ -3976,5 +3976,11 @@ pub(crate) mod tests {
             remaining.push(extract_relay_media_frame_seq(&f));
         }
         assert_eq!(remaining, vec![Some(2)]);
+    }
+
+    #[test]
+    fn relay_tcp_keepalive_parameters_are_tightened() {
+        assert_eq!(KEEPALIVE_IDLE, Duration::from_secs(10));
+        assert_eq!(KEEPALIVE_INTERVAL, Duration::from_secs(3));
     }
 }

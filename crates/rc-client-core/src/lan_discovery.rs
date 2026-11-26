@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 #[cfg(target_os = "macos")]
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -55,8 +55,8 @@ pub const MULTICAST_PORT: u16 = 19999;
 /// 默认信标广播周期。
 const BROADCAST_INTERVAL: Duration = Duration::from_millis(1_500);
 
-/// 接收超时分片（兼顾低功耗与 `stop()` 快速回收）。
-const RECV_POLL_TIMEOUT: Duration = Duration::from_millis(200);
+/// 接收超时分片（兼顾低功耗、`clear_and_refresh()` 切网快速响应与 `stop()` 快速回收）。
+const RECV_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// 多播网卡复检周期（检测局域网 IP 变化或补做首次加入失败的重试，U-M4）。
 const MULTICAST_IFACE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -249,6 +249,11 @@ impl PeerTable {
             .retain(|_, entry| now_ms.saturating_sub(entry.last_seen_ms) < ttl_ms);
     }
 
+    /// 立刻清空所有已缓存的局域网节点（用于切网后清除旧网段缓存）。
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// 导出当前在线节点快照（按名称、地址、实例 ID 稳定排序）。
     pub fn snapshot(&self) -> Vec<LanPeer> {
         let mut peers: Vec<LanPeer> = self.entries.values().map(|e| e.peer.clone()).collect();
@@ -368,63 +373,61 @@ pub fn local_hostname() -> String {
     "本机 Mac".to_string()
 }
 
+/// 发现句柄与后台线程共享状态。
+struct DiscoveryShared {
+    advertising: Mutex<Option<(u16, bool)>>,
+    local_device_id: Mutex<Option<String>>,
+    advertising_dirty: AtomicBool,
+    peers: Mutex<PeerTable>,
+    refresh_gen: AtomicU64,
+    refresh_applied_gen: AtomicU64,
+    stop_flag: AtomicBool,
+}
+
 /// 局域网发现后台线程句柄。
 ///
 /// 同时负责接收同网段其他 RabbitControl 实例的信标与按需广播本机被控端信息；
 /// 若多播端口 `19999` 被占用或多播不可用，自动静默降级，绝不 panic 或阻塞应用启动。
 pub struct LanDiscoveryHandle {
-    advertising: Arc<Mutex<Option<(u16, bool)>>>,
-    local_device_id: Arc<Mutex<Option<String>>>,
-    advertising_dirty: Arc<AtomicBool>,
-    peers: Arc<Mutex<PeerTable>>,
-    stop_flag: Arc<AtomicBool>,
+    shared: Arc<DiscoveryShared>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl LanDiscoveryHandle {
     /// 启动局域网发现后台线程（默认不广播，仅监听；调用 [`Self::set_advertising`] 开启广播）。
     pub fn spawn(instance_id: u64, device_name: String) -> Self {
-        let advertising = Arc::new(Mutex::new(None));
-        let local_device_id = Arc::new(Mutex::new(None));
-        let advertising_dirty = Arc::new(AtomicBool::new(false));
-        let peers = Arc::new(Mutex::new(PeerTable::new(instance_id)));
-        let stop_flag = Arc::new(AtomicBool::new(false));
-
-        let t_adv = Arc::clone(&advertising);
-        let t_did = Arc::clone(&local_device_id);
-        let t_dirty = Arc::clone(&advertising_dirty);
-        let t_peers = Arc::clone(&peers);
-        let t_stop = Arc::clone(&stop_flag);
+        let shared = Arc::new(DiscoveryShared {
+            advertising: Mutex::new(None),
+            local_device_id: Mutex::new(None),
+            advertising_dirty: AtomicBool::new(false),
+            peers: Mutex::new(PeerTable::new(instance_id)),
+            refresh_gen: AtomicU64::new(0),
+            refresh_applied_gen: AtomicU64::new(0),
+            stop_flag: AtomicBool::new(false),
+        });
+        let t_shared = Arc::clone(&shared);
 
         let handle = thread::Builder::new()
             .name("rc-ui-lan-discovery".to_string())
             .spawn(move || {
-                run_discovery_loop(
-                    instance_id,
-                    device_name,
-                    t_adv,
-                    t_did,
-                    t_dirty,
-                    t_peers,
-                    t_stop,
-                );
+                run_discovery_loop(instance_id, device_name, t_shared);
             })
             .expect("spawn rc-ui-lan-discovery thread");
 
         Self {
-            advertising,
-            local_device_id,
-            advertising_dirty,
-            peers,
-            stop_flag,
+            shared,
             thread: Some(handle),
         }
     }
 
     /// 设置本机广播状态：`Some((listen_port, requires_password))` 开启广播，`None` 停止广播。
     pub fn set_advertising(&self, target: Option<(u16, bool)>) {
-        *self.advertising.lock().unwrap_or_else(|e| e.into_inner()) = target;
-        self.advertising_dirty.store(true, Ordering::Release);
+        *self
+            .shared
+            .advertising
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = target;
+        self.shared.advertising_dirty.store(true, Ordering::Release);
     }
 
     /// 设置本机关联的 9 位数字设备码（仅合法 9 位数字会随局域网信标广播）。
@@ -433,15 +436,17 @@ impl LanDiscoveryHandle {
             .map(|s| s.trim().to_string())
             .filter(|s| is_valid_beacon_device_id(s));
         *self
+            .shared
             .local_device_id
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = normalized;
-        self.advertising_dirty.store(true, Ordering::Release);
+        self.shared.advertising_dirty.store(true, Ordering::Release);
     }
 
     /// 获取当前在线局域网节点快照。
     pub fn peers(&self) -> Vec<LanPeer> {
-        self.peers
+        self.shared
+            .peers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .snapshot()
@@ -449,15 +454,31 @@ impl LanDiscoveryHandle {
 
     /// 查询指定 9 位设备码最近活跃的局域网直连地址（`UDP LAN` 路由快查）。
     pub fn lookup_lan_addr(&self, device_id: &str) -> Option<SocketAddr> {
-        self.peers
+        self.shared
+            .peers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .lookup_addr(device_id)
     }
 
+    /// 切网后立刻清空已缓存的局域网节点表，并通知后台线程重新探测多播网卡且立即重发发现广播。
+    ///
+    /// 用于在网络切换（如 Wi-Fi 切热点/蜂窝、切换子网或系统休眠唤醒）时立即丢弃旧网段 IP，
+    /// 避免残留的旧局域网地址误导 Tier 1 探测。
+    pub fn clear_and_refresh(&self) {
+        // 先推进刷新代次再持锁清空，配合后台线程在持锁 upsert 前复检代次，
+        // 避免切网前在途收到的旧网段信标在清空后写回 peers 表。
+        self.shared.refresh_gen.fetch_add(1, Ordering::AcqRel);
+        self.shared
+            .peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
     /// 停止发现线程并等待回收（幂等）。
     pub fn stop(&mut self) {
-        self.stop_flag.store(true, Ordering::Release);
+        self.shared.stop_flag.store(true, Ordering::Release);
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -527,12 +548,17 @@ impl DiscoverySocket {
 
     /// 检查本机局域网 IPv4 是否变化或首次入组失败；必要时重新设置出向网卡并重加多播组（U-M4）。
     fn refresh_multicast_iface(&mut self) {
+        self.refresh_multicast_iface_inner(false);
+    }
+
+    /// 按需或强制（切网/唤醒触发）重新探测出向网卡并重加多播组。
+    fn refresh_multicast_iface_inner(&mut self, force: bool) {
         let current_lan = detect_local_lan_ipv4();
         let iface_changed = current_lan != self.lan_iface;
-        if !iface_changed && (!self.can_recv || self.joined_ok) {
+        if !force && !iface_changed && (!self.can_recv || self.joined_ok) {
             return;
         }
-        if self.can_recv && self.joined_ok && iface_changed {
+        if self.can_recv && self.joined_ok && (iface_changed || force) {
             let old_iface = self.lan_iface.unwrap_or(Ipv4Addr::UNSPECIFIED);
             let _ = self.sock.leave_multicast_v4(&MULTICAST_ADDR, &old_iface);
             self.joined_ok = false;
@@ -551,41 +577,47 @@ impl DiscoverySocket {
     }
 }
 
-fn run_discovery_loop(
-    instance_id: u64,
-    device_name: String,
-    advertising: Arc<Mutex<Option<(u16, bool)>>>,
-    local_device_id: Arc<Mutex<Option<String>>>,
-    advertising_dirty: Arc<AtomicBool>,
-    peers: Arc<Mutex<PeerTable>>,
-    stop_flag: Arc<AtomicBool>,
-) {
+fn run_discovery_loop(instance_id: u64, device_name: String, shared: Arc<DiscoveryShared>) {
     let origin = Instant::now();
     let target = SocketAddrV4::new(MULTICAST_ADDR, MULTICAST_PORT);
     let mut socket_opt = DiscoverySocket::bind();
     let mut last_broadcast: Option<Instant> = None;
     let mut last_iface_check = Instant::now();
+    let mut seen_refresh_gen = 0u64;
     let mut recv_buf = [0u8; 256];
 
-    while !stop_flag.load(Ordering::Acquire) {
+    while !shared.stop_flag.load(Ordering::Acquire) {
         let now_ms = u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let current_refresh_gen = shared.refresh_gen.load(Ordering::Acquire);
+        let refresh_requested = current_refresh_gen != seen_refresh_gen;
+        if refresh_requested {
+            seen_refresh_gen = current_refresh_gen;
+            last_broadcast = None;
+            last_iface_check = Instant::now();
+            if let Some(ref mut ds) = socket_opt {
+                ds.refresh_multicast_iface_inner(true);
+            } else {
+                socket_opt = DiscoverySocket::bind();
+            }
+        }
 
         if let Some(ref mut ds) = socket_opt {
-            if last_iface_check.elapsed() >= MULTICAST_IFACE_CHECK_INTERVAL {
+            if !refresh_requested && last_iface_check.elapsed() >= MULTICAST_IFACE_CHECK_INTERVAL {
                 last_iface_check = Instant::now();
                 ds.refresh_multicast_iface();
             }
 
-            // 1) 定期或在状态变更时发送本机信标。
-            let adv = *advertising.lock().unwrap_or_else(|e| e.into_inner());
-            let dirty = advertising_dirty.swap(false, Ordering::AcqRel);
+            // 1) 定期或在状态变更 / 切网刷新时发送本机信标。
+            let adv = *shared.advertising.lock().unwrap_or_else(|e| e.into_inner());
+            let dirty = shared.advertising_dirty.swap(false, Ordering::AcqRel);
             let should_send = dirty
                 || last_broadcast
                     .map(|t| t.elapsed() >= BROADCAST_INTERVAL)
                     .unwrap_or(true);
             if should_send {
                 if let Some((listen_port, requires_password)) = adv {
-                    let device_id = local_device_id
+                    let device_id = shared
+                        .local_device_id
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
@@ -603,18 +635,23 @@ fn run_discovery_loop(
                 }
             }
 
-            // 2) 接收同网段信标（200ms 超时分片，不阻塞停机）。
+            if refresh_requested {
+                shared
+                    .refresh_applied_gen
+                    .store(seen_refresh_gen, Ordering::Release);
+            }
+
+            // 2) 接收同网段信标（100ms 超时分片，兼顾切网快速响应与停机回收）。
             if ds.can_recv {
                 match ds.sock.recv_from(&mut recv_buf) {
                     Ok((len, src)) => {
                         if let Some(beacon) = decode_beacon(&recv_buf[..len]) {
                             let rx_ms =
                                 u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX);
-                            peers.lock().unwrap_or_else(|e| e.into_inner()).upsert(
-                                src.ip(),
-                                beacon,
-                                rx_ms,
-                            );
+                            let mut guard = shared.peers.lock().unwrap_or_else(|e| e.into_inner());
+                            if shared.refresh_gen.load(Ordering::Acquire) == seen_refresh_gen {
+                                guard.upsert(src.ip(), beacon, rx_ms);
+                            }
                         }
                     }
                     Err(_) => {
@@ -625,12 +662,18 @@ fn run_discovery_loop(
                 thread::sleep(RECV_POLL_TIMEOUT);
             }
         } else {
+            if refresh_requested {
+                shared
+                    .refresh_applied_gen
+                    .store(seen_refresh_gen, Ordering::Release);
+            }
             // 极端受限环境无法绑定任何 UDP 套接字：降级空转等待退出。
             thread::sleep(RECV_POLL_TIMEOUT);
         }
 
         // 3) 清理过期节点。
-        peers
+        shared
+            .peers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .prune(now_ms, DEFAULT_PEER_TTL_MS);
@@ -919,5 +962,66 @@ mod tests {
             detect_local_lan_ipv4_for_targets(&[])
         );
         assert_eq!(detect_local_lan_ipv4(), baseline.into_iter().next());
+    }
+
+    #[test]
+    fn clear_and_refresh_immediately_clears_peers_and_advances_generation() {
+        let mut handle = LanDiscoveryHandle::spawn(100, "Test Host".to_string());
+
+        // 预置旧网段缓存节点。
+        handle
+            .shared
+            .peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upsert(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 88, 42)),
+                Beacon {
+                    instance_id: 201,
+                    listen_port: 9901,
+                    requires_password: true,
+                    name: "Old LAN Peer".to_string(),
+                    device_id: Some("604928235".to_string()),
+                },
+                1_000,
+            );
+        assert_eq!(handle.peers().len(), 1);
+        assert_eq!(
+            handle.lookup_lan_addr("604928235"),
+            Some("192.168.88.42:9901".parse().unwrap())
+        );
+        assert_eq!(handle.shared.refresh_gen.load(Ordering::Acquire), 0);
+
+        // 调用 clear_and_refresh 必须同步清空缓存并递增刷新代次。
+        handle.clear_and_refresh();
+        assert!(handle.peers().is_empty());
+        assert_eq!(handle.lookup_lan_addr("604928235"), None);
+        assert_eq!(handle.shared.refresh_gen.load(Ordering::Acquire), 1);
+
+        // 等待后台线程在下一个短周期内消化刷新代次（远小于 5s 周期复检）。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.shared.refresh_applied_gen.load(Ordering::Acquire) < 1
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            handle.shared.refresh_applied_gen.load(Ordering::Acquire),
+            1,
+            "后台发现线程应在切网刷新后迅速消费 refresh_gen"
+        );
+
+        // 连续二次刷新应继续单调推进代次并再次被消费。
+        handle.clear_and_refresh();
+        assert_eq!(handle.shared.refresh_gen.load(Ordering::Acquire), 2);
+        let deadline2 = Instant::now() + Duration::from_secs(2);
+        while handle.shared.refresh_applied_gen.load(Ordering::Acquire) < 2
+            && Instant::now() < deadline2
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(handle.shared.refresh_applied_gen.load(Ordering::Acquire), 2);
+
+        handle.stop();
     }
 }

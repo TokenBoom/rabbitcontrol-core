@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -30,6 +30,7 @@ use crate::server_config::{
     format_device_id, format_host_port, next_status_revision, parse_device_id_input,
     parse_server_input, ServerConfig, ServerConnectionState, ServerStatusSnapshot,
 };
+use crate::upnp::{map_udp_port, renew_udp_mapping, unmap_udp_port, UpnpMappingLease, UpnpStatus};
 
 /// 单条 TCP 信令 JSON 帧的最大字节数（对齐服务端 `MAX_SIGNAL_FRAME_LEN`）。
 pub const MAX_SIGNAL_FRAME_LEN: usize = 65_536;
@@ -41,12 +42,26 @@ const UDP_PROTO_VERSION: u8 = 1;
 /// UDP `RCSP` 探测包定长字节数。
 pub const UDP_PROBE_LEN: usize = 22;
 
-/// 心跳与 UDP 探测发送周期（30 秒）。
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-/// 服务端失活判定阈值（`2 * 30s + 15s`）：超时无任何入站帧视为半开死链并重连。
-const SERVER_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(75);
+/// 心跳与 UDP 探测发送周期（10 秒）。
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// 服务端失活判定阈值（`2 * 10s + 5s`）：超时无任何入站帧视为半开死链并重连。
+const SERVER_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(25);
 /// 判定连接健康稳定、可重置退避的最短持续时长（30 秒）。
 const STABLE_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
+/// 切网或主动触发快速重连后的短退避窗口（200ms）。
+const FAST_RECONNECT_DELAY: Duration = Duration::from_millis(200);
+/// 请求超时触发重连的冷却期（5 秒），防止并发或连续超时引发重连与 UPnP 风暴。
+const TIMEOUT_RECONNECT_COOLDOWN: Duration = Duration::from_secs(5);
+/// 若距上次收到服务端入站帧未超过该阈值（3 秒），判定信令链路活跃、单次请求超时不盲目切断连接。
+const TIMEOUT_RECONNECT_ACTIVITY_GRACE: Duration = Duration::from_secs(3);
+/// UPnP / NAT-PMP 自动端口映射租期（1800 秒）。
+const UPNP_LEASE_SECS: u32 = 1800;
+/// UPnP / NAT-PMP 探测、映射与续租超时上限（1500ms）。
+const UPNP_MAP_TIMEOUT: Duration = Duration::from_millis(1500);
+/// UPnP / NAT-PMP 长连期间异步续租周期（900 秒，租期一半）。
+const UPNP_RENEW_INTERVAL: Duration = Duration::from_secs(900);
+/// UPnP / NAT-PMP 尽力退租超时上限（500ms）。
+const UPNP_UNMAP_TIMEOUT: Duration = Duration::from_millis(500);
 /// 建连与首包注册握手超时。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 读循环空闲检查粒度（用于响应 `stop()`、心跳、失活超时并最小化 TLS 写端等待）。
@@ -116,6 +131,8 @@ pub struct RelayIncoming {
     pub owner_grant: Option<OwnerGrantPayload>,
     /// 本次连接是否为同一登录账号的自控连接。
     pub is_owner_connection: bool,
+    /// 是否为服务端显式 `relay_ready`（强制中继/切中继，而非 `punch_coord`）。
+    pub is_relay_alloc: bool,
 }
 
 /// 出站连接请求获批后返回的中继/打洞凭据（本端作为控制端 `client` 接收）。
@@ -210,7 +227,7 @@ pub type TokenProvider = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
 /// （入参为刚被拒绝的过期令牌，由上层接入 `AuthSessionManager::refresh_after_unauthorized`）。
 pub type TokenRefresher = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
-/// 信令客户端启动扩展参数（注入动态 Token 提供器、设备公钥、远程控制/协助与动态局域网探测开关）。
+/// 信令客户端启动扩展参数（注入动态 Token 提供器、设备公钥、远程控制/协助、动态局域网与 UPnP 开关）。
 #[derive(Clone, Default)]
 pub struct SignalClientOptions {
     /// 可选动态 Access Token 提供器；每次建连与断线重连注册时自动拉取最新（必要时已轮换的）令牌。
@@ -225,6 +242,8 @@ pub struct SignalClientOptions {
     pub allow_remote_control: Option<bool>,
     /// 是否按信令出向路由动态探测本机局域网 IPv4 候选并前置于静态 `lan_addrs`（默认 `false`）。
     pub dynamic_lan_discovery: bool,
+    /// 是否启用 UPnP IGD / NAT-PMP 自动 UDP 端口映射（默认 `false`，避免离线测试向真实局域网发送 SSDP 广播）。
+    pub upnp_enabled: bool,
 }
 
 impl fmt::Debug for SignalClientOptions {
@@ -236,6 +255,7 @@ impl fmt::Debug for SignalClientOptions {
             .field("allow_remote_assist", &self.allow_remote_assist)
             .field("allow_remote_control", &self.allow_remote_control)
             .field("dynamic_lan_discovery", &self.dynamic_lan_discovery)
+            .field("upnp_enabled", &self.upnp_enabled)
             .finish()
     }
 }
@@ -464,11 +484,23 @@ struct SharedState {
     kicked_reasons: Mutex<VecDeque<String>>,
     pending_connects: Mutex<HashMap<String, PendingConnect>>,
     active_writer: Mutex<Option<SignalWriter>>,
-    /// 独立于 `active_writer` 的关闭句柄：`signal_stop()` 永不等待写锁即可瞬间切断套接字。
+    /// 独立于 `active_writer` 的关闭句柄：`signal_stop()` / `trigger_reconnect()` 永不等待写锁即可瞬间切断套接字。
     shutdown_stream: Mutex<Option<TcpStream>>,
     stop_flag: AtomicBool,
     stop_lock: Mutex<bool>,
     stop_cv: Condvar,
+    /// 快速重连标记：由 `trigger_reconnect` / 超时触发置位。
+    fast_reconnect: AtomicBool,
+    /// 重连时是否重置退避阶梯：外部显式 `trigger_reconnect` 置 `true`，请求超时自动触发置 `false`。
+    reset_backoff_on_reconnect: AtomicBool,
+    /// 重连代际计数器：每次 `trigger_reconnect` 递增，用于立即打断拨号、握手、读循环与退避等待。
+    reconnect_epoch: AtomicU64,
+    /// 最近一次触发快速重连的原因说明（供状态日志展示）。
+    reconnect_reason: Mutex<Option<String>>,
+    /// 最近一次在活跃连接读循环中收到服务端入站帧的时刻（断线清零）。
+    last_server_activity: Mutex<Option<Instant>>,
+    /// 上一次因 `request_connect` 超时触发重连的时刻（用于冷却期防风暴）。
+    last_timeout_reconnect: Mutex<Option<Instant>>,
     /// 持久化 UDP `RCSP` 探测套接字的本地端口（0 表示未绑定）。
     local_udp_port: AtomicU16,
     /// 持久化 UDP `RCSP` 探测套接字是否绑定在 IPv6 地址族（仅在 `local_udp_port != 0` 时有效）。
@@ -479,6 +511,18 @@ struct SharedState {
     connected_probe_targets: Mutex<Vec<SocketAddr>>,
     /// 当前信令 TCP 对端是否位于回环地址（仅在同机联调时允许上报回环候选）。
     server_is_loopback: AtomicBool,
+    /// 是否启用 UPnP / NAT-PMP 自动端口映射。
+    upnp_enabled: AtomicBool,
+    /// 当前 UPnP / NAT-PMP 端口映射状态快照。
+    upnp_status: Mutex<UpnpStatus>,
+    /// 当前生效的 UPnP / NAT-PMP 公网 UDP 地址（`ip:port`）。
+    upnp_external_addr: Mutex<Option<String>>,
+    /// 当前生效的 UPnP / NAT-PMP 端口映射租约（用于周期续租与断开退租）。
+    upnp_lease: Mutex<Option<UpnpMappingLease>>,
+    /// UPnP 映射代际号：每次绑定新 UDP 端口、切网重连或开关切换递增，过期后台线程结果自动丢弃并退租。
+    upnp_gen: AtomicU64,
+    /// UPnP 映射成功后置位，促使信令循环尽快发一次增量 `Heartbeat` 把新公网候选同步给服务端。
+    upnp_heartbeat_needed: AtomicBool,
     lan_addrs: Vec<String>,
     enabled: bool,
     token_provider: Option<TokenProvider>,
@@ -486,6 +530,13 @@ struct SharedState {
     device_pubkey: Option<String>,
     allow_remote_assist: AtomicU8,
     allow_remote_control: AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SleepWake {
+    TimedOut,
+    Reconnect,
+    Stopped,
 }
 
 fn snapshots_same_payload(a: &ServerStatusSnapshot, b: &ServerStatusSnapshot) -> bool {
@@ -601,6 +652,7 @@ impl SharedState {
     }
 
     fn clear_active_writer(&self) {
+        self.clear_last_server_activity();
         self.local_udp_port.store(0, Ordering::Release);
         self.local_udp_is_ipv6.store(false, Ordering::Release);
         self.server_is_loopback.store(false, Ordering::Release);
@@ -608,6 +660,7 @@ impl SharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.reset_upnp_for_disconnect();
         self.shutdown_active_socket();
         let writer = self
             .active_writer
@@ -617,6 +670,244 @@ impl SharedState {
         if let Some(w) = writer {
             w.shutdown_and_close();
         }
+    }
+
+    fn record_server_activity(&self, at: Instant) {
+        *self
+            .last_server_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(at);
+    }
+
+    fn clear_last_server_activity(&self) {
+        *self
+            .last_server_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn try_acquire_timeout_reconnect_slot(&self, now: Instant) -> bool {
+        let recent_activity = {
+            let guard = self
+                .last_server_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.is_some_and(|t| {
+                now.saturating_duration_since(t) < TIMEOUT_RECONNECT_ACTIVITY_GRACE
+            })
+        };
+        if recent_activity {
+            return false;
+        }
+        let mut last_guard = self
+            .last_timeout_reconnect
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = *last_guard {
+            if now.saturating_duration_since(prev) < TIMEOUT_RECONNECT_COOLDOWN {
+                return false;
+            }
+        }
+        *last_guard = Some(now);
+        true
+    }
+
+    fn disable_upnp_mapping(&self) {
+        let old_lease = {
+            let mut lease_guard = self.upnp_lease.lock().unwrap_or_else(|e| e.into_inner());
+            self.upnp_enabled.store(false, Ordering::Release);
+            self.upnp_gen.fetch_add(1, Ordering::AcqRel);
+            self.upnp_heartbeat_needed.store(false, Ordering::Release);
+            let old = lease_guard.take();
+            *self
+                .upnp_external_addr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            *self.upnp_status.lock().unwrap_or_else(|e| e.into_inner()) = UpnpStatus::Disabled;
+            old
+        };
+        if let Some(lease) = old_lease {
+            spawn_upnp_unmap_task(lease);
+        }
+    }
+
+    fn prepare_upnp_if_enabled(
+        &self,
+        expected_udp_port: Option<u16>,
+        next_status: UpnpStatus,
+    ) -> Option<u64> {
+        let (result, old_lease) = {
+            let mut lease_guard = self.upnp_lease.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.upnp_enabled.load(Ordering::Acquire) || self.stop_flag.load(Ordering::Acquire)
+            {
+                return None;
+            }
+            if let Some(expected) = expected_udp_port {
+                if self.local_udp_port.load(Ordering::Acquire) != expected {
+                    return None;
+                }
+            }
+            let next_gen = self.upnp_gen.fetch_add(1, Ordering::AcqRel) + 1;
+            self.upnp_heartbeat_needed.store(false, Ordering::Release);
+            let old = lease_guard.take();
+            *self
+                .upnp_external_addr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            *self.upnp_status.lock().unwrap_or_else(|e| e.into_inner()) = next_status;
+            (Some(next_gen), old)
+        };
+        if let Some(lease) = old_lease {
+            spawn_upnp_unmap_task(lease);
+        }
+        result
+    }
+
+    /// 持 `upnp_lease -> upnp_external_addr -> upnp_status` 锁原子开启 UPnP 并复检当前 UDP 端口与连接态，
+    /// 与并发 `clear_active_writer` / `reset_upnp_for_disconnect` 串行化，避免为已清零的旧端口发起无效映射。
+    fn enable_upnp_and_prepare(&self) -> Option<(u16, u64)> {
+        let (spawn_args, old_lease) = {
+            let mut lease_guard = self.upnp_lease.lock().unwrap_or_else(|e| e.into_inner());
+            if self.stop_flag.load(Ordering::Acquire) {
+                return None;
+            }
+            let was_enabled = self.upnp_enabled.swap(true, Ordering::AcqRel);
+            let mut addr_guard = self
+                .upnp_external_addr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut status_guard = self.upnp_status.lock().unwrap_or_else(|e| e.into_inner());
+            if was_enabled
+                && matches!(
+                    *status_guard,
+                    UpnpStatus::Discovering | UpnpStatus::Mapped { .. }
+                )
+            {
+                return None;
+            }
+
+            let port = self.local_udp_port.load(Ordering::Acquire);
+            let is_ipv6 = self.local_udp_is_ipv6.load(Ordering::Acquire);
+            let is_loopback = self.server_is_loopback.load(Ordering::Acquire);
+
+            let next_gen = self.upnp_gen.fetch_add(1, Ordering::AcqRel) + 1;
+            self.upnp_heartbeat_needed.store(false, Ordering::Release);
+            let old = lease_guard.take();
+            *addr_guard = None;
+
+            let (next_status, to_spawn) = if port == 0 {
+                (UpnpStatus::Discovering, None)
+            } else if is_ipv6 {
+                (
+                    UpnpStatus::Unavailable {
+                        reason: "当前信令通道使用 IPv6，无需 IPv4 UPnP 映射".to_string(),
+                    },
+                    None,
+                )
+            } else if is_loopback {
+                (
+                    UpnpStatus::Unavailable {
+                        reason: "本地回环调试模式已跳过 UPnP 网关探测".to_string(),
+                    },
+                    None,
+                )
+            } else {
+                (UpnpStatus::Discovering, Some((port, next_gen)))
+            };
+            *status_guard = next_status;
+            (to_spawn, old)
+        };
+        if let Some(lease) = old_lease {
+            spawn_upnp_unmap_task(lease);
+        }
+        spawn_args
+    }
+
+    fn reset_upnp_for_disconnect(&self) {
+        let old_lease = {
+            let mut lease_guard = self.upnp_lease.lock().unwrap_or_else(|e| e.into_inner());
+            self.upnp_gen.fetch_add(1, Ordering::AcqRel);
+            self.upnp_heartbeat_needed.store(false, Ordering::Release);
+            let old = lease_guard.take();
+            *self
+                .upnp_external_addr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            let next_status = if self.upnp_enabled.load(Ordering::Acquire)
+                && !self.stop_flag.load(Ordering::Acquire)
+            {
+                UpnpStatus::Discovering
+            } else {
+                UpnpStatus::Disabled
+            };
+            *self.upnp_status.lock().unwrap_or_else(|e| e.into_inner()) = next_status;
+            old
+        };
+        if let Some(lease) = old_lease {
+            spawn_upnp_unmap_task(lease);
+        }
+    }
+
+    fn cleanup_upnp_on_stop(&self) {
+        let old_lease = {
+            let mut lease_guard = self.upnp_lease.lock().unwrap_or_else(|e| e.into_inner());
+            self.upnp_gen.fetch_add(1, Ordering::AcqRel);
+            self.upnp_heartbeat_needed.store(false, Ordering::Release);
+            let old = lease_guard.take();
+            *self
+                .upnp_external_addr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            if !self.upnp_enabled.load(Ordering::Acquire) {
+                *self.upnp_status.lock().unwrap_or_else(|e| e.into_inner()) = UpnpStatus::Disabled;
+            }
+            old
+        };
+        if let Some(lease) = old_lease {
+            spawn_upnp_unmap_task(lease);
+        }
+    }
+
+    fn format_reconnect_reason(&self) -> String {
+        let reason = self
+            .reconnect_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match reason {
+            Some(r) if !r.is_empty() => format!("触发信令快速重连 ({r})"),
+            _ => "触发信令快速重连".to_string(),
+        }
+    }
+
+    fn request_fast_reconnect(&self, reason: &str, reset_backoff: bool) {
+        let trimmed = reason.trim();
+        {
+            let mut reason_guard = self
+                .reconnect_reason
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *reason_guard = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        {
+            let guard = self.stop_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if *guard || self.stop_flag.load(Ordering::Acquire) {
+                return;
+            }
+            self.fast_reconnect.store(true, Ordering::Release);
+            if reset_backoff {
+                self.reset_backoff_on_reconnect
+                    .store(true, Ordering::Release);
+            }
+            self.reconnect_epoch.fetch_add(1, Ordering::AcqRel);
+            self.stop_cv.notify_all();
+        }
+        self.reset_upnp_for_disconnect();
+        self.shutdown_active_socket();
     }
 
     fn current_effective_lan_addrs(
@@ -629,7 +920,7 @@ impl SharedState {
             return Vec::new();
         }
         let allow_loopback = self.server_is_loopback.load(Ordering::Acquire);
-        if self.dynamic_lan_discovery && !local_udp_is_ipv6 {
+        let mut out = if self.dynamic_lan_discovery && !local_udp_is_ipv6 {
             let targets = self
                 .connected_probe_targets
                 .lock()
@@ -640,20 +931,43 @@ impl SharedState {
                 let mut combined: Vec<String> =
                     discovered.into_iter().map(|ip| ip.to_string()).collect();
                 combined.extend(static_lan_addrs.iter().cloned());
-                return effective_lan_addrs(
-                    &combined,
+                effective_lan_addrs(&combined, local_udp_port, local_udp_is_ipv6, allow_loopback)
+            } else {
+                effective_lan_addrs(
+                    static_lan_addrs,
                     local_udp_port,
                     local_udp_is_ipv6,
                     allow_loopback,
-                );
+                )
+            }
+        } else {
+            effective_lan_addrs(
+                static_lan_addrs,
+                local_udp_port,
+                local_udp_is_ipv6,
+                allow_loopback,
+            )
+        };
+
+        if !local_udp_is_ipv6 {
+            let upnp_ext = self
+                .upnp_external_addr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(ext) = upnp_ext {
+                let trimmed = ext.trim();
+                if !trimmed.is_empty()
+                    && trimmed.len() <= MAX_LAN_ADDR_BYTES
+                    && trimmed.bytes().all(|b| b.is_ascii_graphic())
+                    && !out.iter().any(|existing| existing == trimmed)
+                    && out.len() < MAX_LAN_ADDRS
+                {
+                    out.push(trimmed.to_string());
+                }
             }
         }
-        effective_lan_addrs(
-            static_lan_addrs,
-            local_udp_port,
-            local_udp_is_ipv6,
-            allow_loopback,
-        )
+        out
     }
 
     fn send_msg(&self, msg: &OutgoingSignalMsg) -> Result<(), String> {
@@ -680,13 +994,19 @@ impl SharedState {
         send_res
     }
 
-    fn sleep_or_stop(&self, duration: Duration) -> bool {
+    fn sleep_or_stop(&self, duration: Duration, sleep_epoch: u64) -> SleepWake {
         let mut guard = self.stop_lock.lock().unwrap_or_else(|e| e.into_inner());
         if *guard || self.stop_flag.load(Ordering::Acquire) {
-            return true;
+            return SleepWake::Stopped;
+        }
+        if self.reconnect_epoch.load(Ordering::Acquire) != sleep_epoch {
+            return SleepWake::Reconnect;
         }
         let deadline = Instant::now() + duration;
-        while !*guard && !self.stop_flag.load(Ordering::Acquire) {
+        while !*guard
+            && !self.stop_flag.load(Ordering::Acquire)
+            && self.reconnect_epoch.load(Ordering::Acquire) == sleep_epoch
+        {
             let now = Instant::now();
             if now >= deadline {
                 break;
@@ -700,7 +1020,13 @@ impl SharedState {
                 break;
             }
         }
-        *guard || self.stop_flag.load(Ordering::Acquire)
+        if *guard || self.stop_flag.load(Ordering::Acquire) {
+            SleepWake::Stopped
+        } else if self.reconnect_epoch.load(Ordering::Acquire) != sleep_epoch {
+            SleepWake::Reconnect
+        } else {
+            SleepWake::TimedOut
+        }
     }
 
     fn signal_stop(&self) {
@@ -713,6 +1039,152 @@ impl SharedState {
         // 先立即失败所有在途请求，再通过独立 shutdown_stream 切断套接字（绝不等待 active_writer 锁）。
         self.fail_all_pending("信令客户端已停止");
         self.shutdown_active_socket();
+    }
+}
+
+fn spawn_upnp_unmap_task(lease: UpnpMappingLease) {
+    let _ = thread::Builder::new()
+        .name("rc-upnp-unmap".to_string())
+        .spawn(move || {
+            unmap_udp_port(&lease, UPNP_UNMAP_TIMEOUT);
+        });
+}
+
+fn spawn_upnp_map_task(shared: Arc<SharedState>, bound_udp_port: u16, generation: u64) {
+    let _ = thread::Builder::new()
+        .name("rc-upnp-map".to_string())
+        .spawn(move || {
+            if shared.upnp_gen.load(Ordering::Acquire) != generation
+                || shared.local_udp_port.load(Ordering::Acquire) != bound_udp_port
+                || !shared.upnp_enabled.load(Ordering::Acquire)
+                || shared.stop_flag.load(Ordering::Acquire)
+            {
+                return;
+            }
+            let res = map_udp_port(bound_udp_port, UPNP_LEASE_SECS, UPNP_MAP_TIMEOUT);
+            apply_upnp_map_result(&shared, generation, res);
+        });
+}
+
+fn maybe_spawn_upnp_renew(shared: &Arc<SharedState>) {
+    if !shared.upnp_enabled.load(Ordering::Acquire) || shared.stop_flag.load(Ordering::Acquire) {
+        return;
+    }
+    let (generation, lease_opt) = {
+        let lease_guard = shared.upnp_lease.lock().unwrap_or_else(|e| e.into_inner());
+        (shared.upnp_gen.load(Ordering::Acquire), lease_guard.clone())
+    };
+    let Some(lease) = lease_opt else {
+        return;
+    };
+    let shared_bg = Arc::clone(shared);
+    let _ = thread::Builder::new()
+        .name("rc-upnp-renew".to_string())
+        .spawn(move || {
+            let res = renew_udp_mapping(&lease, UPNP_LEASE_SECS, UPNP_MAP_TIMEOUT);
+            apply_upnp_map_result(&shared_bg, generation, res);
+        });
+}
+
+fn trigger_upnp_for_bound_udp(
+    shared: &Arc<SharedState>,
+    bound_udp_port: u16,
+    bound_udp_is_ipv6: bool,
+    server_is_loopback: bool,
+) {
+    if !shared.upnp_enabled.load(Ordering::Acquire) || shared.stop_flag.load(Ordering::Acquire) {
+        return;
+    }
+    if bound_udp_port == 0 {
+        let _ = shared.prepare_upnp_if_enabled(
+            None,
+            UpnpStatus::Unavailable {
+                reason: "未绑定持久化 UDP 探测端口".to_string(),
+            },
+        );
+        return;
+    }
+    if bound_udp_is_ipv6 {
+        let _ = shared.prepare_upnp_if_enabled(
+            Some(bound_udp_port),
+            UpnpStatus::Unavailable {
+                reason: "当前信令通道使用 IPv6，无需 IPv4 UPnP 映射".to_string(),
+            },
+        );
+        return;
+    }
+    if server_is_loopback {
+        let _ = shared.prepare_upnp_if_enabled(
+            Some(bound_udp_port),
+            UpnpStatus::Unavailable {
+                reason: "本地回环调试模式已跳过 UPnP 网关探测".to_string(),
+            },
+        );
+        return;
+    }
+    if let Some(generation) =
+        shared.prepare_upnp_if_enabled(Some(bound_udp_port), UpnpStatus::Discovering)
+    {
+        spawn_upnp_map_task(Arc::clone(shared), bound_udp_port, generation);
+    }
+}
+
+fn apply_upnp_map_result(
+    shared: &SharedState,
+    generation: u64,
+    result: Result<UpnpMappingLease, String>,
+) {
+    let mut lease_to_unmap: Option<UpnpMappingLease> = None;
+    {
+        let mut lease_guard = shared.upnp_lease.lock().unwrap_or_else(|e| e.into_inner());
+        let stale = shared.upnp_gen.load(Ordering::Acquire) != generation
+            || !shared.upnp_enabled.load(Ordering::Acquire)
+            || shared.stop_flag.load(Ordering::Acquire);
+        if stale {
+            if let Ok(stale_lease) = result {
+                lease_to_unmap = Some(stale_lease);
+            }
+        } else {
+            match result {
+                Ok(lease) => {
+                    let ext_str = lease.external_addr.to_string();
+                    let proto_str = lease.protocol.as_str().to_string();
+                    let new_ext_addr = lease.external_addr;
+                    if let Some(prev) = lease_guard.replace(lease) {
+                        if prev.external_addr != new_ext_addr {
+                            lease_to_unmap = Some(prev);
+                        }
+                    }
+                    let mut addr_guard = shared
+                        .upnp_external_addr
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let changed = addr_guard.as_deref() != Some(ext_str.as_str());
+                    *addr_guard = Some(ext_str.clone());
+                    let mut status_guard =
+                        shared.upnp_status.lock().unwrap_or_else(|e| e.into_inner());
+                    *status_guard = UpnpStatus::Mapped {
+                        external_addr: ext_str,
+                        protocol: proto_str,
+                    };
+                    if changed {
+                        shared.upnp_heartbeat_needed.store(true, Ordering::Release);
+                    }
+                }
+                Err(reason) => {
+                    *lease_guard = None;
+                    *shared
+                        .upnp_external_addr
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+                    *shared.upnp_status.lock().unwrap_or_else(|e| e.into_inner()) =
+                        UpnpStatus::Unavailable { reason };
+                }
+            }
+        }
+    }
+    if let Some(lease) = lease_to_unmap {
+        unmap_udp_port(&lease, UPNP_UNMAP_TIMEOUT);
     }
 }
 
@@ -812,6 +1284,7 @@ impl SignalClientHandle {
             initial_assist,
             initial_remote_ctrl,
             dynamic_lan_discovery,
+            upnp_enabled,
         ) = match options {
             Some(opts) => {
                 let pubkey = opts
@@ -835,9 +1308,23 @@ impl SignalClientHandle {
                     assist,
                     remote_ctrl,
                     opts.dynamic_lan_discovery,
+                    opts.upnp_enabled,
                 )
             }
-            None => (None, None, None, ASSIST_UNSET, REMOTE_CTRL_UNSET, false),
+            None => (
+                None,
+                None,
+                None,
+                ASSIST_UNSET,
+                REMOTE_CTRL_UNSET,
+                false,
+                false,
+            ),
+        };
+        let initial_upnp_status = if upnp_enabled {
+            UpnpStatus::Discovering
+        } else {
+            UpnpStatus::Disabled
         };
 
         let shared = Arc::new(SharedState {
@@ -852,11 +1339,23 @@ impl SignalClientHandle {
             stop_flag: AtomicBool::new(false),
             stop_lock: Mutex::new(false),
             stop_cv: Condvar::new(),
+            fast_reconnect: AtomicBool::new(false),
+            reset_backoff_on_reconnect: AtomicBool::new(false),
+            reconnect_epoch: AtomicU64::new(0),
+            reconnect_reason: Mutex::new(None),
+            last_server_activity: Mutex::new(None),
+            last_timeout_reconnect: Mutex::new(None),
             local_udp_port: AtomicU16::new(0),
             local_udp_is_ipv6: AtomicBool::new(false),
             dynamic_lan_discovery,
             connected_probe_targets: Mutex::new(Vec::new()),
             server_is_loopback: AtomicBool::new(false),
+            upnp_enabled: AtomicBool::new(upnp_enabled),
+            upnp_status: Mutex::new(initial_upnp_status),
+            upnp_external_addr: Mutex::new(None),
+            upnp_lease: Mutex::new(None),
+            upnp_gen: AtomicU64::new(0),
+            upnp_heartbeat_needed: AtomicBool::new(false),
             lan_addrs: clean_lan_addrs.clone(),
             enabled: active,
             token_provider,
@@ -978,12 +1477,20 @@ impl SignalClientHandle {
         match rx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let mut pending = self
+                {
+                    let mut pending = self
+                        .shared
+                        .pending_connects
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    pending.remove(&session_id);
+                }
+                if self
                     .shared
-                    .pending_connects
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                pending.remove(&session_id);
+                    .try_acquire_timeout_reconnect_slot(Instant::now())
+                {
+                    self.trigger_reconnect_inner("connect_request_timeout", false);
+                }
                 Err("等待服务器下发连接凭据超时".to_string())
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -996,6 +1503,45 @@ impl SignalClientHandle {
                 Err("信令连接已断开".to_string())
             }
         }
+    }
+
+    fn trigger_reconnect_inner(&self, reason: &str, reset_backoff: bool) {
+        if !self.shared.enabled || self.shared.stop_flag.load(Ordering::Acquire) {
+            return;
+        }
+        self.shared.request_fast_reconnect(reason, reset_backoff);
+    }
+
+    /// 主动触发信令快速重连（适用于系统切网、休眠唤醒或检测到底层半开死连接）。
+    ///
+    /// 置位快速重连标记（下次退避窗口缩短为 `200ms` 并重置退避阶梯），立即关闭当前活跃的
+    /// TCP/TLS 套接字并唤醒退避等待条件变量；在未连接、正在重连或未启用状态下调用均幂等安全。
+    pub fn trigger_reconnect(&self, reason: &str) {
+        self.trigger_reconnect_inner(reason, true);
+    }
+
+    /// 动态开启或关闭 UPnP / NAT-PMP 自动 UDP 端口映射。
+    ///
+    /// 关闭时立即递增代际号、清空公网映射地址、置状态为 [`UpnpStatus::Disabled`] 并在后台短线程
+    /// 尽力调用 [`unmap_udp_port`] 释放旧租约；开启时若当前已绑定非零 IPv4 持久化 UDP 探测端口
+    /// （且非本地回环模式），则立即触发后台异步端口映射。
+    pub fn set_upnp_enabled(&self, enabled: bool) {
+        if !enabled {
+            self.shared.disable_upnp_mapping();
+            return;
+        }
+        if let Some((port, generation)) = self.shared.enable_upnp_and_prepare() {
+            spawn_upnp_map_task(Arc::clone(&self.shared), port, generation);
+        }
+    }
+
+    /// 返回当前 UPnP / NAT-PMP 自动端口映射状态快照。
+    pub fn upnp_status(&self) -> UpnpStatus {
+        self.shared
+            .upnp_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 实时更新本机「允许他人远程协助」状态并同步发送 `UpdateAssistState` 信令帧（不覆写远端 `allow_remote_control`）。
@@ -1085,12 +1631,13 @@ impl SignalClientHandle {
         self.shared.signal_stop();
     }
 
-    /// 优雅停止后台信令线程并等待其退出。
+    /// 优雅停止后台信令线程并等待其退出，同时尽力异步清理残留 UPnP 映射租约。
     pub fn stop(&mut self) {
         self.shared.signal_stop();
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
+        self.shared.cleanup_upnp_on_stop();
     }
 }
 
@@ -1450,10 +1997,38 @@ fn worker_loop(
             }
         }
 
-        let wait = timing.backoffs[backoff_idx];
-        backoff_idx = (backoff_idx + 1).min(timing.backoffs.len() - 1);
-        if shared.sleep_or_stop(wait) {
-            break;
+        let (wait, sleep_epoch) = {
+            let _guard = shared.stop_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let epoch = shared.reconnect_epoch.load(Ordering::Acquire);
+            let fast = shared.fast_reconnect.swap(false, Ordering::AcqRel);
+            let reset_backoff = shared
+                .reset_backoff_on_reconnect
+                .swap(false, Ordering::AcqRel);
+            if reset_backoff {
+                backoff_idx = 0;
+                (FAST_RECONNECT_DELAY, epoch)
+            } else if fast && backoff_idx == 0 {
+                backoff_idx = (backoff_idx + 1).min(timing.backoffs.len() - 1);
+                (FAST_RECONNECT_DELAY, epoch)
+            } else {
+                let w = timing.backoffs[backoff_idx];
+                backoff_idx = (backoff_idx + 1).min(timing.backoffs.len() - 1);
+                (w, epoch)
+            }
+        };
+        match shared.sleep_or_stop(wait, sleep_epoch) {
+            SleepWake::Stopped => break,
+            SleepWake::Reconnect => {
+                let _guard = shared.stop_lock.lock().unwrap_or_else(|e| e.into_inner());
+                shared.fast_reconnect.store(false, Ordering::Release);
+                if shared
+                    .reset_backoff_on_reconnect
+                    .swap(false, Ordering::AcqRel)
+                {
+                    backoff_idx = 0;
+                }
+            }
+            SleepWake::TimedOut => {}
         }
     }
 
@@ -1520,6 +2095,7 @@ fn parse_signal_server_name(host: &str) -> Result<ServerName<'static>, String> {
 
 enum TlsHandshakeErr {
     Stopped,
+    Reconnecting,
     Failed(String),
 }
 
@@ -1528,10 +2104,14 @@ fn complete_tls_handshake(
     tcp: &mut TcpStream,
     deadline: Instant,
     stop_flag: &AtomicBool,
+    reconnect_epoch: (&AtomicU64, u64),
 ) -> Result<(), TlsHandshakeErr> {
     while conn.is_handshaking() {
         if stop_flag.load(Ordering::Acquire) {
             return Err(TlsHandshakeErr::Stopped);
+        }
+        if reconnect_epoch.0.load(Ordering::Acquire) != reconnect_epoch.1 {
+            return Err(TlsHandshakeErr::Reconnecting);
         }
         if Instant::now() >= deadline {
             return Err(TlsHandshakeErr::Failed("信令 TLS 1.3 握手超时".to_string()));
@@ -1543,6 +2123,9 @@ fn complete_tls_handshake(
                 continue;
             }
             Err(e) => {
+                if reconnect_epoch.0.load(Ordering::Acquire) != reconnect_epoch.1 {
+                    return Err(TlsHandshakeErr::Reconnecting);
+                }
                 return Err(TlsHandshakeErr::Failed(format!(
                     "信令 TLS 1.3 握手失败：{e}"
                 )));
@@ -1584,7 +2167,7 @@ impl SignalReader {
 
 #[allow(clippy::too_many_arguments)]
 fn run_single_connection(
-    shared: &SharedState,
+    shared: &Arc<SharedState>,
     cfg: &ServerConfig,
     hostname: &str,
     lan_addrs: &[String],
@@ -1598,6 +2181,7 @@ fn run_single_connection(
     if shared.stop_flag.load(Ordering::Acquire) {
         return ConnectionOutcome::Stopped;
     }
+    let conn_reconnect_epoch = shared.reconnect_epoch.load(Ordering::Acquire);
 
     // 在拨号建连前完成 Access Token 获取/强制刷新，避免 HTTP 刷新往返挤占服务端
     // handshake_timeout（10s），并在刷新瞬态失败时保留 expired_token 供下轮重试。
@@ -1626,16 +2210,31 @@ fn run_single_connection(
     if shared.stop_flag.load(Ordering::Acquire) {
         return ConnectionOutcome::Stopped;
     }
+    if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+        return ConnectionOutcome::ConnectFailed(shared.format_reconnect_reason());
+    }
     let mut sent_access_token = access_token.clone();
 
-    let stream = match dial_tcp(default_signal_addr, HANDSHAKE_TIMEOUT, &shared.stop_flag) {
+    let stream = match dial_tcp_with_epoch(
+        default_signal_addr,
+        HANDSHAKE_TIMEOUT,
+        &shared.stop_flag,
+        Some((&shared.reconnect_epoch, conn_reconnect_epoch)),
+    ) {
         Ok(s) => s,
         Err(DialError::Stopped) => return ConnectionOutcome::Stopped,
+        Err(DialError::Reconnecting) => {
+            return ConnectionOutcome::ConnectFailed(shared.format_reconnect_reason());
+        }
         Err(DialError::Failed(err)) => return ConnectionOutcome::ConnectFailed(err),
     };
     if shared.stop_flag.load(Ordering::Acquire) {
         let _ = stream.shutdown(Shutdown::Both);
         return ConnectionOutcome::Stopped;
+    }
+    if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+        let _ = stream.shutdown(Shutdown::Both);
+        return ConnectionOutcome::ConnectFailed(shared.format_reconnect_reason());
     }
 
     let _ = stream.set_nodelay(true);
@@ -1644,7 +2243,7 @@ fn run_single_connection(
     let _ = stream.set_read_timeout(Some(READ_POLL_TIMEOUT));
     let peer_addr = stream.peer_addr().ok();
 
-    // 在握手前即注册独立 shutdown_stream，确保 stop() 可瞬间打断握手读写。
+    // 在握手前即注册独立 shutdown_stream，确保 stop() / trigger_reconnect() 可瞬间打断握手读写。
     let shutdown_clone = match stream.try_clone() {
         Ok(s) => s,
         Err(err) => {
@@ -1660,6 +2259,11 @@ fn run_single_connection(
             drop(shutdown_guard);
             let _ = stream.shutdown(Shutdown::Both);
             return ConnectionOutcome::Stopped;
+        }
+        if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+            drop(shutdown_guard);
+            let _ = stream.shutdown(Shutdown::Both);
+            return ConnectionOutcome::ConnectFailed(shared.format_reconnect_reason());
         }
         *shutdown_guard = Some(shutdown_clone);
     }
@@ -1695,10 +2299,14 @@ fn run_single_connection(
             &mut tcp_for_tls,
             handshake_deadline,
             &shared.stop_flag,
+            (&shared.reconnect_epoch, conn_reconnect_epoch),
         ) {
             let _ = tcp_for_tls.shutdown(Shutdown::Both);
             return match err {
                 TlsHandshakeErr::Stopped => ConnectionOutcome::Stopped,
+                TlsHandshakeErr::Reconnecting => {
+                    ConnectionOutcome::ConnectFailed(shared.format_reconnect_reason())
+                }
                 TlsHandshakeErr::Failed(msg) => ConnectionOutcome::ConnectFailed(msg),
             };
         }
@@ -1770,6 +2378,9 @@ fn run_single_connection(
         if shared.stop_flag.load(Ordering::Acquire) {
             return ConnectionOutcome::Stopped;
         }
+        if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+            return ConnectionOutcome::ConnectFailed(shared.format_reconnect_reason());
+        }
         return ConnectionOutcome::ConnectFailed(format!("发送注册请求失败：{err}"));
     }
 
@@ -1778,6 +2389,9 @@ fn run_single_connection(
         if shared.stop_flag.load(Ordering::Acquire) {
             return ConnectionOutcome::Stopped;
         }
+        if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+            return ConnectionOutcome::ConnectFailed(shared.format_reconnect_reason());
+        }
         if Instant::now() >= handshake_deadline {
             return ConnectionOutcome::ConnectFailed("等待服务器注册响应超时".to_string());
         }
@@ -1785,11 +2399,17 @@ fn run_single_connection(
             FrameRead::IdleTick => continue,
             FrameRead::Stopped => return ConnectionOutcome::Stopped,
             FrameRead::Eof => {
+                if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+                    return ConnectionOutcome::ConnectFailed(shared.format_reconnect_reason());
+                }
                 return ConnectionOutcome::ConnectFailed("服务器在注册阶段关闭了连接".to_string());
             }
             FrameRead::Error(err) => {
                 if shared.stop_flag.load(Ordering::Acquire) {
                     return ConnectionOutcome::Stopped;
+                }
+                if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+                    return ConnectionOutcome::ConnectFailed(shared.format_reconnect_reason());
                 }
                 return ConnectionOutcome::ConnectFailed(format!("读取注册响应失败：{err}"));
             }
@@ -1856,6 +2476,11 @@ fn run_single_connection(
             shared.clear_active_writer();
             return ConnectionOutcome::Stopped;
         }
+        if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+            drop(writer_guard);
+            shared.clear_active_writer();
+            return ConnectionOutcome::ConnectFailed(shared.format_reconnect_reason());
+        }
         *writer_guard = Some(writer_template);
     }
 
@@ -1865,7 +2490,8 @@ fn run_single_connection(
 
     let connected_at = Instant::now();
     let mut last_server_activity = connected_at;
-    // 在 Registered 时一次性解析 UDP 探测目标（优先匹配 TCP 对端地址族），避免每 30s 阻塞 DNS。
+    shared.clear_last_server_activity();
+    // 在 Registered 时一次性解析 UDP 探测目标（优先匹配 TCP 对端地址族），避免每 10s 阻塞 DNS。
     let udp_probe_target = resolve_udp_probe_target(&effective_udp_probe_addr, peer_addr);
     let server_is_loopback = peer_addr.is_some_and(|addr| canonicalize_ip(addr.ip()).is_loopback());
     shared
@@ -1906,6 +2532,13 @@ fn run_single_connection(
             if shared.stop_flag.load(Ordering::Acquire) {
                 return ConnectionOutcome::Stopped;
             }
+            if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+                return ConnectionOutcome::ConnectedThenDropped {
+                    reason: shared.format_reconnect_reason(),
+                    healthy_duration: connected_at.elapsed(),
+                    kicked: false,
+                };
+            }
             return ConnectionOutcome::ConnectedThenDropped {
                 reason: format!("发送初始心跳失败：{err}"),
                 healthy_duration: connected_at.elapsed(),
@@ -1913,6 +2546,14 @@ fn run_single_connection(
             };
         }
     }
+
+    // 异步非阻塞启动 UPnP / NAT-PMP 端口映射（绝不阻塞注册、心跳与 Connected 宣告）。
+    trigger_upnp_for_bound_udp(
+        shared,
+        bound_udp_port,
+        bound_udp_is_ipv6,
+        server_is_loopback,
+    );
 
     shared.set_status(
         ServerStatusSnapshot {
@@ -1936,10 +2577,18 @@ fn run_single_connection(
     }
 
     let mut last_heartbeat = Instant::now();
+    let mut last_upnp_renew = Instant::now();
 
     loop {
         if shared.stop_flag.load(Ordering::Acquire) {
             return ConnectionOutcome::Stopped;
+        }
+        if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+            return ConnectionOutcome::ConnectedThenDropped {
+                reason: shared.format_reconnect_reason(),
+                healthy_duration: connected_at.elapsed(),
+                kicked: false,
+            };
         }
 
         if last_server_activity.elapsed() >= timing.activity_timeout {
@@ -1950,7 +2599,14 @@ fn run_single_connection(
             };
         }
 
-        if last_heartbeat.elapsed() >= timing.heartbeat_interval {
+        if last_upnp_renew.elapsed() >= UPNP_RENEW_INTERVAL {
+            last_upnp_renew = Instant::now();
+            maybe_spawn_upnp_renew(shared);
+        }
+
+        let upnp_hb_due = shared.upnp_heartbeat_needed.swap(false, Ordering::AcqRel);
+        let periodic_hb_due = last_heartbeat.elapsed() >= timing.heartbeat_interval;
+        if periodic_hb_due || upnp_hb_due {
             let current_udp_port = shared.local_udp_port.load(Ordering::Acquire);
             let current_udp_is_ipv6 = shared.local_udp_is_ipv6.load(Ordering::Acquire);
             if let Err(err) = send_heartbeat_frame(
@@ -1965,22 +2621,38 @@ fn run_single_connection(
                 if shared.stop_flag.load(Ordering::Acquire) {
                     return ConnectionOutcome::Stopped;
                 }
+                if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+                    return ConnectionOutcome::ConnectedThenDropped {
+                        reason: shared.format_reconnect_reason(),
+                        healthy_duration: connected_at.elapsed(),
+                        kicked: false,
+                    };
+                }
                 return ConnectionOutcome::ConnectedThenDropped {
                     reason: format!("发送心跳失败：{err}"),
                     healthy_duration: connected_at.elapsed(),
                     kicked: false,
                 };
             }
-            if let Some(ref probe) = udp_probe {
-                probe.send_probe(&assigned_id);
+            if periodic_hb_due {
+                if let Some(ref probe) = udp_probe {
+                    probe.send_probe(&assigned_id);
+                }
+                last_heartbeat = Instant::now();
             }
-            last_heartbeat = Instant::now();
         }
 
         match reader.read_frame(&shared.stop_flag) {
             FrameRead::IdleTick => continue,
             FrameRead::Stopped => return ConnectionOutcome::Stopped,
             FrameRead::Eof => {
+                if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+                    return ConnectionOutcome::ConnectedThenDropped {
+                        reason: shared.format_reconnect_reason(),
+                        healthy_duration: connected_at.elapsed(),
+                        kicked: false,
+                    };
+                }
                 return ConnectionOutcome::ConnectedThenDropped {
                     reason: "信令服务器断开连接".to_string(),
                     healthy_duration: connected_at.elapsed(),
@@ -1991,6 +2663,13 @@ fn run_single_connection(
                 if shared.stop_flag.load(Ordering::Acquire) {
                     return ConnectionOutcome::Stopped;
                 }
+                if shared.reconnect_epoch.load(Ordering::Acquire) != conn_reconnect_epoch {
+                    return ConnectionOutcome::ConnectedThenDropped {
+                        reason: shared.format_reconnect_reason(),
+                        healthy_duration: connected_at.elapsed(),
+                        kicked: false,
+                    };
+                }
                 return ConnectionOutcome::ConnectedThenDropped {
                     reason: format!("读取信令帧失败：{err}"),
                     healthy_duration: connected_at.elapsed(),
@@ -1998,7 +2677,9 @@ fn run_single_connection(
                 };
             }
             FrameRead::Message(msg) => {
-                last_server_activity = Instant::now();
+                let now = Instant::now();
+                last_server_activity = now;
+                shared.record_server_activity(now);
                 match handle_incoming_message(
                     shared,
                     &assigned_id,
@@ -2119,6 +2800,7 @@ fn handle_incoming_message(
                     peer_lan_addrs,
                     owner_grant,
                     is_owner_connection,
+                    is_relay_alloc: false,
                 },
             );
             IncomingAction::Continue
@@ -2151,6 +2833,7 @@ fn handle_incoming_message(
                     peer_lan_addrs: Vec::new(),
                     owner_grant,
                     is_owner_connection,
+                    is_relay_alloc: true,
                 },
             );
             IncomingAction::Continue
@@ -2226,6 +2909,7 @@ struct CoordPayload {
     peer_lan_addrs: Vec<String>,
     owner_grant: Option<OwnerGrantPayload>,
     is_owner_connection: bool,
+    is_relay_alloc: bool,
 }
 
 fn normalize_optional_addr(raw: Option<String>) -> Option<String> {
@@ -2243,6 +2927,7 @@ fn dispatch_coord(shared: &SharedState, coord: CoordPayload) {
         peer_lan_addrs,
         owner_grant,
         is_owner_connection,
+        is_relay_alloc,
     } = coord;
     let peer_public_addr = normalize_optional_addr(peer_public_addr);
     let local_port = shared.local_udp_port.load(Ordering::Acquire);
@@ -2260,6 +2945,7 @@ fn dispatch_coord(shared: &SharedState, coord: CoordPayload) {
             local_udp_port,
             owner_grant,
             is_owner_connection,
+            is_relay_alloc,
         });
         return;
     }
@@ -2513,11 +3199,13 @@ fn configure_tcp_keepalive(stream: &TcpStream) {
 #[derive(Debug)]
 enum DialError {
     Stopped,
+    Reconnecting,
     Failed(String),
 }
 
 enum SingleConnectErr {
     Stopped,
+    Reconnecting,
     TimedOut,
     Io(io::Error),
 }
@@ -2563,9 +3251,13 @@ fn connect_single_interruptible(
     addr: SocketAddr,
     timeout: Duration,
     stop_flag: &AtomicBool,
+    reconnect_epoch: Option<(&AtomicU64, u64)>,
 ) -> Result<TcpStream, SingleConnectErr> {
     if stop_flag.load(Ordering::Acquire) {
         return Err(SingleConnectErr::Stopped);
+    }
+    if reconnect_epoch.is_some_and(|(atom, expected)| atom.load(Ordering::Acquire) != expected) {
+        return Err(SingleConnectErr::Reconnecting);
     }
 
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
@@ -2581,6 +3273,11 @@ fn connect_single_interruptible(
             loop {
                 if stop_flag.load(Ordering::Acquire) {
                     return Err(SingleConnectErr::Stopped);
+                }
+                if reconnect_epoch
+                    .is_some_and(|(atom, expected)| atom.load(Ordering::Acquire) != expected)
+                {
+                    return Err(SingleConnectErr::Reconnecting);
                 }
                 if let Some(so_err) = socket.take_error().map_err(SingleConnectErr::Io)? {
                     return Err(SingleConnectErr::Io(so_err));
@@ -2660,13 +3357,26 @@ fn connect_single_interruptible(
     Ok(socket.into())
 }
 
+#[cfg(test)]
 fn dial_tcp(
     addr_str: &str,
     timeout: Duration,
     stop_flag: &AtomicBool,
 ) -> Result<TcpStream, DialError> {
+    dial_tcp_with_epoch(addr_str, timeout, stop_flag, None)
+}
+
+fn dial_tcp_with_epoch(
+    addr_str: &str,
+    timeout: Duration,
+    stop_flag: &AtomicBool,
+    reconnect_epoch: Option<(&AtomicU64, u64)>,
+) -> Result<TcpStream, DialError> {
     if stop_flag.load(Ordering::Acquire) {
         return Err(DialError::Stopped);
+    }
+    if reconnect_epoch.is_some_and(|(atom, expected)| atom.load(Ordering::Acquire) != expected) {
+        return Err(DialError::Reconnecting);
     }
     let addrs: Vec<SocketAddr> = addr_str
         .to_socket_addrs()
@@ -2684,14 +3394,19 @@ fn dial_tcp(
         if stop_flag.load(Ordering::Acquire) {
             return Err(DialError::Stopped);
         }
+        if reconnect_epoch.is_some_and(|(atom, expected)| atom.load(Ordering::Acquire) != expected)
+        {
+            return Err(DialError::Reconnecting);
+        }
         let now = Instant::now();
         if now >= deadline {
             return Err(DialError::Failed(format!("连接信令服务器 {addr_str} 超时")));
         }
         let budget = per_addr_timeout(deadline - now, addrs.len() - idx);
-        match connect_single_interruptible(addr, budget, stop_flag) {
+        match connect_single_interruptible(addr, budget, stop_flag, reconnect_epoch) {
             Ok(stream) => return Ok(stream),
             Err(SingleConnectErr::Stopped) => return Err(DialError::Stopped),
+            Err(SingleConnectErr::Reconnecting) => return Err(DialError::Reconnecting),
             Err(SingleConnectErr::TimedOut) => timed_out_any = true,
             Err(SingleConnectErr::Io(err)) => last_err = Some(err),
         }
@@ -3097,6 +3812,7 @@ mod tests {
                 local_udp_port: Some(probe_port),
                 owner_grant: None,
                 is_owner_connection: false,
+                is_relay_alloc: false,
             }
         );
 
@@ -3400,11 +4116,23 @@ mod tests {
             stop_flag: AtomicBool::new(false),
             stop_lock: Mutex::new(false),
             stop_cv: Condvar::new(),
+            fast_reconnect: AtomicBool::new(false),
+            reset_backoff_on_reconnect: AtomicBool::new(false),
+            reconnect_epoch: AtomicU64::new(0),
+            reconnect_reason: Mutex::new(None),
+            last_server_activity: Mutex::new(None),
+            last_timeout_reconnect: Mutex::new(None),
             local_udp_port: AtomicU16::new(45678),
             local_udp_is_ipv6: AtomicBool::new(false),
             dynamic_lan_discovery: false,
             connected_probe_targets: Mutex::new(Vec::new()),
             server_is_loopback: AtomicBool::new(false),
+            upnp_enabled: AtomicBool::new(false),
+            upnp_status: Mutex::new(UpnpStatus::Disabled),
+            upnp_external_addr: Mutex::new(None),
+            upnp_lease: Mutex::new(None),
+            upnp_gen: AtomicU64::new(0),
+            upnp_heartbeat_needed: AtomicBool::new(false),
             lan_addrs: Vec::new(),
             enabled: true,
             token_provider: None,
@@ -3436,6 +4164,7 @@ mod tests {
                 peer_lan_addrs: Vec::new(),
                 owner_grant: None,
                 is_owner_connection: false,
+                is_relay_alloc: false,
             },
         );
         assert!(rx1.try_recv().is_err());
@@ -3454,6 +4183,7 @@ mod tests {
                 peer_lan_addrs: Vec::new(),
                 owner_grant: None,
                 is_owner_connection: false,
+                is_relay_alloc: false,
             },
         );
         assert!(rx1.try_recv().is_err());
@@ -3487,6 +4217,7 @@ mod tests {
                 peer_lan_addrs: vec!["10.0.0.2:50000".to_string()],
                 owner_grant: None,
                 is_owner_connection: false,
+                is_relay_alloc: false,
             },
         );
         let grant = rx1.try_recv().unwrap().unwrap();
@@ -3509,12 +4240,59 @@ mod tests {
                 peer_lan_addrs: vec!["192.168.1.9:9901".to_string()],
                 owner_grant: None,
                 is_owner_connection: false,
+                is_relay_alloc: false,
             },
         );
         let inc = shared.incoming.lock().unwrap().pop_front().unwrap();
         assert_eq!(inc.peer_public_addr.as_deref(), Some("198.51.100.7:44444"));
         assert_eq!(inc.peer_lan_addrs, vec!["192.168.1.9:9901".to_string()]);
         assert_eq!(inc.local_udp_port, Some(45678));
+        assert!(!inc.is_relay_alloc);
+
+        // 验证 handle_incoming_message 对 RelayReady 设置 is_relay_alloc=true、对 PunchCoord 设置 is_relay_alloc=false
+        handle_incoming_message(
+            &shared,
+            "987654321",
+            IncomingSignalMsg::RelayReady {
+                session_id: "in-relay-ready".to_string(),
+                role: "host".to_string(),
+                peer_id: "111222333".to_string(),
+                relay_token: "tok-relay-alloc".to_string(),
+                relay_addr: "127.0.0.1:21117".to_string(),
+                owner_grant: None,
+                is_owner_connection: true,
+            },
+            "127.0.0.1",
+            21117,
+            "127.0.0.1:21117",
+            "127.0.0.1:21117",
+        );
+        let inc_relay = shared.incoming.lock().unwrap().pop_front().unwrap();
+        assert!(inc_relay.is_relay_alloc);
+        assert_eq!(inc_relay.relay_token, "tok-relay-alloc");
+
+        handle_incoming_message(
+            &shared,
+            "987654321",
+            IncomingSignalMsg::PunchCoord {
+                session_id: "in-punch".to_string(),
+                role: "host".to_string(),
+                peer_id: "111222333".to_string(),
+                peer_public_udp_addr: None,
+                peer_lan_addrs: Vec::new(),
+                relay_token: "tok-punch".to_string(),
+                relay_addr: "127.0.0.1:21117".to_string(),
+                owner_grant: None,
+                is_owner_connection: true,
+            },
+            "127.0.0.1",
+            21117,
+            "127.0.0.1:21117",
+            "127.0.0.1:21117",
+        );
+        let inc_punch = shared.incoming.lock().unwrap().pop_front().unwrap();
+        assert!(!inc_punch.is_relay_alloc);
+        assert_eq!(inc_punch.relay_token, "tok-punch");
     }
 
     #[test]
@@ -3587,9 +4365,9 @@ mod tests {
             ..ServerConfig::default()
         };
         let fast_timing = SignalTiming {
-            heartbeat_interval: Duration::from_secs(30),
-            activity_timeout: Duration::from_secs(75),
-            stable_threshold: Duration::from_secs(30),
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            activity_timeout: SERVER_ACTIVITY_TIMEOUT,
+            stable_threshold: STABLE_CONNECTION_THRESHOLD,
             backoffs: [
                 Duration::from_millis(30),
                 Duration::from_millis(60),
@@ -3780,11 +4558,23 @@ mod tests {
             stop_flag: AtomicBool::new(false),
             stop_lock: Mutex::new(false),
             stop_cv: Condvar::new(),
+            fast_reconnect: AtomicBool::new(false),
+            reset_backoff_on_reconnect: AtomicBool::new(false),
+            reconnect_epoch: AtomicU64::new(0),
+            reconnect_reason: Mutex::new(None),
+            last_server_activity: Mutex::new(None),
+            last_timeout_reconnect: Mutex::new(None),
             local_udp_port: AtomicU16::new(0),
             local_udp_is_ipv6: AtomicBool::new(false),
             dynamic_lan_discovery: false,
             connected_probe_targets: Mutex::new(Vec::new()),
             server_is_loopback: AtomicBool::new(false),
+            upnp_enabled: AtomicBool::new(false),
+            upnp_status: Mutex::new(UpnpStatus::Disabled),
+            upnp_external_addr: Mutex::new(None),
+            upnp_lease: Mutex::new(None),
+            upnp_gen: AtomicU64::new(0),
+            upnp_heartbeat_needed: AtomicBool::new(false),
             lan_addrs: Vec::new(),
             enabled: true,
             token_provider: None,
@@ -3968,11 +4758,23 @@ mod tests {
             stop_flag: AtomicBool::new(false),
             stop_lock: Mutex::new(false),
             stop_cv: Condvar::new(),
+            fast_reconnect: AtomicBool::new(false),
+            reset_backoff_on_reconnect: AtomicBool::new(false),
+            reconnect_epoch: AtomicU64::new(0),
+            reconnect_reason: Mutex::new(None),
+            last_server_activity: Mutex::new(None),
+            last_timeout_reconnect: Mutex::new(None),
             local_udp_port: AtomicU16::new(50000),
             local_udp_is_ipv6: AtomicBool::new(false),
             dynamic_lan_discovery,
             connected_probe_targets: Mutex::new(vec!["192.0.2.10:21116".parse().unwrap()]),
             server_is_loopback: AtomicBool::new(true),
+            upnp_enabled: AtomicBool::new(false),
+            upnp_status: Mutex::new(UpnpStatus::Disabled),
+            upnp_external_addr: Mutex::new(None),
+            upnp_lease: Mutex::new(None),
+            upnp_gen: AtomicU64::new(0),
+            upnp_heartbeat_needed: AtomicBool::new(false),
             lan_addrs: Vec::new(),
             enabled: true,
             token_provider: None,
@@ -4071,11 +4873,23 @@ mod tests {
             stop_flag: AtomicBool::new(false),
             stop_lock: Mutex::new(false),
             stop_cv: Condvar::new(),
+            fast_reconnect: AtomicBool::new(false),
+            reset_backoff_on_reconnect: AtomicBool::new(false),
+            reconnect_epoch: AtomicU64::new(0),
+            reconnect_reason: Mutex::new(None),
+            last_server_activity: Mutex::new(None),
+            last_timeout_reconnect: Mutex::new(None),
             local_udp_port: AtomicU16::new(45678),
             local_udp_is_ipv6: AtomicBool::new(false),
             dynamic_lan_discovery: false,
             connected_probe_targets: Mutex::new(Vec::new()),
             server_is_loopback: AtomicBool::new(false),
+            upnp_enabled: AtomicBool::new(false),
+            upnp_status: Mutex::new(UpnpStatus::Disabled),
+            upnp_external_addr: Mutex::new(None),
+            upnp_lease: Mutex::new(None),
+            upnp_gen: AtomicU64::new(0),
+            upnp_heartbeat_needed: AtomicBool::new(false),
             lan_addrs: Vec::new(),
             enabled: true,
             token_provider: None,
@@ -4102,6 +4916,7 @@ mod tests {
                 peer_lan_addrs: Vec::new(),
                 owner_grant: None,
                 is_owner_connection: false,
+                is_relay_alloc: false,
             },
         );
         let inc = shared.incoming.lock().unwrap().pop_front().unwrap();
@@ -4335,9 +5150,9 @@ mod tests {
             ..SignalClientOptions::default()
         };
         let fast_timing = SignalTiming {
-            heartbeat_interval: Duration::from_secs(30),
-            activity_timeout: Duration::from_secs(75),
-            stable_threshold: Duration::from_secs(30),
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            activity_timeout: SERVER_ACTIVITY_TIMEOUT,
+            stable_threshold: STABLE_CONNECTION_THRESHOLD,
             backoffs: [
                 Duration::from_millis(30),
                 Duration::from_millis(60),
@@ -4560,9 +5375,9 @@ mod tests {
             ..SignalClientOptions::default()
         };
         let fast_timing = SignalTiming {
-            heartbeat_interval: Duration::from_secs(30),
-            activity_timeout: Duration::from_secs(75),
-            stable_threshold: Duration::from_secs(30),
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            activity_timeout: SERVER_ACTIVITY_TIMEOUT,
+            stable_threshold: STABLE_CONNECTION_THRESHOLD,
             backoffs: [
                 Duration::from_millis(25),
                 Duration::from_millis(50),
@@ -4663,9 +5478,9 @@ mod tests {
             ..SignalClientOptions::default()
         };
         let fast_timing = SignalTiming {
-            heartbeat_interval: Duration::from_secs(30),
-            activity_timeout: Duration::from_secs(75),
-            stable_threshold: Duration::from_secs(30),
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            activity_timeout: SERVER_ACTIVITY_TIMEOUT,
+            stable_threshold: STABLE_CONNECTION_THRESHOLD,
             backoffs: [
                 Duration::from_millis(25),
                 Duration::from_millis(50),
@@ -4982,9 +5797,9 @@ mod tests {
             ..SignalClientOptions::default()
         };
         let fast_timing = SignalTiming {
-            heartbeat_interval: Duration::from_secs(30),
-            activity_timeout: Duration::from_secs(75),
-            stable_threshold: Duration::from_secs(30),
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            activity_timeout: SERVER_ACTIVITY_TIMEOUT,
+            stable_threshold: STABLE_CONNECTION_THRESHOLD,
             backoffs: [
                 Duration::from_millis(25),
                 Duration::from_millis(50),
@@ -5178,9 +5993,9 @@ mod tests {
             ..SignalClientOptions::default()
         };
         let fast_timing = SignalTiming {
-            heartbeat_interval: Duration::from_secs(30),
-            activity_timeout: Duration::from_secs(75),
-            stable_threshold: Duration::from_secs(30),
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            activity_timeout: SERVER_ACTIVITY_TIMEOUT,
+            stable_threshold: STABLE_CONNECTION_THRESHOLD,
             backoffs: [
                 Duration::from_millis(25),
                 Duration::from_millis(50),
@@ -5317,5 +6132,792 @@ mod tests {
 
         client.stop();
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn heartbeat_and_activity_timeout_constants_are_tightened() {
+        assert_eq!(HEARTBEAT_INTERVAL, Duration::from_secs(10));
+        assert_eq!(SERVER_ACTIVITY_TIMEOUT, Duration::from_secs(25));
+        assert_eq!(FAST_RECONNECT_DELAY, Duration::from_millis(200));
+        assert_eq!(UPNP_LEASE_SECS, 1800);
+        assert_eq!(UPNP_MAP_TIMEOUT, Duration::from_millis(1500));
+        assert_eq!(UPNP_RENEW_INTERVAL, Duration::from_secs(900));
+    }
+
+    #[test]
+    fn trigger_reconnect_interrupts_active_connection_and_long_backoff_promptly() {
+        // 1) 未启用客户端调用 trigger_reconnect 幂等安全且不 panic
+        let mut disabled = SignalClientHandle::spawn(
+            ServerConfig::default(),
+            "disabled-reconnect".to_string(),
+            Vec::new(),
+        );
+        disabled.trigger_reconnect("noop");
+        disabled.stop();
+        disabled.trigger_reconnect("after_stop");
+
+        // 2) 活跃连接 + 大退避 [10s; 4]：调用 trigger_reconnect 立即切断当前连接并在 ~200ms 快速重连
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let round2_connected = Arc::new(AtomicBool::new(false));
+        let round2_connected_srv = Arc::clone(&round2_connected);
+
+        let server = thread::spawn(move || {
+            // Round 1: 正常注册后保持空闲等待客户端主动切断
+            let (mut s1, _) = listener.accept().unwrap();
+            let _ = s1.set_read_timeout(Some(Duration::from_secs(3)));
+            let reg1 = read_test_frame(&mut s1);
+            assert_eq!(reg1["type"], "register");
+            write_test_frame(
+                &mut s1,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "611222333",
+                    "formatted_id": "611 222 333",
+                    "udp_probe_addr": "",
+                    "relay_addr": ""
+                }),
+            );
+            let mut sink = [0u8; 64];
+            while matches!(s1.read(&mut sink), Ok(n) if n > 0) {}
+
+            // Round 2: 客户端快速重连进入第 2 轮
+            let (mut s2, _) = listener.accept().unwrap();
+            let _ = s2.set_read_timeout(Some(Duration::from_secs(3)));
+            let reg2 = read_test_frame(&mut s2);
+            assert_eq!(reg2["type"], "register");
+            write_test_frame(
+                &mut s2,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "611222333",
+                    "formatted_id": "611 222 333",
+                    "udp_probe_addr": "",
+                    "relay_addr": ""
+                }),
+            );
+            round2_connected_srv.store(true, Ordering::Release);
+            let mut sink2 = [0u8; 64];
+            while matches!(s2.read(&mut sink2), Ok(n) if n > 0) {}
+        });
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: addr.port(),
+            relay_port: 21117,
+            use_https: false,
+            device_key: crate::server_config::generate_device_key(),
+            ..ServerConfig::default()
+        };
+        let huge_backoff_timing = SignalTiming {
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            activity_timeout: SERVER_ACTIVITY_TIMEOUT,
+            stable_threshold: STABLE_CONNECTION_THRESHOLD,
+            backoffs: [Duration::from_secs(10); 4],
+        };
+        let mut client = SignalClientHandle::spawn_with_timing(
+            cfg,
+            "fast-reconnect-test".to_string(),
+            Vec::new(),
+            None,
+            huge_backoff_timing,
+            |_| {},
+        );
+
+        let snap1 = wait_until_connected(&client, Duration::from_secs(3));
+        assert_eq!(snap1.device_id.as_deref(), Some("611222333"));
+
+        let t0 = Instant::now();
+        client.trigger_reconnect("network_switched");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !round2_connected.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(15));
+        }
+        assert!(
+            round2_connected.load(Ordering::Acquire),
+            "trigger_reconnect must interrupt active connection and reconnect promptly"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "fast reconnect must bypass 10s backoff, took {:?}",
+            t0.elapsed()
+        );
+        client.stop();
+        server.join().unwrap();
+
+        // 3) 正在大退避睡眠（10s）中调用 trigger_reconnect，必须立即唤醒 condvar 重连
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let round1_dropped = Arc::new(AtomicBool::new(false));
+        let round1_dropped_srv = Arc::clone(&round1_dropped);
+        let woke_connected = Arc::new(AtomicBool::new(false));
+        let woke_connected_srv = Arc::clone(&woke_connected);
+
+        let server2 = thread::spawn(move || {
+            // Round 1: 接受连接后立刻关闭，迫使客户端进入 10s 退避睡眠
+            let (s1, _) = listener2.accept().unwrap();
+            drop(s1);
+            round1_dropped_srv.store(true, Ordering::Release);
+
+            // Round 2: 被 trigger_reconnect 唤醒后注册成功
+            let (mut s2, _) = listener2.accept().unwrap();
+            let _ = s2.set_read_timeout(Some(Duration::from_secs(3)));
+            let reg = read_test_frame(&mut s2);
+            assert_eq!(reg["type"], "register");
+            write_test_frame(
+                &mut s2,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "622333444",
+                    "formatted_id": "622 333 444",
+                    "udp_probe_addr": "",
+                    "relay_addr": ""
+                }),
+            );
+            woke_connected_srv.store(true, Ordering::Release);
+            let mut sink = [0u8; 64];
+            while matches!(s2.read(&mut sink), Ok(n) if n > 0) {}
+        });
+
+        let cfg2 = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: addr2.port(),
+            relay_port: 21117,
+            use_https: false,
+            device_key: crate::server_config::generate_device_key(),
+            ..ServerConfig::default()
+        };
+        let mut client2 = SignalClientHandle::spawn_with_timing(
+            cfg2,
+            "wake-backoff-test".to_string(),
+            Vec::new(),
+            None,
+            huge_backoff_timing,
+            |_| {},
+        );
+        let d_drop = Instant::now() + Duration::from_secs(3);
+        while (!round1_dropped.load(Ordering::Acquire)
+            || client2.status().state != ServerConnectionState::Error)
+            && Instant::now() < d_drop
+        {
+            thread::sleep(Duration::from_millis(15));
+        }
+        // 等客户端进入 10s stop_cv.wait_timeout
+        thread::sleep(Duration::from_millis(80));
+        let t1 = Instant::now();
+        client2.trigger_reconnect("wifi_recovered");
+        let d_wake = Instant::now() + Duration::from_secs(3);
+        while !woke_connected.load(Ordering::Acquire) && Instant::now() < d_wake {
+            thread::sleep(Duration::from_millis(15));
+        }
+        assert!(
+            woke_connected.load(Ordering::Acquire),
+            "trigger_reconnect must wake backoff condvar immediately"
+        );
+        assert!(
+            t1.elapsed() < Duration::from_secs(3),
+            "condvar wakeup reconnect took too long: {:?}",
+            t1.elapsed()
+        );
+        client2.stop();
+        server2.join().unwrap();
+    }
+
+    #[test]
+    fn request_connect_timeout_triggers_fast_reconnect_to_break_half_open_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let round2_registered = Arc::new(AtomicBool::new(false));
+        let round2_registered_srv = Arc::clone(&round2_registered);
+
+        let server = thread::spawn(move || {
+            // Round 1: 接受 connect_request 但故意不回复，模拟半开死连接
+            {
+                let (mut s1, _) = listener.accept().unwrap();
+                let _ = s1.set_read_timeout(Some(Duration::from_secs(3)));
+                let reg1 = read_test_frame(&mut s1);
+                assert_eq!(reg1["type"], "register");
+                write_test_frame(
+                    &mut s1,
+                    &serde_json::json!({
+                        "type": "registered",
+                        "device_id": "633444555",
+                        "formatted_id": "633 444 555",
+                        "udp_probe_addr": "",
+                        "relay_addr": "127.0.0.1:21117"
+                    }),
+                );
+                let req = loop {
+                    let frame = read_test_frame(&mut s1);
+                    if frame["type"] == "heartbeat" {
+                        continue;
+                    }
+                    break frame;
+                };
+                assert_eq!(req["type"], "connect_request");
+                // 不回复 punch_coord，等待客户端超时触发重连并关闭套接字
+                let mut sink = [0u8; 64];
+                while matches!(s1.read(&mut sink), Ok(n) if n > 0) {}
+            }
+
+            // Round 2: 客户端因 request_connect 超时自动快速重连并恢复正常连接
+            {
+                let (mut s2, _) = listener.accept().unwrap();
+                let _ = s2.set_read_timeout(Some(Duration::from_secs(3)));
+                let reg2 = read_test_frame(&mut s2);
+                assert_eq!(reg2["type"], "register");
+                write_test_frame(
+                    &mut s2,
+                    &serde_json::json!({
+                        "type": "registered",
+                        "device_id": "633444555",
+                        "formatted_id": "633 444 555",
+                        "udp_probe_addr": "",
+                        "relay_addr": "127.0.0.1:21117"
+                    }),
+                );
+                round2_registered_srv.store(true, Ordering::Release);
+                let req2 = loop {
+                    let frame = read_test_frame(&mut s2);
+                    if frame["type"] == "heartbeat" {
+                        continue;
+                    }
+                    break frame;
+                };
+                assert_eq!(req2["type"], "connect_request");
+                let sid = req2["session_id"].as_str().unwrap().to_string();
+                write_test_frame(
+                    &mut s2,
+                    &serde_json::json!({
+                        "type": "punch_coord",
+                        "session_id": sid,
+                        "role": "client",
+                        "peer_id": "987654321",
+                        "peer_lan_addrs": [],
+                        "relay_token": "tok-after-timeout-reconnect",
+                        "relay_addr": "127.0.0.1:21117"
+                    }),
+                );
+                let mut sink = [0u8; 64];
+                while matches!(s2.read(&mut sink), Ok(n) if n > 0) {}
+            }
+        });
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: addr.port(),
+            relay_port: 21117,
+            use_https: false,
+            device_key: crate::server_config::generate_device_key(),
+            ..ServerConfig::default()
+        };
+        let huge_backoff_timing = SignalTiming {
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            activity_timeout: SERVER_ACTIVITY_TIMEOUT,
+            stable_threshold: STABLE_CONNECTION_THRESHOLD,
+            backoffs: [Duration::from_secs(10); 4],
+        };
+        let mut client = SignalClientHandle::spawn_with_timing(
+            cfg,
+            "connect-timeout-reconnect".to_string(),
+            Vec::new(),
+            None,
+            huge_backoff_timing,
+            |_| {},
+        );
+
+        wait_until_connected(&client, Duration::from_secs(3));
+        let t0 = Instant::now();
+        let timeout_err = client
+            .request_connect("987654321", Duration::from_millis(150))
+            .expect_err("silent server must trigger request_connect timeout");
+        assert!(
+            timeout_err.contains("超时"),
+            "unexpected err: {timeout_err}"
+        );
+
+        // 超时后必须通过 trigger_reconnect("connect_request_timeout") 在 ~200ms 内完成第 2 轮重连
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (!round2_registered.load(Ordering::Acquire)
+            || client.status().state != ServerConnectionState::Connected)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(15));
+        }
+        assert!(
+            round2_registered.load(Ordering::Acquire),
+            "request_connect timeout must trigger fast reconnect"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "reconnect after timeout must not wait 10s backoff, took {:?}",
+            t0.elapsed()
+        );
+
+        let grant = client
+            .request_connect("987654321", Duration::from_secs(2))
+            .expect("second connect_request on fresh connection must succeed");
+        assert_eq!(grant.relay_token, "tok-after-timeout-reconnect");
+
+        client.stop();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn upnp_external_addr_injected_into_effective_lan_addrs_with_dedup_cap_and_heartbeat() {
+        let opts = SignalClientOptions::default();
+        assert!(!opts.upnp_enabled);
+        assert!(format!("{opts:?}").contains("upnp_enabled: false"));
+
+        let cfg = ServerConfig::default();
+        let shared = SharedState {
+            status: Mutex::new(cfg.disabled_snapshot()),
+            status_updates: Mutex::new(VecDeque::new()),
+            incoming: Mutex::new(VecDeque::new()),
+            device_status_events: Mutex::new(VecDeque::new()),
+            kicked_reasons: Mutex::new(VecDeque::new()),
+            pending_connects: Mutex::new(HashMap::new()),
+            active_writer: Mutex::new(None),
+            shutdown_stream: Mutex::new(None),
+            stop_flag: AtomicBool::new(false),
+            stop_lock: Mutex::new(false),
+            stop_cv: Condvar::new(),
+            fast_reconnect: AtomicBool::new(false),
+            reset_backoff_on_reconnect: AtomicBool::new(false),
+            reconnect_epoch: AtomicU64::new(0),
+            reconnect_reason: Mutex::new(None),
+            last_server_activity: Mutex::new(None),
+            last_timeout_reconnect: Mutex::new(None),
+            local_udp_port: AtomicU16::new(50000),
+            local_udp_is_ipv6: AtomicBool::new(false),
+            dynamic_lan_discovery: false,
+            connected_probe_targets: Mutex::new(Vec::new()),
+            server_is_loopback: AtomicBool::new(false),
+            upnp_enabled: AtomicBool::new(true),
+            upnp_status: Mutex::new(UpnpStatus::Mapped {
+                external_addr: "198.51.100.77:41234".to_string(),
+                protocol: "upnp_igd_v2".to_string(),
+            }),
+            upnp_external_addr: Mutex::new(Some("198.51.100.77:41234".to_string())),
+            upnp_lease: Mutex::new(None),
+            upnp_gen: AtomicU64::new(1),
+            upnp_heartbeat_needed: AtomicBool::new(false),
+            lan_addrs: Vec::new(),
+            enabled: true,
+            token_provider: None,
+            token_refresher: None,
+            device_pubkey: None,
+            allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
+            allow_remote_control: AtomicU8::new(REMOTE_CTRL_UNSET),
+        };
+
+        // 1) 追加 UPnP 外网地址且保留其外网端口（不改写为 local_udp_port）
+        let static_addrs = vec!["192.168.1.10:9901".to_string()];
+        assert_eq!(
+            shared.current_effective_lan_addrs(&static_addrs, 50000, false),
+            vec![
+                "192.168.1.10:50000".to_string(),
+                "198.51.100.77:41234".to_string(),
+            ]
+        );
+
+        // 2) 去重：静态列表改写后已包含相同地址时不重复追加
+        *shared.upnp_external_addr.lock().unwrap() = Some("192.168.1.10:50000".to_string());
+        assert_eq!(
+            shared.current_effective_lan_addrs(&static_addrs, 50000, false),
+            vec!["192.168.1.10:50000".to_string()]
+        );
+
+        // 3) 总数不超过服务端 MAX_LAN_ADDRS (16) 上限
+        *shared.upnp_external_addr.lock().unwrap() = Some("203.0.113.99:49999".to_string());
+        let sixteen: Vec<String> = (1..=MAX_LAN_ADDRS)
+            .map(|i| format!("192.168.10.{i}:9901"))
+            .collect();
+        let capped = shared.current_effective_lan_addrs(&sixteen, 50000, false);
+        assert_eq!(capped.len(), MAX_LAN_ADDRS);
+
+        // 4) IPv6 与 local_udp_port == 0 时不追加 IPv4 UPnP 地址
+        assert!(shared
+            .current_effective_lan_addrs(&static_addrs, 0, false)
+            .is_empty());
+        assert_eq!(
+            shared.current_effective_lan_addrs(&["[fd00::1]:9901".to_string()], 50000, true),
+            vec!["[fd00::1]:50000".to_string()]
+        );
+
+        // 5) 端到端验证：置位 upnp_heartbeat_needed 后信令循环立即补发增量 Heartbeat 携带 upnp_external_addr
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_addr = udp_sock.local_addr().unwrap().to_string();
+        let seen_upnp_hb = Arc::new(AtomicBool::new(false));
+        let seen_upnp_hb_srv = Arc::clone(&seen_upnp_hb);
+
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+            let reg = read_test_frame(&mut s);
+            assert_eq!(reg["type"], "register");
+            write_test_frame(
+                &mut s,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "644555666",
+                    "formatted_id": "644 555 666",
+                    "udp_probe_addr": udp_addr,
+                    "relay_addr": "127.0.0.1:21117"
+                }),
+            );
+            // 读取初始心跳和增量 UPnP 心跳
+            for _ in 0..8 {
+                let frame = read_test_frame(&mut s);
+                if frame["type"] == "heartbeat" {
+                    let addrs = frame["lan_addrs"].as_array().cloned().unwrap_or_default();
+                    if addrs
+                        .iter()
+                        .any(|v| v.as_str() == Some("198.51.100.88:54321"))
+                    {
+                        seen_upnp_hb_srv.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+            let mut sink = [0u8; 64];
+            while matches!(s.read(&mut sink), Ok(n) if n > 0) {}
+        });
+
+        let srv_cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: addr.port(),
+            relay_port: 21117,
+            use_https: false,
+            device_key: crate::server_config::generate_device_key(),
+            ..ServerConfig::default()
+        };
+        let mut client = SignalClientHandle::spawn(
+            srv_cfg,
+            "upnp-hb-test".to_string(),
+            vec!["192.168.1.10:9901".to_string()],
+        );
+        wait_until_connected(&client, Duration::from_secs(3));
+        *client.shared.upnp_external_addr.lock().unwrap() = Some("198.51.100.88:54321".to_string());
+        client
+            .shared
+            .upnp_heartbeat_needed
+            .store(true, Ordering::Release);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !seen_upnp_hb.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(15));
+        }
+        assert!(
+            seen_upnp_hb.load(Ordering::Acquire),
+            "setting upnp_heartbeat_needed must promptly emit incremental Heartbeat with upnp_external_addr"
+        );
+        client.stop();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn set_upnp_enabled_false_clears_state_and_generation_guards_stale_results() {
+        // 默认 options.upnp_enabled == false -> 初始状态为 Disabled
+        let mut client_off = SignalClientHandle::spawn_with_options(
+            ServerConfig::default(),
+            "upnp-off".to_string(),
+            Vec::new(),
+            SignalClientOptions::default(),
+            |_| {},
+        );
+        assert_eq!(client_off.upnp_status(), UpnpStatus::Disabled);
+
+        // options.upnp_enabled == true -> 初始状态为 Discovering（未启用信令时不发 SSDP）
+        let mut client_on = SignalClientHandle::spawn_with_options(
+            ServerConfig::default(),
+            "upnp-on".to_string(),
+            Vec::new(),
+            SignalClientOptions {
+                upnp_enabled: true,
+                ..SignalClientOptions::default()
+            },
+            |_| {},
+        );
+        assert_eq!(client_on.upnp_status(), UpnpStatus::Discovering);
+
+        // 模拟已映射状态并调用 set_upnp_enabled(false)
+        let gen_before = client_on.shared.upnp_gen.load(Ordering::Acquire);
+        *client_on.shared.upnp_external_addr.lock().unwrap() =
+            Some("203.0.113.42:45000".to_string());
+        *client_on.shared.upnp_status.lock().unwrap() = UpnpStatus::Mapped {
+            external_addr: "203.0.113.42:45000".to_string(),
+            protocol: "upnp_igd_v2".to_string(),
+        };
+        client_on
+            .shared
+            .upnp_heartbeat_needed
+            .store(true, Ordering::Release);
+
+        client_on.set_upnp_enabled(false);
+        assert!(
+            client_on.shared.upnp_gen.load(Ordering::Acquire) > gen_before,
+            "set_upnp_enabled(false) must increment upnp_gen"
+        );
+        assert_eq!(client_on.upnp_status(), UpnpStatus::Disabled);
+        assert!(client_on
+            .shared
+            .upnp_external_addr
+            .lock()
+            .unwrap()
+            .is_none());
+        assert!(client_on.shared.upnp_lease.lock().unwrap().is_none());
+        assert!(!client_on
+            .shared
+            .upnp_heartbeat_needed
+            .load(Ordering::Acquire));
+
+        // 过期代际结果到达不得覆写 Disabled 状态
+        apply_upnp_map_result(
+            &client_on.shared,
+            gen_before,
+            Err("stale gateway timeout".to_string()),
+        );
+        assert_eq!(client_on.upnp_status(), UpnpStatus::Disabled);
+
+        // 重新开启（未绑定 UDP 端口）进入 Discovering，同代际失败正确写入 Unavailable，过期代际被丢弃
+        client_on.set_upnp_enabled(true);
+        assert_eq!(client_on.upnp_status(), UpnpStatus::Discovering);
+        let active_gen = client_on.shared.upnp_gen.load(Ordering::Acquire);
+        apply_upnp_map_result(
+            &client_on.shared,
+            active_gen.saturating_sub(1),
+            Err("old gen error".to_string()),
+        );
+        assert_eq!(client_on.upnp_status(), UpnpStatus::Discovering);
+
+        apply_upnp_map_result(
+            &client_on.shared,
+            active_gen,
+            Err("CGNAT detected".to_string()),
+        );
+        assert_eq!(
+            client_on.upnp_status(),
+            UpnpStatus::Unavailable {
+                reason: "CGNAT detected".to_string()
+            }
+        );
+
+        // 回环模式下开启 UPnP 必须跳过真实 SSDP 探测并标记 Unavailable
+        client_off
+            .shared
+            .local_udp_port
+            .store(51234, Ordering::Release);
+        client_off
+            .shared
+            .server_is_loopback
+            .store(true, Ordering::Release);
+        client_off.set_upnp_enabled(true);
+        assert!(matches!(
+            client_off.upnp_status(),
+            UpnpStatus::Unavailable { .. }
+        ));
+        client_off.set_upnp_enabled(false);
+        assert_eq!(client_off.upnp_status(), UpnpStatus::Disabled);
+
+        client_on.stop();
+        client_off.stop();
+    }
+
+    #[test]
+    fn request_connect_timeout_respects_cooldown_recent_activity_and_does_not_reset_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let accept_count_srv = Arc::clone(&accept_count);
+        let stop_srv = Arc::new(AtomicBool::new(false));
+        let stop_srv_bg = Arc::clone(&stop_srv);
+
+        let server = thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            let mut conns = Vec::new();
+            let mut round = 0usize;
+            while !stop_srv_bg.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        round += 1;
+                        let _ = s.set_nonblocking(false);
+                        let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                        let reg = read_test_frame(&mut s);
+                        assert_eq!(reg["type"], "register");
+                        write_test_frame(
+                            &mut s,
+                            &serde_json::json!({
+                                "type": "registered",
+                                "device_id": "655666777",
+                                "formatted_id": "655 666 777",
+                                "udp_probe_addr": "",
+                                "relay_addr": "127.0.0.1:21117"
+                            }),
+                        );
+                        if round == 1 {
+                            // Round 1 主动回一帧 HeartbeatAck 证明链路存活，随后不回 punch_coord
+                            write_test_frame(
+                                &mut s,
+                                &serde_json::json!({ "type": "heartbeat_ack" }),
+                            );
+                        }
+                        accept_count_srv.store(round, Ordering::Release);
+                        conns.push(s);
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: addr.port(),
+            relay_port: 21117,
+            use_https: false,
+            device_key: crate::server_config::generate_device_key(),
+            ..ServerConfig::default()
+        };
+        let timing = SignalTiming {
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            activity_timeout: SERVER_ACTIVITY_TIMEOUT,
+            stable_threshold: STABLE_CONNECTION_THRESHOLD,
+            backoffs: [
+                Duration::from_millis(100),
+                Duration::from_millis(800),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+            ],
+        };
+        let mut client = SignalClientHandle::spawn_with_timing(
+            cfg,
+            "timeout-storm-guard".to_string(),
+            Vec::new(),
+            None,
+            timing,
+            |_| {},
+        );
+
+        wait_until_connected(&client, Duration::from_secs(3));
+        // 等待 Round 1 收到服务端 heartbeat_ack 并记录 last_server_activity
+        let wait_act = Instant::now() + Duration::from_secs(2);
+        while client.shared.last_server_activity.lock().unwrap().is_none()
+            && Instant::now() < wait_act
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(client.shared.last_server_activity.lock().unwrap().is_some());
+
+        // 1) 刚收到服务端响应（< 3s），单次短超时不得切断活跃连接
+        let epoch_before = client.shared.reconnect_epoch.load(Ordering::Acquire);
+        let err1 = client
+            .request_connect("987654321", Duration::from_millis(80))
+            .expect_err("should timeout");
+        assert!(err1.contains("超时"));
+        assert_eq!(
+            client.shared.reconnect_epoch.load(Ordering::Acquire),
+            epoch_before,
+            "recent server activity must suppress timeout-triggered reconnect"
+        );
+        assert_eq!(accept_count.load(Ordering::Acquire), 1);
+
+        // 2) 模拟服务端活动已超过 3s 静默，首次超时允许触发重连（进入 Round 2）
+        *client.shared.last_server_activity.lock().unwrap() =
+            Some(Instant::now() - TIMEOUT_RECONNECT_ACTIVITY_GRACE - Duration::from_secs(1));
+        let err2 = client
+            .request_connect("987654321", Duration::from_millis(80))
+            .expect_err("should timeout");
+        assert!(err2.contains("超时"));
+        assert_eq!(
+            client.shared.reconnect_epoch.load(Ordering::Acquire),
+            epoch_before + 1
+        );
+
+        let wait_r2 = Instant::now() + Duration::from_secs(3);
+        while (accept_count.load(Ordering::Acquire) < 2
+            || client.status().state != ServerConnectionState::Connected)
+            && Instant::now() < wait_r2
+        {
+            thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(accept_count.load(Ordering::Acquire), 2);
+
+        // 3) 冷却期（5s）内连续超时必须被抑制，绝不触发重连风暴
+        let epoch_r2 = client.shared.reconnect_epoch.load(Ordering::Acquire);
+        for _ in 0..3 {
+            let err_cool = client
+                .request_connect("987654321", Duration::from_millis(60))
+                .expect_err("should timeout during cooldown");
+            assert!(err_cool.contains("超时"));
+        }
+        assert_eq!(
+            client.shared.reconnect_epoch.load(Ordering::Acquire),
+            epoch_r2,
+            "consecutive timeouts within cooldown must not trigger reconnect"
+        );
+        assert_eq!(accept_count.load(Ordering::Acquire), 2);
+
+        // 4) 冷却期满后再次超时触发重连：因不重置 backoff_idx，此次必须走退避阶梯（backoffs[1] = 800ms），而非 200ms 快速重连
+        *client.shared.last_timeout_reconnect.lock().unwrap() =
+            Some(Instant::now() - TIMEOUT_RECONNECT_COOLDOWN - Duration::from_secs(1));
+        let t_r3 = Instant::now();
+        let err3 = client
+            .request_connect("987654321", Duration::from_millis(60))
+            .expect_err("should timeout after cooldown");
+        assert!(err3.contains("超时"));
+        assert_eq!(
+            client.shared.reconnect_epoch.load(Ordering::Acquire),
+            epoch_r2 + 1
+        );
+        let wait_r3 = Instant::now() + Duration::from_secs(3);
+        while accept_count.load(Ordering::Acquire) < 3 && Instant::now() < wait_r3 {
+            thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(accept_count.load(Ordering::Acquire), 3);
+        assert!(
+            t_r3.elapsed() >= Duration::from_millis(700),
+            "second timeout reconnect must obey non-reset backoff (expected >=700ms, got {:?})",
+            t_r3.elapsed()
+        );
+
+        stop_srv.store(true, Ordering::Release);
+        client.stop();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn set_upnp_enabled_rechecks_port_under_lease_lock_and_skips_cleared_port() {
+        let mut client = SignalClientHandle::spawn_with_options(
+            ServerConfig::default(),
+            "upnp-port-recheck".to_string(),
+            Vec::new(),
+            SignalClientOptions::default(),
+            |_| {},
+        );
+        // 模拟并发断连刚将 local_udp_port 清零后调用 set_upnp_enabled(true)：不得为旧端口触发映射
+        client.shared.local_udp_port.store(0, Ordering::Release);
+        assert!(client.shared.enable_upnp_and_prepare().is_none());
+        assert_eq!(client.upnp_status(), UpnpStatus::Discovering);
+
+        // 当端口被清零后，旧端口的 prepare_upnp_if_enabled(Some(old_port), ...) 必须被拒绝
+        client.shared.local_udp_port.store(50123, Ordering::Release);
+        client.shared.clear_active_writer();
+        assert_eq!(client.shared.local_udp_port.load(Ordering::Acquire), 0);
+        assert!(client
+            .shared
+            .prepare_upnp_if_enabled(Some(50123), UpnpStatus::Discovering)
+            .is_none());
+
+        client.stop();
     }
 }

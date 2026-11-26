@@ -70,6 +70,25 @@ const RELAY_INCOMING_QUEUE_CAP: usize = 8;
 /// 入站中继请求的存活有效期（超时未消费的过期令牌自动丢弃）。
 const RELAY_INCOMING_TTL: Duration = Duration::from_secs(20);
 
+/// LAN / mTLS LAN 模式下 `HostSession` 的 `Detached` 断线保持窗口（短窗口，避免长期占线）。
+const HOST_LAN_RESUME_TTL: Duration = Duration::from_secs(6);
+
+/// 串流/断线期巡检入站抢占候选的时间间隔（~100ms）。
+const PREEMPT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 同账号自控新入站连接触发旧会话失活抢占的静默阈值（3s）。
+const PREEMPT_OWNER_IDLE_THRESHOLD_US: u64 = 3_000_000;
+
+/// 任意入站连接触发旧会话半开失活抢占的静默阈值（4s）。
+const PREEMPT_ANY_IDLE_THRESHOLD_US: u64 = 4_000_000;
+
+/// 系统音频采集异常中断/初始化失败的退避序列（300ms -> 1s -> 2s）。
+const AUDIO_RECOVERY_INITIAL_BACKOFF: Duration = Duration::from_millis(300);
+const AUDIO_RECOVERY_MID_BACKOFF: Duration = Duration::from_secs(1);
+const AUDIO_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(2);
+/// 系统音频采集器判定为「稳定存活」、可将重试退避复位回 300ms 的最短连续运行时长（5s）。
+const AUDIO_RECOVERY_STABLE_WINDOW: Duration = Duration::from_secs(5);
+
 /// 临时验证码长度（8 位无歧义大写字母数字，排除 `0`/`O`/`1`/`I`）。
 pub const TEMP_CODE_LEN: usize = 8;
 
@@ -322,7 +341,7 @@ impl BoundedRelayIncomingQueue {
             if elapsed > ttl {
                 continue;
             }
-            if !item.peer_lan_addrs.is_empty() && elapsed < lan_grace {
+            if !item.is_relay_alloc && !item.peer_lan_addrs.is_empty() && elapsed < lan_grace {
                 deferred.push_back((enqueued_at, item));
                 continue;
             }
@@ -346,6 +365,75 @@ impl BoundedRelayIncomingQueue {
             enqueued_at.elapsed() <= ttl
                 && (peer_device_id != Some(item.peer_id.as_str()) || *enqueued_at >= cutoff)
         });
+    }
+
+    /// 主动清理当前 LAN / mTLS LAN 会话初始宽限期内到达的同对端陈旧 `PunchCoord`（`!is_relay_alloc`），
+    /// 防止其滞留满 20s TTL 后在 `Detached` 期复活误抢占并打断 6s 续传；
+    /// 严格保留显式切中继（`is_relay_alloc == true`）、宽限期之后的新请求及其他对端条目。
+    fn purge_stale_lan_punch_for_peer(
+        &self,
+        peer_device_id: Option<&str>,
+        lan_grace_cutoff: Instant,
+        ttl: Duration,
+    ) {
+        let Some(cur_peer) = peer_device_id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        q.retain(|(enqueued_at, item)| {
+            enqueued_at.elapsed() <= ttl
+                && !(item.peer_id == cur_peer
+                    && !item.is_relay_alloc
+                    && *enqueued_at <= lan_grace_cutoff)
+        });
+    }
+
+    /// 只读检查入站队列中是否存在可立即抢占当前旧会话的新连接候选：
+    /// 1. 同设备重连（`active_peer_id` 非空且与 `item.peer_id` 相同）；
+    /// 2. 同账号自控失活抢占（`item.is_owner_connection` 且 `is_detached || active_idle_us >= 3s`）；
+    /// 3. 旧会话已失活（`is_detached || active_idle_us >= 4s`）。
+    ///
+    /// 若旧会话活跃（`!is_detached && active_idle_us < 3s`）且到达的是不同设备，返回 `false` 保护当前活跃用户。
+    #[cfg(test)]
+    fn has_preempt_candidate(
+        &self,
+        ttl: Duration,
+        active_peer_id: Option<&str>,
+        active_idle_us: u64,
+        is_detached: bool,
+    ) -> bool {
+        self.has_preempt_candidate_filtered(ttl, active_peer_id, active_idle_us, is_detached, None)
+    }
+
+    fn has_preempt_candidate_filtered(
+        &self,
+        ttl: Duration,
+        active_peer_id: Option<&str>,
+        active_idle_us: u64,
+        is_detached: bool,
+        ignore_same_peer_lan_before: Option<Instant>,
+    ) -> bool {
+        let q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        q.iter()
+            .filter(|(enqueued_at, _)| enqueued_at.elapsed() <= ttl)
+            .any(|(enqueued_at, item)| {
+                let same_peer =
+                    active_peer_id.is_some_and(|cur| !cur.is_empty() && cur == item.peer_id);
+                // LAN / mTLS LAN 初始宽限期内到达的同对端普通 PunchCoord（!is_relay_alloc）
+                // 一律视为本次 LAN 建连同源迟到的旧信令：无论 peer_lan_addrs 是否为空、
+                // 无论是否满 3s/4s、无论当前处于 Streaming 还是 Detached，绝不触发误抢占。
+                if same_peer
+                    && !item.is_relay_alloc
+                    && ignore_same_peer_lan_before.is_some_and(|cutoff| *enqueued_at <= cutoff)
+                {
+                    return false;
+                }
+                same_peer
+                    || (item.is_owner_connection
+                        && (is_detached || active_idle_us >= PREEMPT_OWNER_IDLE_THRESHOLD_US))
+                    || is_detached
+                    || active_idle_us >= PREEMPT_ANY_IDLE_THRESHOLD_US
+            })
     }
 }
 
@@ -836,10 +924,31 @@ impl MidSessionWakeDriver {
     }
 }
 
+#[derive(Clone)]
+struct HostClockAnchor {
+    origin: Arc<Mutex<ClockOrigin>>,
+    /// 指示下一次管线工厂构造必须放弃旧纪元零点并重新锚定（供 `Bye(Refresh)` 与 `DetachOutcome::Replaced` 跨纪元复位）。
+    reanchor_next_build: Arc<AtomicBool>,
+}
+
+impl HostClockAnchor {
+    fn new_pending() -> Self {
+        Self {
+            origin: Arc::new(Mutex::new(ClockOrigin::Pending(Instant::now()))),
+            reanchor_next_build: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn reset_pending(&self) {
+        *self.origin.lock().unwrap_or_else(|e| e.into_inner()) =
+            ClockOrigin::Pending(Instant::now());
+    }
+}
+
 struct BuiltUiHost {
     host: HostSession,
     clock: SessionClock,
-    clock_origin: Arc<Mutex<ClockOrigin>>,
+    clock_anchor: HostClockAnchor,
     backend_label: Arc<Mutex<String>>,
     hardware_video_active: Arc<AtomicBool>,
     wake_guard: SharedWakeGuard,
@@ -1054,7 +1163,7 @@ type HostPipelineFactory =
 
 fn make_host_pipeline_factory(
     prefer_hardware: bool,
-    clock_origin: Arc<Mutex<ClockOrigin>>,
+    clock_anchor: HostClockAnchor,
     backend_label: Arc<Mutex<String>>,
     hardware_video_active: Arc<AtomicBool>,
     wake_guard: SharedWakeGuard,
@@ -1062,12 +1171,21 @@ fn make_host_pipeline_factory(
 ) -> HostPipelineFactory {
     Box::new(
         move |pcfg: &PipelineConfig| -> rc_types::Result<rc_pipeline::HostPipeline> {
-            // 若会话已锚定过时钟零点（例如热切换分辨率/帧率重建管线），复用同一零点，
-            // 保证会话钟与采集 PTS 严格单调连续、不触发时钟倒退或饱和刷新误判。
-            let existing_origin = clock_origin
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            // 同会话热切换分辨率/帧率/编解码器时复用既有零点，保证会话钟与采集 PTS 严格单调连续；
+            // 发生 `Bye(Refresh)` / `DetachOutcome::Replaced` 纪元重置时放弃旧零点并重新锚定，
+            // 防止 71.58 分钟 `u32::MAX` 饱和导致 8s 看门狗与采集时间戳永久卡死。
+            let force_reanchor = clock_anchor
+                .reanchor_next_build
+                .swap(false, Ordering::AcqRel);
+            let existing_origin = if force_reanchor {
+                ClockOrigin::Pending(Instant::now())
+            } else {
+                clock_anchor
+                    .origin
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            };
             if prefer_hardware {
                 match crate::platform::wake_display_if_asleep() {
                     Ok(Some(guard)) => {
@@ -1100,8 +1218,10 @@ fn make_host_pipeline_factory(
                 match final_try {
                     Ok((p, l, origin_us)) => {
                         *backend_label.lock().unwrap_or_else(|e| e.into_inner()) = l;
-                        *clock_origin.lock().unwrap_or_else(|e| e.into_inner()) =
-                            ClockOrigin::HostClock(origin_us);
+                        *clock_anchor
+                            .origin
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = ClockOrigin::HostClock(origin_us);
                         hardware_video_active.store(true, Ordering::Release);
                         return Ok(p);
                     }
@@ -1135,8 +1255,10 @@ fn make_host_pipeline_factory(
                             _ => None,
                         };
                         let (p, anchor) = fake_stack_anchored(pcfg, existing_fake)?;
-                        *clock_origin.lock().unwrap_or_else(|e| e.into_inner()) =
-                            ClockOrigin::Fake(anchor);
+                        *clock_anchor
+                            .origin
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = ClockOrigin::Fake(anchor);
                         return Ok(p);
                     }
                 }
@@ -1148,7 +1270,10 @@ fn make_host_pipeline_factory(
                 _ => None,
             };
             let (p, anchor) = fake_stack_anchored(pcfg, existing_fake)?;
-            *clock_origin.lock().unwrap_or_else(|e| e.into_inner()) = ClockOrigin::Fake(anchor);
+            *clock_anchor
+                .origin
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = ClockOrigin::Fake(anchor);
             Ok(p)
         },
     )
@@ -1241,9 +1366,8 @@ fn build_host_session(
         approver,
     );
 
-    let clock_origin: Arc<Mutex<ClockOrigin>> =
-        Arc::new(Mutex::new(ClockOrigin::Pending(Instant::now())));
-    let clock = make_session_clock(Arc::clone(&clock_origin));
+    let clock_anchor = HostClockAnchor::new_pending();
+    let clock = make_session_clock(Arc::clone(&clock_anchor.origin));
     let backend_label: Arc<Mutex<String>> = Arc::new(Mutex::new(if prefer_hardware {
         "auto".to_string()
     } else {
@@ -1254,7 +1378,7 @@ fn build_host_session(
 
     let factory = make_host_pipeline_factory(
         prefer_hardware,
-        Arc::clone(&clock_origin),
+        clock_anchor.clone(),
         Arc::clone(&backend_label),
         Arc::clone(&hardware_video_active),
         Arc::clone(&wake_guard),
@@ -1263,6 +1387,10 @@ fn build_host_session(
 
     let mut host = HostSession::new(host_cfg, DEV_CERT_PEM, DEV_KEY_PEM, Arc::clone(&clock))
         .map_err(|e| format!("host 会话构造失败: {e}"))?;
+    let _ = host.set_reconnect(rc_session::ReconnectConfig {
+        resume_ttl: host_resume_ttl(HostTransportKind::Lan),
+        ..rc_session::ReconnectConfig::default()
+    });
     host.set_preserve_caps_aspect(preserve_aspect);
     host.set_pipeline_factory_for(factory);
     if clipboard_enabled {
@@ -1274,7 +1402,7 @@ fn build_host_session(
     Ok(BuiltUiHost {
         host,
         clock,
-        clock_origin,
+        clock_anchor,
         backend_label,
         hardware_video_active,
         wake_guard,
@@ -1286,6 +1414,7 @@ fn build_host_session(
 fn build_transport_host_session(
     listen_addr: SocketAddr,
     transport: Box<dyn Transport>,
+    transport_kind: HostTransportKind,
     password: Option<String>,
     approval_timeout_us: u64,
     prefer_hardware: bool,
@@ -1309,9 +1438,8 @@ fn build_transport_host_session(
         approver,
     );
 
-    let clock_origin: Arc<Mutex<ClockOrigin>> =
-        Arc::new(Mutex::new(ClockOrigin::Pending(Instant::now())));
-    let clock = make_session_clock(Arc::clone(&clock_origin));
+    let clock_anchor = HostClockAnchor::new_pending();
+    let clock = make_session_clock(Arc::clone(&clock_anchor.origin));
     let backend_label: Arc<Mutex<String>> = Arc::new(Mutex::new(if prefer_hardware {
         "auto".to_string()
     } else {
@@ -1351,11 +1479,15 @@ fn build_transport_host_session(
         Arc::clone(&clock),
     )
     .map_err(|e| format!("信令 host 会话构造失败: {e}"))?;
+    let _ = host.set_reconnect(rc_session::ReconnectConfig {
+        resume_ttl: host_resume_ttl(transport_kind),
+        ..rc_session::ReconnectConfig::default()
+    });
     host.set_preserve_caps_aspect(preserve_aspect);
 
     let factory = make_host_pipeline_factory(
         prefer_hardware,
-        Arc::clone(&clock_origin),
+        clock_anchor.clone(),
         Arc::clone(&backend_label),
         Arc::clone(&hardware_video_active),
         Arc::clone(&wake_guard),
@@ -1371,7 +1503,7 @@ fn build_transport_host_session(
     Ok(BuiltUiHost {
         host,
         clock,
-        clock_origin,
+        clock_anchor,
         backend_label,
         hardware_video_active,
         wake_guard,
@@ -1956,6 +2088,234 @@ enum HostTransportKind {
     Relay,
 }
 
+fn host_resume_ttl(transport_kind: HostTransportKind) -> Duration {
+    match transport_kind {
+        HostTransportKind::Relay | HostTransportKind::P2p => Duration::ZERO,
+        HostTransportKind::Lan | HostTransportKind::MtlsLan => HOST_LAN_RESUME_TTL,
+    }
+}
+
+fn next_audio_recovery_backoff(cur: Duration) -> Duration {
+    if cur < AUDIO_RECOVERY_MID_BACKOFF {
+        AUDIO_RECOVERY_MID_BACKOFF
+    } else {
+        AUDIO_RECOVERY_MAX_BACKOFF
+    }
+}
+
+/// 在独立后台线程异步拉起系统音频采集器，绝不在 `Welcome` 后同步阻塞首帧出图（H13）。
+/// 若会话在后台线程完成前退出并丢弃接收端，后台线程立即停止并释放刚创建的采集器。
+fn spawn_audio_capture_init() -> mpsc::Receiver<Box<dyn AudioCapture>> {
+    spawn_audio_capture_init_with(rc_audio::create_system_audio_capture)
+}
+
+fn spawn_audio_capture_init_with<F>(creator: F) -> mpsc::Receiver<Box<dyn AudioCapture>>
+where
+    F: FnOnce() -> Result<Box<dyn AudioCapture>, String> + Send + 'static,
+{
+    let (tx, rx) = mpsc::sync_channel::<Box<dyn AudioCapture>>(1);
+    let _ = thread::Builder::new()
+        .name("rc-audio-cap-init".to_string())
+        .spawn(move || {
+            if let Ok(cap) = creator() {
+                if let Err(mpsc::SendError(mut cap)) = tx.send(cap) {
+                    cap.stop();
+                    drop(cap);
+                }
+            }
+        });
+    rx
+}
+
+type AudioCaptureCreator = Arc<dyn Fn() -> Result<Box<dyn AudioCapture>, String> + Send + Sync>;
+
+/// 被控端音频采集生命周期与有界退避自愈管理器（`300ms -> 1s -> 2s`）：
+/// - 检测底层 `AudioCapture::is_stopped()`（如 macOS 改物理分辨率或切屏导致 SCStream 中止）时立即停止并重建；
+/// - 异步初始化失败（如锁屏期无音频流）按有界退避重试；
+/// - 纯工具态 `media_paused == true` 时主动停流且禁止拉起自愈。
+struct HostAudioManager {
+    enabled: bool,
+    capture: Option<Box<dyn AudioCapture>>,
+    started_at: Option<Instant>,
+    init_rx: Option<mpsc::Receiver<Box<dyn AudioCapture>>>,
+    retry_at: Option<Instant>,
+    retry_backoff: Duration,
+    creator: Option<AudioCaptureCreator>,
+}
+
+impl HostAudioManager {
+    fn new(enabled: bool) -> Self {
+        let mut mgr = Self {
+            enabled,
+            capture: None,
+            started_at: None,
+            init_rx: None,
+            retry_at: None,
+            retry_backoff: AUDIO_RECOVERY_INITIAL_BACKOFF,
+            creator: None,
+        };
+        if enabled {
+            mgr.start_init();
+        }
+        mgr
+    }
+
+    #[cfg(test)]
+    fn with_creator(
+        enabled: bool,
+        initial_capture: Option<Box<dyn AudioCapture>>,
+        creator: AudioCaptureCreator,
+    ) -> Self {
+        let started_at = initial_capture.as_ref().map(|_| Instant::now());
+        let mut mgr = Self {
+            enabled,
+            capture: initial_capture,
+            started_at,
+            init_rx: None,
+            retry_at: None,
+            retry_backoff: AUDIO_RECOVERY_INITIAL_BACKOFF,
+            creator: Some(creator),
+        };
+        if enabled && mgr.capture.is_none() {
+            mgr.start_init();
+        }
+        mgr
+    }
+
+    fn start_init(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let rx = match &self.creator {
+            Some(factory) => {
+                let f = Arc::clone(factory);
+                spawn_audio_capture_init_with(move || f())
+            }
+            None => spawn_audio_capture_init(),
+        };
+        self.init_rx = Some(rx);
+    }
+
+    fn pause(&mut self, silence_gate: &mut AudioSilenceGate) {
+        self.stop_all();
+        silence_gate.reset();
+        self.retry_backoff = AUDIO_RECOVERY_INITIAL_BACKOFF;
+    }
+
+    fn resume(&mut self, silence_gate: &mut AudioSilenceGate) {
+        if !self.enabled {
+            return;
+        }
+        silence_gate.reset();
+        self.retry_backoff = AUDIO_RECOVERY_INITIAL_BACKOFF;
+        self.retry_at = None;
+        if self.capture.is_none() && self.init_rx.is_none() {
+            self.start_init();
+        }
+    }
+
+    fn reset_backoff_for_display_change(&mut self, now: Instant) {
+        self.retry_backoff = AUDIO_RECOVERY_INITIAL_BACKOFF;
+        let fast_at = now + AUDIO_RECOVERY_INITIAL_BACKOFF;
+        if self.retry_at.is_some_and(|at| at > fast_at) {
+            self.retry_at = Some(fast_at);
+        }
+    }
+
+    fn poll_and_recover(
+        &mut self,
+        now: Instant,
+        media_paused: bool,
+        silence_gate: &mut AudioSilenceGate,
+    ) {
+        if !self.enabled || media_paused {
+            return;
+        }
+
+        if let Some(cap) = self.capture.as_ref() {
+            let stable = self.started_at.is_some_and(|at| {
+                now.saturating_duration_since(at) >= AUDIO_RECOVERY_STABLE_WINDOW
+            });
+            if cap.is_stopped() {
+                if stable {
+                    self.retry_backoff = AUDIO_RECOVERY_INITIAL_BACKOFF;
+                }
+                if let Some(mut old) = self.capture.take() {
+                    old.stop();
+                }
+                self.started_at = None;
+                silence_gate.reset();
+                let delay = self.retry_backoff;
+                self.retry_at = Some(now + delay);
+                self.retry_backoff = next_audio_recovery_backoff(delay);
+                eprintln!(
+                    "[rc-ui-host] 检测到系统音频采集已中止，预约 {}ms 后自动重建",
+                    delay.as_millis()
+                );
+            } else if stable {
+                self.retry_backoff = AUDIO_RECOVERY_INITIAL_BACKOFF;
+            }
+        }
+
+        if self.capture.is_none() {
+            if let Some(ref rx) = self.init_rx {
+                match rx.try_recv() {
+                    Ok(cap) => {
+                        self.capture = Some(cap);
+                        self.started_at = Some(now);
+                        self.init_rx = None;
+                        self.retry_at = None;
+                        // 不在刚创建时立即复位 retry_backoff：需稳定存活 >= 5s 后才复位回 300ms，
+                        // 防止采集器刚创建即 is_stopped() 退化为固定 300ms 高频重建抖动。
+                        silence_gate.reset();
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.init_rx = None;
+                        let delay = self.retry_backoff;
+                        self.retry_at = Some(now + delay);
+                        self.retry_backoff = next_audio_recovery_backoff(delay);
+                    }
+                }
+            }
+        }
+
+        if self.capture.is_none()
+            && self.init_rx.is_none()
+            && self.retry_at.is_some_and(|at| now >= at)
+        {
+            self.retry_at = None;
+            self.start_init();
+        }
+    }
+
+    fn capture_mut(&mut self) -> Option<&mut Box<dyn AudioCapture>> {
+        self.capture.as_mut()
+    }
+
+    fn stop_all(&mut self) {
+        // 先释放异步初始化接收端，确保尚未完成的 `rc-audio-cap-init` 线程立即感知并停止释放采集器（H13）。
+        self.init_rx = None;
+        if let Some(ref mut cap) = self.capture {
+            cap.stop();
+        }
+        self.capture = None;
+        self.started_at = None;
+        self.retry_at = None;
+    }
+}
+
+impl Drop for HostAudioManager {
+    fn drop(&mut self) {
+        self.stop_all();
+    }
+}
+
+struct DriveSessionOutcome {
+    reason: String,
+    preempted_by_incoming: bool,
+}
+
 /// 单通道无丢帧重试冲刷：
 /// - 若 `pending` 非空，先冲刷待重试帧且不继续拉取引擎（避免回压期无界堆积）；
 /// - 仅当 `pending` 为空时从引擎最多拉取 `max_frames` 帧；
@@ -2473,6 +2833,7 @@ fn drive_ui_host_session(
     drive_ui_host_session_inner(
         host,
         clock,
+        None,
         updates,
         password_version,
         observed_pw_ver,
@@ -2490,7 +2851,11 @@ fn drive_ui_host_session(
         &mut owner_terminals,
         wake_guard,
         file_transfer_dir,
+        None,
+        None,
+        Instant::now(),
     )
+    .reason
 }
 
 const RELAY_MIN_BITRATE_BPS: u32 = 2_000_000;
@@ -2622,6 +2987,7 @@ impl RelayBitrateController {
 fn drive_ui_host_session_inner(
     host: &mut HostSession,
     clock: &SessionClock,
+    clock_anchor: Option<&HostClockAnchor>,
     updates: &BoundedHostUpdateQueue,
     password_version: &AtomicU64,
     observed_pw_ver: u64,
@@ -2639,7 +3005,68 @@ fn drive_ui_host_session_inner(
     owner_terminals: &mut PersistentOwnerTerminals,
     wake_guard: SharedWakeGuard,
     file_transfer_dir: SharedFileTransferDir,
-) -> String {
+    incoming_relay: Option<&Arc<BoundedRelayIncomingQueue>>,
+    active_peer_id: Option<&str>,
+    session_started_at: Instant,
+) -> DriveSessionOutcome {
+    let audio_mgr =
+        HostAudioManager::new(audio_enabled && prefer_hardware && hardware_video_active);
+    drive_ui_host_session_with_audio(
+        host,
+        clock,
+        clock_anchor,
+        updates,
+        password_version,
+        observed_pw_ver,
+        config_version,
+        observed_cfg_ver,
+        disconnect_flag,
+        stop_flag,
+        close_reason,
+        transport_kind,
+        prefer_hardware,
+        hardware_video_active,
+        lock_screen_count,
+        auth_state,
+        owner_terminals,
+        wake_guard,
+        file_transfer_dir,
+        incoming_relay,
+        active_peer_id,
+        session_started_at,
+        audio_mgr,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_ui_host_session_with_audio(
+    host: &mut HostSession,
+    clock: &SessionClock,
+    clock_anchor: Option<&HostClockAnchor>,
+    updates: &BoundedHostUpdateQueue,
+    password_version: &AtomicU64,
+    observed_pw_ver: u64,
+    config_version: &AtomicU64,
+    observed_cfg_ver: u64,
+    disconnect_flag: &AtomicBool,
+    stop_flag: &AtomicBool,
+    close_reason: &AtomicU8,
+    transport_kind: HostTransportKind,
+    prefer_hardware: bool,
+    hardware_video_active: bool,
+    lock_screen_count: &AtomicU64,
+    auth_state: Option<&Mutex<AuthRuntimeState>>,
+    owner_terminals: &mut PersistentOwnerTerminals,
+    wake_guard: SharedWakeGuard,
+    file_transfer_dir: SharedFileTransferDir,
+    incoming_relay: Option<&Arc<BoundedRelayIncomingQueue>>,
+    active_peer_id: Option<&str>,
+    mut session_started_at: Instant,
+    mut audio_mgr: HostAudioManager,
+) -> DriveSessionOutcome {
+    // 启用 8s 应用层客户端失活看门狗（控制端在静屏与纯工具模式下每 1s 发送 ProbePing 心跳）。
+    host.set_client_idle_timeout_us(HostSession::CLIENT_IDLE_TIMEOUT_US);
+
     let _wake_guard_releaser = WakeGuardReleaser {
         slot: Arc::clone(&wake_guard),
     };
@@ -2650,10 +3077,14 @@ fn drive_ui_host_session_inner(
     let mut shows_cursor = false;
     let mut user_pinned_resolution = false;
     let mut auto_hidpi_active = false;
+    let mut active_peer_id: Option<String> = active_peer_id.map(str::to_string);
 
     let mut detached_reason: Option<String> = None;
     let mut drive_err: Option<String> = None;
     let mut pending_lock_on_exit = false;
+    let mut preempted_by_incoming = false;
+    let mut last_preempt_check = Instant::now();
+    let mut epoch_reanchored_in_detached = false;
 
     // 文件 I/O 与端口映射严格绑定单次控制端会话（断线清理 .rcpart 与监听套接字）；
     // W3 终端在机主（OwnerTicket）身份下复用 `owner_terminals` 跨重连保活，访客会话仅使用会话级 `guest_term_host`。
@@ -2737,26 +3168,6 @@ fn drive_ui_host_session_inner(
         pending_update_tx.enqueue(&ver_msg, host.authenticated_owner().is_some());
     }
 
-    // H13：仅当启用音频且硬件视频管线确实为真实 SCK+VT（未降级假栈）时，
-    // 在独立后台线程异步初始化系统音频采集，绝不在 `Welcome` 后同步阻塞首帧出图。
-    let mut audio_capture: Option<Box<dyn AudioCapture>> = None;
-    let mut audio_init_rx: Option<mpsc::Receiver<Box<dyn AudioCapture>>> =
-        if audio_enabled && prefer_hardware && hardware_video_active {
-            let (tx, rx) = mpsc::sync_channel::<Box<dyn AudioCapture>>(1);
-            let _ = thread::Builder::new()
-                .name("rc-audio-cap-init".to_string())
-                .spawn(move || {
-                    if let Ok(cap) = rc_audio::create_system_audio_capture() {
-                        if let Err(mpsc::SendError(mut cap)) = tx.send(cap) {
-                            cap.stop();
-                            drop(cap);
-                        }
-                    }
-                });
-            Some(rx)
-        } else {
-            None
-        };
     let mut audio_muted = false;
     let mut audio_silence_gate = AudioSilenceGate::default();
     let mut audio_seq: u32 = 0;
@@ -2828,21 +3239,12 @@ fn drive_ui_host_session_inner(
                             }
                         }
 
-                        // 0) 非阻塞检查后台音频采集与桌面壁纸初始化是否就绪（H13）。
-                        if audio_capture.is_none() {
-                            if let Some(ref rx) = audio_init_rx {
-                                match rx.try_recv() {
-                                    Ok(cap) => {
-                                        audio_capture = Some(cap);
-                                        audio_init_rx = None;
-                                    }
-                                    Err(mpsc::TryRecvError::Empty) => {}
-                                    Err(mpsc::TryRecvError::Disconnected) => {
-                                        audio_init_rx = None;
-                                    }
-                                }
-                            }
-                        }
+                        // 0) 非阻塞检查后台音频采集初始化/自愈重建（H13）与桌面壁纸初始化是否就绪。
+                        audio_mgr.poll_and_recover(
+                            Instant::now(),
+                            host.is_media_paused(),
+                            &mut audio_silence_gate,
+                        );
                         if let Some(ref rx) = wallpaper_rx {
                             match rx.try_recv() {
                                 Ok(jpeg) => {
@@ -2925,6 +3327,9 @@ fn drive_ui_host_session_inner(
                                                             None
                                                         };
                                                     if let Some(switched_res) = switched_main {
+                                                        audio_mgr.reset_backoff_for_display_change(
+                                                            Instant::now(),
+                                                        );
                                                         user_pinned_resolution = true;
                                                         auto_hidpi_active = false;
                                                         host.set_injector_screen_size(
@@ -3633,6 +4038,9 @@ fn drive_ui_host_session_inner(
                                                             (true, false)
                                                         };
                                                     if reconfig_ok {
+                                                        audio_mgr.reset_backoff_for_display_change(
+                                                            Instant::now(),
+                                                        );
                                                         active_display_id = next_active;
                                                         session_native_res = disp_res;
                                                         session_max_res = next_max;
@@ -3828,6 +4236,10 @@ fn drive_ui_host_session_inner(
                                                         };
                                                         match switch_res {
                                                             Ok(()) => {
+                                                                audio_mgr
+                                                                    .reset_backoff_for_display_change(
+                                                                        Instant::now(),
+                                                                    );
                                                                 active_display_id =
                                                                     Some(resolved.id);
                                                                 session_native_res = vres;
@@ -3923,6 +4335,9 @@ fn drive_ui_host_session_inner(
                                                 display_id,
                                             );
                                             if removed {
+                                                audio_mgr.reset_backoff_for_display_change(
+                                                    Instant::now(),
+                                                );
                                                 hw_cleanup.virtual_display_count = hw_cleanup
                                                     .virtual_display_count
                                                     .saturating_sub(1);
@@ -4030,6 +4445,116 @@ fn drive_ui_host_session_inner(
                                                 encode_host_displays_state(active_display_id)
                                             {
                                                 pending_display_tx.push_back(dp);
+                                            }
+                                        }
+                                        Some(DisplayControlMsg::SetMediaPaused { paused }) => {
+                                            if paused {
+                                                host.pause_media();
+                                                audio_mgr.pause(&mut audio_silence_gate);
+                                                if let Some(mp) = display_ctrl::encode_display_ctrl(
+                                                    &DisplayControlMsg::MediaState { paused: true },
+                                                ) {
+                                                    pending_display_tx.push_back(mp);
+                                                }
+                                            } else {
+                                                let wanted_hevc =
+                                                    host.active_codec() == rc_encode::Codec::Hevc;
+                                                match host.resume_media() {
+                                                    Ok(()) => {
+                                                        if wanted_hevc
+                                                            && host.active_codec()
+                                                                != rc_encode::Codec::Hevc
+                                                        {
+                                                            hevc_runtime_failed = true;
+                                                            auto_hidpi_active = false;
+                                                        }
+                                                        let (caps_native, presets) =
+                                                            if active_display_id.is_some() {
+                                                                (
+                                                                    session_native_res,
+                                                                    display_ctrl::build_resolution_presets(
+                                                                        session_native_res.width,
+                                                                        session_native_res.height,
+                                                                        session_max_res.width,
+                                                                        session_max_res.height,
+                                                                    ),
+                                                                )
+                                                            } else {
+                                                                (
+                                                                    original_native_res.unwrap_or(
+                                                                        session_native_res,
+                                                                    ),
+                                                                    build_hardware_display_presets(
+                                                                        prefer_hardware,
+                                                                        hardware_video_active,
+                                                                        original_native_res,
+                                                                    ),
+                                                                )
+                                                            };
+                                                        if let Some(cp) = encode_host_display_caps(
+                                                            host,
+                                                            caps_native,
+                                                            session_max_res,
+                                                            presets,
+                                                            host_hevc_available(
+                                                                hevc_runtime_failed,
+                                                            ),
+                                                        ) {
+                                                            pending_display_tx.push_back(cp);
+                                                        }
+                                                        if prefer_hardware && hardware_video_active
+                                                        {
+                                                            if let Some(dp) =
+                                                                encode_host_displays_state(
+                                                                    active_display_id,
+                                                                )
+                                                            {
+                                                                pending_display_tx.push_back(dp);
+                                                            }
+                                                        }
+                                                        let screen_state = (
+                                                            crate::platform::is_screen_locked(),
+                                                            host.is_capture_suspended(),
+                                                        );
+                                                        if let Some(sp) =
+                                                            display_ctrl::encode_display_ctrl(
+                                                                &DisplayControlMsg::HostScreenState {
+                                                                    locked: screen_state.0,
+                                                                    capture_suspended: screen_state.1,
+                                                                },
+                                                            )
+                                                        {
+                                                            pending_display_tx.push_back(sp);
+                                                        }
+                                                        last_reported_screen_state =
+                                                            Some(screen_state);
+                                                        last_screen_state_check = Instant::now();
+                                                        audio_mgr.resume(&mut audio_silence_gate);
+                                                        if let Some(mp) =
+                                                            display_ctrl::encode_display_ctrl(
+                                                                &DisplayControlMsg::MediaState {
+                                                                    paused: false,
+                                                                },
+                                                            )
+                                                        {
+                                                            pending_display_tx.push_back(mp);
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        eprintln!(
+                                                            "[rc-ui-host] 恢复媒体管线失败: {err}"
+                                                        );
+                                                        if let Some(mp) =
+                                                            display_ctrl::encode_display_ctrl(
+                                                                &DisplayControlMsg::MediaState {
+                                                                    paused: host.is_media_paused(),
+                                                                },
+                                                            )
+                                                        {
+                                                            pending_display_tx.push_back(mp);
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         Some(
@@ -4180,37 +4705,77 @@ fn drive_ui_host_session_inner(
                         let stream_a_congested = !pending_file_tx.is_empty()
                             || !pending_portmap_tx.is_empty()
                             || !pending_update_tx.is_empty();
-                        let audio_busy = match audio_capture.as_mut() {
-                            Some(cap) => pump_host_audio(
-                                host,
-                                cap.as_mut(),
-                                audio_muted || stream_a_congested,
-                                &mut audio_silence_gate,
-                                &mut audio_seq,
-                            ),
-                            None => false,
+                        let audio_busy = if host.is_media_paused() {
+                            false
+                        } else {
+                            match audio_mgr.capture_mut() {
+                                Some(cap) => pump_host_audio(
+                                    host,
+                                    cap.as_mut(),
+                                    audio_muted || stream_a_congested,
+                                    &mut audio_silence_gate,
+                                    &mut audio_seq,
+                                ),
+                                None => false,
+                            }
                         };
 
-                        if !host.has_pipeline() {
+                        if !host.is_media_paused() && !host.has_pipeline() {
                             drive_err =
                                 Some("硬件视频管线热重建失败且无法恢复，会话已终止".to_string());
                             break;
                         }
 
+                        if let Some(relay_q) = incoming_relay {
+                            if last_preempt_check.elapsed() >= PREEMPT_CHECK_INTERVAL {
+                                last_preempt_check = Instant::now();
+                                let idle_us = host.idle_since_last_client_rx_us(u64::from(clock()));
+                                let ignore_lan_before = matches!(
+                                    transport_kind,
+                                    HostTransportKind::Lan | HostTransportKind::MtlsLan
+                                )
+                                .then_some(session_started_at + LAN_STALE_SIGNAL_GRACE);
+                                if let Some(cutoff) = ignore_lan_before {
+                                    // 主动清掉本次 LAN 建连同源迟到的旧 PunchCoord（!is_relay_alloc），
+                                    // 防止其滞留满 20s 后在 Detached 期复活误抢占、打断 6s 续传。
+                                    relay_q.purge_stale_lan_punch_for_peer(
+                                        active_peer_id.as_deref(),
+                                        cutoff,
+                                        RELAY_INCOMING_TTL,
+                                    );
+                                }
+                                if relay_q.has_preempt_candidate_filtered(
+                                    RELAY_INCOMING_TTL,
+                                    active_peer_id.as_deref(),
+                                    idle_us,
+                                    false,
+                                    ignore_lan_before,
+                                ) {
+                                    preempted_by_incoming = true;
+                                    break;
+                                }
+                            }
+                        }
+
                         last_busy = r.busy || tools_busy || audio_busy;
-                        if !last_busy
-                            && host.state() == SessionState::Streaming
-                            && host.has_pipeline()
-                        {
+                        if !last_busy && host.state() == SessionState::Streaming {
                             let wait_ms = if pending_file_in.is_empty()
                                 && pending_display_tx.is_empty()
                                 && pending_update_tx.is_empty()
                             {
-                                2
+                                if host.is_media_paused() {
+                                    3
+                                } else {
+                                    2
+                                }
                             } else {
                                 1
                             };
-                            host.pipeline().wait_event(Duration::from_millis(wait_ms));
+                            if host.has_pipeline() {
+                                host.pipeline().wait_event(Duration::from_millis(wait_ms));
+                            } else if host.is_media_paused() {
+                                thread::sleep(Duration::from_millis(wait_ms));
+                            }
                         }
                     }
                     Err(e) => {
@@ -4236,6 +4801,10 @@ fn drive_ui_host_session_inner(
                     }
                     HostTransportKind::Lan => {}
                 }
+                if host.is_media_paused() && !host.is_pending_epoch_reset() {
+                    detached_reason = Some("纯工具连接已断开".to_string());
+                    break;
+                }
                 if password_version.load(Ordering::Acquire) != observed_pw_ver {
                     detached_reason = Some("密码已变更，重置监听".to_string());
                     break;
@@ -4244,13 +4813,58 @@ fn drive_ui_host_session_inner(
                     detached_reason = Some("鉴权配置已变更，重置监听".to_string());
                     break;
                 }
+                if let Some(relay_q) = incoming_relay {
+                    if last_preempt_check.elapsed() >= PREEMPT_CHECK_INTERVAL {
+                        last_preempt_check = Instant::now();
+                        let idle_us = host.idle_since_last_client_rx_us(u64::from(clock()));
+                        let ignore_lan_before = matches!(
+                            transport_kind,
+                            HostTransportKind::Lan | HostTransportKind::MtlsLan
+                        )
+                        .then_some(session_started_at + LAN_STALE_SIGNAL_GRACE);
+                        if let Some(cutoff) = ignore_lan_before {
+                            relay_q.purge_stale_lan_punch_for_peer(
+                                active_peer_id.as_deref(),
+                                cutoff,
+                                RELAY_INCOMING_TTL,
+                            );
+                        }
+                        if relay_q.has_preempt_candidate_filtered(
+                            RELAY_INCOMING_TTL,
+                            active_peer_id.as_deref(),
+                            idle_us,
+                            true,
+                            ignore_lan_before,
+                        ) {
+                            preempted_by_incoming = true;
+                            break;
+                        }
+                    }
+                }
+                // 70 分钟 `Bye(Refresh)` 触发后立即重锚会话钟原点并复位活动钟，
+                // 避免 71.58 分钟 `u32::MAX` 饱和导致 Detached 候选超时与新纪元 8s 看门狗失明。
+                if host.is_pending_epoch_reset() && !epoch_reanchored_in_detached {
+                    if let Some(anchor) = clock_anchor {
+                        anchor.reset_pending();
+                    }
+                    host.reset_activity_clock(u64::from(clock()));
+                    epoch_reanchored_in_detached = true;
+                }
+                if let Some(anchor) = clock_anchor {
+                    anchor.reanchor_next_build.store(true, Ordering::Release);
+                }
                 let now_us = u64::from(clock());
-                match host.tick_detached(now_us) {
+                let detach_res = host.tick_detached(now_us);
+                let factory_consumed_reanchor = clock_anchor
+                    .map(|anchor| !anchor.reanchor_next_build.swap(false, Ordering::AcqRel))
+                    .unwrap_or(false);
+                match detach_res {
                     Ok(DetachOutcome::TornDown) => {
                         detached_reason = Some("控制端重连超时已断开".to_string());
                         break;
                     }
                     Ok(DetachOutcome::Resumed) => {
+                        epoch_reanchored_in_detached = false;
                         host.reset_clipboard_epoch();
                         last_busy = true;
                         pending_display_tx.clear();
@@ -4316,6 +4930,16 @@ fn drive_ui_host_session_inner(
                         emit_peer_connected(host, &host.peer_addr().to_string(), updates);
                     }
                     Ok(DetachOutcome::Replaced) => {
+                        // 新会话落成（含 70 分钟 Bye(Refresh) 跨纪元重建）：确保时钟原点已重锚
+                        // 且被控端 8s 失活看门狗与刷新基准以新纪元零点起算。
+                        epoch_reanchored_in_detached = false;
+                        session_started_at = Instant::now();
+                        if !factory_consumed_reanchor {
+                            if let Some(anchor) = clock_anchor {
+                                anchor.reset_pending();
+                            }
+                        }
+                        host.reset_activity_clock(u64::from(clock()));
                         // M9：新控制端顶替旧会话时复位隐私幕布/被控端静音/虚拟屏、音频静音与全部会话级工具引擎，
                         // 避免新客户端继承旧客户端的隐私/音频/虚拟屏状态、终端 PTY 或陈旧线帧。
                         // `finalize_session` 已基于 `cfg.pipeline` 基线模板在主屏上启动新管线，
@@ -4351,6 +4975,10 @@ fn drive_ui_host_session_inner(
                         audio_muted = false;
                         audio_silence_gate.reset();
                         audio_seq = 0;
+                        audio_mgr.resume(&mut audio_silence_gate);
+                        active_peer_id = host
+                            .authenticated_owner()
+                            .map(|o| o.caller_device_id.clone());
                         pending_file_in.clear();
                         pending_file_tx.clear();
                         pending_term_tx.clear();
@@ -4453,12 +5081,9 @@ fn drive_ui_host_session_inner(
         }
     }
 
-    // 先释放异步初始化接收端，确保尚未完成的 `rc-audio-cap-init` 线程立即感知并停止释放采集器（H13）。
-    drop(audio_init_rx);
-    if let Some(ref mut cap) = audio_capture {
-        cap.stop();
-    }
-    drop(audio_capture);
+    // 停止并释放音频采集器与在途初始化接收端（H13）。
+    audio_mgr.stop_all();
+    drop(audio_mgr);
     drop(file_worker);
     if use_owner_terminals {
         owner_terminals.detach_all();
@@ -4482,22 +5107,27 @@ fn drive_ui_host_session_inner(
         ByeReason::Normal
     };
     let close_res = host.close(bye_reason);
-    if user_disconnected {
-        return "本机主动断开".to_string();
-    }
-    if let Some(err) = drive_err {
-        return err;
-    }
-    if let Some(reason) = detached_reason {
-        return reason;
-    }
-    match close_res {
-        Ok(summary) => match summary.stop_reason {
-            StopReason::Requested => "本机主动断开".to_string(),
-            StopReason::ByeReceived(_) => "控制端已断开".to_string(),
-            StopReason::Disconnected(r) => format!("连接中断 ({r})"),
-        },
-        Err(e) => format!("会话运行异常: {e}"),
+    let reason = if preempted_by_incoming {
+        "收到新的远控连接，已切换会话".to_string()
+    } else if user_disconnected {
+        "本机主动断开".to_string()
+    } else if let Some(err) = drive_err {
+        err
+    } else if let Some(reason) = detached_reason {
+        reason
+    } else {
+        match close_res {
+            Ok(summary) => match summary.stop_reason {
+                StopReason::Requested => "本机主动断开".to_string(),
+                StopReason::ByeReceived(_) => "控制端已断开".to_string(),
+                StopReason::Disconnected(r) => format!("连接中断 ({r})"),
+            },
+            Err(e) => format!("会话运行异常: {e}"),
+        }
+    };
+    DriveSessionOutcome {
+        reason,
+        preempted_by_incoming,
     }
 }
 
@@ -4565,6 +5195,7 @@ enum HandshakeTransportOutcome {
 #[allow(clippy::too_many_arguments)]
 fn build_and_handshake_transport(
     raw_transport: Box<dyn Transport>,
+    transport_kind: HostTransportKind,
     peer_label: &str,
     actual_addr: SocketAddr,
     opts: HostWorkerOptions,
@@ -4607,6 +5238,7 @@ fn build_and_handshake_transport(
     let mut built = match build_transport_host_session(
         actual_addr,
         transport,
+        transport_kind,
         live_pw,
         opts.approval_timeout_us,
         opts.prefer_hardware,
@@ -4628,8 +5260,7 @@ fn build_and_handshake_transport(
         }
     };
 
-    *built.clock_origin.lock().unwrap_or_else(|e| e.into_inner()) =
-        ClockOrigin::Pending(Instant::now());
+    built.clock_anchor.reset_pending();
     let handshake_res = built.host.handshake();
     approver.set_remote_addr_override(None);
 
@@ -4755,6 +5386,7 @@ fn dial_relay_for_incoming(
 #[allow(clippy::too_many_arguments)]
 fn serve_relay_incoming(
     incoming: RelayIncoming,
+    incoming_relay: &Arc<BoundedRelayIncomingQueue>,
     actual_addr: SocketAddr,
     display_addr: &str,
     opts: HostWorkerOptions,
@@ -4862,6 +5494,7 @@ fn serve_relay_incoming(
             let peer_label = format!("设备 {} (P2P 直连)", incoming.peer_id);
             match build_and_handshake_transport(
                 Box::new(p2p_conn),
+                HostTransportKind::P2p,
                 &peer_label,
                 actual_addr,
                 opts,
@@ -4944,6 +5577,7 @@ fn serve_relay_incoming(
             };
             match build_and_handshake_transport(
                 raw_transport,
+                transport_kind,
                 &peer_label,
                 actual_addr,
                 opts,
@@ -4980,7 +5614,7 @@ fn serve_relay_incoming(
     let BuiltUiHost {
         mut host,
         clock,
-        clock_origin: _,
+        clock_anchor,
         backend_label,
         hardware_video_active,
         wake_guard,
@@ -4989,9 +5623,10 @@ fn serve_relay_incoming(
     streaming_started.store(true, Ordering::Release);
     emit_peer_connected(&host, &peer_label, updates);
 
-    let reason = drive_ui_host_session_inner(
+    let outcome = drive_ui_host_session_inner(
         &mut host,
         &clock,
+        Some(&clock_anchor),
         updates,
         password_version,
         live_pw_ver,
@@ -5009,7 +5644,11 @@ fn serve_relay_incoming(
         owner_terminals,
         wake_guard,
         Arc::clone(file_transfer_dir),
+        Some(incoming_relay),
+        Some(incoming.peer_id.as_str()),
+        Instant::now(),
     );
+    let reason = outcome.reason;
     let last_backend = backend_label
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -5271,7 +5910,7 @@ fn run_host_worker(
                 let BuiltUiHost {
                     mut host,
                     clock,
-                    clock_origin,
+                    clock_anchor,
                     backend_label,
                     hardware_video_active,
                     wake_guard,
@@ -5288,6 +5927,7 @@ fn run_host_worker(
                     {
                         serve_relay_incoming(
                             incoming,
+                            &incoming_relay,
                             actual_addr,
                             &display_addr,
                             opts,
@@ -5322,8 +5962,7 @@ fn run_host_worker(
                             host.update_caps_resolution(live_res.width, live_res.height);
                         }
                     }
-                    *clock_origin.lock().unwrap_or_else(|e| e.into_inner()) =
-                        ClockOrigin::Pending(Instant::now());
+                    clock_anchor.reset_pending();
 
                     match host.accept_and_handshake(HOST_ACCEPT_SLICE) {
                         Ok(_) => break true,
@@ -5347,11 +5986,15 @@ fn run_host_worker(
                 let session_started_at = Instant::now();
                 disconnect_flag.store(false, Ordering::Release);
                 let remote_addr = host.peer_addr().to_string();
+                let initial_lan_peer_did = host
+                    .authenticated_owner()
+                    .map(|o| o.caller_device_id.clone());
                 emit_peer_connected(&host, &remote_addr, &updates);
 
-                let reason = drive_ui_host_session_inner(
+                let outcome = drive_ui_host_session_inner(
                     &mut host,
                     &clock,
+                    Some(&clock_anchor),
                     &updates,
                     &password_version,
                     observed_pw_ver,
@@ -5369,10 +6012,15 @@ fn run_host_worker(
                     &mut owner_terminals,
                     wake_guard,
                     Arc::clone(&file_transfer_dir),
+                    Some(&incoming_relay),
+                    initial_lan_peer_did.as_deref(),
+                    session_started_at,
                 );
+                let reason = outcome.reason;
                 let lan_peer_did = host
                     .authenticated_owner()
-                    .map(|o| o.caller_device_id.clone());
+                    .map(|o| o.caller_device_id.clone())
+                    .or(initial_lan_peer_did);
                 let last_backend = backend_label
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -5394,11 +6042,16 @@ fn run_host_worker(
                     // 避免对端在旧 quinn::Endpoint 异步释放窗口内重连撞上 CONNECTION_REFUSED。
                     pending_listening_notify = true;
                 }
-                incoming_relay.purge_for_peer_before(
-                    lan_peer_did.as_deref(),
-                    lan_stale_signal_cutoff(session_started_at, Instant::now()),
-                    RELAY_INCOMING_TTL,
-                );
+                if outcome.preempted_by_incoming {
+                    // 被入站新连接抢占时绝不调用 purge_for_peer_before 误删刚到达的抢占凭据。
+                    incoming_relay.purge_expired(RELAY_INCOMING_TTL);
+                } else {
+                    incoming_relay.purge_for_peer_before(
+                        lan_peer_did.as_deref(),
+                        lan_stale_signal_cutoff(session_started_at, Instant::now()),
+                        RELAY_INCOMING_TTL,
+                    );
+                }
             }
             HostListener::AwaitingMtlsCert => {
                 while !stop_flag.load(Ordering::Acquire) {
@@ -5432,6 +6085,7 @@ fn run_host_worker(
                     {
                         serve_relay_incoming(
                             incoming,
+                            &incoming_relay,
                             actual_addr,
                             &display_addr,
                             opts,
@@ -5475,6 +6129,7 @@ fn run_host_worker(
                             };
                             match build_and_handshake_transport(
                                 Box::new(quic_transport),
+                                HostTransportKind::MtlsLan,
                                 &peer_label,
                                 actual_addr,
                                 opts,
@@ -5496,16 +6151,17 @@ fn run_host_worker(
                                     let BuiltUiHost {
                                         mut host,
                                         clock,
-                                        clock_origin: _,
+                                        clock_anchor,
                                         backend_label,
                                         hardware_video_active,
                                         wake_guard,
                                     } = *built;
                                     streaming_started.store(true, Ordering::Release);
                                     emit_peer_connected(&host, &peer_label, &updates);
-                                    let reason = drive_ui_host_session_inner(
+                                    let outcome = drive_ui_host_session_inner(
                                         &mut host,
                                         &clock,
+                                        Some(&clock_anchor),
                                         &updates,
                                         &password_version,
                                         live_pw_ver,
@@ -5523,7 +6179,11 @@ fn run_host_worker(
                                         &mut owner_terminals,
                                         wake_guard,
                                         Arc::clone(&file_transfer_dir),
+                                        Some(&incoming_relay),
+                                        mtls_peer_did.as_deref(),
+                                        session_started_at,
                                     );
+                                    let reason = outcome.reason;
                                     let last_backend = backend_label
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner())
@@ -5544,11 +6204,18 @@ fn run_host_worker(
                                             backend: last_backend,
                                         });
                                     }
-                                    incoming_relay.purge_for_peer_before(
-                                        mtls_peer_did.as_deref(),
-                                        lan_stale_signal_cutoff(session_started_at, Instant::now()),
-                                        RELAY_INCOMING_TTL,
-                                    );
+                                    if outcome.preempted_by_incoming {
+                                        incoming_relay.purge_expired(RELAY_INCOMING_TTL);
+                                    } else {
+                                        incoming_relay.purge_for_peer_before(
+                                            mtls_peer_did.as_deref(),
+                                            lan_stale_signal_cutoff(
+                                                session_started_at,
+                                                Instant::now(),
+                                            ),
+                                            RELAY_INCOMING_TTL,
+                                        );
+                                    }
                                 }
                                 HandshakeTransportOutcome::Failed(_)
                                 | HandshakeTransportOutcome::BuildError => {
@@ -5980,7 +6647,7 @@ mod tests {
                         negotiated = true;
                         break;
                     }
-                    crate::session_bridge::SessionUpdate::Ended { reason } => {
+                    crate::session_bridge::SessionUpdate::Ended { reason, .. } => {
                         panic!("使用新密码握手不应失败: {reason}");
                     }
                     _ => {}
@@ -6155,6 +6822,7 @@ mod tests {
             local_udp_port: None,
             owner_grant: None,
             is_owner_connection: true,
+            is_relay_alloc: false,
         };
 
         queue.push(make_item("111222333", "old-token"));
@@ -6838,6 +7506,7 @@ mod tests {
             local_udp_port: None,
             owner_grant: None,
             is_owner_connection: true,
+            is_relay_alloc: false,
         };
 
         q.push(mk("111222333", "stale-lan-token", vec!["192.168.1.5:9901"]));
@@ -6876,5 +7545,1159 @@ mod tests {
             recent_switch_signal >= cutoff,
             "fresh switch signal arriving right before disconnect must be preserved"
         );
+    }
+
+    struct ChannelTestTransport {
+        in_rx: mpsc::Receiver<NetEvent>,
+        out_reliable_tx: mpsc::Sender<Vec<u8>>,
+        out_datagram_count: Arc<AtomicU64>,
+    }
+
+    impl Transport for ChannelTestTransport {
+        fn send_datagram(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+            self.out_datagram_count.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn send_reliable(&mut self, data: &[u8]) -> rc_types::Result<()> {
+            let _ = self.out_reliable_tx.send(data.to_vec());
+            Ok(())
+        }
+
+        fn poll(&mut self, timeout: Duration) -> rc_types::Result<Vec<NetEvent>> {
+            let mut events = Vec::new();
+            match self.in_rx.recv_timeout(timeout) {
+                Ok(ev) => {
+                    events.push(ev);
+                    while let Ok(more) = self.in_rx.try_recv() {
+                        events.push(more);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    events.push(NetEvent::Disconnected {
+                        reason: "channel closed".to_string(),
+                    });
+                }
+            }
+            Ok(events)
+        }
+
+        fn stats(&self) -> NetStats {
+            NetStats::default()
+        }
+    }
+
+    struct ScriptedAudioCapture {
+        inner: rc_audio::FakeAudioCapture,
+        stopped: Arc<AtomicBool>,
+        stop_calls: Arc<AtomicU64>,
+    }
+
+    impl AudioCapture for ScriptedAudioCapture {
+        fn try_recv_frame(&mut self) -> Option<rc_audio::PcmFrame> {
+            if self.stopped.load(Ordering::Acquire) {
+                return None;
+            }
+            self.inner.try_recv_frame()
+        }
+
+        fn sample_rate(&self) -> u32 {
+            self.inner.sample_rate()
+        }
+
+        fn channels(&self) -> u8 {
+            self.inner.channels()
+        }
+
+        fn stop(&mut self) {
+            self.stopped.store(true, Ordering::Release);
+            self.stop_calls.fetch_add(1, Ordering::AcqRel);
+            self.inner.stop();
+        }
+
+        fn is_stopped(&self) -> bool {
+            self.stopped.load(Ordering::Acquire) || self.inner.is_stopped()
+        }
+    }
+
+    fn build_streaming_channel_host(
+        clock: SessionClock,
+    ) -> (
+        HostSession,
+        mpsc::Sender<NetEvent>,
+        mpsc::Receiver<Vec<u8>>,
+        Arc<AtomicU64>,
+    ) {
+        use rc_session::proto::{AuthMethod, ControlMessage, Hello, PROTOCOL_VERSION};
+
+        let requested = SessionParams {
+            width: 320,
+            height: 240,
+            fps: 30,
+            bitrate_bps: 2_000_000,
+        };
+        let hello_msg = ControlMessage::Hello(Hello {
+            version: PROTOCOL_VERSION,
+            session_id: 42,
+            requested,
+            auth_method: AuthMethod::None,
+            auth_payload: Vec::new(),
+        });
+        let mut hello_bytes = Vec::new();
+        hello_msg.encode(&mut hello_bytes);
+
+        let (in_tx, in_rx) = mpsc::channel::<NetEvent>();
+        let (out_reliable_tx, out_reliable_rx) = mpsc::channel::<Vec<u8>>();
+        let out_datagram_count = Arc::new(AtomicU64::new(0));
+        in_tx
+            .send(NetEvent::Reliable(hello_bytes))
+            .expect("queue hello");
+
+        let transport = ChannelTestTransport {
+            in_rx,
+            out_reliable_tx,
+            out_datagram_count: Arc::clone(&out_datagram_count),
+        };
+        let capture = rc_capture::FakeBackend::new(rc_capture::FakeBackendConfig {
+            display: rc_capture::DisplayInfo {
+                id: rc_types::DisplayId(0),
+                resolution: Resolution::new(320, 240),
+                scale: 1.0,
+                hdr: false,
+            },
+            fps: 30,
+            content: rc_capture::FakeContent::Dynamic,
+            dirty_rect: None,
+        })
+        .expect("fake capture");
+        let encoder = rc_encode::FakeEncoder::new(rc_encode::EncoderConfig {
+            resolution: Resolution::new(320, 240),
+            fps: 30,
+            bitrate_bps: 2_000_000,
+            ..rc_encode::EncoderConfig::default()
+        })
+        .expect("fake encoder");
+
+        let cfg = HostSessionConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            mtu: rc_session::DEFAULT_SESSION_MTU,
+            caps: requested,
+            pipeline: PipelineConfig {
+                resolution: Resolution::new(320, 240),
+                fps: 30,
+                bitrate_bps: 2_000_000,
+                prefer_hardware: false,
+                target_latency_us: 22_000,
+                trace_capacity: 64,
+                diff: DiffMode::TrustPlatform,
+                clock_origin_us: None,
+                max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+                ..PipelineConfig::default()
+            },
+            handshake_timeout: Duration::from_secs(5),
+            injector: Box::new(RecordingInjector::new()),
+            pace_capture: false,
+            auth: HostAuthConfig::default(),
+            approver: Box::new(AutoApprover),
+        };
+        let mut host = HostSession::with_parts(
+            cfg,
+            Box::new(transport),
+            Box::new(capture),
+            Box::new(encoder),
+            clock,
+        )
+        .expect("with_parts");
+        host.set_pipeline_factory_for(Box::new(|pcfg| {
+            let (p, _) = fake_stack_anchored(pcfg, None)?;
+            Ok(p)
+        }));
+        host.handshake().expect("handshake");
+        assert_eq!(host.state(), SessionState::Streaming);
+        (host, in_tx, out_reliable_rx, out_datagram_count)
+    }
+
+    fn send_display_ctrl_event(tx: &mpsc::Sender<NetEvent>, msg: &DisplayControlMsg) {
+        let payload = display_ctrl::encode_display_ctrl(msg).expect("encode display ctrl");
+        let mut wire = Vec::new();
+        rc_session::proto::ControlMessage::ToolChannel {
+            channel: TOOL_CHANNEL_DISPLAY_CTRL,
+            payload,
+        }
+        .encode(&mut wire);
+        tx.send(NetEvent::Reliable(wire)).expect("send tool event");
+    }
+
+    fn recv_display_ctrl_until(
+        rx: &mpsc::Receiver<Vec<u8>>,
+        timeout: Duration,
+        mut pred: impl FnMut(&DisplayControlMsg) -> bool,
+    ) -> Vec<DisplayControlMsg> {
+        let deadline = Instant::now() + timeout;
+        let mut collected = Vec::new();
+        while Instant::now() < deadline {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(rem.min(Duration::from_millis(20))) {
+                Ok(raw) => {
+                    if let Ok(rc_session::proto::ControlMessage::ToolChannel {
+                        channel: TOOL_CHANNEL_DISPLAY_CTRL,
+                        payload,
+                    }) = rc_session::proto::ControlMessage::decode(&raw)
+                    {
+                        if let Some(msg) = display_ctrl::decode_display_ctrl(&payload) {
+                            let matched = pred(&msg);
+                            collected.push(msg);
+                            if matched {
+                                return collected;
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        collected
+    }
+
+    #[test]
+    fn set_media_paused_toggles_pipeline_without_exiting_and_emits_media_state() {
+        assert_eq!(host_resume_ttl(HostTransportKind::Relay), Duration::ZERO);
+        assert_eq!(host_resume_ttl(HostTransportKind::P2p), Duration::ZERO);
+        assert_eq!(
+            host_resume_ttl(HostTransportKind::Lan),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            host_resume_ttl(HostTransportKind::MtlsLan),
+            Duration::from_secs(6)
+        );
+
+        let clock: SessionClock = Arc::new(|| 10_000);
+        let (mut host, in_tx, out_rx, out_dgrams) =
+            build_streaming_channel_host(Arc::clone(&clock));
+
+        let cap1_stopped = Arc::new(AtomicBool::new(false));
+        let cap1_stop_calls = Arc::new(AtomicU64::new(0));
+        let created_count = Arc::new(AtomicU64::new(0));
+        let initial_cap: Box<dyn AudioCapture> = Box::new(ScriptedAudioCapture {
+            inner: rc_audio::FakeAudioCapture::new(),
+            stopped: Arc::clone(&cap1_stopped),
+            stop_calls: Arc::clone(&cap1_stop_calls),
+        });
+        let creator_counter = Arc::clone(&created_count);
+        let audio_mgr = HostAudioManager::with_creator(
+            true,
+            Some(initial_cap),
+            Arc::new(move || {
+                creator_counter.fetch_add(1, Ordering::AcqRel);
+                Ok(Box::new(rc_audio::FakeAudioCapture::new()))
+            }),
+        );
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop_flag);
+        let t_clock = Arc::clone(&clock);
+        let driver = thread::spawn(move || {
+            let updates = BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP);
+            let pw_ver = AtomicU64::new(0);
+            let cfg_ver = AtomicU64::new(0);
+            let disc = AtomicBool::new(false);
+            let close_reason = AtomicU8::new(ByeReason::Normal as u8);
+            let lock_cnt = AtomicU64::new(0);
+            let mut owner_terms = PersistentOwnerTerminals::new();
+            let wake_guard: SharedWakeGuard = Arc::new(Mutex::new(None));
+            let ft_dir: SharedFileTransferDir = Arc::new(RwLock::new(None));
+            let outcome = drive_ui_host_session_with_audio(
+                &mut host,
+                &t_clock,
+                None,
+                &updates,
+                &pw_ver,
+                0,
+                &cfg_ver,
+                0,
+                &disc,
+                &t_stop,
+                &close_reason,
+                HostTransportKind::Lan,
+                false,
+                false,
+                &lock_cnt,
+                None,
+                &mut owner_terms,
+                wake_guard,
+                ft_dir,
+                None,
+                None,
+                Instant::now(),
+                audio_mgr,
+            );
+            (outcome, host.client_idle_timeout_us())
+        });
+
+        // 1) 发送 SetMediaPaused { paused: true } -> 回执 MediaState { paused: true }，停管线与音频，不退出会话。
+        send_display_ctrl_event(&in_tx, &DisplayControlMsg::SetMediaPaused { paused: true });
+        let paused_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(m, DisplayControlMsg::MediaState { paused: true })
+        });
+        assert!(
+            paused_msgs
+                .iter()
+                .any(|m| matches!(m, DisplayControlMsg::MediaState { paused: true })),
+            "must emit MediaState(paused=true), got: {paused_msgs:?}"
+        );
+        assert!(
+            cap1_stopped.load(Ordering::Acquire) && cap1_stop_calls.load(Ordering::Acquire) >= 1,
+            "pausing media must immediately stop and drop active audio capture"
+        );
+
+        // 暂停后继续空转一段时间：不应产出新视频数据报，也不应因 !has_pipeline() 异常退出。
+        let dgrams_after_pause = out_dgrams.load(Ordering::Acquire);
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            out_dgrams.load(Ordering::Acquire),
+            dgrams_after_pause,
+            "media_paused must produce zero new video datagrams"
+        );
+        assert!(
+            !driver.is_finished(),
+            "host loop must stay alive in pure-tool paused state without pipeline"
+        );
+
+        // 2) 发送 SetMediaPaused { paused: false } -> 重建管线、补发 Capabilities/HostScreenState、拉起新音频、回执 MediaState { paused: false }。
+        send_display_ctrl_event(&in_tx, &DisplayControlMsg::SetMediaPaused { paused: false });
+        let resumed_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(m, DisplayControlMsg::MediaState { paused: false })
+        });
+        assert!(
+            resumed_msgs
+                .iter()
+                .any(|m| matches!(m, DisplayControlMsg::Capabilities { .. })),
+            "resume must re-emit Capabilities, got: {resumed_msgs:?}"
+        );
+        assert!(
+            resumed_msgs
+                .iter()
+                .any(|m| matches!(m, DisplayControlMsg::HostScreenState { .. })),
+            "resume must re-emit HostScreenState, got: {resumed_msgs:?}"
+        );
+        assert!(
+            resumed_msgs
+                .iter()
+                .any(|m| matches!(m, DisplayControlMsg::MediaState { paused: false })),
+            "resume must emit MediaState(paused=false), got: {resumed_msgs:?}"
+        );
+
+        let resume_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < resume_deadline
+            && (out_dgrams.load(Ordering::Acquire) <= dgrams_after_pause
+                || created_count.load(Ordering::Acquire) == 0)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            out_dgrams.load(Ordering::Acquire) > dgrams_after_pause,
+            "resumed pipeline must produce video datagrams again"
+        );
+        assert!(
+            created_count.load(Ordering::Acquire) >= 1,
+            "resume must respawn audio capture"
+        );
+
+        stop_flag.store(true, Ordering::Release);
+        let (outcome, idle_timeout) = driver.join().expect("join driver");
+        assert_eq!(idle_timeout, HostSession::CLIENT_IDLE_TIMEOUT_US);
+        assert!(!outcome.preempted_by_incoming);
+        assert!(
+            !outcome.reason.contains("热重建失败"),
+            "clean stop must not report pipeline failure: {}",
+            outcome.reason
+        );
+    }
+
+    #[test]
+    fn relay_incoming_has_preempt_candidate_covers_same_peer_idle_and_active_third_party() {
+        let mk =
+            |peer_id: &str, is_owner: bool, lan: Vec<&str>, is_relay_alloc: bool| RelayIncoming {
+                session_id: format!("sid-{peer_id}"),
+                peer_id: peer_id.to_string(),
+                relay_addr: "127.0.0.1:21117".to_string(),
+                relay_token: format!("tok-{peer_id}"),
+                peer_public_addr: None,
+                peer_lan_addrs: lan.into_iter().map(str::to_string).collect(),
+                local_udp_port: None,
+                owner_grant: None,
+                is_owner_connection: is_owner,
+                is_relay_alloc,
+            };
+
+        let ttl = Duration::from_secs(20);
+        let q = BoundedRelayIncomingQueue::new(8);
+        assert!(!q.has_preempt_candidate(ttl, Some("peer-a"), 0, false));
+
+        // 1) 同设备重连：即使旧会话活跃（idle=0, !detached）也立即允许抢占。
+        q.push(mk("peer-a", false, vec![], false));
+        assert!(q.has_preempt_candidate(ttl, Some("peer-a"), 0, false));
+        // 空 active_peer_id 不得误匹配。
+        assert!(!q.has_preempt_candidate(ttl, Some(""), 0, false));
+
+        // 过期条目自动忽略。
+        thread::sleep(Duration::from_millis(5));
+        assert!(!q.has_preempt_candidate(Duration::ZERO, Some("peer-a"), 0, false));
+
+        // 2) 不同设备的普通协助连接：旧会话活跃（< 4s 且未 Detached）时拒绝抢占；>= 4s 或 Detached 时放行。
+        let q_guest = BoundedRelayIncomingQueue::new(8);
+        q_guest.push(mk("peer-b", false, vec![], false));
+        assert!(!q_guest.has_preempt_candidate(ttl, Some("peer-a"), 0, false));
+        assert!(!q_guest.has_preempt_candidate(ttl, Some("peer-a"), 2_999_999, false));
+        assert!(!q_guest.has_preempt_candidate(ttl, Some("peer-a"), 3_500_000, false));
+        assert!(q_guest.has_preempt_candidate(ttl, Some("peer-a"), 4_000_000, false));
+        assert!(q_guest.has_preempt_candidate(ttl, Some("peer-a"), 0, true));
+
+        // 3) 不同设备的同账号自控连接：活跃（< 3s 且未 Detached）时保护当前用户；>= 3s 或 Detached 时抢占。
+        let q_owner = BoundedRelayIncomingQueue::new(8);
+        q_owner.push(mk("peer-owner-2", true, vec![], false));
+        assert!(!q_owner.has_preempt_candidate(ttl, Some("peer-a"), 0, false));
+        assert!(!q_owner.has_preempt_candidate(ttl, Some("peer-a"), 2_999_999, false));
+        assert!(q_owner.has_preempt_candidate(ttl, Some("peer-a"), 3_000_000, false));
+        assert!(q_owner.has_preempt_candidate(ttl, Some("peer-a"), 0, true));
+
+        // 4) LAN 刚建连的 3s 宽限期内：无论 peer_lan_addrs 是否为空、无论 idle 是否 >= 3s/4s、
+        //    无论 Streaming 还是 Detached，同对端普通 PunchCoord（is_relay_alloc=false）一律忽略；
+        //    仅当显式切中继（is_relay_alloc=true）或晚于宽限期的新请求才触发抢占。
+        let q_lan_guard = BoundedRelayIncomingQueue::new(8);
+        let session_started = Instant::now();
+        let cutoff = session_started + LAN_STALE_SIGNAL_GRACE;
+        q_lan_guard.push(mk("peer-a", true, vec![], false));
+        assert!(!q_lan_guard.has_preempt_candidate_filtered(
+            ttl,
+            Some("peer-a"),
+            0,
+            false,
+            Some(cutoff),
+        ));
+        assert!(!q_lan_guard.has_preempt_candidate_filtered(
+            ttl,
+            Some("peer-a"),
+            5_000_000,
+            false,
+            Some(cutoff),
+        ));
+        assert!(!q_lan_guard.has_preempt_candidate_filtered(
+            ttl,
+            Some("peer-a"),
+            0,
+            true,
+            Some(cutoff),
+        ));
+        q_lan_guard.push(mk("peer-a", true, vec![], true));
+        assert!(q_lan_guard.has_preempt_candidate_filtered(
+            ttl,
+            Some("peer-a"),
+            0,
+            false,
+            Some(cutoff),
+        ));
+        assert!(q_lan_guard.has_preempt_candidate_filtered(
+            ttl,
+            Some("peer-a"),
+            0,
+            true,
+            Some(cutoff),
+        ));
+
+        // 5) 端到端验证：drive_ui_host_session_inner 检测到同设备新入站连接时迅速抢占退出且不删队列凭据。
+        let clock: SessionClock = Arc::new(|| 10_000);
+        let (mut host, _in_tx, _out_rx, _out_dgrams) =
+            build_streaming_channel_host(Arc::clone(&clock));
+        let incoming_q = Arc::new(BoundedRelayIncomingQueue::new(8));
+        incoming_q.push(mk("peer-a", true, vec![], true));
+        let t_q = Arc::clone(&incoming_q);
+        let t_clock = Arc::clone(&clock);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop_flag);
+        let started = Instant::now();
+        let outcome = drive_ui_host_session_inner(
+            &mut host,
+            &t_clock,
+            None,
+            &BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP),
+            &AtomicU64::new(0),
+            0,
+            &AtomicU64::new(0),
+            0,
+            &AtomicBool::new(false),
+            &t_stop,
+            &AtomicU8::new(ByeReason::Normal as u8),
+            HostTransportKind::Relay,
+            false,
+            false,
+            false,
+            &AtomicU64::new(0),
+            None,
+            &mut PersistentOwnerTerminals::new(),
+            Arc::new(Mutex::new(None)),
+            Arc::new(RwLock::new(None)),
+            Some(&t_q),
+            Some("peer-a"),
+            started,
+        );
+        assert!(
+            outcome.preempted_by_incoming,
+            "same-peer RelayIncoming must preempt active Relay session"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "preemption must complete promptly, took {:?}",
+            started.elapsed()
+        );
+        let preserved = incoming_q
+            .pop_ready(ttl, Duration::ZERO)
+            .expect("preempting RelayIncoming token must remain intact in queue");
+        assert_eq!(preserved.peer_id, "peer-a");
+    }
+
+    #[test]
+    fn audio_capture_is_stopped_triggers_automatic_self_healing_and_resumes_sending() {
+        // Part A：端到端验证旧 AudioCapture::is_stopped() == true 后自动停止旧采集器、
+        // 300ms 后异步创建新采集器并恢复向对端发送 AudioFrame。
+        let clock: SessionClock = Arc::new(|| 10_000);
+        let (mut host, _in_tx, out_rx, _out_dgrams) =
+            build_streaming_channel_host(Arc::clone(&clock));
+
+        let cap1_stopped = Arc::new(AtomicBool::new(false));
+        let cap1_stop_calls = Arc::new(AtomicU64::new(0));
+        let rebuilt_count = Arc::new(AtomicU64::new(0));
+
+        let cap1: Box<dyn AudioCapture> = Box::new(ScriptedAudioCapture {
+            inner: rc_audio::FakeAudioCapture::new(),
+            stopped: Arc::clone(&cap1_stopped),
+            stop_calls: Arc::clone(&cap1_stop_calls),
+        });
+        let t_rebuilt = Arc::clone(&rebuilt_count);
+        let audio_mgr = HostAudioManager::with_creator(
+            true,
+            Some(cap1),
+            Arc::new(move || {
+                t_rebuilt.fetch_add(1, Ordering::AcqRel);
+                Ok(Box::new(rc_audio::FakeAudioCapture::new()))
+            }),
+        );
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop_flag);
+        let t_clock = Arc::clone(&clock);
+        let driver = thread::spawn(move || {
+            drive_ui_host_session_with_audio(
+                &mut host,
+                &t_clock,
+                None,
+                &BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP),
+                &AtomicU64::new(0),
+                0,
+                &AtomicU64::new(0),
+                0,
+                &AtomicBool::new(false),
+                &t_stop,
+                &AtomicU8::new(ByeReason::Normal as u8),
+                HostTransportKind::Lan,
+                false,
+                false,
+                &AtomicU64::new(0),
+                None,
+                &mut PersistentOwnerTerminals::new(),
+                Arc::new(Mutex::new(None)),
+                Arc::new(RwLock::new(None)),
+                None,
+                None,
+                Instant::now(),
+                audio_mgr,
+            )
+        });
+
+        let wait_audio_seq = |rx: &mpsc::Receiver<Vec<u8>>, min_seq: u32, timeout: Duration| {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if let Ok(raw) = rx.recv_timeout(rem.min(Duration::from_millis(20))) {
+                    if let Ok(rc_session::proto::ControlMessage::AudioFrame { seq, .. }) =
+                        rc_session::proto::ControlMessage::decode(&raw)
+                    {
+                        if seq >= min_seq {
+                            return Some(seq);
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        // 1) 旧采集器先正常送出音频帧。
+        let before_seq =
+            wait_audio_seq(&out_rx, 1, Duration::from_secs(2)).expect("initial audio frames");
+
+        // 2) 模拟改分辨率/切屏导致底层 SCStream 中止：cap1.is_stopped() -> true。
+        cap1_stopped.store(true, Ordering::Release);
+
+        // 等待旧采集器被 stop() 释放并完成异步自愈重建（~300ms）。
+        let heal_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < heal_deadline && rebuilt_count.load(Ordering::Acquire) == 0 {
+            thread::sleep(Duration::from_millis(15));
+        }
+        assert!(
+            cap1_stop_calls.load(Ordering::Acquire) >= 1,
+            "stopped audio capture must be explicitly stopped and replaced"
+        );
+        assert!(
+            rebuilt_count.load(Ordering::Acquire) >= 1,
+            "audio manager must spawn a replacement AudioCapture after 300ms"
+        );
+
+        // 排空重建前可能已入队的旧帧，确认新采集器持续产出递增 seq 的 AudioFrame。
+        let mut max_seen = before_seq;
+        while let Ok(raw) = out_rx.try_recv() {
+            if let Ok(rc_session::proto::ControlMessage::AudioFrame { seq, .. }) =
+                rc_session::proto::ControlMessage::decode(&raw)
+            {
+                max_seen = max_seen.max(seq);
+            }
+        }
+        let after_seq = wait_audio_seq(&out_rx, max_seen.saturating_add(2), Duration::from_secs(2))
+            .expect("replacement audio capture must resume sending AudioFrame packets");
+        assert!(after_seq > max_seen);
+
+        stop_flag.store(true, Ordering::Release);
+        let _ = driver.join().expect("join driver");
+
+        // Part B：验证初始化失败时的有界退避序列（300ms -> 1s -> 2s -> 2s）及 media_paused 抑制。
+        let attempts = Arc::new(AtomicU64::new(0));
+        let t_attempts = Arc::clone(&attempts);
+        let mut mgr = HostAudioManager::with_creator(
+            true,
+            None,
+            Arc::new(move || {
+                t_attempts.fetch_add(1, Ordering::AcqRel);
+                Err("locked screen".to_string())
+            }),
+        );
+        let mut gate = AudioSilenceGate::default();
+        let t0 = Instant::now();
+        // 等待首次异步失败线程退出并被 poll 消费 -> 预约 t0 + 300ms，下次退避升至 1s。
+        let wait_init_fail = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < wait_init_fail && mgr.retry_at.is_none() {
+            mgr.poll_and_recover(t0, false, &mut gate);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(mgr.retry_at, Some(t0 + Duration::from_millis(300)));
+        assert_eq!(mgr.retry_backoff, Duration::from_secs(1));
+
+        // 推进虚拟时间至 +300ms 触发第 2 次失败 -> 预约 +1s，下次退避升至 2s。
+        let t1 = t0 + Duration::from_millis(300);
+        mgr.poll_and_recover(t1, false, &mut gate);
+        let wait_fail2 = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < wait_fail2 && mgr.retry_at.is_none() {
+            mgr.poll_and_recover(t1, false, &mut gate);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(mgr.retry_at, Some(t1 + Duration::from_secs(1)));
+        assert_eq!(mgr.retry_backoff, Duration::from_secs(2));
+
+        // 推进虚拟时间至 +1s 触发第 3 次失败 -> 封顶 2s。
+        let t2 = t1 + Duration::from_secs(1);
+        mgr.poll_and_recover(t2, false, &mut gate);
+        let wait_fail3 = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < wait_fail3 && mgr.retry_at.is_none() {
+            mgr.poll_and_recover(t2, false, &mut gate);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(mgr.retry_at, Some(t2 + Duration::from_secs(2)));
+        assert_eq!(mgr.retry_backoff, Duration::from_secs(2));
+
+        // 显示器切换后退避重置为 300ms，且 media_paused == true 时绝不拉起自愈。
+        mgr.reset_backoff_for_display_change(t2);
+        assert_eq!(mgr.retry_backoff, Duration::from_millis(300));
+        assert_eq!(mgr.retry_at, Some(t2 + Duration::from_millis(300)));
+        let attempts_before_paused = attempts.load(Ordering::Acquire);
+        mgr.poll_and_recover(t2 + Duration::from_secs(10), true, &mut gate);
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            attempts_before_paused,
+            "media_paused must suppress audio self-healing retries"
+        );
+    }
+
+    #[test]
+    fn lan_stale_punch_coord_empty_addrs_never_preempts_and_is_purged_while_relay_alloc_and_post_grace_preempt(
+    ) {
+        let mk = |peer_id: &str, token: &str, lan: Vec<&str>, is_relay_alloc: bool| RelayIncoming {
+            session_id: format!("sid-{token}"),
+            peer_id: peer_id.to_string(),
+            relay_addr: "127.0.0.1:21117".to_string(),
+            relay_token: token.to_string(),
+            peer_public_addr: None,
+            peer_lan_addrs: lan.into_iter().map(str::to_string).collect(),
+            local_udp_port: None,
+            owner_grant: None,
+            is_owner_connection: true,
+            is_relay_alloc,
+        };
+
+        let ttl = Duration::from_secs(20);
+        let q = BoundedRelayIncomingQueue::new(8);
+        let session_started = Instant::now();
+        let lan_grace_cutoff = session_started + Duration::from_millis(80);
+
+        // 1) 同对端迟到的普通 PunchCoord（is_relay_alloc=false）即使 peer_lan_addrs 为空，
+        //    在 Streaming（含 idle>=3s/4s）和 Detached 两态均绝不抢占。
+        q.push(mk("peer-a", "stale-empty-lan", vec![], false));
+        assert!(!q.has_preempt_candidate_filtered(
+            ttl,
+            Some("peer-a"),
+            0,
+            false,
+            Some(lan_grace_cutoff),
+        ));
+        assert!(!q.has_preempt_candidate_filtered(
+            ttl,
+            Some("peer-a"),
+            3_500_000,
+            false,
+            Some(lan_grace_cutoff),
+        ));
+        assert!(!q.has_preempt_candidate_filtered(
+            ttl,
+            Some("peer-a"),
+            5_000_000,
+            false,
+            Some(lan_grace_cutoff),
+        ));
+        assert!(!q.has_preempt_candidate_filtered(
+            ttl,
+            Some("peer-a"),
+            0,
+            true,
+            Some(lan_grace_cutoff),
+        ));
+
+        // 2) purge_stale_lan_punch_for_peer 主动清掉同对端陈旧 PunchCoord，同时保留其他对端条目。
+        q.push(mk("peer-other", "other-token", vec![], false));
+        q.purge_stale_lan_punch_for_peer(Some("peer-a"), lan_grace_cutoff, ttl);
+        let remaining = q
+            .pop_ready(ttl, Duration::ZERO)
+            .expect("other peer entry must survive stale LAN punch purge");
+        assert_eq!(remaining.peer_id, "peer-other");
+        assert!(q.pop_ready(ttl, Duration::ZERO).is_none());
+
+        // 3) 显式切中继（is_relay_alloc=true）在宽限期内也不被清理，且在 Streaming 与 Detached 均立即抢占。
+        q.push(mk("peer-a", "explicit-relay", vec![], true));
+        q.purge_stale_lan_punch_for_peer(Some("peer-a"), lan_grace_cutoff, ttl);
+        assert!(q.has_preempt_candidate_filtered(
+            ttl,
+            Some("peer-a"),
+            0,
+            false,
+            Some(lan_grace_cutoff),
+        ));
+        assert!(q.has_preempt_candidate_filtered(
+            ttl,
+            Some("peer-a"),
+            0,
+            true,
+            Some(lan_grace_cutoff),
+        ));
+        let preserved_relay = q
+            .pop_ready(ttl, Duration::ZERO)
+            .expect("explicit RelayReady must survive stale LAN purge");
+        assert_eq!(preserved_relay.relay_token, "explicit-relay");
+
+        // 4) 明确晚于宽限期的新 PunchCoord（enqueued_at > lan_grace_cutoff）不被清理，且立即抢占。
+        let past_cutoff = Instant::now();
+        thread::sleep(Duration::from_millis(5));
+        q.push(mk("peer-a", "post-grace-punch", vec![], false));
+        q.purge_stale_lan_punch_for_peer(Some("peer-a"), past_cutoff, ttl);
+        assert!(q.has_preempt_candidate_filtered(ttl, Some("peer-a"), 0, false, Some(past_cutoff),));
+        assert!(q.has_preempt_candidate_filtered(ttl, Some("peer-a"), 0, true, Some(past_cutoff),));
+
+        // 5) 端到端验证：LAN 会话驱动循环收到 peer_lan_addrs 为空的同源旧 PunchCoord 时绝不误抢占，
+        //    且在 Streaming 巡检后主动将其从队列中清理干净。
+        let clock: SessionClock = Arc::new(|| 10_000);
+        let (mut host, _in_tx, _out_rx, _out_dgrams) =
+            build_streaming_channel_host(Arc::clone(&clock));
+        let incoming_q = Arc::new(BoundedRelayIncomingQueue::new(8));
+        let started = Instant::now();
+        incoming_q.push(mk("peer-a", "late-same-origin", vec![], false));
+        let t_q = Arc::clone(&incoming_q);
+        let t_clock = Arc::clone(&clock);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop_flag);
+        let driver = thread::spawn(move || {
+            drive_ui_host_session_inner(
+                &mut host,
+                &t_clock,
+                None,
+                &BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP),
+                &AtomicU64::new(0),
+                0,
+                &AtomicU64::new(0),
+                0,
+                &AtomicBool::new(false),
+                &t_stop,
+                &AtomicU8::new(ByeReason::Normal as u8),
+                HostTransportKind::Lan,
+                false,
+                false,
+                false,
+                &AtomicU64::new(0),
+                None,
+                &mut PersistentOwnerTerminals::new(),
+                Arc::new(Mutex::new(None)),
+                Arc::new(RwLock::new(None)),
+                Some(&t_q),
+                Some("peer-a"),
+                started,
+            )
+        });
+
+        // 超过 PREEMPT_CHECK_INTERVAL (100ms) 后，旧 PunchCoord 应已被清理且会话未被误抢占。
+        thread::sleep(Duration::from_millis(220));
+        assert!(
+            !driver.is_finished(),
+            "stale same-peer PunchCoord with empty peer_lan_addrs must not preempt LAN session"
+        );
+        assert!(
+            incoming_q.pop_ready(ttl, Duration::ZERO).is_none(),
+            "stale same-peer PunchCoord must be actively purged during LAN Streaming"
+        );
+
+        stop_flag.store(true, Ordering::Release);
+        let outcome = driver.join().expect("join driver");
+        assert!(!outcome.preempted_by_incoming);
+    }
+
+    #[test]
+    fn host_audio_manager_immediate_stop_escalates_backoff_and_resets_after_stable_window() {
+        let should_start_stopped = Arc::new(AtomicBool::new(true));
+        let t_stopped_flag = Arc::clone(&should_start_stopped);
+        let created = Arc::new(AtomicU64::new(0));
+        let t_created = Arc::clone(&created);
+
+        let mut mgr = HostAudioManager::with_creator(
+            true,
+            None,
+            Arc::new(move || {
+                t_created.fetch_add(1, Ordering::AcqRel);
+                let stopped = Arc::new(AtomicBool::new(t_stopped_flag.load(Ordering::Acquire)));
+                Ok(Box::new(ScriptedAudioCapture {
+                    inner: rc_audio::FakeAudioCapture::new(),
+                    stopped,
+                    stop_calls: Arc::new(AtomicU64::new(0)),
+                }))
+            }),
+        );
+        let mut gate = AudioSilenceGate::default();
+        let t0 = Instant::now();
+
+        // 第 1 次创建成功但刚创建即 is_stopped() -> 预约 +300ms，下次退避升至 1s。
+        let wait1 = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < wait1 && mgr.capture.is_none() {
+            mgr.poll_and_recover(t0, false, &mut gate);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(mgr.capture.is_some());
+        mgr.poll_and_recover(t0 + Duration::from_millis(10), false, &mut gate);
+        assert!(mgr.capture.is_none());
+        assert_eq!(
+            mgr.retry_at,
+            Some(t0 + Duration::from_millis(10) + Duration::from_millis(300))
+        );
+        assert_eq!(mgr.retry_backoff, Duration::from_secs(1));
+
+        // 第 2 次刚创建即 is_stopped() -> 不回退到 300ms，预约 +1s，下次退避升至 2s。
+        let t1 = t0 + Duration::from_millis(310);
+        mgr.poll_and_recover(t1, false, &mut gate);
+        let wait2 = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < wait2 && mgr.capture.is_none() {
+            mgr.poll_and_recover(t1, false, &mut gate);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(mgr.capture.is_some());
+        assert_eq!(
+            mgr.retry_backoff,
+            Duration::from_secs(1),
+            "receiving Ok(cap) must not prematurely reset retry_backoff before stable window"
+        );
+        mgr.poll_and_recover(t1 + Duration::from_millis(10), false, &mut gate);
+        assert!(mgr.capture.is_none());
+        assert_eq!(
+            mgr.retry_at,
+            Some(t1 + Duration::from_millis(10) + Duration::from_secs(1))
+        );
+        assert_eq!(mgr.retry_backoff, Duration::from_secs(2));
+
+        // 第 3 次刚创建即 is_stopped() -> 预约 +2s，封顶 2s。
+        let t2 = t1 + Duration::from_millis(1010);
+        mgr.poll_and_recover(t2, false, &mut gate);
+        let wait3 = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < wait3 && mgr.capture.is_none() {
+            mgr.poll_and_recover(t2, false, &mut gate);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(mgr.capture.is_some());
+        mgr.poll_and_recover(t2 + Duration::from_millis(10), false, &mut gate);
+        assert!(mgr.capture.is_none());
+        assert_eq!(
+            mgr.retry_at,
+            Some(t2 + Duration::from_millis(10) + Duration::from_secs(2))
+        );
+        assert_eq!(mgr.retry_backoff, Duration::from_secs(2));
+
+        // 第 4 次创建健康采集器并稳定存活 >= 5s -> 退避复位回 300ms。
+        should_start_stopped.store(false, Ordering::Release);
+        let t3 = t2 + Duration::from_millis(2010);
+        mgr.poll_and_recover(t3, false, &mut gate);
+        let wait4 = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < wait4 && mgr.capture.is_none() {
+            mgr.poll_and_recover(t3, false, &mut gate);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(mgr.capture.is_some());
+        mgr.poll_and_recover(t3 + Duration::from_secs(4), false, &mut gate);
+        assert_eq!(
+            mgr.retry_backoff,
+            Duration::from_secs(2),
+            "backoff must remain elevated before reaching 5s stable window"
+        );
+        mgr.poll_and_recover(t3 + AUDIO_RECOVERY_STABLE_WINDOW, false, &mut gate);
+        assert_eq!(
+            mgr.retry_backoff, AUDIO_RECOVERY_INITIAL_BACKOFF,
+            "backoff must reset to 300ms once capture survives >= 5s"
+        );
+        assert_eq!(created.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn pure_tool_epoch_refresh_stays_detached_reanchors_clock_and_preserves_watchdog() {
+        use rc_session::auth::ClientAuthConfig;
+        use rc_session::{ClientSession, ClientSessionConfig, ReconnectConfig};
+
+        struct EmptyInput;
+        impl rc_input::InputCapture for EmptyInput {
+            fn next_events(
+                &mut self,
+                _timeout: Duration,
+            ) -> rc_types::Result<Vec<rc_input::InputEvent>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let updates = Arc::new(BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP));
+        let owner_replay = Arc::new(Mutex::new(rc_session::OwnerReplayCache::new()));
+        let BuiltUiHost {
+            mut host,
+            clock,
+            clock_anchor,
+            ..
+        } = build_host_session(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            None,
+            rc_session::auth::DEFAULT_AUTH_TIMEOUT_US,
+            false,
+            false,
+            true,
+            true,
+            None,
+            owner_replay,
+            Box::new(AutoApprover),
+            Arc::clone(&updates),
+        )
+        .expect("build_host_session");
+
+        // 将饱和刷新阈值缩短至 150ms，确定性离线触发 Bye(Refresh) 跨纪元重建。
+        host.set_reconnect(ReconnectConfig {
+            resume_ttl: Duration::from_secs(6),
+            refresh_guard_us: 150_000,
+            ..ReconnectConfig::default()
+        })
+        .expect("set_reconnect");
+        let addr = host.local_addr().expect("local_addr");
+
+        let connect_client = |sid: u64| {
+            let mut ccfg = ClientSessionConfig::new(
+                addr,
+                SessionParams {
+                    width: 64,
+                    height: 64,
+                    fps: 30,
+                    bitrate_bps: 1_000_000,
+                },
+                sid,
+                Box::new(EmptyInput),
+            );
+            ccfg.handshake_timeout = Duration::from_secs(3);
+            ccfg.connect_timeout = Duration::from_secs(3);
+            ccfg.auth = ClientAuthConfig::default();
+            let cclock: SessionClock = Arc::new(|| 0);
+            let mut client = ClientSession::new(
+                ccfg,
+                DEV_CERT_PEM,
+                DEV_KEY_PEM,
+                DEV_CERT_PEM,
+                "rabbitcontrol",
+                cclock,
+            )
+            .expect("client new");
+            let welcome = client.connect_and_handshake().expect("client handshake");
+            (client, welcome)
+        };
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop_flag);
+        let t_updates = Arc::clone(&updates);
+        let t_clock_anchor = clock_anchor.clone();
+        let host_thread = thread::spawn(move || {
+            t_clock_anchor.reset_pending();
+            host.accept_and_handshake(Duration::from_secs(3))
+                .expect("host accept_and_handshake");
+            // 进入纯工具模式（media_paused == true）。
+            host.pause_media();
+            assert!(host.is_media_paused());
+
+            let outcome = drive_ui_host_session_inner(
+                &mut host,
+                &clock,
+                Some(&t_clock_anchor),
+                &t_updates,
+                &AtomicU64::new(0),
+                0,
+                &AtomicU64::new(0),
+                0,
+                &AtomicBool::new(false),
+                &t_stop,
+                &AtomicU8::new(ByeReason::Normal as u8),
+                HostTransportKind::Lan,
+                false,
+                false,
+                false,
+                &AtomicU64::new(0),
+                None,
+                &mut PersistentOwnerTerminals::new(),
+                Arc::new(Mutex::new(None)),
+                Arc::new(RwLock::new(None)),
+                None,
+                None,
+                Instant::now(),
+            );
+            (outcome, host.reconnect_stats(), clock())
+        });
+
+        // 1) 初始连接建立后记录首纪元 Fake(anchor1)，再等待被控端在纯工具态满 150ms 触发 Bye(Refresh)。
+        let (mut client1, _w1) = connect_client(9101);
+        let first_anchor = match &*clock_anchor
+            .origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            ClockOrigin::Fake(a) => *a,
+            other => panic!("expected Fake clock origin after first handshake, got {other:?}"),
+        };
+        let refresh_deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_refresh = false;
+        while Instant::now() < refresh_deadline {
+            match client1.tick(Duration::from_millis(10), Instant::now()) {
+                Ok(rep) => {
+                    if matches!(
+                        rep.closed,
+                        Some(StopReason::ByeReceived(ByeReason::Refresh))
+                    ) || client1.state() == SessionState::Reconnecting
+                    {
+                        saw_refresh = true;
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_refresh,
+            "client1 must observe Bye(Refresh) while host is in pure-tool mode"
+        );
+        // 丢弃旧连接，让被控端进入 Detached 等待新纪元 Hello（不得因 media_paused 误退出！）。
+        drop(client1);
+        thread::sleep(Duration::from_millis(60));
+        assert!(
+            !host_thread.is_finished(),
+            "pure-tool host must stay in Detached during Bye(Refresh) instead of breaking"
+        );
+
+        // 发起新纪元连接，验证新会话落成后 clock_origin 已重锚为严格更新的 Fake(anchor2) 而非复用旧零点。
+        let (client2, _w2) = connect_client(9102);
+        let second_anchor = match &*clock_anchor
+            .origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            ClockOrigin::Fake(a) => *a,
+            other => panic!("expected Fake clock origin after epoch rebuild, got {other:?}"),
+        };
+        assert!(
+            second_anchor > first_anchor,
+            "clock_origin must be strictly re-anchored after Bye(Refresh) rebuild (first={first_anchor:?}, second={second_anchor:?})"
+        );
+        let clock_after_reconnect = make_session_clock(Arc::clone(&clock_anchor.origin))();
+        assert!(
+            clock_after_reconnect < 500_000,
+            "re-anchored session clock must restart near 0, got {clock_after_reconnect}us"
+        );
+        let _ = client2;
+
+        stop_flag.store(true, Ordering::Release);
+        let (outcome, rstats, _final_clock) = host_thread.join().expect("join host_thread");
+        assert!(
+            rstats.refreshes >= 1 && rstats.rebuilds >= 1,
+            "must record both refresh and rebuild across pure-tool epoch refresh: {rstats:?}"
+        );
+        assert_ne!(
+            outcome.reason, "纯工具连接已断开",
+            "pure-tool epoch refresh must not abort Detached with ordinary tool disconnect"
+        );
+
+        // 额外验证：纯工具态普通断线（非 Bye(Refresh)）仍立刻退出 Detached。
+        let clock_plain: SessionClock = Arc::new(|| 10_000);
+        let (mut host_plain, in_tx, _out_rx, _out_dgrams) =
+            build_streaming_channel_host(Arc::clone(&clock_plain));
+        host_plain.pause_media();
+        in_tx
+            .send(NetEvent::Disconnected {
+                reason: "ordinary drop".to_string(),
+            })
+            .expect("send disconnect");
+        let plain_outcome = drive_ui_host_session_inner(
+            &mut host_plain,
+            &clock_plain,
+            None,
+            &BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP),
+            &AtomicU64::new(0),
+            0,
+            &AtomicU64::new(0),
+            0,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &AtomicU8::new(ByeReason::Normal as u8),
+            HostTransportKind::Lan,
+            false,
+            false,
+            false,
+            &AtomicU64::new(0),
+            None,
+            &mut PersistentOwnerTerminals::new(),
+            Arc::new(Mutex::new(None)),
+            Arc::new(RwLock::new(None)),
+            None,
+            None,
+            Instant::now(),
+        );
+        assert_eq!(plain_outcome.reason, "纯工具连接已断开");
     }
 }

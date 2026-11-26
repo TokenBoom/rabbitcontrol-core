@@ -66,6 +66,50 @@ pub const MAX_WALLPAPER_BYTES: usize = 96 * 1024;
 /// 默认是否开启端到端加密（mTLS）连接（待 Wave 4 实测 mTLS 延迟损耗确认 ≤ 3ms 后最终定稿）。
 pub const DEFAULT_ENCRYPT_CONNECTION: bool = true;
 
+/// 远控连接路由策略模式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionMode {
+    /// 自动路由（按 LAN → P2P UDP → mTLS 中继优先级自动择优）。
+    #[default]
+    Auto,
+    /// 仅直连 / P2P 模式（拒绝回退至服务端中继）。
+    P2pOnly,
+    /// 强制经服务端 TCP mTLS 中继连接。
+    TcpRelay,
+}
+
+impl ConnectionMode {
+    /// 返回协议与持久化配置的标准小写下划线标识（`"auto"` / `"p2p_only"` / `"tcp_relay"`）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::P2pOnly => "p2p_only",
+            Self::TcpRelay => "tcp_relay",
+        }
+    }
+
+    /// 大小写不敏感解析连接模式字符串（兼容常见横杠与缩写别名）。
+    pub fn parse_lossy(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("auto") {
+            Some(Self::Auto)
+        } else if trimmed.eq_ignore_ascii_case("p2p_only")
+            || trimmed.eq_ignore_ascii_case("p2p-only")
+            || trimmed.eq_ignore_ascii_case("p2p")
+        {
+            Some(Self::P2pOnly)
+        } else if trimmed.eq_ignore_ascii_case("tcp_relay")
+            || trimmed.eq_ignore_ascii_case("tcp-relay")
+            || trimmed.eq_ignore_ascii_case("relay")
+        {
+            Some(Self::TcpRelay)
+        } else {
+            None
+        }
+    }
+}
+
 /// 持久化于本地的单个远端设备快照记录。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -205,6 +249,16 @@ pub struct AppPrefs {
     /// 可选 W2 文件传输自定义存储路径（`None` 表示使用平台默认接收目录）。
     #[serde(default)]
     pub file_transfer_dir: Option<String>,
+    /// 远控连接路由策略（`"auto"` / `"p2p_only"` / `"tcp_relay"`，默认 `Auto`）。
+    #[serde(default)]
+    pub connection_mode: ConnectionMode,
+    /// 是否启用 UPnP IGD / NAT-PMP 自动端口映射以提升 P2P 直连成功率（默认 `true`）。
+    #[serde(default = "default_upnp_enabled")]
+    pub upnp_enabled: bool,
+}
+
+fn default_upnp_enabled() -> bool {
+    true
 }
 
 fn default_privacy_mode() -> String {
@@ -293,6 +347,8 @@ impl Default for AppPrefs {
             mouse_mode: default_mouse_mode(),
             update_mirror_url: String::new(),
             file_transfer_dir: None,
+            connection_mode: ConnectionMode::Auto,
+            upnp_enabled: default_upnp_enabled(),
         }
     }
 }
@@ -1855,6 +1911,87 @@ mod tests {
         let cleaned = load_from_path(&path);
         assert_eq!(cleaned.file_transfer_dir, None);
         assert!(cleaned.is_default_file_transfer_dir());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connection_mode_and_upnp_enabled_defaults_and_legacy_compat() {
+        assert_eq!(ConnectionMode::default(), ConnectionMode::Auto);
+        assert_eq!(ConnectionMode::Auto.as_str(), "auto");
+        assert_eq!(ConnectionMode::P2pOnly.as_str(), "p2p_only");
+        assert_eq!(ConnectionMode::TcpRelay.as_str(), "tcp_relay");
+
+        assert_eq!(
+            ConnectionMode::parse_lossy("auto"),
+            Some(ConnectionMode::Auto)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy(" AUTO "),
+            Some(ConnectionMode::Auto)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("p2p_only"),
+            Some(ConnectionMode::P2pOnly)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("P2P-ONLY"),
+            Some(ConnectionMode::P2pOnly)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("p2p"),
+            Some(ConnectionMode::P2pOnly)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("tcp_relay"),
+            Some(ConnectionMode::TcpRelay)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("TCP-Relay"),
+            Some(ConnectionMode::TcpRelay)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("relay"),
+            Some(ConnectionMode::TcpRelay)
+        );
+        assert_eq!(ConnectionMode::parse_lossy(""), None);
+        assert_eq!(ConnectionMode::parse_lossy("direct_magic"), None);
+
+        let def = AppPrefs::default();
+        assert_eq!(def.connection_mode, ConnectionMode::Auto);
+        assert!(def.upnp_enabled);
+        let json_val = serde_json::to_value(&def).unwrap();
+        assert_eq!(json_val["connectionMode"], "auto");
+        assert_eq!(json_val["upnpEnabled"], true);
+
+        // 旧版 prefs.json 缺少 connectionMode 与 upnpEnabled 字段时应回退安全默认值。
+        let legacy: AppPrefs = serde_json::from_str(
+            r#"{"allowRemoteAssist":true,"bitratePreset":"30m","bitrateBps":30000000,"fps":120}"#,
+        )
+        .expect("legacy prefs without connectionMode/upnpEnabled");
+        assert_eq!(legacy.connection_mode, ConnectionMode::Auto);
+        assert!(legacy.upnp_enabled);
+
+        let dir = temp_test_dir("conn-mode-upnp");
+        let path = dir.join("prefs.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, br#"{"showHud":false}"#).unwrap();
+        let loaded_legacy = load_from_path(&path);
+        assert_eq!(loaded_legacy.connection_mode, ConnectionMode::Auto);
+        assert!(loaded_legacy.upnp_enabled);
+        assert!(!loaded_legacy.show_hud);
+
+        for mode in [ConnectionMode::P2pOnly, ConnectionMode::TcpRelay] {
+            let custom = AppPrefs {
+                connection_mode: mode,
+                upnp_enabled: false,
+                ..AppPrefs::default()
+            };
+            save_to_path(&path, &custom).unwrap();
+            let reloaded = load_from_path(&path);
+            assert_eq!(reloaded.connection_mode, mode);
+            assert!(!reloaded.upnp_enabled);
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

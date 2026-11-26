@@ -430,6 +430,18 @@ pub enum DisplayControlMsg {
         #[serde(default)]
         capture_suspended: bool,
     },
+    /// 控制端 → 被控端：请求暂停或恢复视频采集与编码（用于纯工具模式省电与降带宽）。
+    SetMediaPaused {
+        /// `true` = 暂停视频采集与编码；`false` = 恢复视频流。
+        #[serde(default)]
+        paused: bool,
+    },
+    /// 被控端 → 控制端：确认当前媒体暂停状态。
+    MediaState {
+        /// 当前媒体管线是否处于暂停状态。
+        #[serde(default)]
+        paused: bool,
+    },
 }
 
 const BASE64_ALPHABET: &[u8; 64] =
@@ -1394,5 +1406,44 @@ mod tests {
         // Unknown future variant returns None (safely ignored without crashing).
         let unknown = br#"{"kind":"future_unrecognized_variant","foo":1}"#;
         assert_eq!(decode_display_ctrl(unknown), None);
+    }
+
+    #[test]
+    fn media_paused_messages_roundtrip_and_preserve_legacy_compat() {
+        for paused in [true, false] {
+            let req = DisplayControlMsg::SetMediaPaused { paused };
+            let encoded = encode_display_ctrl(&req).expect("encode set_media_paused");
+            let val: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(val["kind"], "set_media_paused");
+            assert_eq!(val["paused"], paused);
+            assert_eq!(decode_display_ctrl(&encoded), Some(req));
+
+            let ack = DisplayControlMsg::MediaState { paused };
+            let encoded_ack = encode_display_ctrl(&ack).expect("encode media_state");
+            let val_ack: serde_json::Value = serde_json::from_slice(&encoded_ack).unwrap();
+            assert_eq!(val_ack["kind"], "media_state");
+            assert_eq!(val_ack["paused"], paused);
+            assert_eq!(decode_display_ctrl(&encoded_ack), Some(ack));
+        }
+
+        // 缺省 paused 字段的最小载荷默认解码为 false，保证前向/后向兼容。
+        assert_eq!(
+            decode_display_ctrl(br#"{"kind":"set_media_paused"}"#),
+            Some(DisplayControlMsg::SetMediaPaused { paused: false })
+        );
+        assert_eq!(
+            decode_display_ctrl(br#"{"kind":"media_state"}"#),
+            Some(DisplayControlMsg::MediaState { paused: false })
+        );
+
+        // 旧版控制消息与未知未来变体行为保持兼容。
+        assert_eq!(
+            decode_display_ctrl(br#"{"kind":"lock_screen"}"#),
+            Some(DisplayControlMsg::LockScreen)
+        );
+        assert_eq!(
+            decode_display_ctrl(br#"{"kind":"legacy_unknown_v2"}"#),
+            None
+        );
     }
 }

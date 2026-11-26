@@ -47,6 +47,7 @@ use rc_tools::{
 };
 use rc_types::Resolution;
 
+use crate::app_prefs::ConnectionMode;
 use crate::cert_manager::OwnerGrantPayload;
 use crate::display_ctrl::{
     self, DisplayControlMsg, DisplayDescriptor, DisplayPreset, HighRefreshAdvisory, StreamCodec,
@@ -135,9 +136,16 @@ pub struct UiSessionConfig {
     /// 可选中继/P2P 会话凭据（`Some` 时按 LAN → P2P → 中继三阶路由建连，忽略 `connect_addr`）。
     #[serde(skip)]
     pub relay_grant: Option<ConnectGrant>,
-    /// 是否强制跳过 LAN / P2P，直接使用 `TCP Relay` 中继连接（仅在存在 `relay_grant` 时生效）。
+    /// 是否强制跳过 LAN / P2P，直接使用 `TCP Relay` 中继连接（仅在存在 `relay_grant` 时生效；保留以兼容旧配置）。
     #[serde(default)]
     pub force_relay: bool,
+    /// 连接路由模式（`Auto` 自动三阶、`P2pOnly` 仅直连/P2P 禁止中继、`TcpRelay` 强制中继）。
+    #[serde(default)]
+    pub connection_mode: ConnectionMode,
+    /// 纯工具模式：仅建立控制与工具通道，不初始化硬件视频解码/渲染管线并通知被控端暂停视频推流，
+    /// 后续可通过 [`SessionHandle::upgrade_to_desktop`] 原地热升级为桌面控屏。
+    #[serde(default)]
+    pub tools_only: bool,
     /// 是否开启端到端双向 mTLS / E2EE 加密连接（默认 `false` 兼容旧离线无证书单测；由上层配置注入）。
     #[serde(default)]
     pub encrypt_connection: bool,
@@ -170,6 +178,8 @@ impl Default for UiSessionConfig {
             audio_enabled: true,
             relay_grant: None,
             force_relay: false,
+            connection_mode: ConnectionMode::Auto,
+            tools_only: false,
             encrypt_connection: false,
             mtls_config: None,
             owner_grant: None,
@@ -203,6 +213,8 @@ impl fmt::Debug for UiSessionConfig {
             .field("audio_enabled", &self.audio_enabled)
             .field("has_relay_grant", &self.relay_grant.is_some())
             .field("force_relay", &self.force_relay)
+            .field("connection_mode", &self.connection_mode)
+            .field("tools_only", &self.tools_only)
             .field("encrypt_connection", &self.encrypt_connection)
             .field("has_mtls_config", &self.mtls_config.is_some())
             .field("has_owner_grant", &self.owner_grant.is_some())
@@ -256,6 +268,13 @@ pub enum SessionCommand {
     },
     /// 请求立即锁定被控端屏幕（经 `TOOL_CHANNEL_DISPLAY_CTRL` 发送）。
     LockRemoteScreen,
+    /// 暂停或恢复远端视频媒体流（纯工具模式 / 原地热升级桌面）。
+    SetMediaPaused {
+        /// `true` = 暂停视频采集与解码，`false` = 恢复或原地热升级视频管线。
+        paused: bool,
+    },
+    /// 立即触发一次快速链路探测（切网 2s 快检看门狗）。
+    ProbeNow,
 }
 
 /// 连接进度（对齐 T18 计时口径：起点 = Endpoint 创建之前）。
@@ -389,10 +408,38 @@ pub enum SessionUpdate {
         /// 人类可读的切换提示。
         reason: String,
     },
+    /// 纯 IP 直连会话在检测到断链后进入自动重连阶段（按重连尝试次数发射，避免 UI 静默卡死）。
+    Reconnecting {
+        /// 当前正在进行的重连尝试序号（从 1 开始）。
+        attempt: u32,
+        /// 本轮自动重连允许的最大尝试次数。
+        max_attempts: u32,
+        /// 人类可读的重连状态说明。
+        reason: String,
+    },
+    /// 当前会话视频媒体流暂停/恢复状态变更通知（控制端切换或被控端 `MediaState` 回执）。
+    MediaState {
+        /// `true` = 媒体流已暂停（纯工具态），`false` = 媒体流运行中。
+        paused: bool,
+    },
+    /// 媒体流从纯工具态原地热升级或从暂停恢复就绪通知（携带最新后端标签与画面参数）。
+    MediaResumed {
+        /// 实际生效的解码 + 呈现后端标签（如 `"videotoolbox+metal"` / `"fake"` / `"fake(降级)"`）。
+        backend: String,
+        /// 当前生效画面宽度（像素）。
+        width: u32,
+        /// 当前生效画面高度（像素）。
+        height: u32,
+        /// 当前生效帧率（fps）。
+        fps: u32,
+    },
     /// 会话结束（正常 `Bye` / 对端断开 / 驱动错误 / 线程 panic）。
     Ended {
         /// 人类可读的结束原因。
         reason: String,
+        /// 是否属于可由上层自动触发无感重连恢复的意外断网/链路中断终态。
+        #[serde(default)]
+        recoverable: bool,
     },
 }
 
@@ -611,6 +658,7 @@ struct BuiltPipeline {
     backend_label: String,
     renderer: RendererHandle,
     layer_addr: usize,
+    is_hardware: bool,
 }
 
 /// 共享渲染器包装：让会话线程在不改 `ControllerPipeline` API 的前提下响应 `StageRect` resize。
@@ -1830,6 +1878,7 @@ pub struct SessionHandle {
     encrypt_connection: bool,
     base_config: UiSessionConfig,
     layer_lease: Arc<Mutex<Option<LayerLease>>>,
+    upgrade_surface: Arc<Mutex<Option<PreallocatedRenderSurface>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -1861,6 +1910,7 @@ impl SessionHandle {
         let relay_interrupt: Arc<Mutex<Option<ActiveRelayInterrupt>>> = Arc::new(Mutex::new(None));
         let running = Arc::new(AtomicBool::new(true));
         let layer_lease = Arc::new(Mutex::new(None));
+        let upgrade_surface = Arc::new(Mutex::new(preallocated_surface));
         let watch_only = Arc::new(AtomicBool::new(cfg.watch_only));
         let encrypt_connection = cfg.encrypt_connection;
         let base_config = cfg.clone();
@@ -1878,6 +1928,7 @@ impl SessionHandle {
         let t_running = Arc::clone(&running);
         let t_watch_only = Arc::clone(&watch_only);
         let t_layer = Arc::clone(&layer_lease);
+        let t_upgrade_surface = Arc::clone(&upgrade_surface);
 
         let handle = thread::Builder::new()
             .name("rc-ui-session".to_string())
@@ -1888,7 +1939,7 @@ impl SessionHandle {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_session_thread(
                         cfg,
-                        preallocated_surface,
+                        t_upgrade_surface,
                         t_cmd,
                         t_display_ctrl,
                         t_input,
@@ -1904,10 +1955,9 @@ impl SessionHandle {
                         t_watch_only,
                     )
                 }));
-                let reason = match res {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => e,
-                    Err(_) => "会话线程异常退出".to_string(),
+                let end = match res {
+                    Ok(Ok(e)) | Ok(Err(e)) => e,
+                    Err(_) => SessionEnd::fatal("会话线程异常退出"),
                 };
                 // 先标记非运行并回收专用文件工作线程（确保 `.rcpart` 清理完毕），再重置本地工具枢纽。
                 // 注意：主机侧后台终端继续保留在被控端供下次重连恢复，不在此伪造 Exited(-1)。
@@ -1917,12 +1967,15 @@ impl SessionHandle {
                     let mut hub = t_tools_hub.lock().unwrap_or_else(|e| e.into_inner());
                     *hub = ToolClientHub::new();
                 }
-                if reason == SESSION_SWITCHING_REASON {
+                if end.reason == SESSION_SWITCHING_REASON {
                     t_update.push(SessionUpdate::SessionSwitching {
-                        reason: reason.clone(),
+                        reason: end.reason.clone(),
                     });
                 }
-                t_update.push(SessionUpdate::Ended { reason });
+                t_update.push(SessionUpdate::Ended {
+                    reason: end.reason,
+                    recoverable: end.recoverable,
+                });
             })
             .expect("spawn rc-ui-session thread");
 
@@ -1944,6 +1997,7 @@ impl SessionHandle {
             encrypt_connection,
             base_config,
             layer_lease,
+            upgrade_surface,
             thread: Some(handle),
         }
     }
@@ -1974,6 +2028,25 @@ impl SessionHandle {
             return;
         }
         self.cmd_tx.push_drop_oldest(cmd);
+    }
+
+    /// 将纯工具态会话原地热升级为桌面控屏模式（可选传入平台主线程预分配的渲染表面）。
+    ///
+    /// 将预分配表面写入共享槽（若传入 `Some` 则更新共享槽供升级与后续重建复用）并投递
+    /// [`SessionCommand::SetMediaPaused { paused: false }`]，
+    /// 由会话线程在不断开底层连接的前提下构建真实视频管线并请求被控端恢复推流。
+    pub fn upgrade_to_desktop(&self, surface: Option<PreallocatedRenderSurface>) {
+        if !self.is_running() {
+            return;
+        }
+        if let Some(surf) = surface {
+            *self
+                .upgrade_surface
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(surf);
+        }
+        self.cmd_tx
+            .push_drop_oldest(SessionCommand::SetMediaPaused { paused: false });
     }
 
     /// 发送显示/防窥/多屏控制消息（经 `TOOL_CHANNEL_DISPLAY_CTRL` 可靠送达被控端）。
@@ -2091,15 +2164,54 @@ impl SessionHandle {
             let _ = handle.join();
         }
     }
+
+    /// 非阻塞/有界等待中止会话线程：先推送 `Disconnect` 命令并留出短优雅窗口
+    /// （至多 `min(max_wait, 80ms)`，让会话线程在 TCP Relay 下优先发完 `LockScreen` 与 `Bye(Normal)`）；
+    /// 若窗口期满线程仍在运行再调用 `trigger_disconnect()` 强制中断底层套接字并等待至多 `max_wait`，
+    /// 超时仍未退出则将 `JoinHandle` 交由后台回收线程异步 `join`，绝不卡死调用方。
+    pub fn detach_and_abort(mut self, max_wait: Duration) {
+        const GRACEFUL_DISCONNECT_WINDOW: Duration = Duration::from_millis(80);
+
+        if self.is_running() {
+            self.cmd_tx.push_drop_oldest(SessionCommand::Disconnect);
+        }
+        let Some(handle) = self.thread.take() else {
+            self.trigger_disconnect();
+            return;
+        };
+        let start = Instant::now();
+        let total_deadline = start + max_wait;
+        let graceful_deadline = start + max_wait.min(GRACEFUL_DISCONNECT_WINDOW);
+        while (self.is_running() || !handle.is_finished()) && Instant::now() < graceful_deadline {
+            let remaining = graceful_deadline.saturating_duration_since(Instant::now());
+            thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+        if self.is_running() || !handle.is_finished() {
+            self.trigger_disconnect();
+            while (self.is_running() || !handle.is_finished()) && Instant::now() < total_deadline {
+                let remaining = total_deadline.saturating_duration_since(Instant::now());
+                thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            let _ = thread::Builder::new()
+                .name("rc-session-reaper".to_string())
+                .spawn(move || {
+                    let _ = handle.join();
+                });
+        }
+    }
 }
 
 impl Drop for SessionHandle {
     fn drop(&mut self) {
-        self.trigger_disconnect();
-        if self.is_running() {
-            self.cmd_tx.push_drop_oldest(SessionCommand::Disconnect);
-        }
         if let Some(handle) = self.thread.take() {
+            self.trigger_disconnect();
+            if self.is_running() {
+                self.cmd_tx.push_drop_oldest(SessionCommand::Disconnect);
+            }
             let _ = handle.join();
         }
     }
@@ -2488,10 +2600,127 @@ fn dial_lan_direct_quic(
     }
 }
 
+/// 会话线程内部结束结果（携带是否适合上层自动重连恢复的 `recoverable` 标记）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionEnd {
+    reason: String,
+    recoverable: bool,
+}
+
+impl SessionEnd {
+    fn fatal(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            recoverable: false,
+        }
+    }
+
+    fn recoverable(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            recoverable: true,
+        }
+    }
+}
+
+/// 计算实际生效的连接模式（保留 `force_relay: true` 向后兼容强制映射至 `ConnectionMode::TcpRelay`）。
+fn effective_connection_mode(cfg: &UiSessionConfig) -> ConnectionMode {
+    if cfg.force_relay {
+        ConnectionMode::TcpRelay
+    } else {
+        cfg.connection_mode
+    }
+}
+
+/// 判定一段错误/断开文案是否属于不可自动恢复的终态（用户主动断开、密码/鉴权拒绝、mTLS 证书校验失败、仅 P2P 模式拒绝回退、硬件解码持久失败）。
+fn is_non_recoverable_error_reason(msg: &str) -> bool {
+    if is_mtls_cert_or_config_error(msg) {
+        return true;
+    }
+    let lower = msg.to_ascii_lowercase();
+    msg.contains("用户主动断开")
+        || msg.contains("已取消")
+        || lower.contains("cancelled")
+        || msg.contains("仅 P2P")
+        || msg.contains("远端画面解码失败")
+        || msg.contains("密码")
+        || msg.contains("鉴权")
+        || msg.contains("认证")
+        || msg.contains("拒绝")
+        || lower.contains("auth")
+        || lower.contains("password")
+        || lower.contains("unauthorized")
+        || lower.contains("rejected")
+        || lower.contains("denied")
+}
+
+/// 信令会话进入 `Reconnecting` 退出时按当前传输通道标签生成精确文案并标记 `recoverable = true`。
+fn signaling_disconnect_end(transport_label: &str) -> SessionEnd {
+    let reason = match transport_label {
+        "UDP LAN" => "局域网连接已断开",
+        "UDP P2P" => "P2P 连接已断开",
+        _ => "中继连接已断开",
+    };
+    SessionEnd::recoverable(reason)
+}
+
+/// 将 `ClientSession::tick` 返回的 `StopReason` 映射为 [`SessionEnd`]。
+fn classify_stop_reason_end(stop: &rc_session::StopReason) -> SessionEnd {
+    match stop {
+        rc_session::StopReason::ByeReceived(ByeReason::SessionSwitching) => {
+            SessionEnd::fatal(SESSION_SWITCHING_REASON)
+        }
+        rc_session::StopReason::ByeReceived(ByeReason::Normal)
+        | rc_session::StopReason::Requested => SessionEnd::fatal(format!("对端已关闭 ({stop:?})")),
+        rc_session::StopReason::ByeReceived(ByeReason::Refresh) => {
+            SessionEnd::recoverable(format!("对端已关闭 ({stop:?})"))
+        }
+        rc_session::StopReason::Disconnected(msg) => {
+            let reason = format!("对端已关闭 ({stop:?})");
+            if is_non_recoverable_error_reason(msg) {
+                SessionEnd::fatal(reason)
+            } else {
+                SessionEnd::recoverable(reason)
+            }
+        }
+    }
+}
+
+/// 将纯 IP 直连 `ReconnectOutcome::GaveUp` 映射为 [`SessionEnd`]。
+fn classify_gave_up_end(closed_reason: Option<&rc_session::StopReason>) -> SessionEnd {
+    match closed_reason {
+        Some(rc_session::StopReason::ByeReceived(ByeReason::SessionSwitching)) => {
+            SessionEnd::fatal(SESSION_SWITCHING_REASON)
+        }
+        Some(stop @ rc_session::StopReason::ByeReceived(ByeReason::Normal)) => {
+            SessionEnd::fatal(format!("对端已关闭 ({stop:?})"))
+        }
+        _ => SessionEnd::recoverable("重连次数已耗尽"),
+    }
+}
+
+/// 将运行期驱动错误（`pump_probes` / `tick` / `tick_reconnect`）映射为 [`SessionEnd`]。
+fn classify_runtime_err_end(
+    prefix: &str,
+    err: &rc_types::Error,
+    user_disconnected: bool,
+) -> SessionEnd {
+    if user_disconnected {
+        return SessionEnd::fatal("用户主动断开");
+    }
+    let raw = err.to_string();
+    let reason = format!("{prefix}: {raw}");
+    if is_non_recoverable_error_reason(&raw) {
+        SessionEnd::fatal(reason)
+    } else {
+        SessionEnd::recoverable(reason)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_session_thread(
     cfg: UiSessionConfig,
-    preallocated_surface: Option<PreallocatedRenderSurface>,
+    render_surface: Arc<Mutex<Option<PreallocatedRenderSurface>>>,
     cmd_rx: Arc<BoundedQueue<SessionCommand>>,
     display_ctrl_rx: Arc<BoundedQueue<DisplayControlMsg>>,
     input_rx: Arc<BoundedInputQueue>,
@@ -2505,19 +2734,23 @@ fn run_session_thread(
     terminal_events: Arc<BoundedQueue<TerminalEvent>>,
     portmap_latest: Arc<Mutex<Option<Vec<PortMapRuleSnapshot>>>>,
     watch_only: Arc<AtomicBool>,
-) -> Result<String, String> {
+) -> Result<SessionEnd, SessionEnd> {
     let _relay_guard = RelayInterruptSlotGuard {
         slot: &relay_interrupt,
     };
 
     if disconnect_flag.load(Ordering::Acquire) {
-        return Ok("用户主动断开".to_string());
+        return Ok(SessionEnd::fatal("用户主动断开"));
     }
 
     // 严禁静默降级：开启加密连接但缺少 mTLS 证书束时立即拒绝建连。
     if cfg.encrypt_connection && cfg.mtls_config.is_none() {
-        return Err("已开启「加密连接 (mTLS)」，但缺少设备证书配置，已拒绝降级连接".to_string());
+        return Err(SessionEnd::fatal(
+            "已开启「加密连接 (mTLS)」，但缺少设备证书配置，已拒绝降级连接",
+        ));
     }
+
+    let effective_mode = effective_connection_mode(&cfg);
 
     // ── 计时起点：Endpoint 创建之前（T21 U8 / 坑 11，对齐 T18 口径）──
     let t0 = Instant::now();
@@ -2576,14 +2809,45 @@ fn run_session_thread(
     let is_signaling_session = cfg.relay_grant.is_some();
     let streaming_started = Arc::new(AtomicBool::new(false));
     let clipboard_enabled_flag = Arc::new(AtomicBool::new(cfg.clipboard_enabled));
+    let want_real_pipeline = Arc::new(AtomicBool::new(!cfg.tools_only));
+    let real_pipeline_built = Arc::new(AtomicBool::new(false));
+    let is_hw_decoder_slot = Arc::new(AtomicBool::new(false));
 
     let make_pipeline_factory = |backend_suffix: Option<&'static str>| {
         let label = Arc::clone(&backend_label);
         let rend_slot = Arc::clone(&renderer_handle);
         let layer_slot = Arc::clone(&layer_lease);
+        let want_real = Arc::clone(&want_real_pipeline);
+        let built_real = Arc::clone(&real_pipeline_built);
+        let hw_slot = Arc::clone(&is_hw_decoder_slot);
         let prefer_hw = cfg.prefer_hardware;
-        let pre_surface = preallocated_surface.clone();
+        let surface_slot = Arc::clone(&render_surface);
         Box::new(move |pcfg: &PipelineConfig| {
+            if !want_real.load(Ordering::Acquire) {
+                let placeholder_cfg = PipelineConfig {
+                    resolution: Resolution::new(64, 64),
+                    fps: pcfg.fps.max(1),
+                    bitrate_bps: pcfg.bitrate_bps.max(1),
+                    prefer_hardware: false,
+                    async_decode: false,
+                    ..pcfg.clone()
+                };
+                let (pipeline, _renderer) = fake_controller_stack(&placeholder_cfg)?;
+                let final_label = match backend_suffix {
+                    Some(suffix) => format!("tools-only {suffix}"),
+                    None => "tools-only".to_string(),
+                };
+                *label.lock().unwrap_or_else(|e| e.into_inner()) = final_label;
+                *rend_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                // tools_only 模式严禁创建硬件 VT/Metal，也不写入 layer_lease。
+                built_real.store(false, Ordering::Release);
+                hw_slot.store(false, Ordering::Release);
+                return Ok(pipeline);
+            }
+            let pre_surface = surface_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let built = build_controller_pipeline(pcfg, prefer_hw, t0, pre_surface.as_ref())?;
             let final_label = match backend_suffix {
                 Some(suffix) => format!("{} {suffix}", built.backend_label),
@@ -2594,411 +2858,451 @@ fn run_session_thread(
                 Some(Arc::clone(&built.renderer));
             *layer_slot.lock().unwrap_or_else(|e| e.into_inner()) =
                 LayerLease::from_renderer(built.renderer, built.layer_addr);
+            built_real.store(true, Ordering::Release);
+            hw_slot.store(built.is_hardware, Ordering::Release);
             Ok(built.pipeline)
         })
     };
 
-    let (mut client, negotiated, transport_label, mtls_active, peer_cert_fingerprint) =
-        if let Some(grant) = cfg.relay_grant.as_ref() {
-            update_tx.push(SessionUpdate::Connecting {
-                phase: ConnectPhase::Connecting,
-                watch_only: live_watch_only.load(Ordering::Acquire),
-            });
+    let (
+        mut client,
+        negotiated,
+        transport_label,
+        active_backend_suffix,
+        mtls_active,
+        peer_cert_fingerprint,
+    ) = if let Some(grant) = cfg.relay_grant.as_ref() {
+        update_tx.push(SessionUpdate::Connecting {
+            phase: ConnectPhase::Connecting,
+            watch_only: live_watch_only.load(Ordering::Acquire),
+        });
 
-            let dial_cancel = Arc::new(AtomicBool::new(false));
-            *relay_interrupt.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(ActiveRelayInterrupt::Dialing(Arc::clone(&dial_cancel)));
-            if disconnect_flag.load(Ordering::Acquire) {
-                return Ok("用户主动断开".to_string());
-            }
+        let dial_cancel = Arc::new(AtomicBool::new(false));
+        *relay_interrupt.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(ActiveRelayInterrupt::Dialing(Arc::clone(&dial_cancel)));
+        if disconnect_flag.load(Ordering::Acquire) {
+            return Ok(SessionEnd::fatal("用户主动断开"));
+        }
 
-            let peer_bundle = prepare_peer_mtls_bundle(&cfg, grant);
-            let quic_mtls = if cfg.encrypt_connection {
-                let bundle = peer_bundle
-                    .as_ref()
-                    .ok_or_else(|| "已开启「加密连接 (mTLS)」，但缺少设备证书配置".to_string())?;
-                Some(bundle.to_quic_mtls_config()?)
-            } else {
-                None
-            };
-
-            // Tier 1：若未强制中继且命中 LAN 直连候选（lan_direct_addr 或同网段地址），300ms 快速探测 UDP LAN。
-            struct SelectedRelayPath {
-                transport: Box<dyn Transport>,
-                relay_shutdown: Option<RelayShutdownHandle>,
-                transport_label: &'static str,
-                backend_suffix: Option<&'static str>,
-                mtls_active: bool,
-                peer_cert_fingerprint: Option<String>,
-            }
-            let mut chosen: Option<SelectedRelayPath> = None;
-            if !cfg.force_relay && !disconnect_flag.load(Ordering::Acquire) {
-                for lan_addr in collect_lan_candidate_addrs(&cfg, grant) {
-                    if disconnect_flag.load(Ordering::Acquire) {
-                        return Ok("用户主动断开".to_string());
-                    }
-                    match dial_lan_direct_quic(lan_addr, quic_mtls.as_ref(), &disconnect_flag) {
-                        Ok((t, fp)) => {
-                            client_cfg.peer_addr = lan_addr;
-                            chosen = Some(SelectedRelayPath {
-                                transport: t,
-                                relay_shutdown: None,
-                                transport_label: "UDP LAN",
-                                backend_suffix: None,
-                                mtls_active: cfg.encrypt_connection,
-                                peer_cert_fingerprint: fp,
-                            });
-                            break;
-                        }
-                        Err(err) => {
-                            if cfg.encrypt_connection && is_mtls_cert_or_config_error(&err) {
-                                return Err(format!(
-                                    "LAN mTLS 证书校验失败（严禁静默降级）: {err}"
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Tier 2：LAN 未命中或失败且未强制中继时，尝试 UDP P2P 打洞 + QUIC 直连。
-            if chosen.is_none() && !cfg.force_relay && !disconnect_flag.load(Ordering::Acquire) {
-                let candidates = P2pCandidates {
-                    session_id: grant.session_id.clone(),
-                    peer_public_addr: grant.peer_public_addr.clone(),
-                    peer_lan_addrs: grant.peer_lan_addrs.clone(),
-                    local_udp_port: grant.local_udp_port,
-                };
-                if !p2p::parse_candidate_addrs(&candidates).is_empty() {
-                    match p2p::attempt_p2p_quic_client_mtls(
-                        &candidates,
-                        p2p::DEFAULT_PUNCH_TIMEOUT,
-                        p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
-                        &disconnect_flag,
-                        quic_mtls.as_ref(),
-                    ) {
-                        Ok(p2p_conn) => {
-                            let fp = p2p_conn
-                                .peer_mtls_identity()
-                                .map(|id| id.cert_fingerprint_sha256);
-                            chosen = Some(SelectedRelayPath {
-                                transport: Box::new(p2p_conn),
-                                relay_shutdown: None,
-                                transport_label: "UDP P2P",
-                                backend_suffix: Some("(P2P 直连)"),
-                                mtls_active: cfg.encrypt_connection,
-                                peer_cert_fingerprint: fp,
-                            });
-                        }
-                        Err(err) => {
-                            if cfg.encrypt_connection && is_mtls_cert_or_config_error(&err) {
-                                return Err(format!(
-                                    "P2P mTLS 证书校验失败（严禁静默降级）: {err}"
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-
-            if disconnect_flag.load(Ordering::Acquire) {
-                return Ok("用户主动断开".to_string());
-            }
-
-            // Tier 3：P2P 失败/未命中或强制中继 → 回退 `:21117` 中继（有 mtls_config 强制外层 mTLS；encrypt_connection 再叠加内层 E2EE mTLS）。
-            let SelectedRelayPath {
-                transport: raw_transport,
-                relay_shutdown,
-                transport_label: chosen_transport_label,
-                backend_suffix,
-                mtls_active,
-                peer_cert_fingerprint: peer_fp,
-            } = match chosen {
-                Some(ready) => ready,
-                None => {
-                    // 与服务端默认中继配对超时（15s）对齐，兼容远端仍处旧版清理窗口的边缘场景。
-                    const RELAY_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-                    let (raw_transport, shutdown_handle, active, fp): (
-                        Box<dyn Transport>,
-                        RelayShutdownHandle,
-                        bool,
-                        Option<String>,
-                    ) = if cfg.encrypt_connection {
-                        let bundle = peer_bundle.ok_or_else(|| {
-                            "已开启「加密连接 (mTLS)」，但缺少设备证书配置".to_string()
-                        })?;
-                        let relay_mtls = bundle.to_relay_mtls_config(None);
-                        let t = match E2eeRelayTransport::connect_cancellable(
-                            &grant.relay_addr,
-                            RelayRole::Client,
-                            &grant.relay_token,
-                            RELAY_CLIENT_CONNECT_TIMEOUT,
-                            Arc::clone(&dial_cancel),
-                            Some(&relay_mtls),
-                            RelayE2eeMode::ClientRequired(bundle),
-                        ) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                if disconnect_flag.load(Ordering::Acquire) {
-                                    return Ok("用户主动断开".to_string());
-                                }
-                                return Err(classify_relay_connect_error(&e, true, true));
-                            }
-                        };
-                        let h = t.shutdown_handle();
-                        let fp = t
-                            .peer_mtls_identity()
-                            .map(|id| id.cert_fingerprint_sha256.clone());
-                        (Box::new(t), h, true, fp)
-                    } else if let Some(bundle) = peer_bundle {
-                        let relay_mtls = bundle.to_relay_mtls_config(None);
-                        let t = match TcpRelayTransport::connect_mtls_cancellable(
-                            &grant.relay_addr,
-                            RelayRole::Client,
-                            &grant.relay_token,
-                            RELAY_CLIENT_CONNECT_TIMEOUT,
-                            Arc::clone(&dial_cancel),
-                            &relay_mtls,
-                        ) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                if disconnect_flag.load(Ordering::Acquire) {
-                                    return Ok("用户主动断开".to_string());
-                                }
-                                return Err(classify_relay_connect_error(&e, false, true));
-                            }
-                        };
-                        let h = t.shutdown_handle();
-                        (Box::new(t), h, false, None)
-                    } else {
-                        let t = match TcpRelayTransport::connect_cancellable(
-                            &grant.relay_addr,
-                            RelayRole::Client,
-                            &grant.relay_token,
-                            RELAY_CLIENT_CONNECT_TIMEOUT,
-                            Arc::clone(&dial_cancel),
-                        ) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                if disconnect_flag.load(Ordering::Acquire) {
-                                    return Ok("用户主动断开".to_string());
-                                }
-                                return Err(classify_relay_connect_error(&e, false, false));
-                            }
-                        };
-                        let h = t.shutdown_handle();
-                        (Box::new(t), h, false, None)
-                    };
-
-                    *relay_interrupt.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(ActiveRelayInterrupt::Connected(shutdown_handle.clone()));
-                    if disconnect_flag.load(Ordering::Acquire) {
-                        shutdown_handle.shutdown();
-                        return Ok("用户主动断开".to_string());
-                    }
-
-                    SelectedRelayPath {
-                        transport: raw_transport,
-                        relay_shutdown: Some(shutdown_handle),
-                        transport_label: "TCP Relay",
-                        backend_suffix: Some("(中继)"),
-                        mtls_active: active,
-                        peer_cert_fingerprint: fp,
-                    }
-                }
-            };
-
-            update_tx.push(SessionUpdate::Connecting {
-                phase: ConnectPhase::AwaitingWelcome,
-                watch_only: live_watch_only.load(Ordering::Acquire),
-            });
-
-            let bridge_transport = BridgeTransport {
-                inner: raw_transport,
-                pending_control: Arc::clone(&pending_control),
-                disconnect_flag: Arc::clone(&disconnect_flag),
-                relay_shutdown,
-                streaming_started: Arc::clone(&streaming_started),
-            };
-            // 占位解码/渲染器仅用于满足 `ClientSession::with_parts` 签名；握手成功后
-            // `set_pipeline_factory_for` 会按裁定参数构造实际硬件/假栈并挂载 `LayerLease`。
-            let placeholder_res = Resolution::new(64, 64);
-            let dummy_decoder = rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
-                resolution: placeholder_res,
-                ..rc_decode::FakeDecoderConfig::default()
-            })
-            .map_err(|e| format!("会话占位解码器构造失败: {e}"))?;
-            let dummy_renderer = rc_render::FakeRenderer::new(rc_render::FakeRendererConfig {
-                size: (placeholder_res.width, placeholder_res.height),
-                ..rc_render::FakeRendererConfig::default()
-            })
-            .map_err(|e| format!("会话占位渲染器构造失败: {e}"))?;
-
-            let mut client = ClientSession::with_parts(
-                client_cfg,
-                Box::new(bridge_transport),
-                Box::new(dummy_decoder),
-                Box::new(dummy_renderer),
-                clock,
-            )
-            .map_err(|e| format!("信令会话构造失败: {e}"))?;
-            client.set_pipeline_factory_for(make_pipeline_factory(backend_suffix));
-            if let Some(cb) = create_clipboard_backend(cfg.prefer_hardware) {
-                client.enable_clipboard(Box::new(ToggleableClipboardBackend::new(
-                    cb,
-                    Arc::clone(&clipboard_enabled_flag),
-                )));
-            }
-
-            let negotiated = match client.handshake() {
-                Ok(n) => n,
-                Err(e) => {
-                    if disconnect_flag.load(Ordering::Acquire) {
-                        return Ok("用户主动断开".to_string());
-                    }
-                    return Err(format!("连接/握手失败: {e}"));
-                }
-            };
-            (
-                client,
-                negotiated,
-                chosen_transport_label,
-                mtls_active,
-                peer_fp,
-            )
+        let peer_bundle = prepare_peer_mtls_bundle(&cfg, grant);
+        let quic_mtls = if cfg.encrypt_connection {
+            let bundle = peer_bundle.as_ref().ok_or_else(|| {
+                SessionEnd::fatal("已开启「加密连接 (mTLS)」，但缺少设备证书配置")
+            })?;
+            Some(bundle.to_quic_mtls_config().map_err(SessionEnd::fatal)?)
         } else {
-            let direct_mtls = if cfg.encrypt_connection {
-                let bundle = cfg
-                    .mtls_config
-                    .as_ref()
-                    .ok_or_else(|| "已开启「加密连接 (mTLS)」，但缺少设备证书配置".to_string())?;
-                Some(bundle.to_quic_mtls_config()?)
-            } else {
-                None
-            };
-            let direct_peer_fp: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-
-            let server_cert = dev_server_cert_pem();
-            let mut client = ClientSession::new(
-                client_cfg,
-                DEV_CERT_PEM,
-                DEV_KEY_PEM,
-                server_cert,
-                DEV_SERVER_NAME,
-                clock,
-            )
-            .map_err(|e| format!("会话构造失败: {e}"))?;
-            if let Some(cb) = create_clipboard_backend(cfg.prefer_hardware) {
-                client.enable_clipboard(Box::new(ToggleableClipboardBackend::new(
-                    cb,
-                    Arc::clone(&clipboard_enabled_flag),
-                )));
-            }
-
-            // ── 自定义 connect 工厂：精确发射 ConnectPhase + 挂载 BridgeTransport（支持可选 mTLS） ──
-            {
-                let peer_addr = cfg.connect_addr;
-                let pending = Arc::clone(&pending_control);
-                let upd = Arc::clone(&update_tx);
-                let disc = Arc::clone(&disconnect_flag);
-                let started = Arc::clone(&streaming_started);
-                let fp_slot = Arc::clone(&direct_peer_fp);
-                let watch_only_flag = Arc::clone(&live_watch_only);
-                let mut retained_endpoint: Option<QuicEndpoint> = None;
-                let mut first_connect = true;
-                client.set_connect_factory(Box::new(move || {
-                    if disc.load(Ordering::Acquire) {
-                        return Err(rc_types::Error::Network("用户主动断开".to_string()));
-                    }
-                    if retained_endpoint.is_none() {
-                        if first_connect {
-                            upd.push(SessionUpdate::Connecting {
-                                phase: ConnectPhase::EndpointCreating,
-                                watch_only: watch_only_flag.load(Ordering::Acquire),
-                            });
-                        }
-                        let identity = Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM)?;
-                        let net = NetConfig {
-                            role: Role::Controller,
-                            local_addr: "0.0.0.0:0"
-                                .parse()
-                                .expect("0.0.0.0:0 is a valid socket addr"),
-                            peer_addr: Some(peer_addr),
-                            mtu: rc_session::DEFAULT_SESSION_MTU,
-                        };
-                        retained_endpoint = Some(QuicEndpoint::new(&net, &identity)?);
-                    }
-                    if first_connect {
-                        upd.push(SessionUpdate::Connecting {
-                            phase: ConnectPhase::Connecting,
-                            watch_only: watch_only_flag.load(Ordering::Acquire),
-                        });
-                    }
-                    let endpoint = retained_endpoint.as_ref().expect("endpoint initialized");
-                    let transport = if let Some(ref mtls_cfg) = direct_mtls {
-                        let t = endpoint.connect_mtls_cancelable(
-                            peer_addr,
-                            mtls_cfg,
-                            "",
-                            Duration::from_secs(10),
-                            &disc,
-                        )?;
-                        *fp_slot.lock().unwrap_or_else(|e| e.into_inner()) =
-                            t.peer_mtls_identity().map(|id| id.cert_fingerprint_sha256);
-                        t
-                    } else {
-                        let certs = Identity::certs_from_pem(dev_server_cert_pem())?;
-                        endpoint.connect(
-                            peer_addr,
-                            &certs,
-                            DEV_SERVER_NAME,
-                            Duration::from_secs(10),
-                        )?
-                    };
-                    if first_connect {
-                        first_connect = false;
-                        upd.push(SessionUpdate::Connecting {
-                            phase: ConnectPhase::AwaitingWelcome,
-                            watch_only: watch_only_flag.load(Ordering::Acquire),
-                        });
-                    }
-                    Ok(Box::new(BridgeTransport {
-                        inner: Box::new(transport),
-                        pending_control: Arc::clone(&pending),
-                        disconnect_flag: Arc::clone(&disc),
-                        relay_shutdown: None,
-                        streaming_started: Arc::clone(&started),
-                    }))
-                }));
-            }
-
-            // ── 管线工厂：prefer_hardware 时优先 VT + 离屏 MetalRenderer，失败降级假后端 ──
-            client.set_pipeline_factory_for(make_pipeline_factory(None));
-
-            // ── 连接 + 握手 ──
-            let negotiated = match client.connect_and_handshake() {
-                Ok(n) => n,
-                Err(e) => {
-                    if disconnect_flag.load(Ordering::Acquire) {
-                        return Ok("用户主动断开".to_string());
-                    }
-                    return Err(format!("连接/握手失败: {e}"));
-                }
-            };
-            let fp = direct_peer_fp
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            (client, negotiated, "UDP LAN", cfg.encrypt_connection, fp)
+            None
         };
+
+        // Tier 1：若非强制中继（`Auto` 或 `P2pOnly`）且命中 LAN 直连候选，300ms 快速探测 UDP LAN。
+        struct SelectedRelayPath {
+            transport: Box<dyn Transport>,
+            relay_shutdown: Option<RelayShutdownHandle>,
+            transport_label: &'static str,
+            backend_suffix: Option<&'static str>,
+            mtls_active: bool,
+            peer_cert_fingerprint: Option<String>,
+        }
+        let mut chosen: Option<SelectedRelayPath> = None;
+        let mut direct_fail_reasons: Vec<String> = Vec::new();
+        let allow_lan_and_p2p = effective_mode != ConnectionMode::TcpRelay;
+        if allow_lan_and_p2p && !disconnect_flag.load(Ordering::Acquire) {
+            for lan_addr in collect_lan_candidate_addrs(&cfg, grant) {
+                if disconnect_flag.load(Ordering::Acquire) {
+                    return Ok(SessionEnd::fatal("用户主动断开"));
+                }
+                match dial_lan_direct_quic(lan_addr, quic_mtls.as_ref(), &disconnect_flag) {
+                    Ok((t, fp)) => {
+                        client_cfg.peer_addr = lan_addr;
+                        chosen = Some(SelectedRelayPath {
+                            transport: t,
+                            relay_shutdown: None,
+                            transport_label: "UDP LAN",
+                            backend_suffix: None,
+                            mtls_active: cfg.encrypt_connection,
+                            peer_cert_fingerprint: fp,
+                        });
+                        break;
+                    }
+                    Err(err) => {
+                        if cfg.encrypt_connection && is_mtls_cert_or_config_error(&err) {
+                            return Err(SessionEnd::fatal(format!(
+                                "LAN mTLS 证书校验失败（严禁静默降级）: {err}"
+                            )));
+                        }
+                        direct_fail_reasons.push(err);
+                    }
+                }
+            }
+        }
+
+        // Tier 2：LAN 未命中或失败且非强制中继时，尝试 UDP P2P 打洞 + QUIC 直连。
+        if chosen.is_none() && allow_lan_and_p2p && !disconnect_flag.load(Ordering::Acquire) {
+            let candidates = P2pCandidates {
+                session_id: grant.session_id.clone(),
+                peer_public_addr: grant.peer_public_addr.clone(),
+                peer_lan_addrs: grant.peer_lan_addrs.clone(),
+                local_udp_port: grant.local_udp_port,
+            };
+            if !p2p::parse_candidate_addrs(&candidates).is_empty() {
+                match p2p::attempt_p2p_quic_client_mtls(
+                    &candidates,
+                    p2p::DEFAULT_PUNCH_TIMEOUT,
+                    p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
+                    &disconnect_flag,
+                    quic_mtls.as_ref(),
+                ) {
+                    Ok(p2p_conn) => {
+                        let fp = p2p_conn
+                            .peer_mtls_identity()
+                            .map(|id| id.cert_fingerprint_sha256);
+                        chosen = Some(SelectedRelayPath {
+                            transport: Box::new(p2p_conn),
+                            relay_shutdown: None,
+                            transport_label: "UDP P2P",
+                            backend_suffix: Some("(P2P 直连)"),
+                            mtls_active: cfg.encrypt_connection,
+                            peer_cert_fingerprint: fp,
+                        });
+                    }
+                    Err(err) => {
+                        if cfg.encrypt_connection && is_mtls_cert_or_config_error(&err) {
+                            return Err(SessionEnd::fatal(format!(
+                                "P2P mTLS 证书校验失败（严禁静默降级）: {err}"
+                            )));
+                        }
+                        direct_fail_reasons.push(err);
+                    }
+                }
+            } else if effective_mode == ConnectionMode::P2pOnly {
+                direct_fail_reasons.push("无可用直连或 P2P 候选地址".to_string());
+            }
+        }
+
+        if disconnect_flag.load(Ordering::Acquire) {
+            return Ok(SessionEnd::fatal("用户主动断开"));
+        }
+
+        // `P2pOnly` 模式严禁回退至 Tier 3 TCP Relay，直接返回明确不可恢复错误。
+        if chosen.is_none() && effective_mode == ConnectionMode::P2pOnly {
+            let detail = if direct_fail_reasons.is_empty() {
+                "未命中局域网地址且对端无可用 P2P 候选地址".to_string()
+            } else {
+                direct_fail_reasons.join("；")
+            };
+            return Err(SessionEnd::fatal(format!(
+                "P2P 直连失败（当前为「仅 P2P」模式，未回退中继）：{detail}"
+            )));
+        }
+
+        // Tier 3：P2P 失败/未命中或强制中继 → 回退 `:21117` 中继（有 mtls_config 强制外层 mTLS；encrypt_connection 再叠加内层 E2EE mTLS）。
+        let SelectedRelayPath {
+            transport: raw_transport,
+            relay_shutdown,
+            transport_label: chosen_transport_label,
+            backend_suffix,
+            mtls_active,
+            peer_cert_fingerprint: peer_fp,
+        } = match chosen {
+            Some(ready) => ready,
+            None => {
+                // 与服务端默认中继配对超时（15s）对齐，兼容远端仍处旧版清理窗口的边缘场景。
+                const RELAY_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+                let (raw_transport, shutdown_handle, active, fp): (
+                    Box<dyn Transport>,
+                    RelayShutdownHandle,
+                    bool,
+                    Option<String>,
+                ) = if cfg.encrypt_connection {
+                    let bundle = peer_bundle.ok_or_else(|| {
+                        SessionEnd::fatal("已开启「加密连接 (mTLS)」，但缺少设备证书配置")
+                    })?;
+                    let relay_mtls = bundle.to_relay_mtls_config(None);
+                    let t = match E2eeRelayTransport::connect_cancellable(
+                        &grant.relay_addr,
+                        RelayRole::Client,
+                        &grant.relay_token,
+                        RELAY_CLIENT_CONNECT_TIMEOUT,
+                        Arc::clone(&dial_cancel),
+                        Some(&relay_mtls),
+                        RelayE2eeMode::ClientRequired(bundle),
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            if disconnect_flag.load(Ordering::Acquire) {
+                                return Ok(SessionEnd::fatal("用户主动断开"));
+                            }
+                            return Err(SessionEnd::fatal(classify_relay_connect_error(
+                                &e, true, true,
+                            )));
+                        }
+                    };
+                    let h = t.shutdown_handle();
+                    let fp = t
+                        .peer_mtls_identity()
+                        .map(|id| id.cert_fingerprint_sha256.clone());
+                    (Box::new(t), h, true, fp)
+                } else if let Some(bundle) = peer_bundle {
+                    let relay_mtls = bundle.to_relay_mtls_config(None);
+                    let t = match TcpRelayTransport::connect_mtls_cancellable(
+                        &grant.relay_addr,
+                        RelayRole::Client,
+                        &grant.relay_token,
+                        RELAY_CLIENT_CONNECT_TIMEOUT,
+                        Arc::clone(&dial_cancel),
+                        &relay_mtls,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            if disconnect_flag.load(Ordering::Acquire) {
+                                return Ok(SessionEnd::fatal("用户主动断开"));
+                            }
+                            return Err(SessionEnd::fatal(classify_relay_connect_error(
+                                &e, false, true,
+                            )));
+                        }
+                    };
+                    let h = t.shutdown_handle();
+                    (Box::new(t), h, false, None)
+                } else {
+                    let t = match TcpRelayTransport::connect_cancellable(
+                        &grant.relay_addr,
+                        RelayRole::Client,
+                        &grant.relay_token,
+                        RELAY_CLIENT_CONNECT_TIMEOUT,
+                        Arc::clone(&dial_cancel),
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            if disconnect_flag.load(Ordering::Acquire) {
+                                return Ok(SessionEnd::fatal("用户主动断开"));
+                            }
+                            return Err(SessionEnd::fatal(classify_relay_connect_error(
+                                &e, false, false,
+                            )));
+                        }
+                    };
+                    let h = t.shutdown_handle();
+                    (Box::new(t), h, false, None)
+                };
+
+                *relay_interrupt.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(ActiveRelayInterrupt::Connected(shutdown_handle.clone()));
+                if disconnect_flag.load(Ordering::Acquire) {
+                    shutdown_handle.shutdown();
+                    return Ok(SessionEnd::fatal("用户主动断开"));
+                }
+
+                SelectedRelayPath {
+                    transport: raw_transport,
+                    relay_shutdown: Some(shutdown_handle),
+                    transport_label: "TCP Relay",
+                    backend_suffix: Some("(中继)"),
+                    mtls_active: active,
+                    peer_cert_fingerprint: fp,
+                }
+            }
+        };
+
+        update_tx.push(SessionUpdate::Connecting {
+            phase: ConnectPhase::AwaitingWelcome,
+            watch_only: live_watch_only.load(Ordering::Acquire),
+        });
+
+        let bridge_transport = BridgeTransport {
+            inner: raw_transport,
+            pending_control: Arc::clone(&pending_control),
+            disconnect_flag: Arc::clone(&disconnect_flag),
+            relay_shutdown,
+            streaming_started: Arc::clone(&streaming_started),
+        };
+        // 占位解码/渲染器仅用于满足 `ClientSession::with_parts` 签名；握手成功后
+        // `set_pipeline_factory_for` 会按裁定参数构造实际硬件/假栈并挂载 `LayerLease`。
+        let placeholder_res = Resolution::new(64, 64);
+        let dummy_decoder = rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
+            resolution: placeholder_res,
+            ..rc_decode::FakeDecoderConfig::default()
+        })
+        .map_err(|e| SessionEnd::fatal(format!("会话占位解码器构造失败: {e}")))?;
+        let dummy_renderer = rc_render::FakeRenderer::new(rc_render::FakeRendererConfig {
+            size: (placeholder_res.width, placeholder_res.height),
+            ..rc_render::FakeRendererConfig::default()
+        })
+        .map_err(|e| SessionEnd::fatal(format!("会话占位渲染器构造失败: {e}")))?;
+
+        let mut client = ClientSession::with_parts(
+            client_cfg,
+            Box::new(bridge_transport),
+            Box::new(dummy_decoder),
+            Box::new(dummy_renderer),
+            clock,
+        )
+        .map_err(|e| SessionEnd::fatal(format!("信令会话构造失败: {e}")))?;
+        client.set_pipeline_factory_for(make_pipeline_factory(backend_suffix));
+        if let Some(cb) = create_clipboard_backend(cfg.prefer_hardware) {
+            client.enable_clipboard(Box::new(ToggleableClipboardBackend::new(
+                cb,
+                Arc::clone(&clipboard_enabled_flag),
+            )));
+        }
+
+        let negotiated = match client.handshake() {
+            Ok(n) => n,
+            Err(e) => {
+                if disconnect_flag.load(Ordering::Acquire) {
+                    return Ok(SessionEnd::fatal("用户主动断开"));
+                }
+                return Err(SessionEnd::fatal(format!("连接/握手失败: {e}")));
+            }
+        };
+        (
+            client,
+            negotiated,
+            chosen_transport_label,
+            backend_suffix,
+            mtls_active,
+            peer_fp,
+        )
+    } else {
+        let direct_mtls = if cfg.encrypt_connection {
+            let bundle = cfg.mtls_config.as_ref().ok_or_else(|| {
+                SessionEnd::fatal("已开启「加密连接 (mTLS)」，但缺少设备证书配置")
+            })?;
+            Some(bundle.to_quic_mtls_config().map_err(SessionEnd::fatal)?)
+        } else {
+            None
+        };
+        let direct_peer_fp: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let server_cert = dev_server_cert_pem();
+        let mut client = ClientSession::new(
+            client_cfg,
+            DEV_CERT_PEM,
+            DEV_KEY_PEM,
+            server_cert,
+            DEV_SERVER_NAME,
+            clock,
+        )
+        .map_err(|e| SessionEnd::fatal(format!("会话构造失败: {e}")))?;
+        if let Some(cb) = create_clipboard_backend(cfg.prefer_hardware) {
+            client.enable_clipboard(Box::new(ToggleableClipboardBackend::new(
+                cb,
+                Arc::clone(&clipboard_enabled_flag),
+            )));
+        }
+
+        // ── 自定义 connect 工厂：每次建连/重连均丢弃旧端点并重新绑定 `0.0.0.0:0`（避免切网后旧 UDP 套接字失效） ──
+        {
+            let peer_addr = cfg.connect_addr;
+            let pending = Arc::clone(&pending_control);
+            let upd = Arc::clone(&update_tx);
+            let disc = Arc::clone(&disconnect_flag);
+            let started = Arc::clone(&streaming_started);
+            let fp_slot = Arc::clone(&direct_peer_fp);
+            let watch_only_flag = Arc::clone(&live_watch_only);
+            let mut first_connect = true;
+            client.set_connect_factory(Box::new(move || {
+                if disc.load(Ordering::Acquire) {
+                    return Err(rc_types::Error::Network("用户主动断开".to_string()));
+                }
+                if first_connect {
+                    upd.push(SessionUpdate::Connecting {
+                        phase: ConnectPhase::EndpointCreating,
+                        watch_only: watch_only_flag.load(Ordering::Acquire),
+                    });
+                }
+                let identity = Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM)?;
+                let net = NetConfig {
+                    role: Role::Controller,
+                    local_addr: "0.0.0.0:0"
+                        .parse()
+                        .expect("0.0.0.0:0 is a valid socket addr"),
+                    peer_addr: Some(peer_addr),
+                    mtu: rc_session::DEFAULT_SESSION_MTU,
+                };
+                let endpoint = QuicEndpoint::new(&net, &identity)?;
+                if first_connect {
+                    upd.push(SessionUpdate::Connecting {
+                        phase: ConnectPhase::Connecting,
+                        watch_only: watch_only_flag.load(Ordering::Acquire),
+                    });
+                }
+                let transport = if let Some(ref mtls_cfg) = direct_mtls {
+                    let t = endpoint.connect_mtls_cancelable(
+                        peer_addr,
+                        mtls_cfg,
+                        "",
+                        Duration::from_secs(10),
+                        &disc,
+                    )?;
+                    *fp_slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                        t.peer_mtls_identity().map(|id| id.cert_fingerprint_sha256);
+                    t
+                } else {
+                    let certs = Identity::certs_from_pem(dev_server_cert_pem())?;
+                    endpoint.connect_cancelable(
+                        peer_addr,
+                        &certs,
+                        DEV_SERVER_NAME,
+                        Duration::from_secs(10),
+                        &disc,
+                    )?
+                };
+                if first_connect {
+                    first_connect = false;
+                    upd.push(SessionUpdate::Connecting {
+                        phase: ConnectPhase::AwaitingWelcome,
+                        watch_only: watch_only_flag.load(Ordering::Acquire),
+                    });
+                }
+                Ok(Box::new(BridgeTransport {
+                    inner: Box::new(LanQuicTransport {
+                        transport,
+                        _endpoint: endpoint,
+                    }),
+                    pending_control: Arc::clone(&pending),
+                    disconnect_flag: Arc::clone(&disc),
+                    relay_shutdown: None,
+                    streaming_started: Arc::clone(&started),
+                }))
+            }));
+        }
+
+        // ── 管线工厂：prefer_hardware 时优先 VT + 离屏 MetalRenderer，失败降级假后端；tools_only 走轻量占位管线 ──
+        client.set_pipeline_factory_for(make_pipeline_factory(None));
+
+        // ── 连接 + 握手 ──
+        let negotiated = match client.connect_and_handshake() {
+            Ok(n) => n,
+            Err(e) => {
+                if disconnect_flag.load(Ordering::Acquire) {
+                    return Ok(SessionEnd::fatal("用户主动断开"));
+                }
+                return Err(SessionEnd::fatal(format!("连接/握手失败: {e}")));
+            }
+        };
+        let fp = direct_peer_fp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        (
+            client,
+            negotiated,
+            "UDP LAN",
+            None,
+            cfg.encrypt_connection,
+            fp,
+        )
+    };
+    client.set_peer_idle_timeout_us(ClientSession::PEER_IDLE_TIMEOUT_US);
     streaming_started.store(true, Ordering::Release);
     let _activity =
         crate::platform::begin_latency_critical_activity("RabbitControl 远控会话", true);
-    let backend = backend_label
+    let mut backend = backend_label
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let is_hardware_decoder = !backend.starts_with("fake");
+    let mut is_hardware_decoder = is_hw_decoder_slot.load(Ordering::Acquire);
 
     let live_wo = live_watch_only.load(Ordering::Acquire);
     update_tx.push(SessionUpdate::Connecting {
@@ -3036,7 +3340,7 @@ fn run_session_thread(
     )));
     let mut prev_hud = initial_sample;
     let mut last_hud_at = Instant::now();
-    let stream_started_at = Instant::now();
+    let mut stream_started_at = Instant::now();
     let mut first_frame_logged = false;
     let mut decode_error_logged = false;
     let mut last_portmap_poll_at = Instant::now();
@@ -3047,12 +3351,19 @@ fn run_session_thread(
     let mut pending_portmap_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_display_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_update_tx: VecDeque<(bool, Vec<u8>)> = VecDeque::new();
-    let client_supports_hevc =
+    let mut client_supports_hevc =
         cfg.prefer_hardware && is_hardware_decoder && rc_pipeline::platform_supports_hevc();
     let mut active_codec = StreamCodec::H264;
     let mut user_pinned_codec: Option<StreamCodec> = None;
     let mut host_supports_hevc = false;
-    if client_supports_hevc {
+    if cfg.tools_only {
+        client.set_media_paused(true);
+        if let Some(payload) =
+            display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetMediaPaused { paused: true })
+        {
+            pending_display_tx.push_back(payload);
+        }
+    } else if client_supports_hevc {
         if let Some(payload) = display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetCodec {
             codec: "hevc".to_string(),
         }) {
@@ -3071,7 +3382,12 @@ fn run_session_thread(
     let mut last_busy = true;
     let mut epoch_sid = session_id;
     let mut disconnect_requested = false;
-    let mut end_reason = "会话已结束".to_string();
+    let mut end_state = SessionEnd::fatal("会话已结束");
+    let mut in_reconnecting = false;
+    let mut reconnect_base_attempts: u32 = 0;
+    let mut last_emitted_reconnect_attempt: u32 = 0;
+    let mut last_stage_rect: Option<(u32, u32)> = None;
+    let mut pending_desktop_upgrade = false;
     let mut update_relay = crate::updater::ControllerUpdateRelay::new();
     let mut awaiting_host_relay_finish = false;
     let mut active_update_request_id: u64 = 0;
@@ -3102,6 +3418,7 @@ fn run_session_thread(
                 }
                 SessionCommand::StageRect { width, height } => {
                     if width > 0 && height > 0 {
+                        last_stage_rect = Some((width, height));
                         if let Some(rend) = renderer_handle
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -3182,6 +3499,79 @@ fn run_session_thread(
                         pending_display_tx.push_back(payload);
                     }
                 }
+                SessionCommand::SetMediaPaused { paused } => {
+                    if client.state() != SessionState::Streaming {
+                        if paused {
+                            pending_desktop_upgrade = false;
+                            client.set_media_paused(true);
+                            update_tx.push(SessionUpdate::MediaState { paused: true });
+                        } else {
+                            // 重连期间缓存桌面升级/恢复意图，待重连回到 Streaming 后立即执行。
+                            pending_desktop_upgrade = true;
+                        }
+                        continue;
+                    }
+                    if paused {
+                        pending_desktop_upgrade = false;
+                        client.set_media_paused(true);
+                        if let Some(payload) =
+                            display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetMediaPaused {
+                                paused: true,
+                            })
+                        {
+                            pending_display_tx.push_back(payload);
+                        }
+                        update_tx.push(SessionUpdate::MediaState { paused: true });
+                    } else {
+                        pending_desktop_upgrade = false;
+                        let surface = render_surface
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        let _ = try_resume_or_upgrade_desktop(
+                            DesktopUpgradeCtx {
+                                client: &mut client,
+                                real_pipeline_built: &real_pipeline_built,
+                                want_real_pipeline: &want_real_pipeline,
+                                is_hw_decoder_slot: &is_hw_decoder_slot,
+                                backend: &mut backend,
+                                backend_label: &backend_label,
+                                renderer_handle: &renderer_handle,
+                                layer_lease: &layer_lease,
+                                active_backend_suffix,
+                                is_hardware_decoder: &mut is_hardware_decoder,
+                                client_supports_hevc: &mut client_supports_hevc,
+                                active_codec: &mut active_codec,
+                                user_pinned_codec,
+                                prefer_hardware: cfg.prefer_hardware,
+                                hud_width,
+                                hud_height,
+                                current_fps,
+                                negotiated,
+                                last_stage_rect,
+                                stream_started_at: &mut stream_started_at,
+                                first_frame_logged: &mut first_frame_logged,
+                                decode_error_logged: &mut decode_error_logged,
+                                pending_display_tx: &mut pending_display_tx,
+                                update_tx: &update_tx,
+                            },
+                            |upgrade_pcfg| {
+                                build_controller_pipeline(
+                                    upgrade_pcfg,
+                                    cfg.prefer_hardware,
+                                    t0,
+                                    surface.as_ref(),
+                                )
+                            },
+                        );
+                    }
+                }
+                SessionCommand::ProbeNow => {
+                    if client.state() == SessionState::Streaming {
+                        let now_us = u64::from((clock_reader)());
+                        let _ = client.trigger_fast_probe(now_us);
+                    }
+                }
             }
         }
         if client.state() == SessionState::Streaming {
@@ -3242,7 +3632,7 @@ fn run_session_thread(
             }
         }
         if disconnect_requested || disconnect_flag.load(Ordering::Acquire) {
-            end_reason = "用户主动断开".to_string();
+            end_state = SessionEnd::fatal("用户主动断开");
             break;
         }
 
@@ -3250,13 +3640,24 @@ fn run_session_thread(
         match client.state() {
             SessionState::Streaming => {
                 let now_us = u64::from((clock_reader)());
-                client
-                    .pump_probes(now_us)
-                    .map_err(|e| format!("探测泵失败: {e}"))?;
+                client.pump_probes(now_us).map_err(|e| {
+                    classify_runtime_err_end(
+                        "探测泵失败",
+                        &e,
+                        disconnect_flag.load(Ordering::Acquire),
+                    )
+                })?;
+                if client.state() != SessionState::Streaming {
+                    continue;
+                }
                 if !is_tcp_relay {
-                    client
-                        .start_bw_probe(now_us)
-                        .map_err(|e| format!("带宽粗测失败: {e}"))?;
+                    client.start_bw_probe(now_us).map_err(|e| {
+                        classify_runtime_err_end(
+                            "带宽粗测失败",
+                            &e,
+                            disconnect_flag.load(Ordering::Acquire),
+                        )
+                    })?;
                 }
                 if clipboard_enabled_flag.load(Ordering::Acquire) {
                     let _ = client.pump_clipboard(now_us);
@@ -3266,18 +3667,15 @@ fn run_session_thread(
                 } else {
                     RUN_IDLE_POLL_BUDGET
                 };
-                let tick_report = client
-                    .tick(budget, Instant::now())
-                    .map_err(|e| format!("会话运行失败: {e}"))?;
+                let tick_report = client.tick(budget, Instant::now()).map_err(|e| {
+                    classify_runtime_err_end(
+                        "会话运行失败",
+                        &e,
+                        disconnect_flag.load(Ordering::Acquire),
+                    )
+                })?;
                 if let Some(stop) = tick_report.closed {
-                    end_reason = if matches!(
-                        stop,
-                        rc_session::StopReason::ByeReceived(ByeReason::SessionSwitching)
-                    ) {
-                        SESSION_SWITCHING_REASON.to_string()
-                    } else {
-                        format!("对端已关闭 ({stop:?})")
-                    };
+                    end_state = classify_stop_reason_end(&stop);
                     break;
                 }
 
@@ -3620,7 +4018,8 @@ fn run_session_thread(
                     // 当本地启用 VideoToolbox 硬件解码但远端持续产出非 H.264 码流（例如被控端
                     // 未授屏幕录制权限而降级到 FakeEncoder）时，`displayed` 恒为 0 且持续出现
                     // `Outcome::DecodeError`。达到阈值时显式报错并结束会话，避免无限静默黑屏。
-                    if is_hardware_decoder && displayed_now == 0 {
+                    // 媒体处于暂停态（纯工具模式）时跳过检查。
+                    if !client.is_media_paused() && is_hardware_decoder && displayed_now == 0 {
                         let decode_errors = count_decode_errors(&client);
                         if decode_errors > 0 && !decode_error_logged {
                             decode_error_logged = true;
@@ -3640,8 +4039,9 @@ fn run_session_thread(
                                  (backend={backend}, displayed=0, decode_errors={decode_errors}); \
                                  ending session"
                             );
-                            end_reason =
-                                "远端画面解码失败（请确认被控端已授予屏幕录制权限）".to_string();
+                            end_state = SessionEnd::fatal(
+                                "远端画面解码失败（请确认被控端已授予屏幕录制权限）",
+                            );
                             break;
                         }
                     }
@@ -3649,16 +4049,47 @@ fn run_session_thread(
             }
             SessionState::Reconnecting => {
                 if is_signaling_session {
-                    end_reason = if transport_label == "UDP P2P" {
-                        "P2P 连接已断开".to_string()
-                    } else {
-                        "中继连接已断开".to_string()
-                    };
+                    end_state = signaling_disconnect_end(transport_label);
                     break;
+                }
+                let max_attempts = client.reconnect_config().backoff_max_attempts.max(1);
+                if !in_reconnecting {
+                    in_reconnecting = true;
+                    reconnect_base_attempts = client.reconnect_stats().reconnect_attempts;
+                    last_emitted_reconnect_attempt = 1;
+                    update_tx.push(SessionUpdate::Reconnecting {
+                        attempt: 1,
+                        max_attempts,
+                        reason: "连接已中断，正在尝试重连…".to_string(),
+                    });
                 }
                 let outcome = client
                     .tick_reconnect(u64::from((clock_reader)()))
-                    .map_err(|e| format!("重连驱动失败: {e}"))?;
+                    .map_err(|e| {
+                        classify_runtime_err_end(
+                            "重连驱动失败",
+                            &e,
+                            disconnect_flag.load(Ordering::Acquire),
+                        )
+                    })?;
+                let cur_attempt = client
+                    .reconnect_stats()
+                    .reconnect_attempts
+                    .saturating_sub(reconnect_base_attempts);
+                if cur_attempt > last_emitted_reconnect_attempt
+                    && matches!(
+                        outcome,
+                        ReconnectOutcome::Connecting | ReconnectOutcome::Waiting { .. }
+                    )
+                {
+                    let display_attempt = cur_attempt.min(max_attempts);
+                    last_emitted_reconnect_attempt = cur_attempt;
+                    update_tx.push(SessionUpdate::Reconnecting {
+                        attempt: display_attempt,
+                        max_attempts,
+                        reason: format!("第 {display_attempt}/{max_attempts} 次重连尝试中…"),
+                    });
+                }
                 match outcome {
                     ReconnectOutcome::Waiting { next_attempt_in_ms } => {
                         let nap =
@@ -3666,20 +4097,36 @@ fn run_session_thread(
                         thread::sleep(nap);
                     }
                     ReconnectOutcome::GaveUp => {
-                        end_reason = if matches!(
-                            client.closed_reason(),
-                            Some(rc_session::StopReason::ByeReceived(
-                                ByeReason::SessionSwitching
-                            ))
-                        ) {
-                            SESSION_SWITCHING_REASON.to_string()
-                        } else {
-                            "重连次数已耗尽".to_string()
-                        };
+                        end_state = classify_gave_up_end(client.closed_reason());
                         break;
                     }
                     outcome @ (ReconnectOutcome::Resumed | ReconnectOutcome::Rebuilt) => {
+                        in_reconnecting = false;
+                        last_emitted_reconnect_attempt = 0;
                         client.reset_clipboard_epoch();
+                        if matches!(outcome, ReconnectOutcome::Rebuilt) {
+                            backend = backend_label
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone();
+                            is_hardware_decoder = is_hw_decoder_slot.load(Ordering::Acquire);
+                            client_supports_hevc = cfg.prefer_hardware
+                                && is_hardware_decoder
+                                && rc_pipeline::platform_supports_hevc();
+                            active_codec = StreamCodec::H264;
+                            if let Some((w, h)) = last_stage_rect {
+                                if let Some(rend) = renderer_handle
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .as_ref()
+                                {
+                                    let _ = rend
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .resize((w, h));
+                                }
+                            }
+                        }
                         if let Some(n) = client.negotiated() {
                             hud_width = n.width;
                             hud_height = n.height;
@@ -3690,6 +4137,57 @@ fn run_session_thread(
                         // M9：重连恢复或重建后若本地处于静音态，重新向主机同步静音控制消息。
                         if audio_muted {
                             pending_audio_ctrl = Some(encode_audio_ctrl_muted(true));
+                        }
+                        let mut upgraded_after_reconnect = false;
+                        if pending_desktop_upgrade {
+                            pending_desktop_upgrade = false;
+                            let surface = render_surface
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone();
+                            upgraded_after_reconnect = try_resume_or_upgrade_desktop(
+                                DesktopUpgradeCtx {
+                                    client: &mut client,
+                                    real_pipeline_built: &real_pipeline_built,
+                                    want_real_pipeline: &want_real_pipeline,
+                                    is_hw_decoder_slot: &is_hw_decoder_slot,
+                                    backend: &mut backend,
+                                    backend_label: &backend_label,
+                                    renderer_handle: &renderer_handle,
+                                    layer_lease: &layer_lease,
+                                    active_backend_suffix,
+                                    is_hardware_decoder: &mut is_hardware_decoder,
+                                    client_supports_hevc: &mut client_supports_hevc,
+                                    active_codec: &mut active_codec,
+                                    user_pinned_codec,
+                                    prefer_hardware: cfg.prefer_hardware,
+                                    hud_width,
+                                    hud_height,
+                                    current_fps,
+                                    negotiated,
+                                    last_stage_rect,
+                                    stream_started_at: &mut stream_started_at,
+                                    first_frame_logged: &mut first_frame_logged,
+                                    decode_error_logged: &mut decode_error_logged,
+                                    pending_display_tx: &mut pending_display_tx,
+                                    update_tx: &update_tx,
+                                },
+                                |upgrade_pcfg| {
+                                    build_controller_pipeline(
+                                        upgrade_pcfg,
+                                        cfg.prefer_hardware,
+                                        t0,
+                                        surface.as_ref(),
+                                    )
+                                },
+                            );
+                        }
+                        if !upgraded_after_reconnect && client.is_media_paused() {
+                            if let Some(payload) = display_ctrl::encode_display_ctrl(
+                                &DisplayControlMsg::SetMediaPaused { paused: true },
+                            ) {
+                                pending_display_tx.push_back(payload);
+                            }
                         }
                         // 重连恢复（`Resumed` 丢失在途 QUIC Stream A 分块）或重建（`Rebuilt`）后均需中止进行中的安装包中转，
                         // 避免主机接收线程死等丢失分块或控制器卡在 92%；重建时另外重新协商 HEVC。
@@ -3719,6 +4217,8 @@ fn run_session_thread(
                             }
                         }
                         if matches!(outcome, ReconnectOutcome::Rebuilt)
+                            && !upgraded_after_reconnect
+                            && !client.is_media_paused()
                             && client_supports_hevc
                             && user_pinned_codec != Some(StreamCodec::H264)
                         {
@@ -3743,6 +4243,7 @@ fn run_session_thread(
             epoch_sid = client.session_id();
             *clock_anchor.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
             client.reset_clipboard_epoch();
+            client.reset_activity_clock(u64::from((clock_reader)()));
         }
     }
 
@@ -3771,7 +4272,145 @@ fn run_session_thread(
         let _ = client.close(ByeReason::Normal);
     }
 
-    Ok(end_reason)
+    Ok(end_state)
+}
+
+/// 纯工具态原地热升级为桌面控屏的上下文（用于统一 `SetMediaPaused(false)` 与重连回 `Streaming` 补升级）。
+struct DesktopUpgradeCtx<'a> {
+    client: &'a mut ClientSession,
+    real_pipeline_built: &'a AtomicBool,
+    want_real_pipeline: &'a AtomicBool,
+    is_hw_decoder_slot: &'a AtomicBool,
+    backend: &'a mut String,
+    backend_label: &'a Mutex<String>,
+    renderer_handle: &'a Mutex<Option<RendererHandle>>,
+    layer_lease: &'a Mutex<Option<LayerLease>>,
+    active_backend_suffix: Option<&'static str>,
+    is_hardware_decoder: &'a mut bool,
+    client_supports_hevc: &'a mut bool,
+    active_codec: &'a mut StreamCodec,
+    user_pinned_codec: Option<StreamCodec>,
+    prefer_hardware: bool,
+    hud_width: u32,
+    hud_height: u32,
+    current_fps: u32,
+    negotiated: SessionParams,
+    last_stage_rect: Option<(u32, u32)>,
+    stream_started_at: &'a mut Instant,
+    first_frame_logged: &'a mut bool,
+    decode_error_logged: &'a mut bool,
+    pending_display_tx: &'a mut VecDeque<Vec<u8>>,
+    update_tx: &'a BoundedUpdateQueue,
+}
+
+/// 执行纯工具态到桌面控屏的原地热升级（或从暂停恢复媒体推流）。
+///
+/// 若尚未构建真实管线且 `build_pipeline` 或 `client.replace_pipeline` 任一步失败，
+/// 必须保持 `media_paused = true` 并立即返回 `false`——严禁取消暂停、严禁通知被控端恢复推流、
+/// 严禁向 UI 发射 `MediaResumed` / `MediaState(false)`，避免真实码流灌入 64×64 占位解码器。
+fn try_resume_or_upgrade_desktop<F>(ctx: DesktopUpgradeCtx<'_>, build_pipeline: F) -> bool
+where
+    F: FnOnce(&PipelineConfig) -> rc_types::Result<BuiltPipeline>,
+{
+    if !ctx.real_pipeline_built.load(Ordering::Acquire) {
+        let upgrade_w = if ctx.hud_width > 0 {
+            ctx.hud_width
+        } else if ctx.negotiated.width > 0 {
+            ctx.negotiated.width
+        } else {
+            1920
+        };
+        let upgrade_h = if ctx.hud_height > 0 {
+            ctx.hud_height
+        } else if ctx.negotiated.height > 0 {
+            ctx.negotiated.height
+        } else {
+            1080
+        };
+        let upgrade_fps = ctx.current_fps.max(1);
+        let upgrade_pcfg = PipelineConfig {
+            resolution: Resolution::new(upgrade_w, upgrade_h),
+            fps: upgrade_fps,
+            bitrate_bps: ctx.negotiated.bitrate_bps.max(1),
+            prefer_hardware: ctx.prefer_hardware,
+            target_latency_us: 22_000,
+            trace_capacity: 4096,
+            diff: DiffMode::TrustPlatform,
+            clock_origin_us: None,
+            async_decode: ctx.prefer_hardware,
+            max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+            ..PipelineConfig::default()
+        };
+        let built = match build_pipeline(&upgrade_pcfg) {
+            Ok(built) => built,
+            Err(e) => {
+                eprintln!("rc-ui: build_controller_pipeline during desktop upgrade failed: {e}");
+                ctx.client.set_media_paused(true);
+                return false;
+            }
+        };
+        if let Err(e) = ctx.client.replace_pipeline(built.pipeline) {
+            eprintln!("rc-ui: replace_pipeline during desktop upgrade failed: {e}");
+            ctx.client.set_media_paused(true);
+            return false;
+        }
+        let final_label = match ctx.active_backend_suffix {
+            Some(suffix) => format!("{} {suffix}", built.backend_label),
+            None => built.backend_label,
+        };
+        *ctx.backend = final_label.clone();
+        *ctx.backend_label.lock().unwrap_or_else(|e| e.into_inner()) = final_label;
+        if let Some((w, h)) = ctx.last_stage_rect {
+            let _ = built
+                .renderer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .resize((w, h));
+        }
+        *ctx.renderer_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&built.renderer));
+        *ctx.layer_lease.lock().unwrap_or_else(|e| e.into_inner()) =
+            LayerLease::from_renderer(built.renderer, built.layer_addr);
+        *ctx.is_hardware_decoder = built.is_hardware;
+        ctx.is_hw_decoder_slot
+            .store(built.is_hardware, Ordering::Release);
+        *ctx.first_frame_logged = false;
+        *ctx.decode_error_logged = false;
+        ctx.real_pipeline_built.store(true, Ordering::Release);
+        ctx.want_real_pipeline.store(true, Ordering::Release);
+        *ctx.client_supports_hevc = ctx.prefer_hardware
+            && *ctx.is_hardware_decoder
+            && rc_pipeline::platform_supports_hevc();
+        if *ctx.client_supports_hevc
+            && *ctx.active_codec != StreamCodec::Hevc
+            && ctx.user_pinned_codec != Some(StreamCodec::H264)
+        {
+            if let Some(payload) = display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetCodec {
+                codec: StreamCodec::Hevc.as_str().to_string(),
+            }) {
+                ctx.pending_display_tx.push_back(payload);
+                *ctx.active_codec = StreamCodec::Hevc;
+            }
+        }
+    }
+    *ctx.stream_started_at = Instant::now();
+    ctx.client.set_media_paused(false);
+    if let Some(payload) =
+        display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetMediaPaused { paused: false })
+    {
+        ctx.pending_display_tx.push_back(payload);
+    }
+    let _ = ctx.client.request_idr_now();
+    ctx.update_tx.push(SessionUpdate::MediaResumed {
+        backend: ctx.backend.clone(),
+        width: ctx.hud_width,
+        height: ctx.hud_height,
+        fps: ctx.current_fps,
+    });
+    ctx.update_tx
+        .push(SessionUpdate::MediaState { paused: false });
+    true
 }
 
 /// 构造控制端管线（硬件优先 + 假后端降级）。
@@ -3796,6 +4435,7 @@ fn build_controller_pipeline(
             backend_label: "fake(降级)".to_string(),
             renderer,
             layer_addr: 0,
+            is_hardware: false,
         });
     }
     let _ = session_start;
@@ -3805,6 +4445,7 @@ fn build_controller_pipeline(
         backend_label: "fake".to_string(),
         renderer,
         layer_addr: 0,
+        is_hardware: false,
     })
 }
 
@@ -3839,6 +4480,7 @@ fn try_hardware_controller_stack(
         backend_label: format!("{dl}+{}", hw_rend.label),
         renderer: shared,
         layer_addr: hw_rend.layer_addr,
+        is_hardware: true,
     })
 }
 
@@ -4096,6 +4738,7 @@ fn handle_display_ctrl_msg(
             locked,
             capture_suspended,
         }),
+        DisplayControlMsg::MediaState { paused } => Some(SessionUpdate::MediaState { paused }),
         DisplayControlMsg::SetStream { .. }
         | DisplayControlMsg::LockScreen
         | DisplayControlMsg::SetCodec { .. }
@@ -4112,7 +4755,8 @@ fn handle_display_ctrl_msg(
         | DisplayControlMsg::UpdateChunkAbort { .. }
         | DisplayControlMsg::SwitchDisplay { .. }
         | DisplayControlMsg::CreateVirtualDisplay { .. }
-        | DisplayControlMsg::RemoveVirtualDisplay { .. } => None,
+        | DisplayControlMsg::RemoveVirtualDisplay { .. }
+        | DisplayControlMsg::SetMediaPaused { .. } => None,
     }
 }
 
@@ -4955,6 +5599,8 @@ mod tests {
         });
         let cfg: UiSessionConfig = serde_json::from_value(json).expect("deserialize config");
         assert!(!cfg.force_relay);
+        assert_eq!(cfg.connection_mode, ConnectionMode::Auto);
+        assert!(!cfg.tools_only);
         assert!(cfg.clipboard_enabled);
         assert!(cfg.audio_enabled);
     }
@@ -5166,5 +5812,988 @@ mod tests {
             })
         );
         assert_eq!((hud_w, hud_h), (1920, 1080));
+
+        assert_eq!(
+            handle_display_ctrl_msg(
+                DisplayControlMsg::MediaState { paused: true },
+                &mut hud_w,
+                &mut hud_h,
+                true,
+            ),
+            Some(SessionUpdate::MediaState { paused: true })
+        );
+        assert_eq!(
+            handle_display_ctrl_msg(
+                DisplayControlMsg::MediaState { paused: false },
+                &mut hud_w,
+                &mut hud_h,
+                true,
+            ),
+            Some(SessionUpdate::MediaState { paused: false })
+        );
+    }
+
+    #[test]
+    fn p2p_only_fails_without_relay_fallback_and_is_not_recoverable() {
+        // 1) 向后兼容：force_relay=true 覆盖 connection_mode 为 TcpRelay；否则按 connection_mode 生效。
+        assert_eq!(
+            effective_connection_mode(&UiSessionConfig {
+                force_relay: true,
+                connection_mode: ConnectionMode::P2pOnly,
+                ..UiSessionConfig::default()
+            }),
+            ConnectionMode::TcpRelay
+        );
+        assert_eq!(
+            effective_connection_mode(&UiSessionConfig {
+                force_relay: false,
+                connection_mode: ConnectionMode::P2pOnly,
+                ..UiSessionConfig::default()
+            }),
+            ConnectionMode::P2pOnly
+        );
+
+        // 2) 本地监听一个探针 TCP 端口充当中继地址，验证 P2pOnly 失败时绝不拨号中继。
+        let spy_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind spy relay");
+        spy_listener
+            .set_nonblocking(true)
+            .expect("nonblocking spy listener");
+        let spy_addr = spy_listener.local_addr().expect("spy local_addr");
+        let relay_touched = Arc::new(AtomicBool::new(false));
+        let spy_stop = Arc::new(AtomicBool::new(false));
+        let t_touched = Arc::clone(&relay_touched);
+        let t_stop = Arc::clone(&spy_stop);
+        let spy_thread = thread::spawn(move || {
+            while !t_stop.load(Ordering::Acquire) {
+                match spy_listener.accept() {
+                    Ok(_) => {
+                        t_touched.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let session = SessionHandle::spawn(UiSessionConfig {
+            connect_addr: "127.0.0.1:1".parse().unwrap(),
+            connection_mode: ConnectionMode::P2pOnly,
+            force_relay: false,
+            tools_only: false,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            relay_grant: Some(ConnectGrant {
+                session_id: "sess-p2p-only-no-fallback".to_string(),
+                relay_addr: spy_addr.to_string(),
+                relay_token: "unused-token".to_string(),
+                target_id: "900000001".to_string(),
+                peer_public_addr: None,
+                peer_lan_addrs: Vec::new(),
+                local_udp_port: None,
+                ..ConnectGrant::default()
+            }),
+            ..UiSessionConfig::default()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut ended: Option<(String, bool)> = None;
+        while Instant::now() < deadline {
+            if let Some(SessionUpdate::Ended {
+                reason,
+                recoverable,
+            }) = session.try_recv_update()
+            {
+                ended = Some((reason, recoverable));
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        session.join();
+        spy_stop.store(true, Ordering::Release);
+        let _ = spy_thread.join();
+
+        let (reason, recoverable) = ended.expect("P2pOnly 必须以 Ended 退出");
+        assert!(
+            reason.contains("仅 P2P") && reason.contains("未回退中继"),
+            "错误文案应明确说明仅 P2P 未回退中继，实际：{reason}"
+        );
+        assert!(
+            !recoverable,
+            "P2pOnly 首次建连 P2P 失败必须 recoverable = false"
+        );
+        assert!(
+            !relay_touched.load(Ordering::SeqCst),
+            "P2pOnly 模式严禁向 Tier 3 TCP 中继发起连接"
+        );
+    }
+
+    #[test]
+    fn tools_only_startup_pauses_media_and_upgrade_to_desktop_resumes_with_media_resumed() {
+        struct NoopInjector;
+        impl rc_input::InputInjector for NoopInjector {
+            fn inject(&mut self, _events: &[InputEvent]) -> rc_types::Result<()> {
+                Ok(())
+            }
+            fn set_screen_size(&mut self, _width: u32, _height: u32) {}
+        }
+
+        let host_origin = Instant::now();
+        let (host_clock, _) = reanchorable_clock(host_origin);
+        let caps = SessionParams {
+            width: 640,
+            height: 360,
+            fps: 30,
+            bitrate_bps: 2_000_000,
+        };
+        let mut hcfg = rc_session::HostSessionConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            caps,
+            Box::new(NoopInjector),
+        );
+        hcfg.pipeline.prefer_hardware = false;
+        hcfg.pipeline.resolution = Resolution::new(640, 360);
+        hcfg.pipeline.fps = 30;
+        hcfg.pace_capture = true;
+
+        let mut host = rc_session::HostSession::new(hcfg, DEV_CERT_PEM, DEV_KEY_PEM, host_clock)
+            .expect("create host session");
+        let host_addr = host.local_addr().expect("host local_addr");
+
+        let received_ctrl: Arc<Mutex<Vec<DisplayControlMsg>>> = Arc::new(Mutex::new(Vec::new()));
+        let host_stop = Arc::new(AtomicBool::new(false));
+        let t_received = Arc::clone(&received_ctrl);
+        let t_stop = Arc::clone(&host_stop);
+        let host_thread = thread::spawn(move || {
+            if host.accept_and_handshake(Duration::from_secs(5)).is_err() {
+                return;
+            }
+            while !t_stop.load(Ordering::Acquire) && host.state() == SessionState::Streaming {
+                if let Ok(rep) = host.tick(Duration::from_millis(5)) {
+                    if rep.closed.is_some() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+                for (ch, payload) in host.drain_tool_messages() {
+                    if ch == TOOL_CHANNEL_DISPLAY_CTRL {
+                        if let Some(msg) = display_ctrl::decode_display_ctrl(&payload) {
+                            if let DisplayControlMsg::SetMediaPaused { paused } = msg {
+                                if paused {
+                                    host.pause_media();
+                                } else {
+                                    let _ = host.resume_media();
+                                }
+                                if let Some(ack) = display_ctrl::encode_display_ctrl(
+                                    &DisplayControlMsg::MediaState { paused },
+                                ) {
+                                    let _ = host.send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, ack);
+                                }
+                            }
+                            t_received.lock().unwrap().push(msg);
+                        }
+                    }
+                }
+            }
+            let _ = host.close(ByeReason::Normal);
+        });
+
+        let session = SessionHandle::spawn(UiSessionConfig {
+            connect_addr: host_addr,
+            connection_mode: ConnectionMode::Auto,
+            tools_only: true,
+            width: 640,
+            height: 360,
+            fps: 30,
+            bitrate_bps: 2_000_000,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            ..UiSessionConfig::default()
+        });
+
+        // 1) 等待握手完成并确认 tools_only 启动不写 layer_lease、收到 Negotiated 且向被控端发出 SetMediaPaused(true)。
+        let mut updates: Vec<SessionUpdate> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            while let Some(u) = session.try_recv_update() {
+                updates.push(u);
+            }
+            let host_got_pause = received_ctrl
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, DisplayControlMsg::SetMediaPaused { paused: true }));
+            let ui_got_media_paused = updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::MediaState { paused: true }));
+            let ui_got_negotiated = updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::Negotiated { .. }));
+            if host_got_pause && ui_got_media_paused && ui_got_negotiated {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            session.layer_lease().is_none(),
+            "tools_only 启动期间不得写入 layer_lease"
+        );
+        assert!(
+            updates.iter().any(|u| matches!(
+                u,
+                SessionUpdate::Negotiated { backend, .. } if backend == "tools-only"
+            )),
+            "tools_only 握手 Negotiated 后端标签应为 tools-only，实际：{updates:?}"
+        );
+        assert!(
+            received_ctrl
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, DisplayControlMsg::SetMediaPaused { paused: true })),
+            "tools_only 握手成功后必须发送 DisplayControlMsg::SetMediaPaused(true)"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::MediaState { paused: true })),
+            "被控端回传 MediaState(true) 后必须转为 SessionUpdate::MediaState(true)"
+        );
+
+        // 2) 触发原地热升级桌面（upgrade_to_desktop）并顺带验证 ProbeNow 命令不破坏会话。
+        updates.clear();
+        session.upgrade_to_desktop(None);
+        session.send(SessionCommand::ProbeNow);
+
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            while let Some(u) = session.try_recv_update() {
+                updates.push(u);
+            }
+            let host_got_resume = received_ctrl
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, DisplayControlMsg::SetMediaPaused { paused: false }));
+            let ui_got_resumed = updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::MediaResumed { .. }));
+            let ui_got_state_false = updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::MediaState { paused: false }));
+            if host_got_resume && ui_got_resumed && ui_got_state_false {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            received_ctrl
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, DisplayControlMsg::SetMediaPaused { paused: false })),
+            "upgrade_to_desktop 必须发送 DisplayControlMsg::SetMediaPaused(false)"
+        );
+        assert!(
+            updates.iter().any(|u| matches!(
+                u,
+                SessionUpdate::MediaResumed {
+                    backend,
+                    width: 640,
+                    height: 360,
+                    fps: 30,
+                } if backend == "fake"
+            )),
+            "upgrade_to_desktop 必须推送 MediaResumed，实际：{updates:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::MediaState { paused: false })),
+            "upgrade_to_desktop 必须推送 MediaState(false)"
+        );
+
+        // 3) 再次通过命令暂停媒体并验证 SessionUpdate::MediaState(true)。
+        updates.clear();
+        session.send(SessionCommand::SetMediaPaused { paused: true });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            while let Some(u) = session.try_recv_update() {
+                updates.push(u);
+            }
+            if updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::MediaState { paused: true }))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::MediaState { paused: true })),
+            "SetMediaPaused(true) 必须推送 MediaState(true)"
+        );
+
+        session.send(SessionCommand::Disconnect);
+        session.join();
+        host_stop.store(true, Ordering::Release);
+        let _ = host_thread.join();
+    }
+
+    #[test]
+    fn detach_and_abort_returns_within_bounded_max_wait_for_stuck_thread() {
+        let (unblock_tx, unblock_rx) = mpsc::channel::<()>();
+        let cmd_tx = Arc::new(BoundedQueue::new(COMMAND_CHANNEL_CAP));
+        let file_event_rx = Arc::new(BoundedQueue::new(16));
+        let (mut file_worker, file_handle) = FileClientWorker::spawn(Arc::clone(&file_event_rx));
+        let disconnect_flag = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(true));
+
+        let stuck_thread = thread::spawn(move || {
+            // 模拟卡在阻塞系统调用中、不响应 disconnect_flag 的僵尸会话线程。
+            let _ = unblock_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let handle = SessionHandle {
+            cmd_tx: Arc::clone(&cmd_tx),
+            display_ctrl_tx: Arc::new(BoundedQueue::new(COMMAND_CHANNEL_CAP)),
+            input_tx: Arc::new(BoundedInputQueue::new(INPUT_CHANNEL_CAP)),
+            update_rx: Arc::new(BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP)),
+            file_event_rx,
+            terminal_event_rx: Arc::new(BoundedQueue::new(16)),
+            portmap_latest: Arc::new(Mutex::new(None)),
+            tools_hub: Arc::new(Mutex::new(ToolClientHub::new())),
+            file_handle,
+            disconnect_flag: Arc::clone(&disconnect_flag),
+            lock_on_disconnect: Arc::new(AtomicBool::new(false)),
+            relay_interrupt: Arc::new(Mutex::new(None)),
+            running: Arc::clone(&running),
+            watch_only: Arc::new(AtomicBool::new(false)),
+            encrypt_connection: false,
+            base_config: UiSessionConfig::default(),
+            layer_lease: Arc::new(Mutex::new(None)),
+            upgrade_surface: Arc::new(Mutex::new(None)),
+            thread: Some(stuck_thread),
+        };
+
+        let start = Instant::now();
+        handle.detach_and_abort(Duration::from_millis(50));
+        let elapsed = start.elapsed();
+
+        assert!(
+            disconnect_flag.load(Ordering::Acquire),
+            "detach_and_abort 必须立即置位 disconnect_flag"
+        );
+        assert_eq!(cmd_tx.drain_all(), vec![SessionCommand::Disconnect]);
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "detach_and_abort(50ms) 对卡住线程必须有界返回，实际耗时 {elapsed:?}"
+        );
+
+        // 释放阻塞线程以便后台回收线程干净退出。
+        let _ = unblock_tx.send(());
+        file_worker.shutdown();
+    }
+
+    #[test]
+    fn ended_recoverable_classification_covers_all_terminal_and_disconnect_cases() {
+        // 1) 信令会话在 Reconnecting 退出时按 transport_label 精确文案 + recoverable = true。
+        assert_eq!(
+            signaling_disconnect_end("UDP LAN"),
+            SessionEnd {
+                reason: "局域网连接已断开".to_string(),
+                recoverable: true,
+            }
+        );
+        assert_eq!(
+            signaling_disconnect_end("UDP P2P"),
+            SessionEnd {
+                reason: "P2P 连接已断开".to_string(),
+                recoverable: true,
+            }
+        );
+        assert_eq!(
+            signaling_disconnect_end("TCP Relay"),
+            SessionEnd {
+                reason: "中继连接已断开".to_string(),
+                recoverable: true,
+            }
+        );
+
+        // 2) 纯 IP 直连 GaveUp：非 SessionSwitching → recoverable = true；SessionSwitching / ByeNormal → false。
+        let gave_up = classify_gave_up_end(None);
+        assert_eq!(gave_up.reason, "重连次数已耗尽");
+        assert!(gave_up.recoverable);
+
+        let gave_up_disc = classify_gave_up_end(Some(&rc_session::StopReason::Disconnected(
+            "peer timeout".to_string(),
+        )));
+        assert!(gave_up_disc.recoverable);
+
+        let gave_up_switch = classify_gave_up_end(Some(&rc_session::StopReason::ByeReceived(
+            ByeReason::SessionSwitching,
+        )));
+        assert_eq!(gave_up_switch.reason, SESSION_SWITCHING_REASON);
+        assert!(!gave_up_switch.recoverable);
+
+        // 3) Streaming 期 StopReason 判定。
+        assert!(
+            !classify_stop_reason_end(&rc_session::StopReason::ByeReceived(ByeReason::Normal))
+                .recoverable
+        );
+        assert!(
+            !classify_stop_reason_end(&rc_session::StopReason::ByeReceived(
+                ByeReason::SessionSwitching
+            ))
+            .recoverable
+        );
+        assert!(!classify_stop_reason_end(&rc_session::StopReason::Requested).recoverable);
+        assert!(
+            classify_stop_reason_end(&rc_session::StopReason::Disconnected(
+                "connection lost".to_string()
+            ))
+            .recoverable
+        );
+        assert!(
+            !classify_stop_reason_end(&rc_session::StopReason::Disconnected(
+                "用户主动断开".to_string()
+            ))
+            .recoverable
+        );
+        assert!(
+            !classify_stop_reason_end(&rc_session::StopReason::Disconnected(
+                "InvalidPeerCertificate(UnknownIssuer)".to_string()
+            ))
+            .recoverable
+        );
+        assert!(
+            !classify_stop_reason_end(&rc_session::StopReason::Disconnected(
+                "密码错误，鉴权失败".to_string()
+            ))
+            .recoverable
+        );
+
+        // 4) 运行期驱动错误判定（断网可恢复 vs 用户断开/鉴权/mTLS 不可恢复）。
+        assert!(
+            classify_runtime_err_end(
+                "重连驱动失败",
+                &rc_types::Error::Network("transport poll failed".to_string()),
+                false,
+            )
+            .recoverable
+        );
+        assert!(
+            !classify_runtime_err_end(
+                "重连驱动失败",
+                &rc_types::Error::Network("auth rejected: wrong password".to_string()),
+                false,
+            )
+            .recoverable
+        );
+        assert!(
+            !classify_runtime_err_end(
+                "会话运行失败",
+                &rc_types::Error::Network("mTLS InvalidPeerCertificate(Revoked)".to_string()),
+                false,
+            )
+            .recoverable
+        );
+        let user_end = classify_runtime_err_end(
+            "会话运行失败",
+            &rc_types::Error::Network("connection reset".to_string()),
+            true,
+        );
+        assert_eq!(user_end.reason, "用户主动断开");
+        assert!(!user_end.recoverable);
+
+        // 5) 硬件解码持久失败 / P2pOnly 错误文案不可恢复。
+        assert!(is_non_recoverable_error_reason(
+            "远端画面解码失败（请确认被控端已授予屏幕录制权限）"
+        ));
+        assert!(is_non_recoverable_error_reason(
+            "P2P 直连失败（当前为「仅 P2P」模式，未回退中继）：timeout"
+        ));
+
+        // 6) 新增 SessionCommand & SessionUpdate JSON 序列化形态校验。
+        let cmd_pause: SessionCommand =
+            serde_json::from_str(r#"{"type":"set_media_paused","paused":true}"#)
+                .expect("parse set_media_paused");
+        assert_eq!(cmd_pause, SessionCommand::SetMediaPaused { paused: true });
+        let cmd_probe: SessionCommand =
+            serde_json::from_str(r#"{"type":"probe_now"}"#).expect("parse probe_now");
+        assert_eq!(cmd_probe, SessionCommand::ProbeNow);
+
+        let ended_json = serde_json::to_value(SessionUpdate::Ended {
+            reason: "局域网连接已断开".to_string(),
+            recoverable: true,
+        })
+        .expect("serialize Ended");
+        assert_eq!(ended_json["kind"], "ended");
+        assert_eq!(ended_json["data"]["recoverable"], true);
+
+        let reconnecting_json = serde_json::to_value(SessionUpdate::Reconnecting {
+            attempt: 2,
+            max_attempts: 5,
+            reason: "第 2/5 次重连尝试中…".to_string(),
+        })
+        .expect("serialize Reconnecting");
+        assert_eq!(reconnecting_json["kind"], "reconnecting");
+        assert_eq!(reconnecting_json["data"]["attempt"], 2);
+        assert_eq!(reconnecting_json["data"]["max_attempts"], 5);
+
+        let resumed_json = serde_json::to_value(SessionUpdate::MediaResumed {
+            backend: "videotoolbox+metal".to_string(),
+            width: 1920,
+            height: 1080,
+            fps: 60,
+        })
+        .expect("serialize MediaResumed");
+        assert_eq!(resumed_json["kind"], "media_resumed");
+        assert_eq!(resumed_json["data"]["backend"], "videotoolbox+metal");
+    }
+
+    struct StubUpgradeTransport {
+        inbound: VecDeque<NetEvent>,
+    }
+
+    impl Transport for StubUpgradeTransport {
+        fn send_datagram(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+            Ok(())
+        }
+        fn send_reliable(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+            Ok(())
+        }
+        fn send_reliable_urgent(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self, _timeout: Duration) -> rc_types::Result<Vec<NetEvent>> {
+            Ok(self.inbound.drain(..).collect())
+        }
+        fn stats(&self) -> NetStats {
+            NetStats::default()
+        }
+    }
+
+    struct RecordingStageRenderer {
+        resizes: Arc<Mutex<Vec<(u32, u32)>>>,
+    }
+
+    impl Renderer for RecordingStageRenderer {
+        fn present(
+            &mut self,
+            _frame: rc_decode::DecodedFrame,
+        ) -> rc_types::Result<rc_types::Timestamp> {
+            Ok(rc_types::Timestamp(0))
+        }
+        fn resize(&mut self, size: (u32, u32)) -> rc_types::Result<()> {
+            self.resizes.lock().unwrap().push(size);
+            Ok(())
+        }
+        fn set_vsync(&mut self, _on: bool) {}
+        fn set_cursor(&mut self, _pos: (i32, i32), _visible: bool) {}
+    }
+
+    fn make_streaming_tools_only_client(params: SessionParams) -> ClientSession {
+        let mut welcome_buf = Vec::new();
+        ControlMessage::Welcome(rc_session::proto::Welcome {
+            session_id: 99,
+            granted: params,
+            auth_status: rc_session::proto::AuthStatus::Ok,
+            host_flags: rc_session::proto::HostFlags(0),
+        })
+        .encode(&mut welcome_buf);
+        let transport = StubUpgradeTransport {
+            inbound: VecDeque::from([NetEvent::Reliable(welcome_buf)]),
+        };
+        let capture = Box::new(BridgeInputCapture {
+            queue: Arc::new(BoundedInputQueue::new(16)),
+            watch_only: Arc::new(AtomicBool::new(false)),
+        });
+        let mut ccfg =
+            ClientSessionConfig::new("127.0.0.1:9901".parse().unwrap(), params, 99, capture);
+        ccfg.pipeline.prefer_hardware = false;
+        let dec = rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
+            resolution: Resolution::new(64, 64),
+            ..rc_decode::FakeDecoderConfig::default()
+        })
+        .expect("fake decoder");
+        let rend = rc_render::FakeRenderer::new(rc_render::FakeRendererConfig {
+            size: (64, 64),
+            ..rc_render::FakeRendererConfig::default()
+        })
+        .expect("fake renderer");
+        let clock: SessionClock = Arc::new(|| 0);
+        let mut client = ClientSession::with_parts(
+            ccfg,
+            Box::new(transport),
+            Box::new(dec),
+            Box::new(rend),
+            clock,
+        )
+        .expect("with_parts");
+        client.handshake().expect("handshake");
+        client.set_media_paused(true);
+        client
+    }
+
+    #[test]
+    fn desktop_upgrade_failure_keeps_media_paused_and_skips_media_resumed() {
+        let params = SessionParams {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_bps: 8_000_000,
+        };
+
+        // 1) build_controller_pipeline 失败：必须保持 media_paused=true，不发 SetMediaPaused(false)，不发 MediaResumed/MediaState(false)。
+        let mut client = make_streaming_tools_only_client(params);
+        let real_pipeline_built = AtomicBool::new(false);
+        let want_real_pipeline = AtomicBool::new(false);
+        let is_hw_decoder_slot = AtomicBool::new(false);
+        let mut backend = "tools-only".to_string();
+        let backend_label = Mutex::new(backend.clone());
+        let renderer_handle = Mutex::new(None);
+        let layer_lease = Mutex::new(None);
+        let mut is_hardware_decoder = false;
+        let mut client_supports_hevc = false;
+        let mut active_codec = StreamCodec::H264;
+        let mut stream_started_at = Instant::now();
+        let mut first_frame_logged = false;
+        let mut decode_error_logged = false;
+        let mut pending_display_tx = VecDeque::new();
+        let update_tx = BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP);
+
+        let ok = try_resume_or_upgrade_desktop(
+            DesktopUpgradeCtx {
+                client: &mut client,
+                real_pipeline_built: &real_pipeline_built,
+                want_real_pipeline: &want_real_pipeline,
+                is_hw_decoder_slot: &is_hw_decoder_slot,
+                backend: &mut backend,
+                backend_label: &backend_label,
+                renderer_handle: &renderer_handle,
+                layer_lease: &layer_lease,
+                active_backend_suffix: None,
+                is_hardware_decoder: &mut is_hardware_decoder,
+                client_supports_hevc: &mut client_supports_hevc,
+                active_codec: &mut active_codec,
+                user_pinned_codec: None,
+                prefer_hardware: false,
+                hud_width: params.width,
+                hud_height: params.height,
+                current_fps: params.fps,
+                negotiated: params,
+                last_stage_rect: Some((1280, 720)),
+                stream_started_at: &mut stream_started_at,
+                first_frame_logged: &mut first_frame_logged,
+                decode_error_logged: &mut decode_error_logged,
+                pending_display_tx: &mut pending_display_tx,
+                update_tx: &update_tx,
+            },
+            |_pcfg| {
+                Err(rc_types::Error::InvalidConfig(
+                    "simulated hardware init error".into(),
+                ))
+            },
+        );
+        assert!(!ok, "构建管线失败时升级必须返回 false");
+        assert!(
+            client.is_media_paused(),
+            "构建失败后必须保持 media_paused=true"
+        );
+        assert!(!real_pipeline_built.load(Ordering::Acquire));
+        assert!(!want_real_pipeline.load(Ordering::Acquire));
+        assert!(
+            pending_display_tx.is_empty(),
+            "构建失败时严禁通知被控端恢复推流"
+        );
+        assert!(
+            update_tx.try_pop().is_none(),
+            "构建失败时严禁向 UI 发射 MediaResumed 或 MediaState(false)"
+        );
+
+        // 2) client.replace_pipeline 失败（例如非 Streaming 态）：同样保持暂停、不发恢复通知。
+        client.on_disconnected(1_000);
+        assert_eq!(client.state(), SessionState::Reconnecting);
+        let ok2 = try_resume_or_upgrade_desktop(
+            DesktopUpgradeCtx {
+                client: &mut client,
+                real_pipeline_built: &real_pipeline_built,
+                want_real_pipeline: &want_real_pipeline,
+                is_hw_decoder_slot: &is_hw_decoder_slot,
+                backend: &mut backend,
+                backend_label: &backend_label,
+                renderer_handle: &renderer_handle,
+                layer_lease: &layer_lease,
+                active_backend_suffix: None,
+                is_hardware_decoder: &mut is_hardware_decoder,
+                client_supports_hevc: &mut client_supports_hevc,
+                active_codec: &mut active_codec,
+                user_pinned_codec: None,
+                prefer_hardware: false,
+                hud_width: params.width,
+                hud_height: params.height,
+                current_fps: params.fps,
+                negotiated: params,
+                last_stage_rect: Some((1280, 720)),
+                stream_started_at: &mut stream_started_at,
+                first_frame_logged: &mut first_frame_logged,
+                decode_error_logged: &mut decode_error_logged,
+                pending_display_tx: &mut pending_display_tx,
+                update_tx: &update_tx,
+            },
+            |pcfg| build_controller_pipeline(pcfg, false, Instant::now(), None),
+        );
+        assert!(!ok2, "replace_pipeline 失败时升级必须返回 false");
+        assert!(
+            client.is_media_paused(),
+            "replace_pipeline 失败后必须保持暂停"
+        );
+        assert!(pending_display_tx.is_empty());
+        assert!(update_tx.try_pop().is_none());
+        let _ = client.close(ByeReason::Normal);
+    }
+
+    #[test]
+    fn desktop_upgrade_replays_cached_stage_rect_on_new_renderer() {
+        let params = SessionParams {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_bps: 8_000_000,
+        };
+        let mut client = make_streaming_tools_only_client(params);
+        let real_pipeline_built = AtomicBool::new(false);
+        let want_real_pipeline = AtomicBool::new(false);
+        let is_hw_decoder_slot = AtomicBool::new(false);
+        let mut backend = "tools-only".to_string();
+        let backend_label = Mutex::new(backend.clone());
+        let renderer_handle = Mutex::new(None);
+        let layer_lease = Mutex::new(None);
+        let mut is_hardware_decoder = false;
+        let mut client_supports_hevc = false;
+        let mut active_codec = StreamCodec::H264;
+        let mut stream_started_at = Instant::now();
+        let mut first_frame_logged = false;
+        let mut decode_error_logged = false;
+        let mut pending_display_tx = VecDeque::new();
+        let update_tx = BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP);
+        let resizes = Arc::new(Mutex::new(Vec::<(u32, u32)>::new()));
+        let resizes_for_build = Arc::clone(&resizes);
+
+        let ok = try_resume_or_upgrade_desktop(
+            DesktopUpgradeCtx {
+                client: &mut client,
+                real_pipeline_built: &real_pipeline_built,
+                want_real_pipeline: &want_real_pipeline,
+                is_hw_decoder_slot: &is_hw_decoder_slot,
+                backend: &mut backend,
+                backend_label: &backend_label,
+                renderer_handle: &renderer_handle,
+                layer_lease: &layer_lease,
+                active_backend_suffix: None,
+                is_hardware_decoder: &mut is_hardware_decoder,
+                client_supports_hevc: &mut client_supports_hevc,
+                active_codec: &mut active_codec,
+                user_pinned_codec: None,
+                prefer_hardware: false,
+                hud_width: params.width,
+                hud_height: params.height,
+                current_fps: params.fps,
+                negotiated: params,
+                last_stage_rect: Some((1440, 900)),
+                stream_started_at: &mut stream_started_at,
+                first_frame_logged: &mut first_frame_logged,
+                decode_error_logged: &mut decode_error_logged,
+                pending_display_tx: &mut pending_display_tx,
+                update_tx: &update_tx,
+            },
+            move |pcfg| {
+                let dec = rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
+                    resolution: pcfg.resolution,
+                    ..rc_decode::FakeDecoderConfig::default()
+                })?;
+                let shared: RendererHandle =
+                    Arc::new(Mutex::new(Box::new(RecordingStageRenderer {
+                        resizes: resizes_for_build,
+                    })));
+                let wrapper = SharedRenderer {
+                    inner: Arc::clone(&shared),
+                };
+                let pipeline = ControllerPipeline::with_backends(
+                    pcfg.clone(),
+                    Box::new(dec),
+                    Box::new(wrapper),
+                )?;
+                Ok(BuiltPipeline {
+                    pipeline,
+                    backend_label: "fake".to_string(),
+                    renderer: shared,
+                    layer_addr: 0,
+                    is_hardware: false,
+                })
+            },
+        );
+        assert!(ok, "正常升级必须成功");
+        assert!(!client.is_media_paused());
+        assert!(real_pipeline_built.load(Ordering::Acquire));
+        assert!(want_real_pipeline.load(Ordering::Acquire));
+        assert_eq!(
+            *resizes.lock().unwrap(),
+            vec![(1440, 900)],
+            "升级创建新 renderer_handle 后必须立即回放缓存的 StageRect 尺寸"
+        );
+        let mut updates = Vec::new();
+        while let Some(u) = update_tx.try_pop() {
+            updates.push(u);
+        }
+        assert!(updates.iter().any(|u| matches!(
+            u,
+            SessionUpdate::MediaResumed {
+                width: 1280,
+                height: 720,
+                ..
+            }
+        )));
+        assert!(updates
+            .iter()
+            .any(|u| matches!(u, SessionUpdate::MediaState { paused: false })));
+        let _ = client.close(ByeReason::Normal);
+    }
+
+    #[test]
+    fn detach_and_abort_waits_graceful_window_before_triggering_force_disconnect() {
+        // 场景 A：会话线程在优雅窗口内收到 Disconnect 并完成优雅发送后退出，
+        // 期间 disconnect_flag 与 relay_interrupt 均不得提前置位。
+        let cmd_tx = Arc::new(BoundedQueue::new(COMMAND_CHANNEL_CAP));
+        let file_event_rx = Arc::new(BoundedQueue::new(16));
+        let (mut file_worker, file_handle) = FileClientWorker::spawn(Arc::clone(&file_event_rx));
+        let disconnect_flag = Arc::new(AtomicBool::new(false));
+        let relay_cancel = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(true));
+        let observed_clean_graceful = Arc::new(AtomicBool::new(false));
+
+        let t_cmd = Arc::clone(&cmd_tx);
+        let t_disc = Arc::clone(&disconnect_flag);
+        let t_cancel = Arc::clone(&relay_cancel);
+        let t_running = Arc::clone(&running);
+        let t_clean = Arc::clone(&observed_clean_graceful);
+        let graceful_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if let Some(SessionCommand::Disconnect) = t_cmd.try_pop() {
+                    // 模拟发完 LockScreen / Bye(Normal)
+                    thread::sleep(Duration::from_millis(15));
+                    if !t_disc.load(Ordering::Acquire) && !t_cancel.load(Ordering::Acquire) {
+                        t_clean.store(true, Ordering::Release);
+                    }
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            t_running.store(false, Ordering::Release);
+        });
+
+        let handle = SessionHandle {
+            cmd_tx: Arc::clone(&cmd_tx),
+            display_ctrl_tx: Arc::new(BoundedQueue::new(COMMAND_CHANNEL_CAP)),
+            input_tx: Arc::new(BoundedInputQueue::new(INPUT_CHANNEL_CAP)),
+            update_rx: Arc::new(BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP)),
+            file_event_rx,
+            terminal_event_rx: Arc::new(BoundedQueue::new(16)),
+            portmap_latest: Arc::new(Mutex::new(None)),
+            tools_hub: Arc::new(Mutex::new(ToolClientHub::new())),
+            file_handle,
+            disconnect_flag: Arc::clone(&disconnect_flag),
+            lock_on_disconnect: Arc::new(AtomicBool::new(false)),
+            relay_interrupt: Arc::new(Mutex::new(Some(ActiveRelayInterrupt::Dialing(Arc::clone(
+                &relay_cancel,
+            ))))),
+            running: Arc::clone(&running),
+            watch_only: Arc::new(AtomicBool::new(false)),
+            encrypt_connection: false,
+            base_config: UiSessionConfig::default(),
+            layer_lease: Arc::new(Mutex::new(None)),
+            upgrade_surface: Arc::new(Mutex::new(None)),
+            thread: Some(graceful_thread),
+        };
+
+        handle.detach_and_abort(Duration::from_millis(200));
+        assert!(
+            observed_clean_graceful.load(Ordering::Acquire),
+            "detach_and_abort 必须先给优雅窗口，让会话线程在 socket 切断前发完 LockScreen / Bye"
+        );
+        assert!(
+            !disconnect_flag.load(Ordering::Acquire) && !relay_cancel.load(Ordering::Acquire),
+            "优雅窗口内已干净退出的线程不得触发强断"
+        );
+        file_worker.shutdown();
+
+        // 场景 B：线程忽略 Disconnect 卡住，超过 80ms 优雅窗口后必须触发 trigger_disconnect() 强断退出。
+        let cmd_tx2 = Arc::new(BoundedQueue::new(COMMAND_CHANNEL_CAP));
+        let file_event_rx2 = Arc::new(BoundedQueue::new(16));
+        let (mut file_worker2, file_handle2) = FileClientWorker::spawn(Arc::clone(&file_event_rx2));
+        let disconnect_flag2 = Arc::new(AtomicBool::new(false));
+        let relay_cancel2 = Arc::new(AtomicBool::new(false));
+        let running2 = Arc::new(AtomicBool::new(true));
+
+        let t_cancel2 = Arc::clone(&relay_cancel2);
+        let t_running2 = Arc::clone(&running2);
+        let force_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if t_cancel2.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            t_running2.store(false, Ordering::Release);
+        });
+
+        let handle2 = SessionHandle {
+            cmd_tx: cmd_tx2,
+            display_ctrl_tx: Arc::new(BoundedQueue::new(COMMAND_CHANNEL_CAP)),
+            input_tx: Arc::new(BoundedInputQueue::new(INPUT_CHANNEL_CAP)),
+            update_rx: Arc::new(BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP)),
+            file_event_rx: file_event_rx2,
+            terminal_event_rx: Arc::new(BoundedQueue::new(16)),
+            portmap_latest: Arc::new(Mutex::new(None)),
+            tools_hub: Arc::new(Mutex::new(ToolClientHub::new())),
+            file_handle: file_handle2,
+            disconnect_flag: Arc::clone(&disconnect_flag2),
+            lock_on_disconnect: Arc::new(AtomicBool::new(false)),
+            relay_interrupt: Arc::new(Mutex::new(Some(ActiveRelayInterrupt::Dialing(Arc::clone(
+                &relay_cancel2,
+            ))))),
+            running: Arc::clone(&running2),
+            watch_only: Arc::new(AtomicBool::new(false)),
+            encrypt_connection: false,
+            base_config: UiSessionConfig::default(),
+            layer_lease: Arc::new(Mutex::new(None)),
+            upgrade_surface: Arc::new(Mutex::new(None)),
+            thread: Some(force_thread),
+        };
+
+        let start = Instant::now();
+        handle2.detach_and_abort(Duration::from_millis(300));
+        let elapsed = start.elapsed();
+        assert!(
+            disconnect_flag2.load(Ordering::Acquire) && relay_cancel2.load(Ordering::Acquire),
+            "优雅窗口超时后必须触发 trigger_disconnect() 强制中断底层 socket"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(60) && elapsed < Duration::from_millis(300),
+            "强断应发生在 80ms 优雅窗口之后并在 max_wait 内返回，实际耗时 {elapsed:?}"
+        );
+        file_worker2.shutdown();
     }
 }
