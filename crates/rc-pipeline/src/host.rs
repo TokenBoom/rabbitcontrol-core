@@ -1452,13 +1452,13 @@ mod tests {
                 MockCapMode::Healthy => {
                     st.frame_seq += 1;
                     let seq = st.frame_seq;
-                    let ts =
-                        u32::try_from(st.clock_start.elapsed().as_micros()).unwrap_or(u32::MAX);
+                    let clock_start = st.clock_start;
                     let mut pixels = vec![0u8; 64 * 64 * 4];
                     pixels[0] = (seq & 0xff) as u8;
                     pixels[1] = ((seq >> 8) & 0xff) as u8;
                     drop(st);
                     std::thread::sleep(Duration::from_millis(2));
+                    let ts = u32::try_from(clock_start.elapsed().as_micros()).unwrap_or(u32::MAX);
                     Ok(Some(CapturedFrame {
                         texture: FrameTexture::Cpu(rc_types::CpuFrame {
                             width: 64,
@@ -1539,6 +1539,7 @@ mod tests {
             PipelineConfig {
                 resolution: Resolution::new(64, 64),
                 fps: 60,
+                target_latency_us: 2_000_000,
                 ..PipelineConfig::default()
             },
             Box::new(cap),
@@ -1547,7 +1548,7 @@ mod tests {
         .expect("pipeline");
 
         // 1) Observe initial invalidation + first recoverable rebuild failure (must NOT kill pipeline)
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             let _ = pipe
                 .tick(now_us())
@@ -1586,7 +1587,7 @@ mod tests {
         );
 
         // 2) After 500ms backoff elapses, second rebuild succeeds -> clears invalidation and emits IDR frame
-        let recover_deadline = Instant::now() + Duration::from_secs(2);
+        let recover_deadline = Instant::now() + Duration::from_secs(5);
         let mut saw_idr_after_recovery = false;
         while Instant::now() < recover_deadline {
             if let Some(dgs) = pipe.tick(now_us()).expect("tick during recovery") {
@@ -1643,6 +1644,7 @@ mod tests {
             PipelineConfig {
                 resolution: Resolution::new(64, 64),
                 fps: 60,
+                target_latency_us: 2_000_000,
                 ..PipelineConfig::default()
             },
             Box::new(cap),
@@ -1651,7 +1653,7 @@ mod tests {
         .expect("pipeline");
 
         // Produce initial IDR so no_idr_yet becomes false
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && pipe.no_idr_yet {
             let _ = pipe.tick(now_us()).expect("initial tick");
             pipe.wait_event(Duration::from_millis(5));
@@ -1664,7 +1666,7 @@ mod tests {
             st.rebuild_recoverable_failures = 1;
             st.mode = MockCapMode::ErrInvalidated(rc_capture::InvalidationReason::DisplayChanged);
         }
-        let obs_deadline = Instant::now() + Duration::from_secs(2);
+        let obs_deadline = Instant::now() + Duration::from_secs(5);
         let mut observed_display_changed = false;
         while Instant::now() < obs_deadline {
             let _ = pipe.tick(now_us()).expect("recoverable tick");
@@ -1680,7 +1682,7 @@ mod tests {
         );
 
         // Wait for recovery after backoff and verify an IDR frame is emitted even though no_idr_yet is false
-        let rec_deadline = Instant::now() + Duration::from_secs(2);
+        let rec_deadline = Instant::now() + Duration::from_secs(5);
         let mut saw_idr_after_err_recovery = false;
         while Instant::now() < rec_deadline {
             if let Some(dgs) = pipe.tick(now_us()).expect("recovery tick") {
@@ -1777,10 +1779,11 @@ mod tests {
                     MockCapMode::Healthy => {
                         st.frame_seq += 1;
                         let seq = st.frame_seq;
-                        let ts =
-                            u32::try_from(st.clock_start.elapsed().as_micros()).unwrap_or(u32::MAX);
+                        let clock_start = st.clock_start;
                         drop(st);
                         std::thread::sleep(Duration::from_millis(2));
+                        let ts =
+                            u32::try_from(clock_start.elapsed().as_micros()).unwrap_or(u32::MAX);
                         // Pixel-identical BGRA frame before and after rebuild!
                         Ok(Some(CapturedFrame {
                             texture: FrameTexture::Cpu(rc_types::CpuFrame {
@@ -1845,6 +1848,8 @@ mod tests {
                 resolution: Resolution::new(64, 64),
                 fps: 60,
                 diff: DiffMode::TileDiff,
+                // 防止共享 CI runner CPU 抢占 >22ms 导致恢复首帧写入 TileDiff 缓存后被判 Stale 丢弃。
+                target_latency_us: 2_000_000,
                 ..PipelineConfig::default()
             },
             Box::new(cap),
@@ -1853,7 +1858,7 @@ mod tests {
         .expect("pipeline");
 
         // Emit first IDR so TileDiff caches the 0x42 frame hash and no_idr_yet becomes false.
-        let init_deadline = Instant::now() + Duration::from_secs(2);
+        let init_deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < init_deadline && pipe.no_idr_yet {
             let _ = pipe.tick(now_us()).expect("initial tick");
             pipe.wait_event(Duration::from_millis(5));
@@ -1865,7 +1870,7 @@ mod tests {
             let mut st = state.lock().unwrap();
             st.mode = MockCapMode::NoneInvalidated(rc_capture::InvalidationReason::SessionLocked);
         }
-        let rec_deadline = Instant::now() + Duration::from_secs(2);
+        let rec_deadline = Instant::now() + Duration::from_secs(5);
         let mut saw_idr_after_rebuild = false;
         while Instant::now() < rec_deadline {
             if let Some(dgs) = pipe.tick(now_us()).expect("tick") {

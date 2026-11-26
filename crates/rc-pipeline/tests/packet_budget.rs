@@ -35,7 +35,8 @@ fn cfg(max_packet_payload: usize) -> PipelineConfig {
         fps: 60,
         bitrate_bps: 1_000_000,
         prefer_hardware: false,
-        target_latency_us: 22_000,
+        // 避免共享 CI runner 抢占 >22ms 导致假采集首帧被判 Stale。
+        target_latency_us: 2_000_000,
         trace_capacity: 1024,
         diff: DiffMode::TrustPlatform,
         clock_origin_us: None,

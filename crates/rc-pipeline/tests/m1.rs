@@ -19,7 +19,9 @@ fn cfg() -> PipelineConfig {
         fps: 60,
         bitrate_bps: 1_000_000,
         prefer_hardware: false,
-        target_latency_us: 22_000,
+        // 管线功能测试运行真实后台线程，验证 P4/P7/Q5 等不变量而非 22ms 过期阈值（该阈值由 rc-sched 注入时钟单测覆盖）；
+        // 放宽至 2s 防止共享 CI runner CPU 抢占导致健康帧被误判为 DroppedStale。
+        target_latency_us: 2_000_000,
         trace_capacity: 1024,
         diff: DiffMode::TrustPlatform,
         clock_origin_us: None,
@@ -48,9 +50,12 @@ fn fake_capture(content: FakeContent, fps: u32) -> Box<dyn CaptureBackend> {
 
 /// 墙钟包装假采集：与 `session_clock()` 同零点，防止慢速 CI 虚机上调度/启动暂停后
 /// `FakeBackend` 合成零基时间戳落到 `target_latency_us` 之前引发 `Stale` 假阳性。
+/// 当 `max_frames = Some(n)` 时精确产出 `n` 帧后停供，避免排空阶段异步采集线程继续塞入多余帧。
 struct WallCapture {
     inner: Box<dyn CaptureBackend>,
     anchor: std::time::Instant,
+    max_frames: Option<usize>,
+    emitted: usize,
 }
 
 impl CaptureBackend for WallCapture {
@@ -58,8 +63,13 @@ impl CaptureBackend for WallCapture {
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<Option<rc_capture::CapturedFrame>> {
+        if self.max_frames.is_some_and(|limit| self.emitted >= limit) {
+            std::thread::sleep(timeout.min(std::time::Duration::from_millis(2)));
+            return Ok(None);
+        }
         match self.inner.next_frame(timeout)? {
             Some(mut frame) => {
+                self.emitted += 1;
                 frame.timestamp =
                     Timestamp(u32::try_from(self.anchor.elapsed().as_micros()).unwrap_or(u32::MAX));
                 Ok(Some(frame))
@@ -246,12 +256,38 @@ fn host_controller(
     ControllerPipeline,
     std::sync::Arc<dyn Fn() -> u32 + Send + Sync>,
 ) {
+    host_controller_with_limit(capture, encoder, None)
+}
+
+fn host_controller_bounded(
+    capture: Box<dyn CaptureBackend>,
+    encoder: Box<dyn Encoder>,
+    max_frames: usize,
+) -> (
+    HostPipeline,
+    ControllerPipeline,
+    std::sync::Arc<dyn Fn() -> u32 + Send + Sync>,
+) {
+    host_controller_with_limit(capture, encoder, Some(max_frames))
+}
+
+fn host_controller_with_limit(
+    capture: Box<dyn CaptureBackend>,
+    encoder: Box<dyn Encoder>,
+    max_frames: Option<usize>,
+) -> (
+    HostPipeline,
+    ControllerPipeline,
+    std::sync::Arc<dyn Fn() -> u32 + Send + Sync>,
+) {
     // 节流模式：假采集按 60fps 墙钟供帧——异步采集线程下的确定性前提
     //（不节流会瞬时洪灌通道，帧数变成竞态）。
     let (clock, start) = session_clock();
     let capture = Box::new(WallCapture {
         inner: capture,
         anchor: start,
+        max_frames,
+        emitted: 0,
     });
     let mut host =
         HostPipeline::with_backends_paced(cfg(), capture, encoder, true).expect("host ok");
@@ -269,7 +305,7 @@ fn merged(host: &HostPipeline, controller: &ControllerPipeline) -> rc_trace::Tra
 #[test]
 fn pipeline_produces_trace_for_every_frame() {
     let (mut host, mut controller, clock) =
-        host_controller(fake_capture(FakeContent::Dynamic, 60), fake_encoder());
+        host_controller_bounded(fake_capture(FakeContent::Dynamic, 60), fake_encoder(), 30);
     let displayed = drive(&mut host, &mut controller, &clock, 30);
     controller.finish_in_flight();
     let trace = merged(&host, &controller);
@@ -312,7 +348,7 @@ fn encoder_failure_does_not_stop_pipeline() {
         seen: 0,
     });
     let (mut host, mut controller, clock) =
-        host_controller(fake_capture(FakeContent::Dynamic, 60), encoder);
+        host_controller_bounded(fake_capture(FakeContent::Dynamic, 60), encoder, 20);
     let displayed = drive(&mut host, &mut controller, &clock, 20);
     controller.finish_in_flight();
     let s = merged(&host, &controller).summary();
@@ -333,7 +369,7 @@ fn encoder_overload_drop_does_not_stop_pipeline() {
         seen: 0,
     });
     let (mut host, mut controller, clock) =
-        host_controller(fake_capture(FakeContent::Dynamic, 60), encoder);
+        host_controller_bounded(fake_capture(FakeContent::Dynamic, 60), encoder, 20);
     // drive 内部对每次 tick expect("tick ok")：若过载丢帧被上抛（回归），
     // 这里直接 panic，即「管线不终止」断言。
     let displayed = drive(&mut host, &mut controller, &clock, 20);
@@ -365,7 +401,7 @@ fn on_encoded_called_on_all_paths() {
         seen: 0,
     });
     let (mut host, mut controller, clock) =
-        host_controller(fake_capture(FakeContent::Dynamic, 60), encoder);
+        host_controller_bounded(fake_capture(FakeContent::Dynamic, 60), encoder, 20);
     let _ = drive(&mut host, &mut controller, &clock, 20);
     let st = host.sched_stats();
     // 若失败路径漏调 on_encoded，max_in_flight=2 会被永久占满，
@@ -383,15 +419,24 @@ fn reassembly_waits_for_all_packets() {
     // 输出 3000 字节 → 1200+1200+600 三包。
     let encoder = Box::new(FakeEncoder::with_tuning(encoder_cfg(), 5_000, 3_000).expect("valid"));
     let (mut host, mut controller, clock) =
-        host_controller(fake_capture(FakeContent::Dynamic, 60), encoder);
+        host_controller_bounded(fake_capture(FakeContent::Dynamic, 60), encoder, 2);
     let mut datagrams = Vec::new();
-    // 异步编码：多 tick 几轮让完成到达。
-    for _ in 0..12u32 {
+    // 异步编码：按 deadline 等待首帧完整 3 包到达，防止慢速共享 CI runner 12ms 内未出帧。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
         if let Some(d) = host.tick(clock()).expect("tick") {
             datagrams.extend(d);
+            if datagrams.len() >= 3 {
+                break;
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        host.wait_event(std::time::Duration::from_millis(5));
     }
+    assert!(
+        datagrams.len() >= 3,
+        "2s 内应收到至少 3 个分片包，实际 {}",
+        datagrams.len()
+    );
     // 取第一帧的三包（同 frame_seq）。
     let (h0, _) = rc_proto::MediaHeader::parse_datagram(&datagrams[0]).expect("header");
     let first_seq = h0.frame_seq;
@@ -434,6 +479,8 @@ fn keyframe_request_propagates_to_encoder() {
         Box::new(WallCapture {
             inner: fake_capture(FakeContent::Dynamic, 60),
             anchor: start,
+            max_frames: None,
+            emitted: 0,
         }),
         fake_encoder(),
         true,
@@ -444,7 +491,7 @@ fn keyframe_request_propagates_to_encoder() {
     // 按采集计数驱动到第 10 帧（断链点 5 之后），1ms 步进等异步线程。
     let mut kf_seen = false;
     let mut idr_after_kf = false;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while host.sched_stats().captured < 10 && std::time::Instant::now() < deadline {
         let now = clock();
         if controller.take_keyframe_request() {
@@ -469,7 +516,7 @@ fn keyframe_request_propagates_to_encoder() {
 #[test]
 fn pipeline_reports_consistent_counts() {
     let (mut host, mut controller, clock) =
-        host_controller(fake_capture(FakeContent::Dynamic, 60), fake_encoder());
+        host_controller_bounded(fake_capture(FakeContent::Dynamic, 60), fake_encoder(), 40);
     let _ = drive(&mut host, &mut controller, &clock, 40);
     controller.finish_in_flight();
     let s = merged(&host, &controller).summary();
@@ -510,7 +557,7 @@ fn factory_falls_back_when_primary_unavailable() {
 #[test]
 fn latency_breakdown_sums_to_total() {
     let (mut host, mut controller, clock) =
-        host_controller(fake_capture(FakeContent::Dynamic, 60), fake_encoder());
+        host_controller_bounded(fake_capture(FakeContent::Dynamic, 60), fake_encoder(), 20);
     let _ = drive(&mut host, &mut controller, &clock, 20);
     controller.finish_in_flight();
     let trace = merged(&host, &controller);
@@ -539,7 +586,7 @@ fn latency_breakdown_sums_to_total() {
 #[test]
 fn datagram_header_roundtrip() {
     let (mut host, mut controller, clock) =
-        host_controller(fake_capture(FakeContent::Dynamic, 60), fake_encoder());
+        host_controller_bounded(fake_capture(FakeContent::Dynamic, 60), fake_encoder(), 3);
     let _ = drive(&mut host, &mut controller, &clock, 3);
     // drive 排空后 trace 里至少有一帧走完 Sent。
     let frame = host.trace().frames().first().expect("has frame");
@@ -774,7 +821,8 @@ fn async_decode_gates_broken_p_frames_until_idr() {
     for p in make_pkts(0, true, rc_proto::MAX_PAYLOAD) {
         let _ = controller.push_datagram(&p, 1_200).expect("seq 0");
     }
-    for _ in 0..40 {
+    let dl0 = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < dl0 {
         if controller.displayed() >= 1 {
             break;
         }
@@ -816,7 +864,8 @@ fn async_decode_gates_broken_p_frames_until_idr() {
     for p in make_pkts(3, true, rc_proto::MAX_PAYLOAD) {
         let _ = controller.push_datagram(&p, 4_200).expect("seq 3 idr");
     }
-    for _ in 0..40 {
+    let dl1 = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < dl1 {
         if controller.displayed() >= 2 {
             break;
         }
@@ -889,7 +938,8 @@ fn async_decode_absorbs_burst_without_breaking_p_chain() {
         }
     }
 
-    for _ in 0..80 {
+    let dl_burst1 = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < dl_burst1 {
         if controller.displayed() >= 2 {
             break;
         }
@@ -910,7 +960,8 @@ fn async_decode_absorbs_burst_without_breaking_p_chain() {
         }
     }
 
-    for _ in 0..80 {
+    let dl_burst2 = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < dl_burst2 {
         if controller.displayed() >= 4 {
             break;
         }
