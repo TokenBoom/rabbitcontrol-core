@@ -302,6 +302,11 @@ impl BoundedRelayIncomingQueue {
 
     fn push(&self, item: RelayIncoming) {
         let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // 同对端发起新连接或动态切换传输模式时，队列中尚未消费的旧入站凭据必然已作废；
+        // 立即替换避免被控端先拨号过期旧令牌浪费 11.5s 导致新会话中继配对超时。
+        if !item.peer_id.is_empty() {
+            q.retain(|(_, existing)| existing.peer_id != item.peer_id);
+        }
         while q.len() >= self.cap {
             q.pop_front();
         }
@@ -342,6 +347,22 @@ impl BoundedRelayIncomingQueue {
                 && (peer_device_id != Some(item.peer_id.as_str()) || *enqueued_at >= cutoff)
         });
     }
+}
+
+/// LAN 建连后容忍广域网信令迟到推送的旧 `PunchCoord` 清理宽限（3s）。
+const LAN_STALE_SIGNAL_GRACE: Duration = Duration::from_secs(3);
+/// 保护会话刚断开前 500ms 内到达的新切换请求（兼容尚未等待旧连接完全退出的老客户端）。
+const SWITCH_SIGNAL_PROTECT_WINDOW: Duration = Duration::from_millis(500);
+
+/// 计算 LAN / mTLS LAN 会话结束后的旧信令清理截止点：
+/// LAN 直连往往比 WAN 信令 `PunchCoord` 提前 50–300ms 完成建连，若仅用 `session_started_at`
+/// 会漏清同一次初始连接产生的迟到旧令牌；将截止点向后延展至多 3s 且不超过断连前 500ms，
+/// 既清掉初始迟到旧令牌又保护临近断连时的新切换请求。
+fn lan_stale_signal_cutoff(session_started_at: Instant, session_ended_at: Instant) -> Instant {
+    session_ended_at
+        .checked_sub(SWITCH_SIGNAL_PROTECT_WINDOW)
+        .map(|guard| (session_started_at + LAN_STALE_SIGNAL_GRACE).min(guard))
+        .unwrap_or(session_started_at)
 }
 
 struct PasswordState {
@@ -5375,7 +5396,7 @@ fn run_host_worker(
                 }
                 incoming_relay.purge_for_peer_before(
                     lan_peer_did.as_deref(),
-                    session_started_at,
+                    lan_stale_signal_cutoff(session_started_at, Instant::now()),
                     RELAY_INCOMING_TTL,
                 );
             }
@@ -5525,7 +5546,7 @@ fn run_host_worker(
                                     }
                                     incoming_relay.purge_for_peer_before(
                                         mtls_peer_did.as_deref(),
-                                        session_started_at,
+                                        lan_stale_signal_cutoff(session_started_at, Instant::now()),
                                         RELAY_INCOMING_TTL,
                                     );
                                 }
@@ -6802,5 +6823,58 @@ mod tests {
         );
 
         host.stop();
+    }
+
+    #[test]
+    fn relay_incoming_queue_supersedes_older_entry_from_same_peer_preserving_others() {
+        let q = BoundedRelayIncomingQueue::new(4);
+        let mk = |peer: &str, token: &str, lan: Vec<&str>| RelayIncoming {
+            session_id: format!("sid-{token}"),
+            peer_id: peer.to_string(),
+            relay_addr: "127.0.0.1:21117".to_string(),
+            relay_token: token.to_string(),
+            peer_public_addr: None,
+            peer_lan_addrs: lan.into_iter().map(str::to_string).collect(),
+            local_udp_port: None,
+            owner_grant: None,
+            is_owner_connection: true,
+        };
+
+        q.push(mk("111222333", "stale-lan-token", vec!["192.168.1.5:9901"]));
+        q.push(mk("444555666", "other-peer-token", vec![]));
+        q.push(mk("111222333", "fresh-relay-token", vec![]));
+
+        let first = q
+            .pop_ready(Duration::from_secs(20), Duration::from_millis(180))
+            .expect("other peer entry preserved");
+        assert_eq!(first.peer_id, "444555666");
+        assert_eq!(first.relay_token, "other-peer-token");
+
+        let second = q
+            .pop_ready(Duration::from_secs(20), Duration::from_millis(180))
+            .expect("fresh relay entry for peer 111222333 must immediately pop without lan_grace");
+        assert_eq!(second.peer_id, "111222333");
+        assert_eq!(second.relay_token, "fresh-relay-token");
+
+        assert!(q
+            .pop_ready(Duration::from_secs(20), Duration::from_millis(180))
+            .is_none());
+    }
+
+    #[test]
+    fn lan_stale_signal_cutoff_purges_late_wan_signal_while_protecting_recent_switch() {
+        let started = Instant::now();
+        let ended_6s = started + Duration::from_secs(6);
+        let cutoff = lan_stale_signal_cutoff(started, ended_6s);
+        let late_wan_signal = started + Duration::from_millis(200);
+        let recent_switch_signal = ended_6s - Duration::from_millis(100);
+        assert!(
+            late_wan_signal < cutoff,
+            "late WAN PunchCoord arriving 200ms after LAN start must be purged"
+        );
+        assert!(
+            recent_switch_signal >= cutoff,
+            "fresh switch signal arriving right before disconnect must be preserved"
+        );
     }
 }

@@ -280,6 +280,10 @@ enum OutgoingSignalMsg {
         lan_addrs: Vec<String>,
         nonce: String,
     },
+    RelayAlloc {
+        target_id: String,
+        session_id: String,
+    },
 }
 
 /// 服务端 -> 客户端信令帧（`type` 标签 `snake_case`）。
@@ -894,6 +898,25 @@ impl SignalClientHandle {
         target_id: &str,
         timeout: Duration,
     ) -> Result<ConnectGrant, String> {
+        self.request_connect_inner(target_id, timeout, false)
+    }
+
+    /// 向服务器发起纯中继通道分配请求（`relay_alloc`），跳过双方 LAN 宽限与 UDP P2P 打洞，
+    /// 阻塞等待 `relay_ready`（供「强制安全中转 / TCP Relay」模式使用）。
+    pub fn request_relay(
+        &self,
+        target_id: &str,
+        timeout: Duration,
+    ) -> Result<ConnectGrant, String> {
+        self.request_connect_inner(target_id, timeout, true)
+    }
+
+    fn request_connect_inner(
+        &self,
+        target_id: &str,
+        timeout: Duration,
+        force_relay: bool,
+    ) -> Result<ConnectGrant, String> {
         if !self.shared.enabled {
             return Err("未启用信令服务器，请先在「设置 → 网络」中配置服务器".to_string());
         }
@@ -901,7 +924,6 @@ impl SignalClientHandle {
             .ok_or_else(|| "目标设备码格式无效，请输入 9 位数字设备码".to_string())?;
 
         let session_id = random_hex(16);
-        let nonce = random_hex(8);
         let (tx, rx) = mpsc::sync_channel(1);
 
         {
@@ -922,17 +944,25 @@ impl SignalClientHandle {
             );
         }
 
-        let local_udp_port = self.shared.local_udp_port.load(Ordering::Acquire);
-        let local_udp_is_ipv6 = self.shared.local_udp_is_ipv6.load(Ordering::Acquire);
-        let msg = OutgoingSignalMsg::ConnectRequest {
-            target_id: normalized,
-            session_id: session_id.clone(),
-            lan_addrs: self.shared.current_effective_lan_addrs(
-                &self.shared.lan_addrs,
-                local_udp_port,
-                local_udp_is_ipv6,
-            ),
-            nonce,
+        let msg = if force_relay {
+            OutgoingSignalMsg::RelayAlloc {
+                target_id: normalized,
+                session_id: session_id.clone(),
+            }
+        } else {
+            let nonce = random_hex(8);
+            let local_udp_port = self.shared.local_udp_port.load(Ordering::Acquire);
+            let local_udp_is_ipv6 = self.shared.local_udp_is_ipv6.load(Ordering::Acquire);
+            OutgoingSignalMsg::ConnectRequest {
+                target_id: normalized,
+                session_id: session_id.clone(),
+                lan_addrs: self.shared.current_effective_lan_addrs(
+                    &self.shared.lan_addrs,
+                    local_udp_port,
+                    local_udp_is_ipv6,
+                ),
+                nonce,
+            }
         };
 
         if let Err(err) = self.shared.send_msg(&msg) {
@@ -5195,6 +5225,95 @@ mod tests {
             round2_registered.load(Ordering::Acquire),
             "client must reconnect and complete Round 2 Register with synced policy"
         );
+
+        client.stop();
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn request_relay_sends_relay_alloc_and_receives_relay_ready_without_lan_candidates() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+            let reg = read_test_frame(&mut s);
+            assert_eq!(reg["type"], "register");
+            write_test_frame(
+                &mut s,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "111222333",
+                    "formatted_id": "111 222 333",
+                    "udp_probe_addr": "",
+                    "relay_addr": "127.0.0.1:21117"
+                }),
+            );
+
+            let req = loop {
+                let frame = read_test_frame(&mut s);
+                if frame["type"] == "heartbeat" {
+                    write_test_frame(&mut s, &serde_json::json!({ "type": "heartbeat_ack" }));
+                    continue;
+                }
+                break frame;
+            };
+            assert_eq!(req["type"], "relay_alloc");
+            assert_eq!(req["target_id"], "999888777");
+            let sid = req["session_id"].as_str().unwrap().to_string();
+            assert!(!sid.is_empty());
+
+            write_test_frame(
+                &mut s,
+                &serde_json::json!({
+                    "type": "relay_ready",
+                    "session_id": sid,
+                    "role": "client",
+                    "peer_id": "999888777",
+                    "relay_token": "tok-pure-relay-123",
+                    "relay_addr": "127.0.0.1:21117",
+                    "expires_in_sec": 30,
+                    "is_owner_connection": true
+                }),
+            );
+
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut sink = [0u8; 64];
+            while matches!(s.read(&mut sink), Ok(n) if n > 0) {}
+        });
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: addr.port(),
+            relay_port: 21117,
+            use_https: false,
+            device_key: crate::server_config::generate_device_key(),
+            ..ServerConfig::default()
+        };
+        let mut client = SignalClientHandle::spawn(
+            cfg,
+            "relay-alloc-test".to_string(),
+            vec!["192.168.1.10:9901".to_string()],
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while client.status().state != ServerConnectionState::Connected && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(client.status().state, ServerConnectionState::Connected);
+
+        let grant = client
+            .request_relay("999 888 777", Duration::from_secs(3))
+            .expect("request_relay must succeed");
+        assert_eq!(grant.target_id, "999888777");
+        assert_eq!(grant.relay_token, "tok-pure-relay-123");
+        assert_eq!(grant.relay_addr, "127.0.0.1:21117");
+        assert!(grant.peer_public_addr.is_none());
+        assert!(grant.peer_lan_addrs.is_empty());
+        assert!(grant.is_owner_connection);
 
         client.stop();
         server_thread.join().unwrap();

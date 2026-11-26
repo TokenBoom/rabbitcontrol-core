@@ -2716,6 +2716,8 @@ fn run_session_thread(
             } = match chosen {
                 Some(ready) => ready,
                 None => {
+                    // 与服务端默认中继配对超时（15s）对齐，兼容远端仍处旧版清理窗口的边缘场景。
+                    const RELAY_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
                     let (raw_transport, shutdown_handle, active, fp): (
                         Box<dyn Transport>,
                         RelayShutdownHandle,
@@ -2730,7 +2732,7 @@ fn run_session_thread(
                             &grant.relay_addr,
                             RelayRole::Client,
                             &grant.relay_token,
-                            Duration::from_secs(12),
+                            RELAY_CLIENT_CONNECT_TIMEOUT,
                             Arc::clone(&dial_cancel),
                             Some(&relay_mtls),
                             RelayE2eeMode::ClientRequired(bundle),
@@ -2754,7 +2756,7 @@ fn run_session_thread(
                             &grant.relay_addr,
                             RelayRole::Client,
                             &grant.relay_token,
-                            Duration::from_secs(12),
+                            RELAY_CLIENT_CONNECT_TIMEOUT,
                             Arc::clone(&dial_cancel),
                             &relay_mtls,
                         ) {
@@ -2773,7 +2775,7 @@ fn run_session_thread(
                             &grant.relay_addr,
                             RelayRole::Client,
                             &grant.relay_token,
-                            Duration::from_secs(12),
+                            RELAY_CLIENT_CONNECT_TIMEOUT,
                             Arc::clone(&dial_cancel),
                         ) {
                             Ok(t) => t,
