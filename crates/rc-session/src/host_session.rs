@@ -1943,6 +1943,18 @@ impl HostSession {
             .is_some_and(HostPipeline::has_pending_work)
     }
 
+    /// 当前活动媒体管线的采集失效/挂起原因（无管线或正常采集时为 `None`）。
+    pub fn capture_invalidation(&self) -> Option<rc_capture::InvalidationReason> {
+        self.pipeline
+            .as_ref()
+            .and_then(HostPipeline::capture_invalidation)
+    }
+
+    /// 当前活动媒体管线的采集是否处于挂起/待恢复态。
+    pub fn is_capture_suspended(&self) -> bool {
+        self.capture_invalidation().is_some()
+    }
+
     /// 动态更新注入器的目标屏幕尺寸（例如被控端分辨率热切换后调用）。
     pub fn set_injector_screen_size(&mut self, w: u32, h: u32) {
         self.cfg.injector.set_screen_size(w, h);

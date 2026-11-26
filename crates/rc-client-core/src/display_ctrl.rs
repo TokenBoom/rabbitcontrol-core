@@ -421,6 +421,15 @@ pub enum DisplayControlMsg {
         #[serde(default)]
         reason: String,
     },
+    /// 被控端 → 控制端：通告被控端锁屏状态与屏幕采集挂起状态。
+    HostScreenState {
+        /// 被控端当前是否处于系统锁屏界面。
+        #[serde(default)]
+        locked: bool,
+        /// 被控端屏幕采集当前是否处于挂起/待恢复态。
+        #[serde(default)]
+        capture_suspended: bool,
+    },
 }
 
 const BASE64_ALPHABET: &[u8; 64] =
@@ -1357,5 +1366,33 @@ mod tests {
         assert!(primary_h264
             .iter()
             .any(|p| p.width == 3024 && p.height == 1964));
+    }
+
+    #[test]
+    fn host_screen_state_roundtrips_and_unknown_variants_safely_ignored() {
+        let msg = DisplayControlMsg::HostScreenState {
+            locked: true,
+            capture_suspended: true,
+        };
+        let encoded = encode_display_ctrl(&msg).expect("encode host_screen_state");
+        let val: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(val["kind"], "host_screen_state");
+        assert_eq!(val["locked"], true);
+        assert_eq!(val["capture_suspended"], true);
+        assert_eq!(decode_display_ctrl(&encoded), Some(msg));
+
+        // Omitted boolean fields default to false for forward/backward compatibility.
+        let minimal = br#"{"kind":"host_screen_state"}"#;
+        assert_eq!(
+            decode_display_ctrl(minimal),
+            Some(DisplayControlMsg::HostScreenState {
+                locked: false,
+                capture_suspended: false,
+            })
+        );
+
+        // Unknown future variant returns None (safely ignored without crashing).
+        let unknown = br#"{"kind":"future_unrecognized_variant","foo":1}"#;
+        assert_eq!(decode_display_ctrl(unknown), None);
     }
 }

@@ -17,11 +17,13 @@
 
 #![deny(unsafe_code)]
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -134,6 +136,8 @@ pub struct UiHostConfig {
     pub accept_mtls_lan: bool,
     /// 禁用无密码 `AutoApprover` 兜底（仅 `LoginWindow` 无头服务开启：无固定密码且无审批窗口时强制拒绝匿名协助）。
     pub forbid_passwordless_auto_approve: bool,
+    /// 可选 W2 文件传输默认接收目录（`None` 时沿用宿主默认主目录）。
+    pub file_transfer_dir: Option<PathBuf>,
 }
 
 impl Default for UiHostConfig {
@@ -153,6 +157,7 @@ impl Default for UiHostConfig {
             mtls_config: None,
             accept_mtls_lan: false,
             forbid_passwordless_auto_approve: false,
+            file_transfer_dir: None,
         }
     }
 }
@@ -173,6 +178,7 @@ impl fmt::Debug for UiHostConfig {
             .field("has_owner_verifier", &self.owner_verifier.is_some())
             .field("has_mtls_config", &self.mtls_config.is_some())
             .field("accept_mtls_lan", &self.accept_mtls_lan)
+            .field("file_transfer_dir", &self.file_transfer_dir)
             .finish()
     }
 }
@@ -664,12 +670,153 @@ fn make_session_clock(origin: Arc<Mutex<ClockOrigin>>) -> SessionClock {
     })
 }
 
+type SharedWakeGuard = Arc<Mutex<Option<Box<dyn Any + Send>>>>;
+type SharedFileTransferDir = Arc<RwLock<Option<PathBuf>>>;
+
+/// 在 `SharedWakeGuard` 中替换新守卫，并在锁外析构旧守卫（避免持有互斥锁时调用平台释放 FFI）。
+fn replace_wake_guard(slot: &SharedWakeGuard, new_guard: Option<Box<dyn Any + Send>>) {
+    let old = {
+        let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *g, new_guard)
+    };
+    drop(old);
+}
+
+struct WakeGuardReleaser {
+    slot: SharedWakeGuard,
+}
+
+impl Drop for WakeGuardReleaser {
+    fn drop(&mut self) {
+        replace_wake_guard(&self.slot, None);
+    }
+}
+
+struct MidSessionWakeResult {
+    guard: Option<Box<dyn Any + Send>>,
+    still_asleep: bool,
+    err: Option<String>,
+}
+
+struct AtomicFlagReset(Arc<AtomicBool>);
+
+impl Drop for AtomicFlagReset {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// 会话中单在途非阻塞唤醒驱动器：
+/// - 绝不在 `rc-ui-host` 主循环内同步阻塞等待显示器唤醒（最长可达 2.5s）；
+/// - 同一时刻最多一个后台唤醒线程在途，完成后经 `try_recv()` 交换守卫并在锁外释放旧守卫；
+/// - 若会话在后台唤醒返回前结束，本驱动器析构关闭接收端，后台线程 `send` 失败立即析构新守卫，零泄漏；
+/// - 冷却期从唤醒**完成时刻**起算：唤醒超时/仍熄屏退避 15s，成功亮屏冷却 5s。
+struct MidSessionWakeDriver {
+    in_flight: Arc<AtomicBool>,
+    rx: Option<mpsc::Receiver<MidSessionWakeResult>>,
+    next_allowed_at: Option<Instant>,
+}
+
+impl MidSessionWakeDriver {
+    const WAKE_SUCCESS_COOLDOWN: Duration = Duration::from_secs(5);
+    const WAKE_TIMEOUT_BACKOFF: Duration = Duration::from_secs(15);
+
+    fn new() -> Self {
+        Self {
+            in_flight: Arc::new(AtomicBool::new(false)),
+            rx: None,
+            next_allowed_at: None,
+        }
+    }
+
+    fn poll_completed(&mut self, wake_guard: &SharedWakeGuard, now: Instant) {
+        let Some(ref rx) = self.rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.rx = None;
+                if let Some(ref err) = res.err {
+                    eprintln!("[rc-ui-host] 会话中重新唤醒显示器失败: {err}");
+                }
+                if let Some(new_guard) = res.guard {
+                    replace_wake_guard(wake_guard, Some(new_guard));
+                }
+                let cooldown = if res.still_asleep || res.err.is_some() {
+                    Self::WAKE_TIMEOUT_BACKOFF
+                } else {
+                    Self::WAKE_SUCCESS_COOLDOWN
+                };
+                self.next_allowed_at = Some(now + cooldown);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.rx = None;
+                self.next_allowed_at = Some(now + Self::WAKE_TIMEOUT_BACKOFF);
+            }
+        }
+    }
+
+    fn maybe_spawn<F>(&mut self, now: Instant, wake_fn: F) -> bool
+    where
+        F: FnOnce() -> (Result<Option<Box<dyn Any + Send>>, String>, bool) + Send + 'static,
+    {
+        if self.rx.is_some() || self.in_flight.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.next_allowed_at.is_some_and(|t| now < t) {
+            return false;
+        }
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let (tx, rx) = mpsc::sync_channel::<MidSessionWakeResult>(1);
+        let flag = Arc::clone(&self.in_flight);
+        match thread::Builder::new()
+            .name("rc-mid-session-wake".to_string())
+            .spawn(move || {
+                let _reset = AtomicFlagReset(flag);
+                let (res, still_asleep) = wake_fn();
+                let msg = match res {
+                    Ok(guard) => MidSessionWakeResult {
+                        guard,
+                        still_asleep,
+                        err: None,
+                    },
+                    Err(e) => MidSessionWakeResult {
+                        guard: None,
+                        still_asleep: true,
+                        err: Some(e),
+                    },
+                };
+                // 若会话已结束并丢弃 rx，SendError 携带的 msg（含守卫）会在此立刻析构，零泄漏。
+                let _ = tx.send(msg);
+            }) {
+            Ok(_) => {
+                self.rx = Some(rx);
+                true
+            }
+            Err(e) => {
+                self.in_flight.store(false, Ordering::Release);
+                self.next_allowed_at = Some(now + Self::WAKE_TIMEOUT_BACKOFF);
+                eprintln!("[rc-ui-host] 派发后台显示器唤醒线程失败: {e}");
+                false
+            }
+        }
+    }
+}
+
 struct BuiltUiHost {
     host: HostSession,
     clock: SessionClock,
     clock_origin: Arc<Mutex<ClockOrigin>>,
     backend_label: Arc<Mutex<String>>,
     hardware_video_active: Arc<AtomicBool>,
+    wake_guard: SharedWakeGuard,
 }
 
 /// 查询硬件主显示器逻辑分辨率（`prefer_hardware == true` 且平台钩子已注册时生效）。
@@ -882,6 +1029,7 @@ fn make_host_pipeline_factory(
     clock_origin: Arc<Mutex<ClockOrigin>>,
     backend_label: Arc<Mutex<String>>,
     hardware_video_active: Arc<AtomicBool>,
+    wake_guard: SharedWakeGuard,
     updates: Arc<BoundedHostUpdateQueue>,
 ) -> HostPipelineFactory {
     Box::new(
@@ -893,6 +1041,15 @@ fn make_host_pipeline_factory(
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             if prefer_hardware {
+                match crate::platform::wake_display_if_asleep() {
+                    Ok(Some(guard)) => {
+                        replace_wake_guard(&wake_guard, Some(guard));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("[rc-ui-host] 唤醒熄屏显示器失败（将继续尝试硬件采集）: {e}");
+                    }
+                }
                 let mut hw_cfg = pcfg.clone();
                 hw_cfg.prefer_hardware = true;
                 let existing_host_us = match existing_origin {
@@ -1063,12 +1220,14 @@ fn build_host_session(
         "fake".to_string()
     }));
     let hardware_video_active = Arc::new(AtomicBool::new(false));
+    let wake_guard: SharedWakeGuard = Arc::new(Mutex::new(None));
 
     let factory = make_host_pipeline_factory(
         prefer_hardware,
         Arc::clone(&clock_origin),
         Arc::clone(&backend_label),
         Arc::clone(&hardware_video_active),
+        Arc::clone(&wake_guard),
         updates,
     );
 
@@ -1088,6 +1247,7 @@ fn build_host_session(
         clock_origin,
         backend_label,
         hardware_video_active,
+        wake_guard,
     })
 }
 
@@ -1126,6 +1286,7 @@ fn build_transport_host_session(
         "fake".to_string()
     }));
     let hardware_video_active = Arc::new(AtomicBool::new(false));
+    let wake_guard: SharedWakeGuard = Arc::new(Mutex::new(None));
 
     // 占位后端仅用于满足 `HostSession::with_parts` 签名；握手成功后优先执行
     // `set_pipeline_factory_for`，按裁定参数构建硬件/假栈并锚定会话钟零点。
@@ -1165,6 +1326,7 @@ fn build_transport_host_session(
         Arc::clone(&clock_origin),
         Arc::clone(&backend_label),
         Arc::clone(&hardware_video_active),
+        Arc::clone(&wake_guard),
         updates,
     );
     host.set_pipeline_factory_for(factory);
@@ -1180,6 +1342,7 @@ fn build_transport_host_session(
         clock_origin,
         backend_label,
         hardware_video_active,
+        wake_guard,
     })
 }
 
@@ -1319,6 +1482,7 @@ pub struct HostHandle {
     close_reason: Arc<AtomicU8>,
     running: Arc<AtomicBool>,
     lock_screen_count: Arc<AtomicU64>,
+    file_transfer_dir: SharedFileTransferDir,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -1373,6 +1537,8 @@ impl HostHandle {
         let close_reason = Arc::new(AtomicU8::new(ByeReason::Normal as u8));
         let running = Arc::new(AtomicBool::new(true));
         let lock_screen_count = Arc::new(AtomicU64::new(0));
+        let file_transfer_dir: SharedFileTransferDir =
+            Arc::new(RwLock::new(cfg.file_transfer_dir.clone()));
 
         let make_approver = |require: bool, ui: &UiApprover| -> Box<dyn ConnectionApprover> {
             if require {
@@ -1510,6 +1676,7 @@ impl HostHandle {
         let t_close_reason = Arc::clone(&close_reason);
         let t_running = Arc::clone(&running);
         let t_lock_screen_count = Arc::clone(&lock_screen_count);
+        let t_file_transfer_dir = Arc::clone(&file_transfer_dir);
 
         let listen_addr_shared = Arc::new(Mutex::new(actual_addr));
         let t_listen_addr = Arc::clone(&listen_addr_shared);
@@ -1537,6 +1704,7 @@ impl HostHandle {
                         t_stop,
                         t_close_reason,
                         t_lock_screen_count,
+                        t_file_transfer_dir,
                     )
                 }));
                 if res.is_err() {
@@ -1565,6 +1733,7 @@ impl HostHandle {
             close_reason,
             running,
             lock_screen_count,
+            file_transfer_dir,
             thread: Some(handle),
         })
     }
@@ -1654,6 +1823,15 @@ impl HostHandle {
             st.accept_mtls_lan = accept_mtls_lan;
         }
         self.config_version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 动态更新被控端 W2 文件传输默认接收目录（对当前及后续会话实时生效）。
+    pub fn set_file_transfer_dir(&self, dir: Option<PathBuf>) {
+        let mut guard = self
+            .file_transfer_dir
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = dir;
     }
 
     /// 主动断开当前已连接的控制端会话（触发优雅 `Bye` / 中继即时断流，被控端继续等待新连接）。
@@ -1776,14 +1954,31 @@ struct FileHostWorker {
 }
 
 impl FileHostWorker {
-    fn spawn() -> Self {
+    fn spawn(default_receive_dir: SharedFileTransferDir) -> Self {
         let (in_tx, in_rx) = mpsc::sync_channel::<Vec<u8>>(FILE_HOST_WORKER_CHAN_CAP);
         let (out_tx, out_rx) = mpsc::sync_channel::<Vec<u8>>(FILE_HOST_WORKER_CHAN_CAP);
         let handle = thread::Builder::new()
             .name("rc-file-host-worker".to_string())
             .spawn(move || {
-                let mut engine = FileHostEngine::new();
+                let mut applied_dir = default_receive_dir
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let mut engine =
+                    FileHostEngine::new().with_default_receive_dir(applied_dir.clone());
                 let mut pending_out: VecDeque<Vec<u8>> = VecDeque::new();
+                let sync_receive_dir =
+                    |shared: &RwLock<Option<PathBuf>>,
+                     applied: &mut Option<PathBuf>,
+                     engine: &mut FileHostEngine| {
+                        let guard = shared.read().unwrap_or_else(|e| e.into_inner());
+                        if &*guard != applied {
+                            let current = guard.clone();
+                            drop(guard);
+                            *applied = current.clone();
+                            engine.set_default_receive_dir(current);
+                        }
+                    };
 
                 loop {
                     let mut did_work = false;
@@ -1792,6 +1987,11 @@ impl FileHostWorker {
                     for _ in 0..MAX_TOOL_FRAMES_PER_TICK {
                         match in_rx.try_recv() {
                             Ok(payload) => {
+                                sync_receive_dir(
+                                    &default_receive_dir,
+                                    &mut applied_dir,
+                                    &mut engine,
+                                );
                                 engine.handle_incoming(&payload);
                                 did_work = true;
                             }
@@ -1830,13 +2030,27 @@ impl FileHostWorker {
                         !pending_out.is_empty() || engine.active_download_count() > 0;
                     if out_full {
                         match in_rx.recv_timeout(Duration::from_millis(2)) {
-                            Ok(payload) => engine.handle_incoming(&payload),
+                            Ok(payload) => {
+                                sync_receive_dir(
+                                    &default_receive_dir,
+                                    &mut applied_dir,
+                                    &mut engine,
+                                );
+                                engine.handle_incoming(&payload);
+                            }
                             Err(mpsc::RecvTimeoutError::Timeout) => {}
                             Err(mpsc::RecvTimeoutError::Disconnected) => return,
                         }
                     } else if !did_work && !has_more_work {
                         match in_rx.recv() {
-                            Ok(payload) => engine.handle_incoming(&payload),
+                            Ok(payload) => {
+                                sync_receive_dir(
+                                    &default_receive_dir,
+                                    &mut applied_dir,
+                                    &mut engine,
+                                );
+                                engine.handle_incoming(&payload);
+                            }
                             Err(_) => return,
                         }
                     }
@@ -2200,6 +2414,8 @@ fn drive_ui_host_session(
     let lock_screen_count = AtomicU64::new(0);
     let close_reason = AtomicU8::new(ByeReason::Normal as u8);
     let mut owner_terminals = PersistentOwnerTerminals::new();
+    let wake_guard: SharedWakeGuard = Arc::new(Mutex::new(None));
+    let file_transfer_dir: SharedFileTransferDir = Arc::new(RwLock::new(None));
     drive_ui_host_session_inner(
         host,
         clock,
@@ -2216,6 +2432,8 @@ fn drive_ui_host_session(
         &lock_screen_count,
         None,
         &mut owner_terminals,
+        wake_guard,
+        file_transfer_dir,
     )
 }
 
@@ -2361,7 +2579,12 @@ fn drive_ui_host_session_inner(
     lock_screen_count: &AtomicU64,
     auth_state: Option<&Mutex<AuthRuntimeState>>,
     owner_terminals: &mut PersistentOwnerTerminals,
+    wake_guard: SharedWakeGuard,
+    file_transfer_dir: SharedFileTransferDir,
 ) -> String {
+    let _wake_guard_releaser = WakeGuardReleaser {
+        slot: Arc::clone(&wake_guard),
+    };
     let _activity =
         crate::platform::begin_latency_critical_activity("RabbitControl 被控会话", true);
     let mut hw_cleanup = HostHardwareCleanupGuard::new(prefer_hardware);
@@ -2376,7 +2599,7 @@ fn drive_ui_host_session_inner(
 
     // 文件 I/O 与端口映射严格绑定单次控制端会话（断线清理 .rcpart 与监听套接字）；
     // W3 终端在机主（OwnerTicket）身份下复用 `owner_terminals` 跨重连保活，访客会话仅使用会话级 `guest_term_host`。
-    let mut file_worker = FileHostWorker::spawn();
+    let mut file_worker = FileHostWorker::spawn(Arc::clone(&file_transfer_dir));
     let mut guest_term_host = TerminalHostEngine::new();
     let mut use_owner_terminals = match host.authenticated_owner() {
         Some(owner) => {
@@ -2411,6 +2634,10 @@ fn drive_ui_host_session_inner(
         prefer_hardware && hardware_video_active && !failed && rc_pipeline::platform_supports_hevc()
     };
 
+    let mut last_reported_screen_state: Option<(bool, bool)> = None;
+    let mut last_screen_state_check = Instant::now();
+    let mut mid_session_wake = MidSessionWakeDriver::new();
+
     if host.state() == SessionState::Streaming {
         let presets = build_hardware_display_presets(
             prefer_hardware,
@@ -2431,6 +2658,21 @@ fn drive_ui_host_session_inner(
                 pending_display_tx.push_back(disp_payload);
             }
         }
+        let init_screen_state = (
+            crate::platform::is_screen_locked(),
+            host.is_capture_suspended(),
+        );
+        if init_screen_state.0 || init_screen_state.1 {
+            if let Some(payload) =
+                display_ctrl::encode_display_ctrl(&DisplayControlMsg::HostScreenState {
+                    locked: init_screen_state.0,
+                    capture_suspended: init_screen_state.1,
+                })
+            {
+                pending_display_tx.push_back(payload);
+            }
+        }
+        last_reported_screen_state = Some(init_screen_state);
         let ver_msg = crate::updater::HostUpdateWorker::build_version_info_msg(
             host.authenticated_owner().is_some(),
         );
@@ -3783,6 +4025,47 @@ fn drive_ui_host_session_inner(
                             }
                         }
 
+                        // 2.5) 接收后台唤醒结果并节流巡检被控端锁屏与采集挂起态（250ms）：
+                        // 变化时通知控制端；熄屏且未锁屏时异步派发单在途后台唤醒，绝不阻塞会话主循环。
+                        mid_session_wake.poll_completed(&wake_guard, Instant::now());
+                        if last_screen_state_check.elapsed() >= Duration::from_millis(250) {
+                            let now_screen = Instant::now();
+                            last_screen_state_check = now_screen;
+                            let screen_locked = crate::platform::is_screen_locked();
+                            let capture_suspended = host.is_capture_suspended();
+                            let cur_state = (screen_locked, capture_suspended);
+                            let should_emit = match last_reported_screen_state {
+                                None => screen_locked || capture_suspended,
+                                Some(prev) => prev != cur_state,
+                            };
+                            if should_emit {
+                                if let Some(payload) = display_ctrl::encode_display_ctrl(
+                                    &DisplayControlMsg::HostScreenState {
+                                        locked: screen_locked,
+                                        capture_suspended,
+                                    },
+                                ) {
+                                    pending_display_tx.push_back(payload);
+                                    while pending_display_tx.len() > 64 {
+                                        pending_display_tx.pop_front();
+                                    }
+                                }
+                            }
+                            last_reported_screen_state = Some(cur_state);
+
+                            if prefer_hardware
+                                && capture_suspended
+                                && !screen_locked
+                                && crate::platform::is_display_asleep()
+                            {
+                                mid_session_wake.maybe_spawn(now_screen, || {
+                                    let res = crate::platform::wake_display_if_asleep();
+                                    let still_asleep = crate::platform::is_display_asleep();
+                                    (res, still_asleep)
+                                });
+                            }
+                        }
+
                         // 3) 工具复用通道出站节流泵（每引擎单拍最多 8 帧 + 背压重试队列，零丢块且不饿死视频/输入）。
                         if flush_tool_channel_with_retry(
                             &mut pending_file_tx,
@@ -3953,6 +4236,21 @@ fn drive_ui_host_session_inner(
                             host.authenticated_owner().is_some(),
                         );
                         pending_update_tx.enqueue(&ver_msg, host.authenticated_owner().is_some());
+                        let resumed_screen_state = (
+                            crate::platform::is_screen_locked(),
+                            host.is_capture_suspended(),
+                        );
+                        // 断线恢复后无条件重发一次最新状态（含 `(false, false)`），避免对端卡死在断线前收到的锁屏/挂起提示。
+                        if let Some(payload) =
+                            display_ctrl::encode_display_ctrl(&DisplayControlMsg::HostScreenState {
+                                locked: resumed_screen_state.0,
+                                capture_suspended: resumed_screen_state.1,
+                            })
+                        {
+                            pending_display_tx.push_back(payload);
+                        }
+                        last_reported_screen_state = Some(resumed_screen_state);
+                        last_screen_state_check = Instant::now();
                         emit_peer_connected(host, &host.peer_addr().to_string(), updates);
                     }
                     Ok(DetachOutcome::Replaced) => {
@@ -4042,7 +4340,23 @@ fn drive_ui_host_session_inner(
                         } else {
                             None
                         };
-                        file_worker = FileHostWorker::spawn();
+                        let replaced_screen_state = (
+                            crate::platform::is_screen_locked(),
+                            host.is_capture_suspended(),
+                        );
+                        if replaced_screen_state.0 || replaced_screen_state.1 {
+                            if let Some(payload) = display_ctrl::encode_display_ctrl(
+                                &DisplayControlMsg::HostScreenState {
+                                    locked: replaced_screen_state.0,
+                                    capture_suspended: replaced_screen_state.1,
+                                },
+                            ) {
+                                pending_display_tx.push_back(payload);
+                            }
+                        }
+                        last_reported_screen_state = Some(replaced_screen_state);
+                        last_screen_state_check = Instant::now();
+                        file_worker = FileHostWorker::spawn(Arc::clone(&file_transfer_dir));
                         if use_owner_terminals {
                             owner_terminals.detach_all();
                         } else {
@@ -4386,6 +4700,7 @@ fn serve_relay_incoming(
     close_reason: &Arc<AtomicU8>,
     lock_screen_count: &AtomicU64,
     owner_terminals: &mut PersistentOwnerTerminals,
+    file_transfer_dir: &SharedFileTransferDir,
 ) {
     if stop_flag.load(Ordering::Acquire) {
         return;
@@ -4591,6 +4906,7 @@ fn serve_relay_incoming(
         clock_origin: _,
         backend_label,
         hardware_video_active,
+        wake_guard,
     } = *built;
 
     streaming_started.store(true, Ordering::Release);
@@ -4612,6 +4928,8 @@ fn serve_relay_incoming(
         lock_screen_count,
         Some(auth_state),
         owner_terminals,
+        wake_guard,
+        Arc::clone(file_transfer_dir),
     );
     let last_backend = backend_label
         .lock()
@@ -4650,6 +4968,7 @@ fn run_host_worker(
     stop_flag: Arc<AtomicBool>,
     close_reason: Arc<AtomicU8>,
     lock_screen_count: Arc<AtomicU64>,
+    file_transfer_dir: SharedFileTransferDir,
 ) {
     let mut display_addr = format_display_addr(actual_addr);
     let initial_backend = match &first_listener {
@@ -4872,6 +5191,7 @@ fn run_host_worker(
                     clock_origin,
                     backend_label,
                     hardware_video_active,
+                    wake_guard,
                 } = *built;
 
                 // 1) 分片 accept + 握手循环（同时轮询信令下发的入站中继/P2P 会话）。
@@ -4899,6 +5219,7 @@ fn run_host_worker(
                             &close_reason,
                             &lock_screen_count,
                             &mut owner_terminals,
+                            &file_transfer_dir,
                         );
                         // M6：中继会话结束后清理过期入站令牌，并重建空闲 LAN HostSession 清除期间积压的过期 QUIC 连接。
                         incoming_relay.purge_expired(RELAY_INCOMING_TTL);
@@ -4933,6 +5254,7 @@ fn run_host_worker(
                 };
 
                 if !accepted {
+                    replace_wake_guard(&wake_guard, None);
                     drop(host);
                     continue;
                 }
@@ -4959,6 +5281,8 @@ fn run_host_worker(
                     &lock_screen_count,
                     Some(auth_state.as_ref()),
                     &mut owner_terminals,
+                    wake_guard,
+                    Arc::clone(&file_transfer_dir),
                 );
                 let lan_peer_did = host
                     .authenticated_owner()
@@ -5036,6 +5360,7 @@ fn run_host_worker(
                             &close_reason,
                             &lock_screen_count,
                             &mut owner_terminals,
+                            &file_transfer_dir,
                         );
                         incoming_relay.purge_expired(RELAY_INCOMING_TTL);
                         continue;
@@ -5085,6 +5410,7 @@ fn run_host_worker(
                                         clock_origin: _,
                                         backend_label,
                                         hardware_video_active,
+                                        wake_guard,
                                     } = *built;
                                     streaming_started.store(true, Ordering::Release);
                                     emit_peer_connected(&host, &peer_label, &updates);
@@ -5104,6 +5430,8 @@ fn run_host_worker(
                                         &lock_screen_count,
                                         Some(auth_state.as_ref()),
                                         &mut owner_terminals,
+                                        wake_guard,
+                                        Arc::clone(&file_transfer_dir),
                                     );
                                     let last_backend = backend_label
                                         .lock()
@@ -5655,7 +5983,8 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp test dir");
         std::fs::write(dir.join("probe.txt"), b"hello").expect("write probe file");
 
-        let worker = FileHostWorker::spawn();
+        let shared_dir: SharedFileTransferDir = Arc::new(RwLock::new(None));
+        let worker = FileHostWorker::spawn(shared_dir);
         let req = rc_tools::FileWireMsg::ListDir {
             path: Some(dir.to_string_lossy().into_owned()),
         }
@@ -5992,5 +6321,214 @@ mod tests {
             ),
             (1280, 720, false)
         );
+    }
+
+    #[test]
+    fn host_handle_set_file_transfer_dir_and_worker_dynamic_update_plumbing() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-ui-ft-dir-plumbing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let dir_a = base.join("dir_a");
+        let dir_b = base.join("dir_b");
+
+        let mut host = HostHandle::spawn(UiHostConfig {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            file_transfer_dir: Some(dir_a.clone()),
+            ..UiHostConfig::default()
+        })
+        .expect("spawn host handle");
+
+        assert_eq!(
+            *host
+                .file_transfer_dir
+                .read()
+                .unwrap_or_else(|e| e.into_inner()),
+            Some(dir_a.clone())
+        );
+
+        let worker = FileHostWorker::spawn(Arc::clone(&host.file_transfer_dir));
+
+        let send_empty_dir_upload = |worker: &FileHostWorker, id: u64, name: &str, body: &[u8]| {
+            let start = rc_tools::FileWireMsg::UploadStart {
+                id,
+                remote_dir: String::new(),
+                file_name: name.to_string(),
+                total_bytes: body.len() as u64,
+            }
+            .encode()
+            .unwrap();
+            let chunk = rc_tools::FileWireMsg::UploadChunk {
+                id,
+                offset: 0,
+                data: body.to_vec(),
+            }
+            .encode()
+            .unwrap();
+            let finish = rc_tools::FileWireMsg::UploadFinish { id }.encode().unwrap();
+            worker.try_send_incoming(start).unwrap();
+            worker.try_send_incoming(chunk).unwrap();
+            worker.try_send_incoming(finish).unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut got_done = false;
+            while Instant::now() < deadline {
+                for frame in worker.try_recv_outgoing(8) {
+                    if let Ok(rc_tools::FileWireMsg::UploadDone {
+                        id: done_id,
+                        ok,
+                        error,
+                    }) = rc_tools::FileWireMsg::decode(&frame)
+                    {
+                        assert_eq!(done_id, id);
+                        assert!(ok, "upload failed: {error:?}");
+                        got_done = true;
+                    }
+                }
+                if got_done {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(got_done, "timed out waiting for UploadDone for id={id}");
+        };
+
+        send_empty_dir_upload(&worker, 1, "first.txt", b"payload-a");
+        assert_eq!(
+            std::fs::read(dir_a.join("first.txt")).unwrap(),
+            b"payload-a"
+        );
+
+        // Dynamically switch via HostHandle::set_file_transfer_dir and verify worker picks it up
+        host.set_file_transfer_dir(Some(dir_b.clone()));
+        assert_eq!(
+            *host
+                .file_transfer_dir
+                .read()
+                .unwrap_or_else(|e| e.into_inner()),
+            Some(dir_b.clone())
+        );
+
+        send_empty_dir_upload(&worker, 2, "second.txt", b"payload-b");
+        assert_eq!(
+            std::fs::read(dir_b.join("second.txt")).unwrap(),
+            b"payload-b"
+        );
+
+        drop(worker);
+        host.stop();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mid_session_wake_driver_is_nonblocking_replaces_guard_and_drops_on_session_exit() {
+        struct DropCounter(Arc<AtomicU64>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicU64::new(0));
+        let wake_guard: SharedWakeGuard =
+            Arc::new(Mutex::new(Some(Box::new(DropCounter(Arc::clone(&drops))))));
+        let mut driver = MidSessionWakeDriver::new();
+
+        // 1) Spawning a slow wake must return immediately (non-blocking) and enforce single-in-flight
+        let t0 = Instant::now();
+        let drops_for_new = Arc::clone(&drops);
+        let spawned = driver.maybe_spawn(t0, move || {
+            thread::sleep(Duration::from_millis(60));
+            (Ok(Some(Box::new(DropCounter(drops_for_new)))), true)
+        });
+        assert!(spawned);
+        assert!(
+            t0.elapsed() < Duration::from_millis(40),
+            "maybe_spawn must not block caller thread"
+        );
+        // Second call while in flight is rejected
+        assert!(!driver.maybe_spawn(Instant::now(), || (Ok(None), false)));
+
+        // Wait for background thread to finish and poll_completed to swap guards
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && drops.load(Ordering::SeqCst) == 0 {
+            driver.poll_completed(&wake_guard, Instant::now());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "previous wake guard must be dropped upon swap"
+        );
+        // Because still_asleep == true, backoff is 15s -> immediate retry at +6s is suppressed
+        assert!(
+            !driver.maybe_spawn(Instant::now() + Duration::from_secs(6), || (
+                Ok(None),
+                false
+            ))
+        );
+
+        // 2) If driver is dropped while a wake thread is in flight, the new guard is dropped immediately (zero leak)
+        let mut driver2 = MidSessionWakeDriver::new();
+        let drops_exit = Arc::clone(&drops);
+        assert!(driver2.maybe_spawn(Instant::now(), move || {
+            thread::sleep(Duration::from_millis(40));
+            (Ok(Some(Box::new(DropCounter(drops_exit)))), false)
+        }));
+        drop(driver2);
+        let leak_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < leak_deadline && drops.load(Ordering::SeqCst) < 2 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "in-flight guard must be dropped immediately when session drops MidSessionWakeDriver"
+        );
+
+        // 3) WakeGuardReleaser drops remaining stored guard cleanly
+        {
+            let _releaser = WakeGuardReleaser {
+                slot: Arc::clone(&wake_guard),
+            };
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+
+        // 4) Unread completed rx must block maybe_spawn even after in_flight flips false,
+        //    preserving the completed guard until poll_completed drains it and sets cooldown.
+        let mut driver3 = MidSessionWakeDriver::new();
+        let drops_unread = Arc::new(AtomicU64::new(0));
+        let drops_unread_clone = Arc::clone(&drops_unread);
+        assert!(driver3.maybe_spawn(Instant::now(), move || {
+            (Ok(Some(Box::new(DropCounter(drops_unread_clone)))), false)
+        }));
+        let wait_done = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < wait_done && driver3.in_flight.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            !driver3.in_flight.load(Ordering::Acquire),
+            "background wake should have finished and cleared in_flight"
+        );
+        // rx is still unread: maybe_spawn must return false and not drop the completed guard
+        assert!(!driver3.maybe_spawn(Instant::now(), || (Ok(None), false)));
+        assert_eq!(
+            drops_unread.load(Ordering::SeqCst),
+            0,
+            "unread completed wake guard must not be dropped by maybe_spawn"
+        );
+        // Draining via poll_completed installs the guard and arms the 5s cooldown
+        let unread_slot: SharedWakeGuard = Arc::new(Mutex::new(None));
+        let drain_at = Instant::now();
+        driver3.poll_completed(&unread_slot, drain_at);
+        assert!(unread_slot.lock().unwrap().is_some());
+        assert_eq!(drops_unread.load(Ordering::SeqCst), 0);
+        assert!(!driver3.maybe_spawn(drain_at + Duration::from_secs(2), || (Ok(None), false)));
+        replace_wake_guard(&unread_slot, None);
+        assert_eq!(drops_unread.load(Ordering::SeqCst), 1);
     }
 }

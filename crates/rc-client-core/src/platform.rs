@@ -145,6 +145,21 @@ pub trait ClientPlatformHooks: Send + Sync {
         false
     }
 
+    /// 若宿主显示器当前处于熄屏/休眠状态，则声明用户活动以唤醒亮屏并返回可选 RAII 断言守卫。
+    fn wake_display_if_asleep(&self) -> Result<Option<Box<dyn Any + Send>>, String> {
+        Ok(None)
+    }
+
+    /// 判断宿主显示器当前是否处于熄屏/休眠状态。
+    fn is_display_asleep(&self) -> bool {
+        false
+    }
+
+    /// 判断宿主当前桌面会话是否处于锁屏状态。
+    fn is_screen_locked(&self) -> bool {
+        false
+    }
+
     /// 开启或更新被控端物理防窥隐私幕布（遮挡所有物理屏但对屏幕采集排除）；
     /// `mode` 为 `"privacy"` / `"black"` / `"off"`。
     fn set_privacy_curtain(
@@ -394,6 +409,24 @@ pub fn capture_wallpaper_jpeg(max_width: u32, max_height: u32) -> Option<Vec<u8>
 /// 立即锁定当前主屏幕。
 pub fn lock_screen_now() -> bool {
     PLATFORM_HOOKS.get().is_some_and(|h| h.lock_screen_now())
+}
+
+/// 若宿主显示器当前处于熄屏/休眠状态则唤醒亮屏，返回可选 RAII 断言守卫。
+pub fn wake_display_if_asleep() -> Result<Option<Box<dyn Any + Send>>, String> {
+    match PLATFORM_HOOKS.get() {
+        Some(h) => h.wake_display_if_asleep(),
+        None => Ok(None),
+    }
+}
+
+/// 判断宿主显示器当前是否处于熄屏/休眠状态。
+pub fn is_display_asleep() -> bool {
+    PLATFORM_HOOKS.get().is_some_and(|h| h.is_display_asleep())
+}
+
+/// 判断宿主当前桌面会话是否处于锁屏状态。
+pub fn is_screen_locked() -> bool {
+    PLATFORM_HOOKS.get().is_some_and(|h| h.is_screen_locked())
 }
 
 /// 开启或更新被控端物理防窥隐私幕布。

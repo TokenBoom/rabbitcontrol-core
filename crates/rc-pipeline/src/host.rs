@@ -38,10 +38,15 @@ use std::sync::mpsc::{
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// 采集恢复重建失败后的有界重试退避间隔（冷路径，不影响正常出帧热路径）。
+const CAPTURE_REBUILD_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
 /// 采集线程 → 调用方线程的消息。
 enum CapMsg {
     Frame(Box<CapturedFrame>),
     Invalidated(rc_capture::InvalidationReason),
+    Rebuilt,
+    RebuildFailed(rc_capture::InvalidationReason),
 }
 
 /// 调用方线程 → 采集线程的命令。
@@ -381,6 +386,10 @@ pub struct HostPipeline {
     wake: Arc<(Mutex<u64>, Condvar)>,
     /// 最近一次 `tick()` 开始前观测到的事件代次（防丢失唤醒）。
     last_wake_gen: u64,
+    /// 当前采集失效/挂起原因（正常采集时为 `None`，挂起/重建期间为 `Some`）。
+    capture_invalidation: Option<rc_capture::InvalidationReason>,
+    /// 下一次发送 `CapCmd::Rebuild` 的退避截止时刻（重建可恢复失败时置位）。
+    rebuild_retry_at: Option<Instant>,
 }
 
 fn signal_wake(wake: &(Mutex<u64>, Condvar)) {
@@ -388,6 +397,79 @@ fn signal_wake(wake: &(Mutex<u64>, Condvar)) {
     if let Ok(mut g) = lock.lock() {
         *g = g.wrapping_add(1);
         cv.notify_one();
+    }
+}
+
+/// 冷/错误路径向调用方线程投递采集控制消息（避免停机时在满通道上阻塞死锁）。
+fn send_cap_ctrl_msg(
+    mut msg: CapMsg,
+    cap_tx: &SyncSender<CapMsg>,
+    stop_flag: &AtomicBool,
+    cap_space: &(Mutex<u64>, Condvar),
+    cap_wake: &(Mutex<u64>, Condvar),
+) -> bool {
+    loop {
+        if stop_flag.load(Ordering::Acquire) {
+            return false;
+        }
+        let seen_gen = cap_space.0.lock().map(|g| *g).unwrap_or(0);
+        match cap_tx.try_send(msg) {
+            Ok(()) => {
+                signal_wake(cap_wake);
+                return true;
+            }
+            Err(TrySendError::Full(back)) => msg = back,
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+        let (lock, cv) = cap_space;
+        if let Ok(guard) = lock.lock() {
+            if *guard == seen_gen && !stop_flag.load(Ordering::Acquire) {
+                let _ = cv.wait_timeout(guard, Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+/// 在采集线程内执行一次 `capture.rebuild()` 并汇报结果；返回 `true` 表示线程继续运行，`false` 表示退出。
+fn run_capture_rebuild(
+    capture: &mut dyn CaptureBackend,
+    invalidated: &mut bool,
+    cap_tx: &SyncSender<CapMsg>,
+    stop_flag: &AtomicBool,
+    cap_space: &(Mutex<u64>, Condvar),
+    cap_wake: &(Mutex<u64>, Condvar),
+) -> bool {
+    match capture.rebuild() {
+        Ok(()) => {
+            *invalidated = false;
+            send_cap_ctrl_msg(CapMsg::Rebuilt, cap_tx, stop_flag, cap_space, cap_wake)
+        }
+        Err(e) => {
+            let recoverable = !e.is_fatal();
+            *invalidated = true;
+            if recoverable {
+                let reason = capture
+                    .poll_invalidation()
+                    .filter(|r| r.is_recoverable())
+                    .unwrap_or(rc_capture::InvalidationReason::AccessLost);
+                send_cap_ctrl_msg(
+                    CapMsg::RebuildFailed(reason),
+                    cap_tx,
+                    stop_flag,
+                    cap_space,
+                    cap_wake,
+                )
+            } else {
+                let _ = send_cap_ctrl_msg(
+                    CapMsg::Invalidated(rc_capture::InvalidationReason::Unknown),
+                    cap_tx,
+                    stop_flag,
+                    cap_space,
+                    cap_wake,
+                );
+                false
+            }
+        }
     }
 }
 
@@ -461,14 +543,39 @@ impl HostPipeline {
                 let timeout = Duration::from_millis(16); // C10
                 let interval = Duration::from_micros(u64::from(1_000_000u32 / fps.max(1)));
                 let mut next_emit = std::time::Instant::now();
+                let mut invalidated = false;
                 while !stop_flag.load(Ordering::Acquire) {
+                    // 失效/挂起态：不空转也不重复刷屏 Invalidated，阻塞等待调用方发 Rebuild。
+                    if invalidated {
+                        match cmd_rx.recv_timeout(Duration::from_millis(20)) {
+                            Ok(CapCmd::Rebuild) => {
+                                if !run_capture_rebuild(
+                                    capture.as_mut(),
+                                    &mut invalidated,
+                                    &cap_tx,
+                                    &stop_flag,
+                                    &cap_space_tx,
+                                    &cap_wake,
+                                ) {
+                                    return;
+                                }
+                            }
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        }
+                        continue;
+                    }
                     // 处理重建命令（非阻塞；无命令继续采集）。
                     if let Ok(CapCmd::Rebuild) = cmd_rx.try_recv() {
-                        if let Err(e) = capture.rebuild() {
-                            let _ = cap_tx
-                                .send(CapMsg::Invalidated(rc_capture::InvalidationReason::Unknown));
-                            signal_wake(&cap_wake);
-                            let _ = e;
+                        if !run_capture_rebuild(
+                            capture.as_mut(),
+                            &mut invalidated,
+                            &cap_tx,
+                            &stop_flag,
+                            &cap_space_tx,
+                            &cap_wake,
+                        ) {
+                            return;
                         }
                         continue;
                     }
@@ -529,21 +636,51 @@ impl HostPipeline {
                                 }
                             }
                         }
-                        Ok(None) => { /* C1/P1：无变化，继续循环 */ }
+                        Ok(None) => {
+                            // C1/P1：无变化，但若后端上报了挂起/失效（如锁屏/熄屏），发一次通知并切入待重建态。
+                            if let Some(reason) = capture.poll_invalidation() {
+                                invalidated = true;
+                                if !send_cap_ctrl_msg(
+                                    CapMsg::Invalidated(reason),
+                                    &cap_tx,
+                                    &stop_flag,
+                                    &cap_space_tx,
+                                    &cap_wake,
+                                ) {
+                                    return;
+                                }
+                                if !reason.is_recoverable() {
+                                    return;
+                                }
+                            }
+                        }
                         Err(e) => {
-                            let recoverable = !e.is_fatal();
-                            let reason = if recoverable {
-                                rc_capture::InvalidationReason::AccessLost
+                            let reason = capture.poll_invalidation().unwrap_or_else(|| {
+                                if !e.is_fatal() {
+                                    rc_capture::InvalidationReason::AccessLost
+                                } else {
+                                    rc_capture::InvalidationReason::Unknown
+                                }
+                            });
+                            let recoverable = !e.is_fatal() && reason.is_recoverable();
+                            let effective_reason = if recoverable {
+                                reason
                             } else {
                                 rc_capture::InvalidationReason::Unknown
                             };
-                            let _ = cap_tx.send(CapMsg::Invalidated(reason));
-                            signal_wake(&cap_wake);
+                            invalidated = true;
+                            if !send_cap_ctrl_msg(
+                                CapMsg::Invalidated(effective_reason),
+                                &cap_tx,
+                                &stop_flag,
+                                &cap_space_tx,
+                                &cap_wake,
+                            ) {
+                                return;
+                            }
                             if !recoverable {
                                 return;
                             }
-                            // 可恢复：等待调用方发 Rebuild。
-                            std::thread::sleep(Duration::from_millis(5));
                         }
                     }
                 }
@@ -656,6 +793,8 @@ impl HostPipeline {
             first_capture: None,
             wake,
             last_wake_gen: 0,
+            capture_invalidation: None,
+            rebuild_retry_at: None,
         })
     }
 
@@ -772,8 +911,13 @@ impl HostPipeline {
             signal_wake(&self.cap_space);
             match msg {
                 CapMsg::Invalidated(reason) => {
+                    self.capture_invalidation = Some(reason);
+                    self.rebuild_retry_at = None;
                     if reason.is_recoverable() {
-                        let _ = self.cap_cmd.try_send(CapCmd::Rebuild);
+                        if self.cap_cmd.try_send(CapCmd::Rebuild).is_err() {
+                            self.rebuild_retry_at =
+                                Some(Instant::now() + CAPTURE_REBUILD_RETRY_BACKOFF);
+                        }
                     } else {
                         return Err(Error::Capture {
                             recoverable: false,
@@ -781,12 +925,48 @@ impl HostPipeline {
                         });
                     }
                 }
+                CapMsg::RebuildFailed(reason) => {
+                    self.capture_invalidation = Some(reason);
+                    if reason.is_recoverable() {
+                        self.rebuild_retry_at =
+                            Some(Instant::now() + CAPTURE_REBUILD_RETRY_BACKOFF);
+                    } else {
+                        self.rebuild_retry_at = None;
+                        return Err(Error::Capture {
+                            recoverable: false,
+                            msg: format!("fatal rebuild failure: {reason:?}"),
+                        });
+                    }
+                }
+                CapMsg::Rebuilt => {
+                    self.capture_invalidation = None;
+                    self.rebuild_retry_at = None;
+                    self.pending_idr = true;
+                    self.diff.reset();
+                }
                 CapMsg::Frame(frame) => {
                     saw_frame = true;
                     if let Some(dgs) = self.process_frame(*frame, now_us)? {
                         out.extend(dgs);
                     }
                     break;
+                }
+            }
+        }
+
+        if let Some(retry_at) = self.rebuild_retry_at {
+            if Instant::now() >= retry_at {
+                match self.cap_cmd.try_send(CapCmd::Rebuild) {
+                    Ok(()) => {
+                        self.rebuild_retry_at = None;
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        self.rebuild_retry_at =
+                            Some(Instant::now() + CAPTURE_REBUILD_RETRY_BACKOFF);
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        self.rebuild_retry_at = None;
+                    }
                 }
             }
         }
@@ -861,6 +1041,16 @@ impl HostPipeline {
             .lock()
             .map(|g| *g != self.last_wake_gen)
             .unwrap_or(false)
+    }
+
+    /// 当前采集失效/挂起原因（正常采集时为 `None`，挂起/重建退避期为 `Some(reason)`）。
+    pub fn capture_invalidation(&self) -> Option<rc_capture::InvalidationReason> {
+        self.capture_invalidation
+    }
+
+    /// 当前采集是否处于挂起/待恢复态（如锁屏、显示器休眠或权限暂失）。
+    pub fn is_capture_suspended(&self) -> bool {
+        self.capture_invalidation.is_some()
     }
 
     /// 会话收尾第一步：只停采集线程（不再有新帧进入交接通道）。
@@ -1220,5 +1410,482 @@ mod tests {
             max_in_flight.load(Ordering::SeqCst) <= 2,
             "VT 在途数不得超过 2"
         );
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockCapMode {
+        Healthy,
+        NoneInvalidated(rc_capture::InvalidationReason),
+        ErrInvalidated(rc_capture::InvalidationReason),
+    }
+
+    struct MockCapState {
+        mode: MockCapMode,
+        polled_reason: Option<rc_capture::InvalidationReason>,
+        rebuild_recoverable_failures: usize,
+        rebuild_fatal: bool,
+        rebuild_calls: usize,
+        next_frame_calls: usize,
+        frame_seq: u64,
+        clock_start: Instant,
+    }
+
+    struct MockInvalidatingCapture {
+        state: Arc<Mutex<MockCapState>>,
+    }
+
+    impl CaptureBackend for MockInvalidatingCapture {
+        fn next_frame(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>> {
+            let mut st = self.state.lock().unwrap();
+            st.next_frame_calls += 1;
+            match st.mode {
+                MockCapMode::NoneInvalidated(reason) => {
+                    st.polled_reason = Some(reason);
+                    drop(st);
+                    std::thread::sleep(timeout.min(Duration::from_millis(2)));
+                    Ok(None)
+                }
+                MockCapMode::ErrInvalidated(reason) => {
+                    st.polled_reason = Some(reason);
+                    Err(reason.to_capture_error("simulated capture err"))
+                }
+                MockCapMode::Healthy => {
+                    st.frame_seq += 1;
+                    let seq = st.frame_seq;
+                    let ts =
+                        u32::try_from(st.clock_start.elapsed().as_micros()).unwrap_or(u32::MAX);
+                    let mut pixels = vec![0u8; 64 * 64 * 4];
+                    pixels[0] = (seq & 0xff) as u8;
+                    pixels[1] = ((seq >> 8) & 0xff) as u8;
+                    drop(st);
+                    std::thread::sleep(Duration::from_millis(2));
+                    Ok(Some(CapturedFrame {
+                        texture: FrameTexture::Cpu(rc_types::CpuFrame {
+                            width: 64,
+                            height: 64,
+                            stride: 64 * 4,
+                            format: rc_types::PixelFormat::Bgra8,
+                            data: pixels,
+                        }),
+                        timestamp: Timestamp(ts),
+                        dirty: None,
+                        seq: rc_types::CaptureSeq(seq),
+                        is_repeat: false,
+                        resource_guard: None,
+                    }))
+                }
+            }
+        }
+
+        fn poll_invalidation(&mut self) -> Option<rc_capture::InvalidationReason> {
+            self.state.lock().unwrap().polled_reason
+        }
+
+        fn rebuild(&mut self) -> Result<()> {
+            let mut st = self.state.lock().unwrap();
+            st.rebuild_calls += 1;
+            if st.rebuild_fatal {
+                return Err(Error::Capture {
+                    recoverable: false,
+                    msg: "fatal mock rebuild".into(),
+                });
+            }
+            if st.rebuild_recoverable_failures > 0 {
+                st.rebuild_recoverable_failures -= 1;
+                let reason = st
+                    .polled_reason
+                    .unwrap_or(rc_capture::InvalidationReason::SessionLocked);
+                return Err(reason.to_capture_error("still suspended"));
+            }
+            st.polled_reason = None;
+            st.mode = MockCapMode::Healthy;
+            Ok(())
+        }
+
+        fn display_info(&self) -> rc_capture::DisplayInfo {
+            rc_capture::DisplayInfo {
+                id: rc_types::DisplayId(0),
+                resolution: Resolution::new(64, 64),
+                scale: 1.0,
+                hdr: false,
+            }
+        }
+    }
+
+    #[test]
+    fn ok_none_invalidation_retries_rebuild_with_backoff_and_recovers_with_idr() {
+        let clock_start = Instant::now();
+        let now_us = || u32::try_from(clock_start.elapsed().as_micros()).unwrap_or(u32::MAX);
+        let state = Arc::new(Mutex::new(MockCapState {
+            mode: MockCapMode::NoneInvalidated(rc_capture::InvalidationReason::SessionLocked),
+            polled_reason: Some(rc_capture::InvalidationReason::SessionLocked),
+            rebuild_recoverable_failures: 1,
+            rebuild_fatal: false,
+            rebuild_calls: 0,
+            next_frame_calls: 0,
+            frame_seq: 0,
+            clock_start,
+        }));
+        let cap = MockInvalidatingCapture {
+            state: Arc::clone(&state),
+        };
+        let enc = rc_encode::FakeEncoder::new(EncoderConfig {
+            resolution: Resolution::new(64, 64),
+            fps: 60,
+            ..EncoderConfig::default()
+        })
+        .expect("fake encoder");
+        let mut pipe = HostPipeline::with_backends(
+            PipelineConfig {
+                resolution: Resolution::new(64, 64),
+                fps: 60,
+                ..PipelineConfig::default()
+            },
+            Box::new(cap),
+            Box::new(enc),
+        )
+        .expect("pipeline");
+
+        // 1) Observe initial invalidation + first recoverable rebuild failure (must NOT kill pipeline)
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let _ = pipe
+                .tick(now_us())
+                .expect("recoverable invalidation/rebuild failure must not kill pipeline");
+            if pipe.capture_invalidation() == Some(rc_capture::InvalidationReason::SessionLocked)
+                && state.lock().unwrap().rebuild_calls >= 1
+                && pipe.rebuild_retry_at.is_some()
+            {
+                break;
+            }
+            pipe.wait_event(Duration::from_millis(5));
+        }
+        assert_eq!(
+            pipe.capture_invalidation(),
+            Some(rc_capture::InvalidationReason::SessionLocked)
+        );
+        assert!(pipe.is_capture_suspended());
+        let calls_after_first_fail = state.lock().unwrap().rebuild_calls;
+        assert_eq!(
+            calls_after_first_fail, 1,
+            "first rebuild should have run once and entered backoff"
+        );
+        let next_calls_before_wait = state.lock().unwrap().next_frame_calls;
+        // Brief window within 500ms backoff: capture thread must stay parked (no next_frame spin, no immediate retry)
+        std::thread::sleep(Duration::from_millis(60));
+        let _ = pipe.tick(now_us()).expect("tick during backoff");
+        assert_eq!(
+            state.lock().unwrap().rebuild_calls,
+            1,
+            "rebuild must not fire before 500ms backoff elapses"
+        );
+        assert_eq!(
+            state.lock().unwrap().next_frame_calls,
+            next_calls_before_wait,
+            "capture thread must wait for CapCmd::Rebuild instead of spinning next_frame"
+        );
+
+        // 2) After 500ms backoff elapses, second rebuild succeeds -> clears invalidation and emits IDR frame
+        let recover_deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_idr_after_recovery = false;
+        while Instant::now() < recover_deadline {
+            if let Some(dgs) = pipe.tick(now_us()).expect("tick during recovery") {
+                if !pipe.is_capture_suspended() {
+                    for dg in dgs {
+                        let hdr = datagram_header(&dg).expect("parse header");
+                        if hdr.flags.is_idr() {
+                            saw_idr_after_recovery = true;
+                        }
+                    }
+                }
+            }
+            if !pipe.is_capture_suspended() && saw_idr_after_recovery {
+                break;
+            }
+            pipe.wait_event(Duration::from_millis(10));
+        }
+
+        assert_eq!(pipe.capture_invalidation(), None);
+        assert!(!pipe.is_capture_suspended());
+        assert_eq!(state.lock().unwrap().rebuild_calls, 2);
+        assert!(
+            saw_idr_after_recovery,
+            "recovery must force an IDR frame for the controller"
+        );
+        pipe.shutdown();
+    }
+
+    #[test]
+    fn err_invalidation_preserves_polled_reason_and_fatal_rebuild_fails_pipeline() {
+        // Part 1: Err(recoverable) preserves poll_invalidation() reason (DisplayChanged) and recovers with IDR
+        let clock_start = Instant::now();
+        let now_us = || u32::try_from(clock_start.elapsed().as_micros()).unwrap_or(u32::MAX);
+        let state = Arc::new(Mutex::new(MockCapState {
+            mode: MockCapMode::Healthy,
+            polled_reason: None,
+            rebuild_recoverable_failures: 0,
+            rebuild_fatal: false,
+            rebuild_calls: 0,
+            next_frame_calls: 0,
+            frame_seq: 0,
+            clock_start,
+        }));
+        let cap = MockInvalidatingCapture {
+            state: Arc::clone(&state),
+        };
+        let enc = rc_encode::FakeEncoder::new(EncoderConfig {
+            resolution: Resolution::new(64, 64),
+            fps: 60,
+            ..EncoderConfig::default()
+        })
+        .expect("fake encoder");
+        let mut pipe = HostPipeline::with_backends(
+            PipelineConfig {
+                resolution: Resolution::new(64, 64),
+                fps: 60,
+                ..PipelineConfig::default()
+            },
+            Box::new(cap),
+            Box::new(enc),
+        )
+        .expect("pipeline");
+
+        // Produce initial IDR so no_idr_yet becomes false
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && pipe.no_idr_yet {
+            let _ = pipe.tick(now_us()).expect("initial tick");
+            pipe.wait_event(Duration::from_millis(5));
+        }
+        assert!(!pipe.no_idr_yet, "initial IDR should have been produced");
+
+        // Inject DisplayChanged error + 1 recoverable rebuild failure so we can observe the exact reason
+        {
+            let mut st = state.lock().unwrap();
+            st.rebuild_recoverable_failures = 1;
+            st.mode = MockCapMode::ErrInvalidated(rc_capture::InvalidationReason::DisplayChanged);
+        }
+        let obs_deadline = Instant::now() + Duration::from_secs(2);
+        let mut observed_display_changed = false;
+        while Instant::now() < obs_deadline {
+            let _ = pipe.tick(now_us()).expect("recoverable tick");
+            if pipe.capture_invalidation() == Some(rc_capture::InvalidationReason::DisplayChanged) {
+                observed_display_changed = true;
+                break;
+            }
+            pipe.wait_event(Duration::from_millis(5));
+        }
+        assert!(
+            observed_display_changed,
+            "Err(recoverable) must preserve poll_invalidation() DisplayChanged reason"
+        );
+
+        // Wait for recovery after backoff and verify an IDR frame is emitted even though no_idr_yet is false
+        let rec_deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_idr_after_err_recovery = false;
+        while Instant::now() < rec_deadline {
+            if let Some(dgs) = pipe.tick(now_us()).expect("recovery tick") {
+                if !pipe.is_capture_suspended() {
+                    for dg in dgs {
+                        let hdr = datagram_header(&dg).expect("parse header");
+                        if hdr.flags.is_idr() {
+                            saw_idr_after_err_recovery = true;
+                        }
+                    }
+                }
+            }
+            if !pipe.is_capture_suspended() && saw_idr_after_err_recovery {
+                break;
+            }
+            pipe.wait_event(Duration::from_millis(10));
+        }
+        assert_eq!(pipe.capture_invalidation(), None);
+        assert!(
+            saw_idr_after_err_recovery,
+            "Rebuilt must set pending_idr=true and emit an IDR frame even after initial IDR"
+        );
+        pipe.shutdown();
+
+        // Part 2: Fatal rebuild error fails HostPipeline::tick
+        let fatal_state = Arc::new(Mutex::new(MockCapState {
+            mode: MockCapMode::NoneInvalidated(rc_capture::InvalidationReason::SessionLocked),
+            polled_reason: Some(rc_capture::InvalidationReason::SessionLocked),
+            rebuild_recoverable_failures: 0,
+            rebuild_fatal: true,
+            rebuild_calls: 0,
+            next_frame_calls: 0,
+            frame_seq: 0,
+            clock_start,
+        }));
+        let fatal_cap = MockInvalidatingCapture {
+            state: Arc::clone(&fatal_state),
+        };
+        let fatal_enc = rc_encode::FakeEncoder::new(EncoderConfig {
+            resolution: Resolution::new(64, 64),
+            fps: 60,
+            ..EncoderConfig::default()
+        })
+        .expect("fake encoder");
+        let mut fatal_pipe = HostPipeline::with_backends(
+            PipelineConfig {
+                resolution: Resolution::new(64, 64),
+                fps: 60,
+                ..PipelineConfig::default()
+            },
+            Box::new(fatal_cap),
+            Box::new(fatal_enc),
+        )
+        .expect("pipeline");
+
+        let fatal_deadline = Instant::now() + Duration::from_secs(2);
+        let mut got_fatal_err = false;
+        while Instant::now() < fatal_deadline {
+            match fatal_pipe.tick(now_us()) {
+                Ok(_) => {
+                    fatal_pipe.wait_event(Duration::from_millis(5));
+                }
+                Err(err) => {
+                    assert!(err.is_fatal(), "expected fatal error, got {err:?}");
+                    got_fatal_err = true;
+                    break;
+                }
+            }
+        }
+        assert!(got_fatal_err, "fatal rebuild failure must fail pipeline");
+        fatal_pipe.shutdown();
+    }
+
+    #[test]
+    fn rebuilt_resets_tile_diff_so_identical_recovery_frame_emits_idr() {
+        struct StaticIdenticalRecoveryCapture {
+            state: Arc<Mutex<MockCapState>>,
+        }
+        impl CaptureBackend for StaticIdenticalRecoveryCapture {
+            fn next_frame(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>> {
+                let mut st = self.state.lock().unwrap();
+                st.next_frame_calls += 1;
+                match st.mode {
+                    MockCapMode::NoneInvalidated(reason) => {
+                        st.polled_reason = Some(reason);
+                        drop(st);
+                        std::thread::sleep(timeout.min(Duration::from_millis(2)));
+                        Ok(None)
+                    }
+                    MockCapMode::ErrInvalidated(reason) => {
+                        st.polled_reason = Some(reason);
+                        Err(reason.to_capture_error("simulated err"))
+                    }
+                    MockCapMode::Healthy => {
+                        st.frame_seq += 1;
+                        let seq = st.frame_seq;
+                        let ts =
+                            u32::try_from(st.clock_start.elapsed().as_micros()).unwrap_or(u32::MAX);
+                        drop(st);
+                        std::thread::sleep(Duration::from_millis(2));
+                        // Pixel-identical BGRA frame before and after rebuild!
+                        Ok(Some(CapturedFrame {
+                            texture: FrameTexture::Cpu(rc_types::CpuFrame {
+                                width: 64,
+                                height: 64,
+                                stride: 64 * 4,
+                                format: rc_types::PixelFormat::Bgra8,
+                                data: vec![0x42u8; 64 * 64 * 4],
+                            }),
+                            timestamp: Timestamp(ts),
+                            dirty: None,
+                            seq: rc_types::CaptureSeq(seq),
+                            is_repeat: false,
+                            resource_guard: None,
+                        }))
+                    }
+                }
+            }
+            fn poll_invalidation(&mut self) -> Option<rc_capture::InvalidationReason> {
+                self.state.lock().unwrap().polled_reason
+            }
+            fn rebuild(&mut self) -> Result<()> {
+                let mut st = self.state.lock().unwrap();
+                st.rebuild_calls += 1;
+                st.polled_reason = None;
+                st.mode = MockCapMode::Healthy;
+                Ok(())
+            }
+            fn display_info(&self) -> rc_capture::DisplayInfo {
+                rc_capture::DisplayInfo {
+                    id: rc_types::DisplayId(0),
+                    resolution: Resolution::new(64, 64),
+                    scale: 1.0,
+                    hdr: false,
+                }
+            }
+        }
+
+        let clock_start = Instant::now();
+        let now_us = || u32::try_from(clock_start.elapsed().as_micros()).unwrap_or(u32::MAX);
+        let state = Arc::new(Mutex::new(MockCapState {
+            mode: MockCapMode::Healthy,
+            polled_reason: None,
+            rebuild_recoverable_failures: 0,
+            rebuild_fatal: false,
+            rebuild_calls: 0,
+            next_frame_calls: 0,
+            frame_seq: 0,
+            clock_start,
+        }));
+        let cap = StaticIdenticalRecoveryCapture {
+            state: Arc::clone(&state),
+        };
+        let enc = rc_encode::FakeEncoder::new(EncoderConfig {
+            resolution: Resolution::new(64, 64),
+            fps: 60,
+            ..EncoderConfig::default()
+        })
+        .expect("fake encoder");
+        let mut pipe = HostPipeline::with_backends(
+            PipelineConfig {
+                resolution: Resolution::new(64, 64),
+                fps: 60,
+                diff: DiffMode::TileDiff,
+                ..PipelineConfig::default()
+            },
+            Box::new(cap),
+            Box::new(enc),
+        )
+        .expect("pipeline");
+
+        // Emit first IDR so TileDiff caches the 0x42 frame hash and no_idr_yet becomes false.
+        let init_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < init_deadline && pipe.no_idr_yet {
+            let _ = pipe.tick(now_us()).expect("initial tick");
+            pipe.wait_event(Duration::from_millis(5));
+        }
+        assert!(!pipe.no_idr_yet);
+
+        // Trigger SessionLocked -> rebuild -> pixel-identical 0x42 frame must still emit IDR!
+        {
+            let mut st = state.lock().unwrap();
+            st.mode = MockCapMode::NoneInvalidated(rc_capture::InvalidationReason::SessionLocked);
+        }
+        let rec_deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_idr_after_rebuild = false;
+        while Instant::now() < rec_deadline {
+            if let Some(dgs) = pipe.tick(now_us()).expect("tick") {
+                if state.lock().unwrap().rebuild_calls >= 1 {
+                    for dg in dgs {
+                        if datagram_header(&dg).expect("hdr").flags.is_idr() {
+                            saw_idr_after_rebuild = true;
+                        }
+                    }
+                }
+            }
+            if saw_idr_after_rebuild {
+                break;
+            }
+            pipe.wait_event(Duration::from_millis(5));
+        }
+        assert!(
+            saw_idr_after_rebuild,
+            "TileDiff reset on Rebuilt must allow identical post-recovery frame to emit IDR"
+        );
+        pipe.shutdown();
     }
 }

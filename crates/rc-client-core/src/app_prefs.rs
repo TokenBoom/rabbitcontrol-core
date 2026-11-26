@@ -202,6 +202,9 @@ pub struct AppPrefs {
     /// 可选应用更新镜像加速前缀（空串表示直连 GitHub Releases；非空时必须为 `https://`）。
     #[serde(default)]
     pub update_mirror_url: String,
+    /// 可选 W2 文件传输自定义存储路径（`None` 表示使用平台默认接收目录）。
+    #[serde(default)]
+    pub file_transfer_dir: Option<String>,
 }
 
 fn default_privacy_mode() -> String {
@@ -289,6 +292,7 @@ impl Default for AppPrefs {
             shortcut_exceptions: Vec::new(),
             mouse_mode: default_mouse_mode(),
             update_mirror_url: String::new(),
+            file_transfer_dir: None,
         }
     }
 }
@@ -808,6 +812,33 @@ impl AppPrefs {
         Ok(())
     }
 
+    /// 返回当前生效的文件传输接收目录（未配置或配置无效时回退至平台默认目录）。
+    pub fn resolved_file_transfer_dir(&self) -> PathBuf {
+        match self.file_transfer_dir.as_deref() {
+            Some(raw) => match sanitize_file_transfer_dir(raw) {
+                Ok(Some(clean)) => PathBuf::from(clean),
+                _ => default_file_transfer_dir(),
+            },
+            None => default_file_transfer_dir(),
+        }
+    }
+
+    /// 判断当前是否使用平台默认文件传输接收目录。
+    pub fn is_default_file_transfer_dir(&self) -> bool {
+        self.file_transfer_dir.is_none()
+            || self.resolved_file_transfer_dir() == default_file_transfer_dir()
+    }
+
+    /// 校验并更新文件传输接收目录；传入 `None` 或空串时恢复默认，返回生效路径。
+    pub fn apply_file_transfer_dir(&mut self, raw: Option<String>) -> Result<PathBuf, String> {
+        let next = match raw {
+            None => None,
+            Some(s) => sanitize_file_transfer_dir(&s)?,
+        };
+        self.file_transfer_dir = next;
+        Ok(self.resolved_file_transfer_dir())
+    }
+
     /// 读取自定义隐私屏保图片的 `data:image/...;base64,...` 预览 URL。
     pub fn privacy_custom_data_url(&self, dir: &Path) -> Option<String> {
         let name = self.privacy_custom_image.as_deref()?;
@@ -884,6 +915,158 @@ pub fn default_prefs_path() -> PathBuf {
 /// 返回默认设备壁纸缓存目录：`$HOME/.config/rabbitcontrol/wallpapers`。
 pub fn default_wallpapers_dir() -> PathBuf {
     config_root_dir().join("wallpapers")
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
+
+/// 返回文件传输的平台默认接收目录。
+///
+/// - macOS：`<HOME>/Library/Application Support/RabbitControl/Download`；
+/// - 其他平台：`<HOME/USERPROFILE>/Downloads/RabbitControl`；
+/// - 用户主目录环境变量不可用时回退至 `<user_config_dir>/Download`。
+pub fn default_file_transfer_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("RabbitControl")
+                .join("Download");
+        }
+        crate::config_paths::user_config_dir().join("Download")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(home) = user_home_dir() {
+            return home.join("Downloads").join("RabbitControl");
+        }
+        crate::config_paths::user_config_dir().join("Download")
+    }
+}
+
+fn reject_tilde_absolute_suffix(rest: &str) -> Result<(), String> {
+    if rest.starts_with('/')
+        || rest.starts_with('\\')
+        || Path::new(rest).is_absolute()
+        || matches!(
+            Path::new(rest).components().next(),
+            Some(Component::Prefix(_) | Component::RootDir)
+        )
+    {
+        return Err("文件传输存储路径格式无效".to_string());
+    }
+    Ok(())
+}
+
+fn is_windows_unc_share_root(path: &str) -> bool {
+    let body = if let Some(rest) = path
+        .strip_prefix("\\\\?\\UNC\\")
+        .or_else(|| path.strip_prefix("\\\\.\\UNC\\"))
+    {
+        rest
+    } else if let Some(rest) = path.strip_prefix("\\\\") {
+        if rest.starts_with("?\\") || rest.starts_with(".\\") {
+            return false;
+        }
+        rest
+    } else {
+        return false;
+    };
+    let seg_count = body
+        .split(['\\', '/'])
+        .filter(|seg| !seg.is_empty())
+        .count();
+    seg_count <= 2
+}
+
+fn trim_trailing_separators(normalized: &mut String, is_windows: bool) {
+    if is_windows {
+        while normalized.len() > 1 {
+            let ends_sep = normalized.ends_with('/') || normalized.ends_with('\\');
+            if !ends_sep {
+                break;
+            }
+            // 保留普通盘符根（如 `C:\`、`C:/`）与 verbatim/device 盘符根（如 `\\?\C:\`）。
+            if normalized.as_bytes().get(normalized.len() - 2) == Some(&b':') {
+                break;
+            }
+            // 保留 UNC 共享根目录（如 `\\server\share\`、`\\?\UNC\server\share\`）。
+            if is_windows_unc_share_root(normalized) {
+                break;
+            }
+            #[cfg(windows)]
+            if Path::new(normalized.as_str()).parent().is_none() {
+                break;
+            }
+            normalized.pop();
+        }
+    } else {
+        while normalized.len() > 1 && normalized.ends_with('/') {
+            normalized.pop();
+        }
+    }
+}
+
+/// 校验并规范化自定义文件传输接收目录路径。
+///
+/// - 空串或纯空白返回 `Ok(None)`（恢复默认）；
+/// - 拒绝 NUL 与任意控制字符（`char::is_control`）；
+/// - 展开前导 `~` / `~/`（Windows 同时支持 `~\`），并拒绝 `~//...` 等覆盖主目录的后缀；
+/// - 拒绝包含 `..`（`Component::ParentDir`）的穿越路径；
+/// - 要求结果为绝对路径，并去除非根目录尾部分隔符（保留 POSIX `/`、Windows 盘符/verbatim 根与 UNC 共享根）。
+pub fn sanitize_file_transfer_dir(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("文件传输存储路径不能包含控制字符".to_string());
+    }
+
+    let expanded: PathBuf = if trimmed == "~" {
+        user_home_dir().ok_or_else(|| "无法解析用户主目录（~）".to_string())?
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        reject_tilde_absolute_suffix(rest)?;
+        let home = user_home_dir().ok_or_else(|| "无法解析用户主目录（~）".to_string())?;
+        if rest.is_empty() {
+            home
+        } else {
+            home.join(rest)
+        }
+    } else if cfg!(windows) && trimmed.starts_with("~\\") {
+        let rest = &trimmed[2..];
+        reject_tilde_absolute_suffix(rest)?;
+        let home = user_home_dir().ok_or_else(|| "无法解析用户主目录（~）".to_string())?;
+        if rest.is_empty() {
+            home
+        } else {
+            home.join(rest)
+        }
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    if expanded
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err("文件传输存储路径不能包含父目录引用（..）".to_string());
+    }
+
+    if !expanded.is_absolute() {
+        return Err("文件传输存储路径必须为绝对路径".to_string());
+    }
+
+    let mut normalized = expanded.to_string_lossy().into_owned();
+    trim_trailing_separators(&mut normalized, cfg!(windows));
+
+    Ok(Some(normalized))
 }
 
 pub(crate) fn encode_hex_lower(bytes: &[u8]) -> String {
@@ -989,6 +1172,10 @@ fn sanitize_prefs(prefs: &mut AppPrefs) {
     }
     prefs.update_mirror_url =
         crate::updater::sanitize_update_mirror_url(&prefs.update_mirror_url).unwrap_or_default();
+    prefs.file_transfer_dir = prefs
+        .file_transfer_dir
+        .as_deref()
+        .and_then(|raw| sanitize_file_transfer_dir(raw).ok().flatten());
     let mut clean_exc = Vec::with_capacity(prefs.shortcut_exceptions.len().min(32));
     for item in &prefs.shortcut_exceptions {
         let t = item.trim();
@@ -1553,6 +1740,121 @@ mod tests {
         save_to_path(&path, &custom).unwrap();
         let reloaded = load_from_path(&path);
         assert!(!reloaded.close_to_tray);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_transfer_dir_sanitization_defaults_and_persistence() {
+        let dir = temp_test_dir("ft-dir-prefs");
+        let path = dir.join("prefs.json");
+
+        // 1) Default path & methods
+        let default_dir = default_file_transfer_dir();
+        #[cfg(target_os = "macos")]
+        assert!(default_dir.ends_with("Library/Application Support/RabbitControl/Download"));
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            default_dir.ends_with("Downloads/RabbitControl") || default_dir.ends_with("Download")
+        );
+
+        let mut prefs = AppPrefs::default();
+        assert_eq!(prefs.file_transfer_dir, None);
+        assert!(prefs.is_default_file_transfer_dir());
+        assert_eq!(prefs.resolved_file_transfer_dir(), default_dir);
+
+        // 2) Sanitization: empty -> None, trailing slash normalized, root preserved, ~ expanded
+        assert_eq!(sanitize_file_transfer_dir("   ").unwrap(), None);
+        let custom_dir = dir.join("custom_downloads");
+        let with_trailing = format!("{}/", custom_dir.to_string_lossy());
+        assert_eq!(
+            sanitize_file_transfer_dir(&with_trailing).unwrap(),
+            Some(custom_dir.to_string_lossy().into_owned())
+        );
+
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                sanitize_file_transfer_dir("/").unwrap(),
+                Some("/".to_string())
+            );
+            assert_eq!(
+                sanitize_file_transfer_dir("///").unwrap(),
+                Some("/".to_string())
+            );
+        }
+
+        if user_home_dir().is_some() {
+            let expanded_tilde = sanitize_file_transfer_dir("~/Downloads/").unwrap().unwrap();
+            assert!(Path::new(&expanded_tilde).is_absolute());
+            assert!(!expanded_tilde.ends_with('/'));
+            let expanded_home = sanitize_file_transfer_dir("~").unwrap().unwrap();
+            assert!(Path::new(&expanded_home).is_absolute());
+        }
+
+        // Reject relative paths, NUL, ASCII/Unicode control chars, `..` traversal, and `~//abs` escape
+        assert!(sanitize_file_transfer_dir("relative/path").is_err());
+        assert!(sanitize_file_transfer_dir("./local").is_err());
+        assert!(sanitize_file_transfer_dir("~//etc").is_err());
+        assert!(sanitize_file_transfer_dir("~/\\etc").is_err());
+        assert!(sanitize_file_transfer_dir("~/../../etc").is_err());
+        let traversal = format!("{}/../../etc", custom_dir.to_string_lossy());
+        assert!(sanitize_file_transfer_dir(&traversal).is_err());
+        let bad_nul = format!("{}\0evil", custom_dir.to_string_lossy());
+        assert!(sanitize_file_transfer_dir(&bad_nul).is_err());
+        let bad_ctrl = format!("{}\nline", custom_dir.to_string_lossy());
+        assert!(sanitize_file_transfer_dir(&bad_ctrl).is_err());
+        let bad_del = format!("{}\x7fdel", custom_dir.to_string_lossy());
+        assert!(sanitize_file_transfer_dir(&bad_del).is_err());
+        let bad_c1 = format!("{}\u{0085}nel", custom_dir.to_string_lossy());
+        assert!(sanitize_file_transfer_dir(&bad_c1).is_err());
+
+        // Windows root preservation helper checks (drive root, verbatim root, UNC share root)
+        let mut win_drive = String::from("C:\\");
+        trim_trailing_separators(&mut win_drive, true);
+        assert_eq!(win_drive, "C:\\");
+        let mut win_verbatim = String::from("\\\\?\\C:\\");
+        trim_trailing_separators(&mut win_verbatim, true);
+        assert_eq!(win_verbatim, "\\\\?\\C:\\");
+        let mut win_verbatim_sub = String::from("\\\\?\\C:\\Downloads\\\\");
+        trim_trailing_separators(&mut win_verbatim_sub, true);
+        assert_eq!(win_verbatim_sub, "\\\\?\\C:\\Downloads");
+        let mut win_unc_root = String::from("\\\\server\\share\\");
+        trim_trailing_separators(&mut win_unc_root, true);
+        assert_eq!(win_unc_root, "\\\\server\\share\\");
+        let mut win_unc_sub = String::from("\\\\server\\share\\folder\\\\");
+        trim_trailing_separators(&mut win_unc_sub, true);
+        assert_eq!(win_unc_sub, "\\\\server\\share\\folder");
+
+        // 3) apply_file_transfer_dir + persistence roundtrip
+        let applied = prefs
+            .apply_file_transfer_dir(Some(with_trailing))
+            .expect("apply custom dir");
+        assert_eq!(applied, custom_dir);
+        assert!(!prefs.is_default_file_transfer_dir());
+        assert_eq!(prefs.resolved_file_transfer_dir(), custom_dir);
+
+        save_to_path(&path, &prefs).expect("save prefs with file_transfer_dir");
+        let reloaded = load_from_path(&path);
+        assert_eq!(reloaded.file_transfer_dir, prefs.file_transfer_dir);
+        assert_eq!(reloaded.resolved_file_transfer_dir(), custom_dir);
+
+        // Reset back to default via empty string
+        let reset = prefs
+            .apply_file_transfer_dir(Some(String::new()))
+            .expect("reset default");
+        assert_eq!(reset, default_dir);
+        assert_eq!(prefs.file_transfer_dir, None);
+        assert!(prefs.is_default_file_transfer_dir());
+
+        // 4) Invalid disk value silently resets to None in sanitize_prefs
+        let tainted = serde_json::json!({
+            "fileTransferDir": "relative/not-allowed"
+        });
+        fs::write(&path, serde_json::to_vec(&tainted).unwrap()).unwrap();
+        let cleaned = load_from_path(&path);
+        assert_eq!(cleaned.file_transfer_dir, None);
+        assert!(cleaned.is_default_file_transfer_dir());
 
         let _ = fs::remove_dir_all(&dir);
     }

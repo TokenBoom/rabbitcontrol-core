@@ -377,6 +377,13 @@ pub enum SessionUpdate {
     HostVersion(crate::updater::RemoteHostVersion),
     /// 远端更新或控制端中转推送的实时进度快照。
     RemoteUpdateStatus(crate::updater::UpdateProgress),
+    /// 被控端锁屏与屏幕采集挂起状态变更通知。
+    HostScreenState {
+        /// 被控端当前是否处于系统锁屏界面。
+        locked: bool,
+        /// 被控端屏幕采集当前是否处于挂起/待恢复态。
+        capture_suspended: bool,
+    },
     /// 当收到对端 `ByeReason::SessionSwitching` 时先推送 `SessionSwitching` 通知前端自动短延迟重连。
     SessionSwitching {
         /// 人类可读的切换提示。
@@ -4080,6 +4087,13 @@ fn handle_display_ctrl_msg(
                 error,
             },
         )),
+        DisplayControlMsg::HostScreenState {
+            locked,
+            capture_suspended,
+        } => Some(SessionUpdate::HostScreenState {
+            locked,
+            capture_suspended,
+        }),
         DisplayControlMsg::SetStream { .. }
         | DisplayControlMsg::LockScreen
         | DisplayControlMsg::SetCodec { .. }
@@ -5127,5 +5141,28 @@ mod tests {
             "min_rtt aging must allow recovery after baseline shift"
         );
         assert_eq!(ctrl.current_bps, 14_000_000);
+    }
+
+    #[test]
+    fn handle_display_ctrl_msg_emits_host_screen_state_update() {
+        let mut hud_w = 1920u32;
+        let mut hud_h = 1080u32;
+        let upd = handle_display_ctrl_msg(
+            DisplayControlMsg::HostScreenState {
+                locked: true,
+                capture_suspended: false,
+            },
+            &mut hud_w,
+            &mut hud_h,
+            true,
+        );
+        assert_eq!(
+            upd,
+            Some(SessionUpdate::HostScreenState {
+                locked: true,
+                capture_suspended: false,
+            })
+        );
+        assert_eq!((hud_w, hud_h), (1920, 1080));
     }
 }

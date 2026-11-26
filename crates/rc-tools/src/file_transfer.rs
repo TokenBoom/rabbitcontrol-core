@@ -983,6 +983,7 @@ pub struct FileHostEngine {
     uploads: BTreeMap<u64, HostActiveUpload>,
     downloads: BTreeMap<u64, HostActiveDownload>,
     download_rr_cursor: u64,
+    default_receive_dir: Option<PathBuf>,
 }
 
 impl Default for FileHostEngine {
@@ -999,7 +1000,19 @@ impl FileHostEngine {
             uploads: BTreeMap::new(),
             downloads: BTreeMap::new(),
             download_rr_cursor: 0,
+            default_receive_dir: None,
         }
+    }
+
+    /// 配置远端上传未指定目标目录时的默认接收目录（链式构造；空路径视为 `None`）。
+    pub fn with_default_receive_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.default_receive_dir = dir.filter(|d| !d.as_os_str().is_empty());
+        self
+    }
+
+    /// 动态更新远端上传未指定目标目录时的默认接收目录（空路径视为 `None`）。
+    pub fn set_default_receive_dir(&mut self, dir: Option<PathBuf>) {
+        self.default_receive_dir = dir.filter(|d| !d.as_os_str().is_empty());
     }
 
     /// 返回当前进行中的上传任务数量。
@@ -1174,7 +1187,41 @@ impl FileHostEngine {
             }
         };
 
-        let dir_path = expand_tilde(remote_dir);
+        let dir_path = if remote_dir.trim().is_empty() {
+            if let Some(ref default_dir) = self.default_receive_dir {
+                if !default_dir.is_absolute()
+                    || default_dir
+                        .components()
+                        .any(|c| matches!(c, Component::ParentDir))
+                {
+                    self.enqueue_critical(&FileWireMsg::UploadAck {
+                        id,
+                        ok: false,
+                        error: Some(format!(
+                            "invalid default receive dir '{}': must be an absolute path without '..'",
+                            default_dir.display()
+                        )),
+                    });
+                    return;
+                }
+                if let Err(e) = fs::create_dir_all(default_dir) {
+                    self.enqueue_critical(&FileWireMsg::UploadAck {
+                        id,
+                        ok: false,
+                        error: Some(format!(
+                            "failed to create default receive dir '{}': {e}",
+                            default_dir.display()
+                        )),
+                    });
+                    return;
+                }
+                default_dir.clone()
+            } else {
+                default_home_dir()
+            }
+        } else {
+            expand_tilde(remote_dir)
+        };
         let canonical_dir = match fs::canonicalize(&dir_path) {
             Ok(p) if p.is_dir() => p,
             Ok(p) => {
@@ -2612,6 +2659,144 @@ mod tests {
             other => panic!("expected DeleteResult ok, got {other:?}"),
         }
         assert!(!Path::new(&renamed_path).exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn host_upload_uses_default_receive_dir_when_remote_dir_empty_and_honors_explicit_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "rc-file-default-recv-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let default_recv = base.join("nested").join("Download");
+        let updated_recv = base.join("updated_recv");
+        let explicit_dir = base.join("explicit");
+        fs::create_dir_all(&explicit_dir).unwrap();
+
+        let mut host = FileHostEngine::new().with_default_receive_dir(Some(default_recv.clone()));
+
+        let run_upload =
+            |host: &mut FileHostEngine, id: u64, remote_dir: &str, name: &str, data: &[u8]| {
+                let frames = [
+                    FileWireMsg::UploadStart {
+                        id,
+                        remote_dir: remote_dir.to_string(),
+                        file_name: name.to_string(),
+                        total_bytes: data.len() as u64,
+                    }
+                    .encode()
+                    .unwrap(),
+                    FileWireMsg::UploadChunk {
+                        id,
+                        offset: 0,
+                        data: data.to_vec(),
+                    }
+                    .encode()
+                    .unwrap(),
+                    FileWireMsg::UploadFinish { id }.encode().unwrap(),
+                ];
+                for f in frames {
+                    host.handle_incoming(&f);
+                }
+                let out = host.poll_outgoing(16);
+                let mut saw_ack = false;
+                let mut saw_done = false;
+                for f in out {
+                    match FileWireMsg::decode(&f).unwrap() {
+                        FileWireMsg::UploadAck {
+                            id: ack_id,
+                            ok,
+                            error,
+                        } if ack_id == id => {
+                            assert!(ok, "UploadAck failed: {error:?}");
+                            saw_ack = true;
+                        }
+                        FileWireMsg::UploadDone {
+                            id: done_id,
+                            ok,
+                            error,
+                        } if done_id == id => {
+                            assert!(ok, "UploadDone failed: {error:?}");
+                            saw_done = true;
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(
+                    saw_ack && saw_done,
+                    "expected UploadAck + UploadDone for id={id}"
+                );
+            };
+
+        // 1) Empty remote_dir auto-creates default_receive_dir and writes there
+        assert!(!default_recv.exists());
+        run_upload(&mut host, 1, "", "auto.txt", b"hello-default");
+        assert_eq!(
+            fs::read(default_recv.join("auto.txt")).unwrap(),
+            b"hello-default"
+        );
+
+        // 2) Explicit remote_dir is still honored instead of default_receive_dir
+        run_upload(
+            &mut host,
+            2,
+            explicit_dir.to_str().unwrap(),
+            "explicit.txt",
+            b"hello-explicit",
+        );
+        assert_eq!(
+            fs::read(explicit_dir.join("explicit.txt")).unwrap(),
+            b"hello-explicit"
+        );
+        assert!(!default_recv.join("explicit.txt").exists());
+
+        // 3) Dynamic set_default_receive_dir applies to subsequent empty remote_dir uploads
+        host.set_default_receive_dir(Some(updated_recv.clone()));
+        run_upload(&mut host, 3, "   ", "dynamic.txt", b"hello-updated");
+        assert_eq!(
+            fs::read(updated_recv.join("dynamic.txt")).unwrap(),
+            b"hello-updated"
+        );
+
+        // 4) Empty PathBuf is treated as None (falls back cleanly instead of failing create_dir_all(""))
+        let host_empty = FileHostEngine::new().with_default_receive_dir(Some(PathBuf::new()));
+        assert_eq!(host_empty.default_receive_dir, None);
+
+        // 5) Relative or '..' default_receive_dir is rejected with UploadAck { ok: false } without creating dirs
+        for (tx_id, bad_dir) in [
+            (4u64, PathBuf::from("relative/unsafe_dir")),
+            (5u64, base.join("..").join("escape_dir")),
+        ] {
+            let mut bad_host = FileHostEngine::new().with_default_receive_dir(Some(bad_dir));
+            let start = FileWireMsg::UploadStart {
+                id: tx_id,
+                remote_dir: String::new(),
+                file_name: "bad.txt".to_string(),
+                total_bytes: 3,
+            }
+            .encode()
+            .unwrap();
+            bad_host.handle_incoming(&start);
+            let out = bad_host.poll_outgoing(4);
+            assert_eq!(out.len(), 1);
+            match FileWireMsg::decode(&out[0]).unwrap() {
+                FileWireMsg::UploadAck {
+                    id,
+                    ok: false,
+                    error: Some(err),
+                } => {
+                    assert_eq!(id, tx_id);
+                    assert!(err.contains("absolute path"), "unexpected err: {err}");
+                }
+                other => panic!("expected rejected UploadAck, got {other:?}"),
+            }
+        }
 
         let _ = fs::remove_dir_all(&base);
     }
