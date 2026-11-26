@@ -117,6 +117,7 @@ impl Encoder for FakeEncoder {
         deadline_ts: Timestamp,
     ) -> Result<EncodedFrame> {
         // 软件假编码器只吃 CPU 帧；GPU 纹理应交给硬件编码器后端。
+        #[allow(unreachable_patterns)]
         let cpu = match &frame.texture {
             FrameTexture::Cpu(cpu) => cpu,
             _ => {

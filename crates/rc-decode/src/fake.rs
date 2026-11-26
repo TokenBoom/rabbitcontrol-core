@@ -238,6 +238,7 @@ mod tests {
 
     /// 读取解码输出的帧标记（透传通道的前 8 字节）。
     fn tag_of(frame: &DecodedFrame) -> u64 {
+        #[allow(unreachable_patterns)]
         match &frame.texture {
             FrameTexture::Cpu(cpu) => {
                 let mut buf = [0u8; 8];

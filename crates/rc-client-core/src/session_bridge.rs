@@ -2864,14 +2864,10 @@ fn should_fallback_after_handshake_error(
         return false;
     }
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("protocol")
+    !(lower.contains("protocol")
         || lower.contains("version")
         || lower.contains("incompatible")
-        || lower.contains("unsupported")
-    {
-        return false;
-    }
-    true
+        || lower.contains("unsupported"))
 }
 
 /// 信令会话进入 `Reconnecting` 退出时按当前传输通道标签生成精确文案并标记 `recoverable = true`。

@@ -1175,6 +1175,7 @@ impl HostPipeline {
             return true;
         }
         if self.cfg.diff == DiffMode::TileDiff {
+            #[allow(irrefutable_let_patterns)]
             if let FrameTexture::Cpu(cpu) = &frame.texture {
                 let r: DiffResult = self.diff.update(cpu);
                 return r.is_repeat;
