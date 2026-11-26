@@ -25,6 +25,9 @@ pub mod session_bridge;
 pub mod signal_client;
 pub mod updater;
 pub mod upnp;
+pub mod version;
+
+pub use version::{core_build_info, core_version, CoreBuildInfo, CORE_ABI_VERSION};
 
 /// 根据操作系统名称推导缺省的「允许被远程控制」默认值（供老服务端未返回该字段时安全兜底）。
 ///

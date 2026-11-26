@@ -2242,6 +2242,11 @@ fn derive_session_id() -> u64 {
 }
 
 const LAN_DIRECT_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+/// Tier 1（`UDP LAN`）发送 `Hello` 后等待首条响应的预算（3s，兼顾冷启硬件管线耗时与 `:21117` 15s 中继配对窗口；
+/// 收到 `Welcome{ChallengeRequired}` 进入鉴权/审批后自动放宽至 45s）。
+const LAN_DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Tier 2（`UDP P2P`）发送 `Hello` 后等待首条响应的预算（4s，进入鉴权/审批后自动放宽至 45s）。
+const P2P_DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
 struct LanQuicTransport {
     transport: rc_net::quic::QuicTransport,
@@ -2298,8 +2303,16 @@ pub(crate) fn is_mtls_cert_or_config_error(msg: &str) -> bool {
     lower.contains("invalid peer certificate")
         || lower.contains("invalidcertificate")
         || lower.contains("badcertificate")
+        || lower.contains("bad certificate")
         || lower.contains("unknownissuer")
         || lower.contains("unknown_issuer")
+        || lower.contains("unknown ca")
+        || lower.contains("certificate unknown")
+        || lower.contains("certificate required")
+        || lower.contains("certificate_required")
+        || lower.contains("the cryptographic handshake failed")
+        || lower.contains("crypto error")
+        || lower.contains("handshake failure")
         || lower.contains("notvalidforname")
         || lower.contains("notvalidyet")
         || lower.contains("expired")
@@ -2654,6 +2667,43 @@ fn is_non_recoverable_error_reason(msg: &str) -> bool {
         || lower.contains("denied")
 }
 
+/// 判定 Tier 1（`UDP LAN`）/ Tier 2（`UDP P2P`）会话握手失败后，是否允许安全回退至下一级传输链路。
+///
+/// 严格红线：
+/// - 仅当**尚未进入鉴权/审批交互**（`!entered_auth_or_approval`，未收到 `Welcome` / `AuthChallenge`）
+///   且发生底层连接断开/重置或首包超时（`Error::Network` / `Error::Io` / `Error::Timeout`）时才允许回退；
+/// - 严禁在用户主动断开、密码/鉴权拒绝、机主拒绝、mTLS 证书校验失败（含服务端拒收客户端证书的 QUIC
+///   `CRYPTO_ERROR` alert）、协议版本不兼容、或已收到 `Welcome{ChallengeRequired}` / `AuthChallenge`
+///   后的任何失败/审批超时中回退（防止被控端连弹多个审批窗）。
+fn should_fallback_after_handshake_error(
+    err: &rc_types::Error,
+    entered_auth_or_approval: bool,
+    user_disconnected: bool,
+) -> bool {
+    if user_disconnected || entered_auth_or_approval {
+        return false;
+    }
+    if !matches!(
+        err,
+        rc_types::Error::Network(_) | rc_types::Error::Io(_) | rc_types::Error::Timeout(_)
+    ) {
+        return false;
+    }
+    let msg = err.to_string();
+    if is_mtls_cert_or_config_error(&msg) || is_non_recoverable_error_reason(&msg) {
+        return false;
+    }
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("protocol")
+        || lower.contains("version")
+        || lower.contains("incompatible")
+        || lower.contains("unsupported")
+    {
+        return false;
+    }
+    true
+}
+
 /// 信令会话进入 `Reconnecting` 退出时按当前传输通道标签生成精确文案并标记 `recoverable = true`。
 fn signaling_disconnect_end(transport_label: &str) -> SessionEnd {
     let reason = match transport_label {
@@ -2758,10 +2808,6 @@ fn run_session_thread(
     let clock_reader = Arc::clone(&clock);
 
     let live_watch_only = Arc::clone(&watch_only);
-    let capture = Box::new(BridgeInputCapture {
-        queue: input_rx,
-        watch_only,
-    });
 
     let resolution = Resolution::new(
         if cfg.width == 0 { 1920 } else { cfg.width },
@@ -2780,28 +2826,31 @@ fn run_session_thread(
         max_packet_payload: rc_pipeline::MAX_PAYLOAD,
         ..PipelineConfig::default()
     };
-    let session_id = derive_session_id();
-    let mut client_cfg = ClientSessionConfig {
-        peer_addr: cfg.connect_addr,
-        mtu: rc_session::DEFAULT_SESSION_MTU,
-        requested: SessionParams {
-            width: cfg.width,
-            height: cfg.height,
-            fps: cfg.fps.max(1),
-            bitrate_bps: cfg.bitrate_bps.max(1),
-        },
-        session_id,
-        pipeline,
-        connect_timeout: Duration::from_secs(10),
-        handshake_timeout: Duration::from_secs(10),
-        capture,
-        input_window: rc_input::DEFAULT_WINDOW,
-        auth: ClientAuthConfig {
-            password: cfg.password.clone(),
-            owner_signer: cfg.owner_signer.clone(),
-            ..ClientAuthConfig::default()
-        },
-    };
+    let make_client_cfg =
+        |peer_addr: SocketAddr, handshake_timeout: Duration| ClientSessionConfig {
+            peer_addr,
+            mtu: rc_session::DEFAULT_SESSION_MTU,
+            requested: SessionParams {
+                width: cfg.width,
+                height: cfg.height,
+                fps: cfg.fps.max(1),
+                bitrate_bps: cfg.bitrate_bps.max(1),
+            },
+            session_id: derive_session_id(),
+            pipeline: pipeline.clone(),
+            connect_timeout: Duration::from_secs(10),
+            handshake_timeout,
+            capture: Box::new(BridgeInputCapture {
+                queue: Arc::clone(&input_rx),
+                watch_only: Arc::clone(&live_watch_only),
+            }),
+            input_window: rc_input::DEFAULT_WINDOW,
+            auth: ClientAuthConfig {
+                password: cfg.password.clone(),
+                owner_signer: cfg.owner_signer.clone(),
+                ..ClientAuthConfig::default()
+            },
+        };
 
     let pending_control: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
     let backend_label: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -2894,7 +2943,8 @@ fn run_session_thread(
             None
         };
 
-        // Tier 1：若非强制中继（`Auto` 或 `P2pOnly`）且命中 LAN 直连候选，300ms 快速探测 UDP LAN。
+        // Tier 1（UDP LAN）→ Tier 2（UDP P2P）→ Tier 3（TCP Relay）逐级建连并完成会话握手。
+        // 仅当尚未进入鉴权/审批交互且在 Welcome 前发生底层连接断开/重置时，才允许安全回退至下一级。
         struct SelectedRelayPath {
             transport: Box<dyn Transport>,
             relay_shutdown: Option<RelayShutdownHandle>,
@@ -2903,7 +2953,127 @@ fn run_session_thread(
             mtls_active: bool,
             peer_cert_fingerprint: Option<String>,
         }
-        let mut chosen: Option<SelectedRelayPath> = None;
+        struct ReadySignalingSession {
+            client: ClientSession,
+            negotiated: SessionParams,
+            transport_label: &'static str,
+            backend_suffix: Option<&'static str>,
+            mtls_active: bool,
+            peer_cert_fingerprint: Option<String>,
+        }
+        enum TierHandshakeResult {
+            Ready(Box<ReadySignalingSession>),
+            Fallback(String),
+            Abort(Result<SessionEnd, SessionEnd>),
+        }
+
+        let attempt_tier_handshake = |path: SelectedRelayPath,
+                                      peer_addr: SocketAddr,
+                                      handshake_timeout: Duration,
+                                      allow_fallback: bool|
+         -> TierHandshakeResult {
+            let SelectedRelayPath {
+                transport: raw_transport,
+                relay_shutdown,
+                transport_label: chosen_transport_label,
+                backend_suffix,
+                mtls_active,
+                peer_cert_fingerprint: peer_fp,
+            } = path;
+
+            update_tx.push(SessionUpdate::Connecting {
+                phase: ConnectPhase::AwaitingWelcome,
+                watch_only: live_watch_only.load(Ordering::Acquire),
+            });
+
+            let bridge_transport = BridgeTransport {
+                inner: raw_transport,
+                pending_control: Arc::clone(&pending_control),
+                disconnect_flag: Arc::clone(&disconnect_flag),
+                relay_shutdown,
+                streaming_started: Arc::clone(&streaming_started),
+            };
+            // 占位解码/渲染器仅用于满足 `ClientSession::with_parts` 签名；握手成功后
+            // `set_pipeline_factory_for` 会按裁定参数构造实际硬件/假栈并挂载 `LayerLease`。
+            let placeholder_res = Resolution::new(64, 64);
+            let dummy_decoder = match rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
+                resolution: placeholder_res,
+                ..rc_decode::FakeDecoderConfig::default()
+            }) {
+                Ok(d) => d,
+                Err(e) => {
+                    return TierHandshakeResult::Abort(Err(SessionEnd::fatal(format!(
+                        "会话占位解码器构造失败: {e}"
+                    ))));
+                }
+            };
+            let dummy_renderer = match rc_render::FakeRenderer::new(rc_render::FakeRendererConfig {
+                size: (placeholder_res.width, placeholder_res.height),
+                ..rc_render::FakeRendererConfig::default()
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    return TierHandshakeResult::Abort(Err(SessionEnd::fatal(format!(
+                        "会话占位渲染器构造失败: {e}"
+                    ))));
+                }
+            };
+
+            let mut client = match ClientSession::with_parts(
+                make_client_cfg(peer_addr, handshake_timeout),
+                Box::new(bridge_transport),
+                Box::new(dummy_decoder),
+                Box::new(dummy_renderer),
+                Arc::clone(&clock),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    return TierHandshakeResult::Abort(Err(SessionEnd::fatal(format!(
+                        "信令会话构造失败: {e}"
+                    ))));
+                }
+            };
+            client.set_pipeline_factory_for(make_pipeline_factory(backend_suffix));
+            if let Some(cb) = create_clipboard_backend(cfg.prefer_hardware) {
+                client.enable_clipboard(Box::new(ToggleableClipboardBackend::new(
+                    cb,
+                    Arc::clone(&clipboard_enabled_flag),
+                )));
+            }
+
+            match client.handshake() {
+                Ok(negotiated) => TierHandshakeResult::Ready(Box::new(ReadySignalingSession {
+                    client,
+                    negotiated,
+                    transport_label: chosen_transport_label,
+                    backend_suffix,
+                    mtls_active,
+                    peer_cert_fingerprint: peer_fp,
+                })),
+                Err(e) => {
+                    let user_disc = disconnect_flag.load(Ordering::Acquire);
+                    if user_disc {
+                        return TierHandshakeResult::Abort(Ok(SessionEnd::fatal("用户主动断开")));
+                    }
+                    if allow_fallback
+                        && should_fallback_after_handshake_error(
+                            &e,
+                            client.handshake_entered_auth(),
+                            false,
+                        )
+                    {
+                        return TierHandshakeResult::Fallback(format!(
+                            "{chosen_transport_label} 握手前连接断开: {e}"
+                        ));
+                    }
+                    TierHandshakeResult::Abort(Err(SessionEnd::fatal(format!(
+                        "连接/握手失败: {e}"
+                    ))))
+                }
+            }
+        };
+
+        let mut ready: Option<ReadySignalingSession> = None;
         let mut direct_fail_reasons: Vec<String> = Vec::new();
         let allow_lan_and_p2p = effective_mode != ConnectionMode::TcpRelay;
         if allow_lan_and_p2p && !disconnect_flag.load(Ordering::Acquire) {
@@ -2913,16 +3083,32 @@ fn run_session_thread(
                 }
                 match dial_lan_direct_quic(lan_addr, quic_mtls.as_ref(), &disconnect_flag) {
                     Ok((t, fp)) => {
-                        client_cfg.peer_addr = lan_addr;
-                        chosen = Some(SelectedRelayPath {
-                            transport: t,
-                            relay_shutdown: None,
-                            transport_label: "UDP LAN",
-                            backend_suffix: None,
-                            mtls_active: cfg.encrypt_connection,
-                            peer_cert_fingerprint: fp,
-                        });
-                        break;
+                        match attempt_tier_handshake(
+                            SelectedRelayPath {
+                                transport: t,
+                                relay_shutdown: None,
+                                transport_label: "UDP LAN",
+                                backend_suffix: None,
+                                mtls_active: cfg.encrypt_connection,
+                                peer_cert_fingerprint: fp,
+                            },
+                            lan_addr,
+                            LAN_DIRECT_HANDSHAKE_TIMEOUT,
+                            true,
+                        ) {
+                            TierHandshakeResult::Ready(session) => {
+                                ready = Some(*session);
+                                break;
+                            }
+                            TierHandshakeResult::Fallback(reason) => {
+                                direct_fail_reasons.push(reason);
+                                update_tx.push(SessionUpdate::Connecting {
+                                    phase: ConnectPhase::Connecting,
+                                    watch_only: live_watch_only.load(Ordering::Acquire),
+                                });
+                            }
+                            TierHandshakeResult::Abort(res) => return res,
+                        }
                     }
                     Err(err) => {
                         if cfg.encrypt_connection && is_mtls_cert_or_config_error(&err) {
@@ -2936,8 +3122,8 @@ fn run_session_thread(
             }
         }
 
-        // Tier 2：LAN 未命中或失败且非强制中继时，尝试 UDP P2P 打洞 + QUIC 直连。
-        if chosen.is_none() && allow_lan_and_p2p && !disconnect_flag.load(Ordering::Acquire) {
+        // Tier 2：LAN 未命中或安全回退且非强制中继时，尝试 UDP P2P 打洞 + QUIC 直连及握手。
+        if ready.is_none() && allow_lan_and_p2p && !disconnect_flag.load(Ordering::Acquire) {
             let candidates = P2pCandidates {
                 session_id: grant.session_id.clone(),
                 peer_public_addr: grant.peer_public_addr.clone(),
@@ -2956,14 +3142,31 @@ fn run_session_thread(
                         let fp = p2p_conn
                             .peer_mtls_identity()
                             .map(|id| id.cert_fingerprint_sha256);
-                        chosen = Some(SelectedRelayPath {
-                            transport: Box::new(p2p_conn),
-                            relay_shutdown: None,
-                            transport_label: "UDP P2P",
-                            backend_suffix: Some("(P2P 直连)"),
-                            mtls_active: cfg.encrypt_connection,
-                            peer_cert_fingerprint: fp,
-                        });
+                        match attempt_tier_handshake(
+                            SelectedRelayPath {
+                                transport: Box::new(p2p_conn),
+                                relay_shutdown: None,
+                                transport_label: "UDP P2P",
+                                backend_suffix: Some("(P2P 直连)"),
+                                mtls_active: cfg.encrypt_connection,
+                                peer_cert_fingerprint: fp,
+                            },
+                            cfg.connect_addr,
+                            P2P_DIRECT_HANDSHAKE_TIMEOUT,
+                            true,
+                        ) {
+                            TierHandshakeResult::Ready(session) => {
+                                ready = Some(*session);
+                            }
+                            TierHandshakeResult::Fallback(reason) => {
+                                direct_fail_reasons.push(reason);
+                                update_tx.push(SessionUpdate::Connecting {
+                                    phase: ConnectPhase::Connecting,
+                                    watch_only: live_watch_only.load(Ordering::Acquire),
+                                });
+                            }
+                            TierHandshakeResult::Abort(res) => return res,
+                        }
                     }
                     Err(err) => {
                         if cfg.encrypt_connection && is_mtls_cert_or_config_error(&err) {
@@ -2979,12 +3182,12 @@ fn run_session_thread(
             }
         }
 
-        if disconnect_flag.load(Ordering::Acquire) {
+        if ready.is_none() && disconnect_flag.load(Ordering::Acquire) {
             return Ok(SessionEnd::fatal("用户主动断开"));
         }
 
         // `P2pOnly` 模式严禁回退至 Tier 3 TCP Relay，直接返回明确不可恢复错误。
-        if chosen.is_none() && effective_mode == ConnectionMode::P2pOnly {
+        if ready.is_none() && effective_mode == ConnectionMode::P2pOnly {
             let detail = if direct_fail_reasons.is_empty() {
                 "未命中局域网地址且对端无可用 P2P 候选地址".to_string()
             } else {
@@ -2996,15 +3199,15 @@ fn run_session_thread(
         }
 
         // Tier 3：P2P 失败/未命中或强制中继 → 回退 `:21117` 中继（有 mtls_config 强制外层 mTLS；encrypt_connection 再叠加内层 E2EE mTLS）。
-        let SelectedRelayPath {
-            transport: raw_transport,
-            relay_shutdown,
+        let ReadySignalingSession {
+            client,
+            negotiated,
             transport_label: chosen_transport_label,
             backend_suffix,
             mtls_active,
             peer_cert_fingerprint: peer_fp,
-        } = match chosen {
-            Some(ready) => ready,
+        } = match ready {
+            Some(session) => session,
             None => {
                 // 与服务端默认中继配对超时（15s）对齐，兼容远端仍处旧版清理窗口的边缘场景。
                 const RELAY_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -3093,66 +3296,25 @@ fn run_session_thread(
                     return Ok(SessionEnd::fatal("用户主动断开"));
                 }
 
-                SelectedRelayPath {
-                    transport: raw_transport,
-                    relay_shutdown: Some(shutdown_handle),
-                    transport_label: "TCP Relay",
-                    backend_suffix: Some("(中继)"),
-                    mtls_active: active,
-                    peer_cert_fingerprint: fp,
+                match attempt_tier_handshake(
+                    SelectedRelayPath {
+                        transport: raw_transport,
+                        relay_shutdown: Some(shutdown_handle),
+                        transport_label: "TCP Relay",
+                        backend_suffix: Some("(中继)"),
+                        mtls_active: active,
+                        peer_cert_fingerprint: fp,
+                    },
+                    cfg.connect_addr,
+                    Duration::from_secs(10),
+                    false,
+                ) {
+                    TierHandshakeResult::Ready(session) => *session,
+                    TierHandshakeResult::Fallback(reason) => {
+                        return Err(SessionEnd::fatal(format!("连接/握手失败: {reason}")));
+                    }
+                    TierHandshakeResult::Abort(res) => return res,
                 }
-            }
-        };
-
-        update_tx.push(SessionUpdate::Connecting {
-            phase: ConnectPhase::AwaitingWelcome,
-            watch_only: live_watch_only.load(Ordering::Acquire),
-        });
-
-        let bridge_transport = BridgeTransport {
-            inner: raw_transport,
-            pending_control: Arc::clone(&pending_control),
-            disconnect_flag: Arc::clone(&disconnect_flag),
-            relay_shutdown,
-            streaming_started: Arc::clone(&streaming_started),
-        };
-        // 占位解码/渲染器仅用于满足 `ClientSession::with_parts` 签名；握手成功后
-        // `set_pipeline_factory_for` 会按裁定参数构造实际硬件/假栈并挂载 `LayerLease`。
-        let placeholder_res = Resolution::new(64, 64);
-        let dummy_decoder = rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
-            resolution: placeholder_res,
-            ..rc_decode::FakeDecoderConfig::default()
-        })
-        .map_err(|e| SessionEnd::fatal(format!("会话占位解码器构造失败: {e}")))?;
-        let dummy_renderer = rc_render::FakeRenderer::new(rc_render::FakeRendererConfig {
-            size: (placeholder_res.width, placeholder_res.height),
-            ..rc_render::FakeRendererConfig::default()
-        })
-        .map_err(|e| SessionEnd::fatal(format!("会话占位渲染器构造失败: {e}")))?;
-
-        let mut client = ClientSession::with_parts(
-            client_cfg,
-            Box::new(bridge_transport),
-            Box::new(dummy_decoder),
-            Box::new(dummy_renderer),
-            clock,
-        )
-        .map_err(|e| SessionEnd::fatal(format!("信令会话构造失败: {e}")))?;
-        client.set_pipeline_factory_for(make_pipeline_factory(backend_suffix));
-        if let Some(cb) = create_clipboard_backend(cfg.prefer_hardware) {
-            client.enable_clipboard(Box::new(ToggleableClipboardBackend::new(
-                cb,
-                Arc::clone(&clipboard_enabled_flag),
-            )));
-        }
-
-        let negotiated = match client.handshake() {
-            Ok(n) => n,
-            Err(e) => {
-                if disconnect_flag.load(Ordering::Acquire) {
-                    return Ok(SessionEnd::fatal("用户主动断开"));
-                }
-                return Err(SessionEnd::fatal(format!("连接/握手失败: {e}")));
             }
         };
         (
@@ -3176,7 +3338,7 @@ fn run_session_thread(
 
         let server_cert = dev_server_cert_pem();
         let mut client = ClientSession::new(
-            client_cfg,
+            make_client_cfg(cfg.connect_addr, Duration::from_secs(10)),
             DEV_CERT_PEM,
             DEV_KEY_PEM,
             server_cert,
@@ -3380,7 +3542,7 @@ fn run_session_thread(
     let mut relay_rtt_ctrl = is_tcp_relay
         .then(|| RelayRttController::new(negotiated.bitrate_bps.max(1), Instant::now()));
     let mut last_busy = true;
-    let mut epoch_sid = session_id;
+    let mut epoch_sid = client.session_id();
     let mut disconnect_requested = false;
     let mut end_state = SessionEnd::fatal("会话已结束");
     let mut in_reconnecting = false;
@@ -6795,5 +6957,1003 @@ mod tests {
             "强断应发生在 80ms 优雅窗口之后并在 max_wait 内返回，实际耗时 {elapsed:?}"
         );
         file_worker2.shutdown();
+    }
+
+    #[test]
+    fn should_fallback_after_handshake_error_enforces_all_safety_redlines() {
+        let pre_welcome_abort = rc_types::Error::Network(
+            "disconnected while waiting for Welcome: aborted by peer".to_string(),
+        );
+        let pre_welcome_io = rc_types::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+
+        // 1) 仅当尚未进入鉴权/审批交互且发生 Welcome 前底层连接断开/重置时允许回退。
+        assert!(should_fallback_after_handshake_error(
+            &pre_welcome_abort,
+            false,
+            false
+        ));
+        assert!(should_fallback_after_handshake_error(
+            &pre_welcome_io,
+            false,
+            false
+        ));
+
+        // 2) 用户主动断开：严禁回退。
+        assert!(!should_fallback_after_handshake_error(
+            &pre_welcome_abort,
+            false,
+            true
+        ));
+
+        // 3) 已进入鉴权/审批交互（已收 Welcome{ChallengeRequired} 或 AuthChallenge）：
+        //    无论是断连还是等待审批期超时，均严禁回退（防被控端连弹多个审批窗）。
+        assert!(!should_fallback_after_handshake_error(
+            &pre_welcome_abort,
+            true,
+            false
+        ));
+        assert!(!should_fallback_after_handshake_error(
+            &rc_types::Error::Timeout(Duration::from_secs(45)),
+            true,
+            false
+        ));
+
+        // 4) Welcome 前半开黑洞超时（!entered_auth_or_approval）：允许回退下一级链路。
+        assert!(should_fallback_after_handshake_error(
+            &rc_types::Error::Timeout(LAN_DIRECT_HANDSHAKE_TIMEOUT),
+            false,
+            false
+        ));
+
+        // 5) 协议/鉴权拒绝/版本不兼容：严禁回退。
+        assert!(!should_fallback_after_handshake_error(
+            &rc_types::Error::Protocol {
+                offset: 0,
+                msg: "authentication rejected by host".to_string(),
+            },
+            false,
+            false
+        ));
+        assert!(!should_fallback_after_handshake_error(
+            &rc_types::Error::Network("protocol version incompatible".to_string()),
+            false,
+            false
+        ));
+
+        // 6) mTLS 证书校验失败（含客户端验服务端失败与服务端拒收客户端证书的 QUIC CRYPTO_ERROR alert）：严禁回退。
+        assert!(!should_fallback_after_handshake_error(
+            &rc_types::Error::Network("InvalidPeerCertificate(UnknownIssuer)".to_string()),
+            false,
+            false
+        ));
+        assert!(!should_fallback_after_handshake_error(
+            &rc_types::Error::Network(
+                "disconnected while waiting for Welcome: the cryptographic handshake failed: error 48"
+                    .to_string(),
+            ),
+            false,
+            false
+        ));
+        assert!(is_mtls_cert_or_config_error(
+            "the cryptographic handshake failed: error 42"
+        ));
+        assert!(is_mtls_cert_or_config_error("crypto error: unknown ca"));
+        assert!(is_mtls_cert_or_config_error("certificate required"));
+
+        // 7) 真实 ClientSession 状态机校验：收到 Welcome{ChallengeRequired} 进入审批等待后超时，
+        //    handshake_entered_auth() 必须为 true，且绝不允许回退。
+        {
+            struct PendingApprovalMockTransport {
+                sent_challenge_required: bool,
+                session_id: u64,
+            }
+            impl Transport for PendingApprovalMockTransport {
+                fn send_datagram(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+                    Ok(())
+                }
+                fn send_reliable(&mut self, data: &[u8]) -> rc_types::Result<()> {
+                    if let Ok(ControlMessage::Hello(h)) = ControlMessage::decode(data) {
+                        self.session_id = h.session_id;
+                    }
+                    Ok(())
+                }
+                fn send_reliable_urgent(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+                    Ok(())
+                }
+                fn poll(&mut self, timeout: Duration) -> rc_types::Result<Vec<NetEvent>> {
+                    if !self.sent_challenge_required && self.session_id != 0 {
+                        self.sent_challenge_required = true;
+                        let mut buf = Vec::new();
+                        ControlMessage::Welcome(rc_session::proto::Welcome {
+                            session_id: self.session_id,
+                            granted: SessionParams {
+                                width: 640,
+                                height: 360,
+                                fps: 30,
+                                bitrate_bps: 2_000_000,
+                            },
+                            auth_status: rc_session::proto::AuthStatus::ChallengeRequired,
+                            host_flags: rc_session::proto::HostFlags(0),
+                        })
+                        .encode(&mut buf);
+                        return Ok(vec![NetEvent::Reliable(buf)]);
+                    }
+                    thread::sleep(timeout.min(Duration::from_millis(15)));
+                    Ok(Vec::new())
+                }
+                fn stats(&self) -> NetStats {
+                    NetStats::default()
+                }
+                fn set_pacing_rate(&mut self, _bps: u64) {}
+            }
+
+            let placeholder_res = Resolution::new(64, 64);
+            let dummy_dec = rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
+                resolution: placeholder_res,
+                ..rc_decode::FakeDecoderConfig::default()
+            })
+            .expect("dummy dec");
+            let dummy_ren = rc_render::FakeRenderer::new(rc_render::FakeRendererConfig {
+                size: (placeholder_res.width, placeholder_res.height),
+                ..rc_render::FakeRendererConfig::default()
+            })
+            .expect("dummy ren");
+            let t0 = Instant::now();
+            let (clock, _) = reanchorable_clock(t0);
+            let mut ccfg = ClientSessionConfig::new(
+                "127.0.0.1:9901".parse().unwrap(),
+                SessionParams {
+                    width: 640,
+                    height: 360,
+                    fps: 30,
+                    bitrate_bps: 2_000_000,
+                },
+                7777,
+                Box::new(BridgeInputCapture {
+                    queue: Arc::new(BoundedInputQueue::new(16)),
+                    watch_only: Arc::new(AtomicBool::new(false)),
+                }),
+            );
+            ccfg.handshake_timeout = Duration::from_secs(3);
+            ccfg.auth.auth_timeout_us = 120_000; // 120ms 审批超时
+            let mut client = ClientSession::with_parts(
+                ccfg,
+                Box::new(PendingApprovalMockTransport {
+                    sent_challenge_required: false,
+                    session_id: 0,
+                }),
+                Box::new(dummy_dec),
+                Box::new(dummy_ren),
+                clock,
+            )
+            .expect("client with_parts");
+            let err = client
+                .handshake()
+                .expect_err("pending approval must time out");
+            assert!(
+                matches!(err, rc_types::Error::Timeout(_)),
+                "expected Timeout during approval wait, got {err:?}"
+            );
+            assert!(
+                client.handshake_entered_auth(),
+                "Welcome{{ChallengeRequired}} must mark handshake_entered_auth = true"
+            );
+            assert!(
+                !should_fallback_after_handshake_error(
+                    &err,
+                    client.handshake_entered_auth(),
+                    false
+                ),
+                "approval timeout after Welcome{{ChallengeRequired}} must never fall back"
+            );
+        }
+    }
+
+    fn spawn_loopback_rcr1_relay_server(expected_token: String) -> (SocketAddr, JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock rcr1 relay");
+        let addr = listener.local_addr().expect("mock relay addr");
+        let handle = thread::spawn(move || {
+            let Ok((mut s1, _)) = listener.accept() else {
+                return;
+            };
+            let Ok((mut s2, _)) = listener.accept() else {
+                return;
+            };
+            let _ = s1.set_nodelay(true);
+            let _ = s2.set_nodelay(true);
+
+            let read_hs = |s: &mut std::net::TcpStream| -> Option<u8> {
+                let mut head = [0u8; 6];
+                s.read_exact(&mut head).ok()?;
+                if &head[0..4] != b"RCR1" {
+                    return None;
+                }
+                let role = head[4];
+                let mut tok = vec![0u8; head[5] as usize];
+                s.read_exact(&mut tok).ok()?;
+                if std::str::from_utf8(&tok).ok()? != expected_token {
+                    return None;
+                }
+                Some(role)
+            };
+            let Some(r1) = read_hs(&mut s1) else {
+                return;
+            };
+            let Some(r2) = read_hs(&mut s2) else {
+                return;
+            };
+            if r1 == r2 {
+                return;
+            }
+            if s1.write_all(&[0x00]).is_err() || s2.write_all(&[0x00]).is_err() {
+                return;
+            }
+            let Ok(mut s1_r) = s1.try_clone() else {
+                return;
+            };
+            let Ok(mut s2_w) = s2.try_clone() else {
+                return;
+            };
+            let t1 = thread::spawn(move || {
+                let _ = std::io::copy(&mut s1_r, &mut s2_w);
+                let _ = s2_w.shutdown(Shutdown::Write);
+            });
+            let t2 = thread::spawn(move || {
+                let _ = std::io::copy(&mut s2, &mut s1);
+                let _ = s1.shutdown(Shutdown::Write);
+            });
+            let _ = t1.join();
+            let _ = t2.join();
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn tier1_lan_pre_welcome_disconnect_falls_back_to_relay_and_succeeds() {
+        struct NoopInjector;
+        impl rc_input::InputInjector for NoopInjector {
+            fn inject(&mut self, _events: &[InputEvent]) -> rc_types::Result<()> {
+                Ok(())
+            }
+            fn set_screen_size(&mut self, _width: u32, _height: u32) {}
+        }
+
+        // 1) Tier 1 模拟 LAN QUIC 端点：完成 QUIC 建连并收到 Hello 后，在发 Welcome 前主动关闭连接。
+        let lan_id = Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM).expect("dev id");
+        let lan_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+            &lan_id,
+        )
+        .expect("lan ep");
+        let lan_addr = lan_ep.local_addr().expect("lan addr");
+        let lan_saw_hello = Arc::new(AtomicBool::new(false));
+        let t_lan_saw_hello = Arc::clone(&lan_saw_hello);
+        let lan_thread = thread::spawn(move || {
+            let mut transport = lan_ep
+                .accept_with_handshake_timeout(Duration::from_secs(5), Duration::from_secs(5), None)
+                .expect("lan accept");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                for ev in transport.poll(Duration::from_millis(20)).expect("lan poll") {
+                    if matches!(ev, NetEvent::Reliable(_)) {
+                        t_lan_saw_hello.store(true, Ordering::Release);
+                        // 不发 Welcome，直接 drop 关闭连接，复现 Issue #4 场景。
+                        return;
+                    }
+                }
+            }
+        });
+
+        // 2) Tier 3 模拟本地 RCR1 中继服务器 + 正常 HostSession。
+        let token = "fallback-tok-1".to_string();
+        let (relay_addr, relay_srv) = spawn_loopback_rcr1_relay_server(token.clone());
+        let host_stop = Arc::new(AtomicBool::new(false));
+        let t_host_stop = Arc::clone(&host_stop);
+        let relay_addr_str = relay_addr.to_string();
+        let host_thread = thread::spawn(move || {
+            let transport = TcpRelayTransport::connect(
+                &relay_addr_str,
+                RelayRole::Host,
+                &token,
+                Duration::from_secs(5),
+            )
+            .expect("host connect relay");
+            let (hclock, _) = reanchorable_clock(Instant::now());
+            let caps = SessionParams {
+                width: 640,
+                height: 360,
+                fps: 30,
+                bitrate_bps: 2_000_000,
+            };
+            let mut hcfg = rc_session::HostSessionConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                caps,
+                Box::new(NoopInjector),
+            );
+            hcfg.handshake_timeout = Duration::from_secs(5);
+            let cap = rc_capture::FakeBackend::new(rc_capture::FakeBackendConfig {
+                display: rc_capture::DisplayInfo {
+                    id: rc_types::DisplayId(0),
+                    resolution: Resolution::new(640, 360),
+                    scale: 1.0,
+                    hdr: false,
+                },
+                fps: 30,
+                content: rc_capture::FakeContent::Static,
+                dirty_rect: None,
+            })
+            .expect("fake cap");
+            let enc = rc_encode::FakeEncoder::new(rc_encode::EncoderConfig {
+                resolution: Resolution::new(640, 360),
+                fps: 30,
+                bitrate_bps: 2_000_000,
+                ..rc_encode::EncoderConfig::default()
+            })
+            .expect("fake enc");
+            let mut host = rc_session::HostSession::with_parts(
+                hcfg,
+                Box::new(transport),
+                Box::new(cap),
+                Box::new(enc),
+                hclock,
+            )
+            .expect("host with_parts");
+            host.handshake().expect("relay host handshake");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !t_host_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                if host.tick(Duration::from_millis(10)).is_err()
+                    || host.state() == SessionState::Closed
+                {
+                    break;
+                }
+            }
+        });
+
+        // 3) 控制端同时持有 Tier 1 LAN 地址与 Tier 3 Relay 凭据，验证自动回退至 TCP Relay 并握手成功。
+        let session = SessionHandle::spawn(UiSessionConfig {
+            connect_addr: "127.0.0.1:1".parse().unwrap(),
+            lan_direct_addr: Some(lan_addr),
+            width: 640,
+            height: 360,
+            fps: 30,
+            bitrate_bps: 2_000_000,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            connection_mode: ConnectionMode::Auto,
+            relay_grant: Some(ConnectGrant {
+                session_id: "sess-lan-fallback".to_string(),
+                relay_addr: relay_addr.to_string(),
+                relay_token: "fallback-tok-1".to_string(),
+                target_id: "900000002".to_string(),
+                ..ConnectGrant::default()
+            }),
+            ..UiSessionConfig::default()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut negotiated_transport: Option<String> = None;
+        while Instant::now() < deadline {
+            if let Some(upd) = session.try_recv_update() {
+                match upd {
+                    SessionUpdate::Negotiated { transport, .. } => {
+                        negotiated_transport = Some(transport);
+                        break;
+                    }
+                    SessionUpdate::Ended { reason, .. } => {
+                        panic!(
+                            "expected automatic fallback to TCP Relay, but ended early: {reason}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        host_stop.store(true, Ordering::Release);
+        session.trigger_disconnect();
+        session.join();
+        let _ = lan_thread.join();
+        let _ = host_thread.join();
+        let _ = relay_srv.join();
+
+        assert!(
+            lan_saw_hello.load(Ordering::Acquire),
+            "Tier 1 LAN must have been attempted and received Hello before closing"
+        );
+        assert_eq!(
+            negotiated_transport.as_deref(),
+            Some("TCP Relay"),
+            "controller must fall back to Tier 3 TCP Relay after pre-Welcome LAN disconnect"
+        );
+    }
+
+    #[test]
+    fn tier1_lan_auth_reject_mtls_p2p_only_and_post_challenge_never_fallback_to_relay() {
+        use crate::relay_transport::tests::mtls_test_certs::TestCa;
+        use rc_session::proto::{AuthChallenge, AuthStatus, HostFlags, Welcome};
+
+        fn spawn_spy_relay() -> (SocketAddr, Arc<AtomicBool>, Arc<AtomicBool>, JoinHandle<()>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind spy relay");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("spy addr");
+            let touched = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let t_touched = Arc::clone(&touched);
+            let t_stop = Arc::clone(&stop);
+            let jh = thread::spawn(move || {
+                while !t_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok(_) => {
+                            t_touched.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            (addr, touched, stop, jh)
+        }
+
+        fn wait_session_end(session: SessionHandle) -> (String, bool) {
+            let deadline = Instant::now() + Duration::from_secs(6);
+            let mut ended = None;
+            while Instant::now() < deadline {
+                if let Some(SessionUpdate::Ended {
+                    reason,
+                    recoverable,
+                }) = session.try_recv_update()
+                {
+                    ended = Some((reason, recoverable));
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            session.join();
+            ended.expect("session must terminate with Ended")
+        }
+
+        let dev_id = Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM).expect("dev id");
+
+        // 场景 A：鉴权拒绝（Welcome{Rejected}）绝不回退中继。
+        {
+            let (spy_addr, touched, spy_stop, spy_jh) = spawn_spy_relay();
+            let lan_ep = QuicEndpoint::new(
+                &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+                &dev_id,
+            )
+            .expect("lan ep");
+            let lan_addr = lan_ep.local_addr().expect("lan addr");
+            let lan_jh = thread::spawn(move || {
+                let mut t = lan_ep
+                    .accept_with_handshake_timeout(
+                        Duration::from_secs(5),
+                        Duration::from_secs(5),
+                        None,
+                    )
+                    .expect("lan accept");
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    for ev in t.poll(Duration::from_millis(20)).expect("poll") {
+                        if let NetEvent::Reliable(bytes) = ev {
+                            if let Ok(ControlMessage::Hello(h)) = ControlMessage::decode(&bytes) {
+                                let mut out = Vec::new();
+                                ControlMessage::Welcome(Welcome {
+                                    session_id: h.session_id,
+                                    granted: h.requested,
+                                    auth_status: AuthStatus::Rejected,
+                                    host_flags: HostFlags(0),
+                                })
+                                .encode(&mut out);
+                                let _ = t.send_reliable(&out);
+                                let _ = t.poll(Duration::from_millis(50));
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+
+            let session = SessionHandle::spawn(UiSessionConfig {
+                connect_addr: "127.0.0.1:1".parse().unwrap(),
+                lan_direct_addr: Some(lan_addr),
+                width: 640,
+                height: 360,
+                fps: 30,
+                bitrate_bps: 2_000_000,
+                connection_mode: ConnectionMode::Auto,
+                relay_grant: Some(ConnectGrant {
+                    session_id: "sess-auth-reject".to_string(),
+                    relay_addr: spy_addr.to_string(),
+                    relay_token: "unused".to_string(),
+                    target_id: "900000003".to_string(),
+                    ..ConnectGrant::default()
+                }),
+                ..UiSessionConfig::default()
+            });
+            let (reason, recoverable) = wait_session_end(session);
+            spy_stop.store(true, Ordering::Release);
+            let _ = spy_jh.join();
+            let _ = lan_jh.join();
+            assert!(!recoverable, "auth reject must be fatal: {reason}");
+            assert!(
+                !touched.load(Ordering::SeqCst),
+                "auth rejection on Tier 1 must never fall back to Tier 3 relay"
+            );
+        }
+
+        // 场景 B：已收到 Welcome{ChallengeRequired} + AuthChallenge 后对端断连/审批等待失败，绝不回退中继（防连弹审批窗）。
+        {
+            let (spy_addr, touched, spy_stop, spy_jh) = spawn_spy_relay();
+            let lan_ep = QuicEndpoint::new(
+                &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+                &dev_id,
+            )
+            .expect("lan ep");
+            let lan_addr = lan_ep.local_addr().expect("lan addr");
+            let lan_jh = thread::spawn(move || {
+                let mut t = lan_ep
+                    .accept_with_handshake_timeout(
+                        Duration::from_secs(5),
+                        Duration::from_secs(5),
+                        None,
+                    )
+                    .expect("lan accept");
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    for ev in t.poll(Duration::from_millis(20)).expect("poll") {
+                        if let NetEvent::Reliable(bytes) = ev {
+                            if let Ok(ControlMessage::Hello(h)) = ControlMessage::decode(&bytes) {
+                                let mut w_buf = Vec::new();
+                                ControlMessage::Welcome(Welcome {
+                                    session_id: h.session_id,
+                                    granted: h.requested,
+                                    auth_status: AuthStatus::ChallengeRequired,
+                                    host_flags: HostFlags(0),
+                                })
+                                .encode(&mut w_buf);
+                                let _ = t.send_reliable(&w_buf);
+                                let mut ch_buf = Vec::new();
+                                ControlMessage::AuthChallenge(AuthChallenge {
+                                    salt: [0x42u8; 16],
+                                    iterations: 1_000,
+                                })
+                                .encode(&mut ch_buf);
+                                let _ = t.send_reliable(&ch_buf);
+                                // 等待控制端收到挑战并回复 AuthResponse 后再关闭连接。
+                                let wait_resp = Instant::now() + Duration::from_secs(2);
+                                while Instant::now() < wait_resp {
+                                    if t.poll(Duration::from_millis(20))
+                                        .unwrap_or_default()
+                                        .iter()
+                                        .any(|e| matches!(e, NetEvent::Reliable(_)))
+                                    {
+                                        break;
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+
+            let session = SessionHandle::spawn(UiSessionConfig {
+                connect_addr: "127.0.0.1:1".parse().unwrap(),
+                lan_direct_addr: Some(lan_addr),
+                password: Some("test-pass".to_string()),
+                width: 640,
+                height: 360,
+                fps: 30,
+                bitrate_bps: 2_000_000,
+                connection_mode: ConnectionMode::Auto,
+                relay_grant: Some(ConnectGrant {
+                    session_id: "sess-post-challenge".to_string(),
+                    relay_addr: spy_addr.to_string(),
+                    relay_token: "unused".to_string(),
+                    target_id: "900000004".to_string(),
+                    ..ConnectGrant::default()
+                }),
+                ..UiSessionConfig::default()
+            });
+            let (_reason, recoverable) = wait_session_end(session);
+            spy_stop.store(true, Ordering::Release);
+            let _ = spy_jh.join();
+            let _ = lan_jh.join();
+            assert!(!recoverable);
+            assert!(
+                !touched.load(Ordering::SeqCst),
+                "disconnect after AuthChallenge/approval prompt must never fall back to Tier 3 relay"
+            );
+        }
+
+        // 场景 C：mTLS 证书校验失败绝不回退中继。
+        {
+            let mut client_ca = TestCa::new("ClientTrustedCA");
+            let (c_cert, c_key) = client_ca.issue_device("u1", "100000010");
+            let mut rogue_ca = TestCa::new("RogueHostCA");
+            let (h_cert, h_key) = rogue_ca.issue_device("u1", "200000020");
+
+            let host_bundle = SessionMtlsBundle {
+                ca_cert_pem: rogue_ca.ca_pem.clone(),
+                cert_pem: h_cert,
+                key_pem: h_key,
+                local_user_id: "u1".to_string(),
+                expected_peer_device_id: None,
+                expected_peer_user_id: None,
+            };
+            let client_bundle = SessionMtlsBundle {
+                ca_cert_pem: client_ca.ca_pem.clone(),
+                cert_pem: c_cert,
+                key_pem: c_key,
+                local_user_id: "u1".to_string(),
+                expected_peer_device_id: Some("200000020".to_string()),
+                expected_peer_user_id: None,
+            };
+
+            let (spy_addr, touched, spy_stop, spy_jh) = spawn_spy_relay();
+            let lan_ep = QuicEndpoint::new_mtls(
+                &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+                &host_bundle.to_quic_mtls_config().expect("host mtls"),
+            )
+            .expect("mtls lan ep");
+            let lan_addr = lan_ep.local_addr().expect("mtls lan addr");
+            let lan_jh = thread::spawn(move || {
+                let _ = lan_ep.accept_with_handshake_timeout(
+                    Duration::from_secs(3),
+                    Duration::from_secs(2),
+                    None,
+                );
+            });
+
+            let session = SessionHandle::spawn(UiSessionConfig {
+                connect_addr: "127.0.0.1:1".parse().unwrap(),
+                lan_direct_addr: Some(lan_addr),
+                encrypt_connection: true,
+                mtls_config: Some(client_bundle),
+                width: 640,
+                height: 360,
+                fps: 30,
+                bitrate_bps: 2_000_000,
+                connection_mode: ConnectionMode::Auto,
+                relay_grant: Some(ConnectGrant {
+                    session_id: "sess-mtls-fail".to_string(),
+                    relay_addr: spy_addr.to_string(),
+                    relay_token: "unused".to_string(),
+                    target_id: "200000020".to_string(),
+                    ..ConnectGrant::default()
+                }),
+                ..UiSessionConfig::default()
+            });
+            let (reason, recoverable) = wait_session_end(session);
+            spy_stop.store(true, Ordering::Release);
+            let _ = spy_jh.join();
+            let _ = lan_jh.join();
+            assert!(!recoverable, "mTLS failure must be fatal: {reason}");
+            assert!(
+                reason.contains("mTLS") || reason.contains("证书"),
+                "expected mTLS error message, got: {reason}"
+            );
+            assert!(
+                !touched.load(Ordering::SeqCst),
+                "mTLS certificate verification failure must never fall back to Tier 3 relay"
+            );
+        }
+
+        // 场景 D：P2pOnly 模式下 Tier 1 LAN 在 Welcome 前断连，绝不回退至 Tier 3 Relay。
+        {
+            let (spy_addr, touched, spy_stop, spy_jh) = spawn_spy_relay();
+            let lan_ep = QuicEndpoint::new(
+                &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+                &dev_id,
+            )
+            .expect("lan ep");
+            let lan_addr = lan_ep.local_addr().expect("lan addr");
+            let lan_jh = thread::spawn(move || {
+                let mut t = lan_ep
+                    .accept_with_handshake_timeout(
+                        Duration::from_secs(5),
+                        Duration::from_secs(5),
+                        None,
+                    )
+                    .expect("lan accept");
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    if t.poll(Duration::from_millis(20))
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|e| matches!(e, NetEvent::Reliable(_)))
+                    {
+                        return; // 收到 Hello 后不发 Welcome 直接断开
+                    }
+                }
+            });
+
+            let session = SessionHandle::spawn(UiSessionConfig {
+                connect_addr: "127.0.0.1:1".parse().unwrap(),
+                lan_direct_addr: Some(lan_addr),
+                width: 640,
+                height: 360,
+                fps: 30,
+                bitrate_bps: 2_000_000,
+                connection_mode: ConnectionMode::P2pOnly,
+                relay_grant: Some(ConnectGrant {
+                    session_id: "sess-p2p-only-pre-welcome".to_string(),
+                    relay_addr: spy_addr.to_string(),
+                    relay_token: "unused".to_string(),
+                    target_id: "900000005".to_string(),
+                    ..ConnectGrant::default()
+                }),
+                ..UiSessionConfig::default()
+            });
+            let (reason, recoverable) = wait_session_end(session);
+            spy_stop.store(true, Ordering::Release);
+            let _ = spy_jh.join();
+            let _ = lan_jh.join();
+            assert!(!recoverable);
+            assert!(
+                reason.contains("仅 P2P") && reason.contains("未回退中继"),
+                "expected P2pOnly refusal message, got: {reason}"
+            );
+            assert!(
+                !touched.load(Ordering::SeqCst),
+                "P2pOnly must never fall back to Tier 3 relay even after pre-Welcome LAN disconnect"
+            );
+        }
+
+        // 场景 E：Tier 1 MtlsLan 服务端拒收非法客户端证书（客户端验过服务端证书并完成 TLS 1.3 ClientFinished，
+        // 随后收到服务端 QUIC CRYPTO_ERROR alert），控制端绝不回退至 Tier 3 中继。
+        {
+            let mut trusted_ca = TestCa::new("TrustedHostCA");
+            let (h_cert, h_key) = trusted_ca.issue_device("u-host", "200000030");
+            let mut rogue_client_ca = TestCa::new("RogueClientCA");
+            let (bad_c_cert, bad_c_key) = rogue_client_ca.issue_device("u-bad", "100000030");
+
+            let host_bundle = SessionMtlsBundle {
+                ca_cert_pem: trusted_ca.ca_pem.clone(),
+                cert_pem: h_cert,
+                key_pem: h_key,
+                local_user_id: "u-host".to_string(),
+                expected_peer_device_id: None,
+                expected_peer_user_id: None,
+            };
+            // 客户端信任服务端 CA（所以客户端能通过服务端证书校验），但出示由 rogue_client_ca 签发的非法客户端证书。
+            let rogue_client_bundle = SessionMtlsBundle {
+                ca_cert_pem: trusted_ca.ca_pem.clone(),
+                cert_pem: bad_c_cert,
+                key_pem: bad_c_key,
+                local_user_id: "u-bad".to_string(),
+                expected_peer_device_id: Some("200000030".to_string()),
+                expected_peer_user_id: None,
+            };
+
+            let (spy_addr, touched, spy_stop, spy_jh) = spawn_spy_relay();
+            let lan_ep = QuicEndpoint::new_mtls(
+                &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+                &host_bundle.to_quic_mtls_config().expect("host mtls"),
+            )
+            .expect("mtls lan ep");
+            let lan_addr = lan_ep.local_addr().expect("mtls lan addr");
+            let lan_stop = Arc::new(AtomicBool::new(false));
+            let t_lan_stop = Arc::clone(&lan_stop);
+            let lan_jh = thread::spawn(move || {
+                let res = lan_ep.accept_with_handshake_timeout(
+                    Duration::from_secs(3),
+                    Duration::from_secs(2),
+                    None,
+                );
+                assert!(
+                    res.is_err(),
+                    "MtlsLan server must reject untrusted client certificate"
+                );
+                // 保持端点存活（对齐真实 HostListener::MtlsLan 行为），确保 QUIC CRYPTO_ERROR alert 完整送达对端。
+                let wait_until = Instant::now() + Duration::from_secs(3);
+                while !t_lan_stop.load(Ordering::Acquire) && Instant::now() < wait_until {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+
+            let session = SessionHandle::spawn(UiSessionConfig {
+                connect_addr: "127.0.0.1:1".parse().unwrap(),
+                lan_direct_addr: Some(lan_addr),
+                encrypt_connection: true,
+                mtls_config: Some(rogue_client_bundle),
+                width: 640,
+                height: 360,
+                fps: 30,
+                bitrate_bps: 2_000_000,
+                connection_mode: ConnectionMode::Auto,
+                relay_grant: Some(ConnectGrant {
+                    session_id: "sess-server-reject-client-cert".to_string(),
+                    relay_addr: spy_addr.to_string(),
+                    relay_token: "unused".to_string(),
+                    target_id: "200000030".to_string(),
+                    ..ConnectGrant::default()
+                }),
+                ..UiSessionConfig::default()
+            });
+            let (reason, recoverable) = wait_session_end(session);
+            lan_stop.store(true, Ordering::Release);
+            spy_stop.store(true, Ordering::Release);
+            let _ = spy_jh.join();
+            let _ = lan_jh.join();
+            assert!(
+                !recoverable,
+                "server client-cert rejection must be fatal: {reason}"
+            );
+            assert!(
+                !touched.load(Ordering::SeqCst),
+                "server rejecting client mTLS certificate must never fall back to Tier 3 relay: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier1_lan_pre_welcome_blackhole_timeout_falls_back_to_relay_and_succeeds() {
+        struct NoopInjector;
+        impl rc_input::InputInjector for NoopInjector {
+            fn inject(&mut self, _events: &[InputEvent]) -> rc_types::Result<()> {
+                Ok(())
+            }
+            fn set_screen_size(&mut self, _width: u32, _height: u32) {}
+        }
+
+        // 1) Tier 1 LAN 完成 QUIC 建连并收到 Hello 后保持静默黑洞（既不发 Welcome 也不发 AuthChallenge），
+        //    等待 3s 超时后控制端必须自动回退至 Tier 3 TCP Relay 成功握手。
+        let lan_id = Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM).expect("dev id");
+        let lan_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+            &lan_id,
+        )
+        .expect("lan ep");
+        let lan_addr = lan_ep.local_addr().expect("lan addr");
+        let lan_stop = Arc::new(AtomicBool::new(false));
+        let t_lan_stop = Arc::clone(&lan_stop);
+        let lan_saw_hello = Arc::new(AtomicBool::new(false));
+        let t_lan_saw_hello = Arc::clone(&lan_saw_hello);
+        let lan_thread = thread::spawn(move || {
+            let mut transport = lan_ep
+                .accept_with_handshake_timeout(Duration::from_secs(5), Duration::from_secs(5), None)
+                .expect("lan accept");
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !t_lan_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                if let Ok(events) = transport.poll(Duration::from_millis(20)) {
+                    if events.iter().any(|ev| matches!(ev, NetEvent::Reliable(_))) {
+                        t_lan_saw_hello.store(true, Ordering::Release);
+                    }
+                }
+            }
+        });
+
+        let token = "fallback-timeout-tok-1".to_string();
+        let (relay_addr, relay_srv) = spawn_loopback_rcr1_relay_server(token.clone());
+        let host_stop = Arc::new(AtomicBool::new(false));
+        let t_host_stop = Arc::clone(&host_stop);
+        let relay_addr_str = relay_addr.to_string();
+        let host_thread = thread::spawn(move || {
+            let transport = TcpRelayTransport::connect(
+                &relay_addr_str,
+                RelayRole::Host,
+                &token,
+                Duration::from_secs(8),
+            )
+            .expect("host connect relay");
+            let (hclock, _) = reanchorable_clock(Instant::now());
+            let caps = SessionParams {
+                width: 640,
+                height: 360,
+                fps: 30,
+                bitrate_bps: 2_000_000,
+            };
+            let mut hcfg = rc_session::HostSessionConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                caps,
+                Box::new(NoopInjector),
+            );
+            hcfg.handshake_timeout = Duration::from_secs(5);
+            let cap = rc_capture::FakeBackend::new(rc_capture::FakeBackendConfig {
+                display: rc_capture::DisplayInfo {
+                    id: rc_types::DisplayId(0),
+                    resolution: Resolution::new(640, 360),
+                    scale: 1.0,
+                    hdr: false,
+                },
+                fps: 30,
+                content: rc_capture::FakeContent::Static,
+                dirty_rect: None,
+            })
+            .expect("fake cap");
+            let enc = rc_encode::FakeEncoder::new(rc_encode::EncoderConfig {
+                resolution: Resolution::new(640, 360),
+                fps: 30,
+                bitrate_bps: 2_000_000,
+                ..rc_encode::EncoderConfig::default()
+            })
+            .expect("fake enc");
+            let mut host = rc_session::HostSession::with_parts(
+                hcfg,
+                Box::new(transport),
+                Box::new(cap),
+                Box::new(enc),
+                hclock,
+            )
+            .expect("host with_parts");
+            host.handshake().expect("relay host handshake");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !t_host_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                if host.tick(Duration::from_millis(10)).is_err()
+                    || host.state() == SessionState::Closed
+                {
+                    break;
+                }
+            }
+        });
+
+        let session = SessionHandle::spawn(UiSessionConfig {
+            connect_addr: "127.0.0.1:1".parse().unwrap(),
+            lan_direct_addr: Some(lan_addr),
+            width: 640,
+            height: 360,
+            fps: 30,
+            bitrate_bps: 2_000_000,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            connection_mode: ConnectionMode::Auto,
+            relay_grant: Some(ConnectGrant {
+                session_id: "sess-lan-blackhole-fallback".to_string(),
+                relay_addr: relay_addr.to_string(),
+                relay_token: "fallback-timeout-tok-1".to_string(),
+                target_id: "900000006".to_string(),
+                ..ConnectGrant::default()
+            }),
+            ..UiSessionConfig::default()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut negotiated_transport: Option<String> = None;
+        while Instant::now() < deadline {
+            if let Some(upd) = session.try_recv_update() {
+                match upd {
+                    SessionUpdate::Negotiated { transport, .. } => {
+                        negotiated_transport = Some(transport);
+                        break;
+                    }
+                    SessionUpdate::Ended { reason, .. } => {
+                        panic!("expected automatic fallback after pre-Welcome timeout, ended early: {reason}");
+                    }
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(15));
+        }
+
+        lan_stop.store(true, Ordering::Release);
+        host_stop.store(true, Ordering::Release);
+        session.trigger_disconnect();
+        session.join();
+        let _ = lan_thread.join();
+        let _ = host_thread.join();
+        let _ = relay_srv.join();
+
+        assert!(
+            lan_saw_hello.load(Ordering::Acquire),
+            "Tier 1 LAN must have received Hello before blackhole timeout"
+        );
+        assert_eq!(
+            negotiated_transport.as_deref(),
+            Some("TCP Relay"),
+            "controller must fall back to Tier 3 TCP Relay after pre-Welcome blackhole timeout"
+        );
     }
 }

@@ -135,6 +135,15 @@ const RELIABLE_RECV_CAPACITY: usize = 256;
 /// 剩余帧留在有界通道内于下一次 `poll` 立即零等待取出。
 const MAX_RELIABLE_PER_POLL: usize = 64;
 
+/// 底层 QUIC 端点已关闭/停止时 `accept` 返回的错误标记文本。
+pub const ENDPOINT_STOPPED_ERROR_MSG: &str = "endpoint stopped before accept";
+
+/// 判断 [`QuicEndpoint::accept`] / [`QuicEndpoint::accept_with_handshake_timeout`] 返回的错误
+/// 是否表示**端点本身已关闭/不可用**（区别于单次入站客户端握手或引导流失败）。
+pub fn is_endpoint_stopped_error(err: &Error) -> bool {
+    matches!(err, Error::Network(msg) if msg == ENDPOINT_STOPPED_ERROR_MSG)
+}
+
 /// 在 `mtu` 预算下，单个媒体分片可承载的最大负载（字节）。
 ///
 /// 数据报 = 32 字节包头 + 媒体片 ≤ `mtu - QUIC_OVERHEAD`（N2），
@@ -472,7 +481,26 @@ impl QuicEndpoint {
 
     /// 作为 Host 等待并接受一个连接（阻塞至握手完成或超时）。
     pub fn accept(&self, timeout: Duration) -> Result<QuicTransport> {
-        self.accept_inner(None, timeout, None)
+        self.accept_inner(None, timeout, None, None)
+    }
+
+    /// 解耦「等待入站连接」与「单次 QUIC 握手及引导流」两段超时的 [`Self::accept`] 变体。
+    ///
+    /// - **阶段 A（等待 `Incoming`）**：仅使用 `wait_timeout`（如 `150ms`），无入站连接时
+    ///   返回 `Err(Error::Timeout(wait_timeout))`，让上层分片循环能及时响应停机或信令事件；
+    /// - **阶段 B（收到 `Incoming` 后的 `incoming.accept()`、`Connecting` 握手与两条引导流）**：
+    ///   立即重算独立 `hs_deadline = Instant::now() + handshake_timeout`（如 `4s`），
+    ///   彻底避免连接落在短分片末尾时被截断导致对端出现 `aborted by peer`；
+    /// - 两个阶段均在 `cancel` 存在时每 `50ms` 轮询取消标志，确保退出不卡顿。
+    /// - 端点本身已停止时返回满足 [`is_endpoint_stopped_error`] 的 `Err(Error::Network)`，
+    ///   与单次入站连接握手失败清晰区分。
+    pub fn accept_with_handshake_timeout(
+        &self,
+        wait_timeout: Duration,
+        handshake_timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<QuicTransport> {
+        self.accept_inner(None, wait_timeout, Some(handshake_timeout), cancel)
     }
 
     /// 可被外部取消标志打断的 [`Self::accept`] 变体（供 P2P Host 建连与快速回退使用）。
@@ -500,17 +528,18 @@ impl QuicEndpoint {
         timeout: Duration,
         cancel: &AtomicBool,
     ) -> Result<QuicTransport> {
-        self.accept_inner(expected_peer, timeout, Some(cancel))
+        self.accept_inner(expected_peer, timeout, None, Some(cancel))
     }
 
     fn accept_inner(
         &self,
         expected_peer: Option<SocketAddr>,
-        timeout: Duration,
+        wait_timeout: Duration,
+        handshake_timeout: Option<Duration>,
         cancel: Option<&AtomicBool>,
     ) -> Result<QuicTransport> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
+        let wait_deadline = Instant::now()
+            .checked_add(wait_timeout)
             .ok_or_else(|| Error::InvalidConfig("accept timeout overflow".into()))?;
         let expected_canon = expected_peer.map(canonical_ip_port);
 
@@ -518,15 +547,18 @@ impl QuicEndpoint {
             if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
                 return Err(Error::Network("cancelled".into()));
             }
-            if Instant::now() >= deadline {
-                return Err(Error::Timeout(timeout));
+            if Instant::now() >= wait_deadline {
+                return Err(Error::Timeout(wait_timeout));
             }
 
-            let incoming =
-                block_on_deadline_cancelable(self.endpoint().accept(), deadline, cancel, || {
-                    Error::Timeout(timeout)
-                })?
-                .ok_or_else(|| Error::Network("endpoint stopped before accept".into()))?;
+            // 阶段 A：在 wait_timeout 预算内等待 Incoming。
+            let incoming = block_on_deadline_cancelable(
+                self.endpoint().accept(),
+                wait_deadline,
+                cancel,
+                || Error::Timeout(wait_timeout),
+            )?
+            .ok_or_else(|| Error::Network(ENDPOINT_STOPPED_ERROR_MSG.into()))?;
 
             if let Some(exp) = expected_canon {
                 if canonical_ip_port(incoming.remote_address()) != exp {
@@ -535,14 +567,25 @@ impl QuicEndpoint {
                 }
             }
 
+            // 阶段 B：已收到 Incoming，解耦时立即重算独立握手截止时间；否则沿用共享 wait_deadline。
+            let (hs_deadline, hs_timeout) = match handshake_timeout {
+                Some(hs) => {
+                    let dl = Instant::now().checked_add(hs).ok_or_else(|| {
+                        Error::InvalidConfig("accept handshake timeout overflow".into())
+                    })?;
+                    (dl, hs)
+                }
+                None => (wait_deadline, wait_timeout),
+            };
+
             // Incoming → Connecting：0.11.12 里 Incoming 本身不是 Future。
             let connecting = match incoming.accept() {
                 Ok(c) => c,
                 Err(_) if expected_canon.is_some() => continue,
                 Err(e) => return Err(Error::Network(format!("accept: {e}"))),
             };
-            let conn = match block_on_deadline_cancelable(connecting, deadline, cancel, || {
-                Error::Timeout(timeout)
+            let conn = match block_on_deadline_cancelable(connecting, hs_deadline, cancel, || {
+                Error::Timeout(hs_timeout)
             }) {
                 Ok(Ok(conn)) => conn,
                 Ok(Err(_)) if expected_canon.is_some() => continue,
@@ -554,29 +597,43 @@ impl QuicEndpoint {
             // 弱网丢包重传会让 accept_bi 的交付顺序与打开顺序颠倒，按到达
             // 顺序分配角色会让两条流静默互换（输入进了控制流、控制进了
             // 输入流）——流 ID 是打开顺序的权威记录，不受乱序影响。
-            let first = match accept_stream(&conn, deadline, timeout, cancel) {
+            let first = match accept_stream(&conn, hs_deadline, hs_timeout, cancel) {
                 Ok(s) => s,
-                Err(Error::Timeout(t)) => return Err(Error::Timeout(t)),
+                Err(Error::Timeout(t)) => {
+                    conn.close(quinn::VarInt::from(0u32), b"handshake timeout");
+                    return Err(Error::Timeout(t));
+                }
                 Err(_) if cancel.is_some_and(|c| c.load(Ordering::Acquire)) => {
+                    conn.close(quinn::VarInt::from(0u32), b"cancelled");
                     return Err(Error::Network("cancelled".into()));
                 }
                 Err(_) if expected_canon.is_some() => {
                     conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
+                    return Err(err);
+                }
             };
-            let second = match accept_stream(&conn, deadline, timeout, cancel) {
+            let second = match accept_stream(&conn, hs_deadline, hs_timeout, cancel) {
                 Ok(s) => s,
-                Err(Error::Timeout(t)) => return Err(Error::Timeout(t)),
+                Err(Error::Timeout(t)) => {
+                    conn.close(quinn::VarInt::from(0u32), b"handshake timeout");
+                    return Err(Error::Timeout(t));
+                }
                 Err(_) if cancel.is_some_and(|c| c.load(Ordering::Acquire)) => {
+                    conn.close(quinn::VarInt::from(0u32), b"cancelled");
                     return Err(Error::Network("cancelled".into()));
                 }
                 Err(_) if expected_canon.is_some() => {
                     conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
+                    return Err(err);
+                }
             };
             let (control, urgent) = match order_by_stream_index(first, second) {
                 Ok(pair) => pair,
@@ -584,7 +641,10 @@ impl QuicEndpoint {
                     conn.close(quinn::VarInt::from(0u32), b"invalid streams");
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    conn.close(quinn::VarInt::from(0u32), b"invalid streams");
+                    return Err(err);
+                }
             };
             let _ = urgent.send.set_priority(URGENT_STREAM_PRIORITY);
             return QuicTransport::new(conn, control, urgent, self.mtu, Arc::clone(&self.closer));
@@ -690,6 +750,15 @@ fn finish_server_config(tls: rustls::ServerConfig) -> Result<quinn::ServerConfig
     Ok(server_config)
 }
 
+/// 格式化 `quinn::WriteError`：`WriteError::ConnectionLost(conn_err)` 的默认 `Display` 只输出
+/// `"connection lost"` 而吞掉内层 `ConnectionError`（含 TLS/mTLS `CRYPTO_ERROR` alert），此处显式保留原因。
+fn format_write_error(err: &quinn::WriteError) -> String {
+    match err {
+        quinn::WriteError::ConnectionLost(conn_err) => format!("connection lost: {conn_err}"),
+        other => other.to_string(),
+    }
+}
+
 /// 打开一条 reliable 双向流并写入 0 长度引导消息（让对端 accept_bi 可见）。
 fn open_bootstrap_stream(
     conn: &quinn::Connection,
@@ -706,7 +775,9 @@ fn open_bootstrap_stream(
         cancel,
         || Error::Timeout(timeout),
     )
-    .and_then(|r| r.map_err(|e| Error::Network(format!("stream bootstrap: {e}"))))?;
+    .and_then(|r| {
+        r.map_err(|e| Error::Network(format!("stream bootstrap: {}", format_write_error(&e))))
+    })?;
     Ok(ReliableStream { send, recv })
 }
 
@@ -1514,7 +1585,7 @@ fn write_framed(stream: &mut quinn::SendStream, data: &[u8]) -> Result<usize> {
     framed.extend_from_slice(data);
     let n = framed.len();
     block_on(stream.write_all(&framed))
-        .map_err(|e| Error::Network(format!("reliable write: {e}")))?;
+        .map_err(|e| Error::Network(format!("reliable write: {}", format_write_error(&e))))?;
     Ok(n)
 }
 
@@ -2177,5 +2248,188 @@ mod tests {
             "QuicTransport::drop must unblock full reliable_rx without deadlock"
         );
         let _ = flooder.join();
+    }
+
+    #[test]
+    fn accept_with_handshake_timeout_completes_delayed_client_beyond_wait_slice() {
+        const CERT_PEM: &str = include_str!("../tests/certs/server-cert.pem");
+        const KEY_PEM: &str = include_str!("../tests/certs/server-key.pem");
+
+        let ident = Identity::from_pem(CERT_PEM, KEY_PEM).expect("identity");
+        let certs = Identity::certs_from_pem(CERT_PEM).expect("certs");
+
+        let host_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+            &ident,
+        )
+        .expect("host ep");
+        let host_addr = host_ep.local_addr().expect("host addr");
+
+        // 进程内 UDP 转发代理：首包（QUIC Initial）立即透传以触发 Phase A，
+        // 后续握手与引导流数据报逐包注入 45ms 延迟（4×45ms = 180ms），确保完整握手耗时必然跨过 150ms 等待分片。
+        let proxy_sock = UdpSocket::bind("127.0.0.1:0").expect("bind proxy udp");
+        let proxy_addr = proxy_sock.local_addr().expect("proxy addr");
+        proxy_sock
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("proxy timeout");
+        let proxy_stop = Arc::new(AtomicBool::new(false));
+        let t_proxy_stop = Arc::clone(&proxy_stop);
+        let proxy_thread = std::thread::spawn(move || {
+            let mut client_peer: Option<SocketAddr> = None;
+            let mut pkt_idx: u32 = 0;
+            let mut buf = [0u8; 2048];
+            while !t_proxy_stop.load(Ordering::Acquire) {
+                let Ok((n, from)) = proxy_sock.recv_from(&mut buf) else {
+                    continue;
+                };
+                if from == host_addr {
+                    if let Some(dst) = client_peer {
+                        if (1..=4).contains(&pkt_idx) {
+                            std::thread::sleep(Duration::from_millis(45));
+                        }
+                        pkt_idx += 1;
+                        let _ = proxy_sock.send_to(&buf[..n], dst);
+                    }
+                } else {
+                    client_peer = Some(from);
+                    if (1..=4).contains(&pkt_idx) {
+                        std::thread::sleep(Duration::from_millis(45));
+                    }
+                    pkt_idx += 1;
+                    let _ = proxy_sock.send_to(&buf[..n], host_addr);
+                }
+            }
+        });
+
+        let client_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Controller, "127.0.0.1:0".parse().unwrap()),
+            &ident,
+        )
+        .expect("client ep");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_host = Arc::clone(&cancel);
+        let wait_slice = Duration::from_millis(150);
+        let hs_budget = Duration::from_secs(4);
+        let t0 = Instant::now();
+        let accepter = std::thread::spawn(move || {
+            let res =
+                host_ep.accept_with_handshake_timeout(wait_slice, hs_budget, Some(&cancel_host));
+            (res, t0.elapsed())
+        });
+
+        // 模拟客户端延迟 ~45ms 到达（留足 ~105ms Phase A 裕量防 CI 调度抖动），
+        // 叠加代理 4×45ms 握手延迟，令 QUIC 握手稳定跨过 150ms 等待片边界完成。
+        std::thread::sleep(Duration::from_millis(45));
+        let mut client = client_ep
+            .connect(proxy_addr, &certs, "rabbitcontrol", Duration::from_secs(4))
+            .expect("client connect must succeed when host decouples handshake timeout");
+        let (host_res, elapsed) = accepter.join().expect("accepter join");
+        let mut host =
+            host_res.expect("accept_with_handshake_timeout must finish beyond 150ms wait slice");
+        assert!(
+            elapsed >= wait_slice,
+            "handshake should have spanned beyond 150ms wait slice to validate decoupling (elapsed={elapsed:?})"
+        );
+
+        client
+            .send_reliable(b"decoupled-ok")
+            .expect("client send reliable");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got = false;
+        while Instant::now() < deadline && !got {
+            for ev in host.poll(Duration::from_millis(20)).expect("host poll") {
+                if matches!(ev, NetEvent::Reliable(ref b) if b == b"decoupled-ok") {
+                    got = true;
+                }
+            }
+        }
+        assert!(
+            got,
+            "host must receive reliable message after decoupled handshake"
+        );
+
+        proxy_stop.store(true, Ordering::Release);
+        let _ = proxy_thread.join();
+    }
+
+    #[test]
+    fn accept_with_handshake_timeout_distinguishes_stopped_endpoint_from_bad_client() {
+        const CERT_PEM: &str = include_str!("../tests/certs/server-cert.pem");
+        const KEY_PEM: &str = include_str!("../tests/certs/server-key.pem");
+
+        let ident = Identity::from_pem(CERT_PEM, KEY_PEM).expect("identity");
+        let certs = Identity::certs_from_pem(CERT_PEM).expect("certs");
+
+        let host_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+            &ident,
+        )
+        .expect("host ep");
+        let host_addr = host_ep.local_addr().expect("host addr");
+        let client_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Controller, "127.0.0.1:0".parse().unwrap()),
+            &ident,
+        )
+        .expect("client ep");
+
+        // 1) 单次非法客户端握手（错误 server_name 导致客户端拒收证书）返回网络错误，
+        //    但绝不判定为端点已停止，同一 host_ep 仍可继续接纳合法连接。
+        let bad_client = std::thread::spawn(move || {
+            let _ = client_ep.connect(
+                host_addr,
+                &certs,
+                "wrong-server-name",
+                Duration::from_secs(2),
+            );
+            client_ep
+        });
+        let err = match host_ep.accept_with_handshake_timeout(
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            None,
+        ) {
+            Ok(_) => panic!("invalid client handshake must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            !is_endpoint_stopped_error(&err),
+            "single client handshake failure must not be classified as endpoint stopped: {err}"
+        );
+        let client_ep = bad_client.join().expect("bad client join");
+
+        // 2) 同一端点随后接纳合法客户端成功。
+        let certs_ok = Identity::certs_from_pem(CERT_PEM).expect("certs ok");
+        let good_client = std::thread::spawn(move || {
+            client_ep
+                .connect(
+                    host_addr,
+                    &certs_ok,
+                    "rabbitcontrol",
+                    Duration::from_secs(3),
+                )
+                .expect("valid client connect")
+        });
+        let _host_ok = host_ep
+            .accept_with_handshake_timeout(Duration::from_secs(2), Duration::from_secs(2), None)
+            .expect("host endpoint must stay healthy after bad client");
+        let _client_ok = good_client.join().expect("good client join");
+
+        // 3) 端点显式关闭后，accept_with_handshake_timeout 返回满足 is_endpoint_stopped_error 的错误。
+        host_ep
+            .endpoint()
+            .close(quinn::VarInt::from(0u32), b"test stop");
+        let stopped_err = match host_ep.accept_with_handshake_timeout(
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+            None,
+        ) {
+            Ok(_) => panic!("stopped endpoint must fail accept"),
+            Err(e) => e,
+        };
+        assert!(
+            is_endpoint_stopped_error(&stopped_err),
+            "stopped endpoint must satisfy is_endpoint_stopped_error, got: {stopped_err}"
+        );
     }
 }

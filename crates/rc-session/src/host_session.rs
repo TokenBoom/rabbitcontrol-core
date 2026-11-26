@@ -31,6 +31,7 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -505,10 +506,44 @@ impl HostSession {
     /// 阻塞 accept 一个连接，随后完成 Hello/Welcome（Init→Connected→Streaming）。
     /// 返回裁定参数。Hello 违规（version≠1 等）返回 Err 且连接关闭。
     ///
+    /// 底层 QUIC 等待与握手超时已解耦：`timeout` 仅约束等待入站 `Incoming` 的时长，
+    /// 收到 `Incoming` 后使用 `self.cfg.handshake_timeout` 完成 QUIC 握手与引导流。
+    ///
     /// T17：端点改为**借用不消耗**——Detached 期 `tick_detached` 还要用
     /// 同一端点 accept 重连/全新连接（T14 实现把它 take 走，是本卡的最小
     /// 内部修正；accept 超时后端点也可重试，行为只会更稳）。
     pub fn accept_and_handshake(&mut self, timeout: Duration) -> Result<SessionParams> {
+        self.accept_and_handshake_inner(timeout, self.cfg.handshake_timeout, None)
+    }
+
+    /// 可取消的 [`Self::accept_and_handshake`] 变体（供 `host_bridge` 传入 `stop_flag`）。
+    ///
+    /// 等待入站 `Incoming` 使用短分片 `wait_timeout`，收到 `Incoming` 后使用
+    /// `self.cfg.handshake_timeout` 作为独立 QUIC 握手预算，并在等待与握手阶段周期检查 `cancel`。
+    pub fn accept_and_handshake_cancelable(
+        &mut self,
+        wait_timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<SessionParams> {
+        self.accept_and_handshake_inner(wait_timeout, self.cfg.handshake_timeout, Some(cancel))
+    }
+
+    /// 可同时指定独立 QUIC 握手预算与取消标志的 [`Self::accept_and_handshake`] 变体。
+    pub fn accept_and_handshake_with_timeout_cancelable(
+        &mut self,
+        wait_timeout: Duration,
+        quic_handshake_timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<SessionParams> {
+        self.accept_and_handshake_inner(wait_timeout, quic_handshake_timeout, Some(cancel))
+    }
+
+    fn accept_and_handshake_inner(
+        &mut self,
+        wait_timeout: Duration,
+        quic_handshake_timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<SessionParams> {
         match self.state {
             SessionState::Init => {}
             other => {
@@ -523,11 +558,11 @@ impl HostSession {
             .ok_or_else(|| {
                 Error::InvalidConfig("accept requires real-network construction (new)".into())
             })?
-            .accept(timeout)?;
+            .accept_with_handshake_timeout(wait_timeout, quic_handshake_timeout, cancel)?;
         self.peer_addr = transport.remote_addr();
         self.transport = Some(Box::new(transport));
         self.state = SessionState::Connected;
-        self.handshake()
+        self.handshake_inner(cancel)
     }
 
     /// 已连通 transport 上的握手步骤（with_parts 后由测试直接驱动）。
@@ -538,6 +573,10 @@ impl HostSession {
     /// 本模块不读任何时钟（见模块文档）；mock transport 忽略超时，
     /// 预置事件即刻交付，同样适用。
     pub fn handshake(&mut self) -> Result<SessionParams> {
+        self.handshake_inner(None)
+    }
+
+    fn handshake_inner(&mut self, cancel: Option<&AtomicBool>) -> Result<SessionParams> {
         match self.state {
             SessionState::Connected => {}
             SessionState::Init => {
@@ -566,6 +605,9 @@ impl HostSession {
         let auth_budget_rounds = auth_budget_ms.div_ceil(slice_ms).max(1) + 2;
 
         loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+                return Err(self.handshake_fail(Error::Network("cancelled".into())));
+            }
             let events = match self
                 .transport
                 .as_mut()

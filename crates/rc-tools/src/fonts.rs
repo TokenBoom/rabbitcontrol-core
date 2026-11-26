@@ -166,6 +166,10 @@ pub fn list_local_fonts() -> Vec<TerminalFontInfo> {
 
 /// 返回当前操作系统的默认系统字体白名单根目录列表。
 pub fn default_font_roots() -> Vec<PathBuf> {
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+        allow(unused_mut)
+    )]
     let mut roots = Vec::new();
     #[cfg(target_os = "macos")]
     {

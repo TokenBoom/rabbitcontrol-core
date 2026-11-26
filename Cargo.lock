@@ -632,21 +632,21 @@ dependencies = [
 
 [[package]]
 name = "rc-audio"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-types",
 ]
 
 [[package]]
 name = "rc-capture"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-types",
 ]
 
 [[package]]
 name = "rc-client-core"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "base64",
  "rand 0.8.8",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "rc-decode"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-capture",
  "rc-types",
@@ -681,14 +681,14 @@ dependencies = [
 
 [[package]]
 name = "rc-diff"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-types",
 ]
 
 [[package]]
 name = "rc-encode"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-capture",
  "rc-types",
@@ -696,14 +696,14 @@ dependencies = [
 
 [[package]]
 name = "rc-fec"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-types",
 ]
 
 [[package]]
 name = "rc-input"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-net",
  "rc-types",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "rc-loopback"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rand 0.8.8",
  "rc-capture",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "rc-net"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "bytes",
  "quinn",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "rc-pipeline"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-capture",
  "rc-decode",
@@ -757,14 +757,14 @@ dependencies = [
 
 [[package]]
 name = "rc-proto"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-types",
 ]
 
 [[package]]
 name = "rc-render"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-capture",
  "rc-decode",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "rc-sched"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-types",
  "thiserror 1.0.69",
@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "rc-session"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rand 0.8.8",
  "rc-capture",
@@ -798,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "rc-tools"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "base64",
  "libc",
@@ -809,14 +809,14 @@ dependencies = [
 
 [[package]]
 name = "rc-trace"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "rc-types",
 ]
 
 [[package]]
 name = "rc-types"
-version = "0.1.0"
+version = "0.1.26"
 dependencies = [
  "thiserror 1.0.69",
 ]

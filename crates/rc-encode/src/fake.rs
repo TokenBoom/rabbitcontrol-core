@@ -350,8 +350,8 @@ mod tests {
 
         let mut enc = FakeEncoder::new(EncoderConfig::default()).expect("配置合法");
 
-        // 非 CPU 纹理（macOS 上可构造 CVPixelBuffer 变体）→ InvalidFrame。
-        #[cfg(target_os = "macos")]
+        // 非 CPU 纹理（macOS / iOS 上可构造 CVPixelBuffer 变体）→ InvalidFrame。
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             let gpu_frame = CapturedFrame {
                 texture: FrameTexture::CVPixelBuffer(std::ptr::null_mut()),

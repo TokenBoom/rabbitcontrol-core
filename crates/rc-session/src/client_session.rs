@@ -260,6 +260,11 @@ pub struct ClientSession {
     refresh_pending: bool,
     /// T19：握手期鉴权子态（Init/Connected ⇄ 终局 Welcome/超时；A6：未终局前零启动管线）。
     auth_phase: AuthPhase,
+    /// 本轮 [`ClientSession::handshake`] 是否已进入鉴权/审批交互（已收到对端 `Welcome` 或 `AuthChallenge`）。
+    ///
+    /// 上层三阶路由回退据此区分「`Welcome` 前底层断连（尚未触发审批/鉴权）」与
+    /// 「已进入密码挑战或机主审批交互后的失败」，防止误回退导致被控端连弹多个审批窗。
+    handshake_entered_auth: bool,
     // ── T20：剪贴板 UTF-8 纯文本双向同步（默认禁用，显式 enable_clipboard 开启）──
     /// 剪贴板同步状态：`Some((channel, backend))` 表示已启用，`None` 表示禁用（CB1）。
     clipboard: Option<(ClipboardChannel, Box<dyn ClipboardBackend>)>,
@@ -430,6 +435,7 @@ impl ClientSession {
             reconnect_phase: ReconnectPhase::Idle,
             refresh_pending: false,
             auth_phase: AuthPhase::Idle,
+            handshake_entered_auth: false,
             clipboard: None,
             clipboard_received_while_disabled: 0,
             tool_rx: VecDeque::new(),
@@ -518,6 +524,7 @@ impl ClientSession {
             reconnect_phase: ReconnectPhase::Idle,
             refresh_pending: false,
             auth_phase: AuthPhase::Idle,
+            handshake_entered_auth: false,
             clipboard: None,
             clipboard_received_while_disabled: 0,
             tool_rx: VecDeque::new(),
@@ -636,6 +643,7 @@ impl ClientSession {
             }
         }
         // T19（A1/A2）：构造全新 ClientAuthenticator，鉴权位来自 hello_auth()（密码绝不进 Hello）。
+        self.handshake_entered_auth = false;
         let mut auth =
             ClientAuthenticator::with_session_id(self.cfg.auth.clone(), self.session_id_current);
         let (auth_method, auth_payload) = auth.hello_auth();
@@ -741,6 +749,11 @@ impl ClientSession {
     /// 当前状态。
     pub fn state(&self) -> SessionState {
         self.state
+    }
+
+    /// 最近一次 [`Self::handshake`] 是否已收到对端 `Welcome` 或 `AuthChallenge`（已进入鉴权/审批交互）。
+    pub fn handshake_entered_auth(&self) -> bool {
+        self.handshake_entered_auth
     }
 
     /// 会话停机原因（未停机前为 `None`）。
@@ -2510,6 +2523,7 @@ impl ClientSession {
         let decoded = ControlMessage::decode(msg)?;
         match decoded {
             ControlMessage::Welcome(welcome) => {
+                self.handshake_entered_auth = true;
                 // S3：session_id 必须回显当前会话号（含过程 Welcome）。
                 if welcome.session_id != self.session_id_current {
                     return Err(Error::Protocol {
@@ -2549,6 +2563,7 @@ impl ClientSession {
                 }
             }
             ControlMessage::AuthChallenge(ch) => {
+                self.handshake_entered_auth = true;
                 let action = match &mut self.auth_phase {
                     AuthPhase::Authenticating(auth) => auth.on_challenge(&ch),
                     AuthPhase::Idle => ClientAuthAction::Failed(

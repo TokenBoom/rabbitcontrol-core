@@ -95,8 +95,11 @@ pub const TEMP_CODE_LEN: usize = 8;
 /// 临时验证码字符表（32 个字符 = 2^5，按低 5 位索引零模偏差）。
 const TEMP_CODE_ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 
-/// 单次 `accept_and_handshake` 分片超时（兼顾 QUIC 握手预算、中继入站响应速度与 `stop()` 回收）。
+/// 单次等待入站连接的短分片超时（与 QUIC 握手预算解耦，兼顾中继入站响应速度与 `stop()` 回收）。
 const HOST_ACCEPT_SLICE: Duration = Duration::from_millis(150);
+
+/// 收到入站 `Incoming` 后执行 QUIC/mTLS 握手与两条引导流的独立超时预算（与 `HOST_ACCEPT_SLICE` 解耦）。
+const HOST_QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// 中继传输层建连与 `RCR1` 握手超时。
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -5668,6 +5671,32 @@ fn serve_relay_incoming(
     }
 }
 
+/// 可随时被 `stop_flag` 打断的有界短退避，防止恶意/故障客户端高频触发 accept 错误导致 tight-loop 烧 CPU。
+fn sleep_cancelable(duration: Duration, stop_flag: &AtomicBool) {
+    let deadline = Instant::now() + duration;
+    while !stop_flag.load(Ordering::Acquire) {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+/// 根据连续 accept 非超时错误次数计算有界退避时长（前 2 次零退避，第 3 次起 20ms→40ms→50ms）。
+fn accept_error_backoff(consecutive_errors: u32) -> Option<Duration> {
+    if consecutive_errors < 3 {
+        None
+    } else {
+        let ms = 20u64
+            .saturating_mul(u64::from(consecutive_errors - 2))
+            .min(50);
+        Some(Duration::from_millis(ms))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_host_worker(
     mut actual_addr: SocketAddr,
@@ -5917,6 +5946,7 @@ fn run_host_worker(
                 } = *built;
 
                 // 1) 分片 accept + 握手循环（同时轮询信令下发的入站中继/P2P 会话）。
+                let mut consecutive_accept_errors: u32 = 0;
                 let accepted = loop {
                     if stop_flag.load(Ordering::Acquire) {
                         break false;
@@ -5957,20 +5987,38 @@ fn run_host_worker(
                         break false;
                     }
                     // 每轮 accept 分片前重锚 Pending 墙钟并刷新当前显示器分辨率能力，避免外接屏/分辨率切换后使用陈旧 caps。
-                    if opts.prefer_hardware {
+                    if opts.prefer_hardware && consecutive_accept_errors == 0 {
                         if let Some(live_res) = host_hardware_display_caps(true) {
                             host.update_caps_resolution(live_res.width, live_res.height);
                         }
                     }
                     clock_anchor.reset_pending();
 
-                    match host.accept_and_handshake(HOST_ACCEPT_SLICE) {
+                    match host.accept_and_handshake_with_timeout_cancelable(
+                        HOST_ACCEPT_SLICE,
+                        HOST_QUIC_HANDSHAKE_TIMEOUT,
+                        &stop_flag,
+                    ) {
                         Ok(_) => break true,
                         Err(rc_types::Error::Timeout(_)) if host.state() == SessionState::Init => {
+                            consecutive_accept_errors = 0;
+                            continue;
+                        }
+                        Err(ref e)
+                            if host.state() == SessionState::Init
+                                && !stop_flag.load(Ordering::Acquire)
+                                && !rc_net::quic::is_endpoint_stopped_error(e) =>
+                        {
+                            // 单个非法/半开客户端在 QUIC 握手阶段失败，端点仍健康；
+                            // 连续失败 >= 3 次时做有界短退避，防高频恶意连接空转烧 CPU。
+                            consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
+                            if let Some(backoff) = accept_error_backoff(consecutive_accept_errors) {
+                                sleep_cancelable(backoff, &stop_flag);
+                            }
                             continue;
                         }
                         Err(_) => {
-                            // 鉴权失败 / 机主拒绝 / 握手超时 / 对端中途断开：本轮结束，回到监听。
+                            // 端点已停止 / 鉴权失败 / 机主拒绝 / 握手超时 / 对端中途断开：本轮结束，回到监听。
                             break false;
                         }
                     }
@@ -6078,6 +6126,7 @@ fn run_host_worker(
             HostListener::MtlsLan { endpoint } => {
                 // mTLS LAN 监听循环：保持 endpoint 复用，直到需要切回 Plain、config_version 变更或收到信令入站会话。
                 let mut need_rebind = false;
+                let mut consecutive_accept_errors: u32 = 0;
                 while !stop_flag.load(Ordering::Acquire) {
                     owner_terminals.sync_auth_and_poll(Some(auth_state.as_ref()));
                     if let Some(incoming) =
@@ -6112,8 +6161,13 @@ fn run_host_worker(
                         break;
                     }
                     observed_pw_ver = password_version.load(Ordering::Acquire);
-                    match endpoint.accept(HOST_ACCEPT_SLICE) {
+                    match endpoint.accept_with_handshake_timeout(
+                        HOST_ACCEPT_SLICE,
+                        HOST_QUIC_HANDSHAKE_TIMEOUT,
+                        Some(&stop_flag),
+                    ) {
                         Ok(quic_transport) => {
+                            consecutive_accept_errors = 0;
                             let session_started_at = Instant::now();
                             disconnect_flag.store(false, Ordering::Release);
                             let mtls_peer_did = quic_transport
@@ -6223,11 +6277,23 @@ fn run_host_worker(
                                 }
                             }
                         }
-                        Err(rc_types::Error::Timeout(_)) => continue,
-                        Err(_) => {
+                        Err(rc_types::Error::Timeout(_)) => {
+                            consecutive_accept_errors = 0;
+                            continue;
+                        }
+                        Err(err) if rc_net::quic::is_endpoint_stopped_error(&err) => {
                             need_rebind = true;
                             pending_listening_notify = true;
                             break;
+                        }
+                        Err(_) => {
+                            // 单个非法/半开客户端握手失败不得重建整个 UDP 端点；
+                            // 连续失败 >= 3 次时做有界短退避，防高频恶意连接空转烧 CPU。
+                            consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
+                            if let Some(backoff) = accept_error_backoff(consecutive_accept_errors) {
+                                sleep_cancelable(backoff, &stop_flag);
+                            }
+                            continue;
                         }
                     }
                 }
@@ -8699,5 +8765,242 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(plain_outcome.reason, "纯工具连接已断开");
+    }
+
+    #[test]
+    fn mtls_lan_survives_invalid_client_handshake_without_rebind_and_accepts_valid_client() {
+        use crate::relay_transport::tests::mtls_test_certs::TestCa;
+        use rc_session::{ClientAuthConfig, ClientSession, ClientSessionConfig};
+
+        struct EmptyInput;
+        impl rc_input::InputCapture for EmptyInput {
+            fn next_events(
+                &mut self,
+                _timeout: Duration,
+            ) -> rc_types::Result<Vec<rc_input::InputEvent>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let mut ca = TestCa::new("MtlsLanHostCA");
+        let (host_cert, host_key) = ca.issue_device("user-lan", "200000001");
+        let (good_cert, good_key) = ca.issue_device("user-lan", "100000001");
+
+        let mut rogue_ca = TestCa::new("RogueClientCA");
+        let (rogue_cert, rogue_key) = rogue_ca.issue_device("attacker", "999999999");
+
+        let host_bundle = SessionMtlsBundle {
+            ca_cert_pem: ca.ca_pem.clone(),
+            cert_pem: host_cert,
+            key_pem: host_key,
+            local_user_id: "user-lan".to_string(),
+            expected_peer_device_id: None,
+            expected_peer_user_id: None,
+        };
+        let good_bundle = SessionMtlsBundle {
+            ca_cert_pem: ca.ca_pem.clone(),
+            cert_pem: good_cert,
+            key_pem: good_key,
+            local_user_id: "user-lan".to_string(),
+            expected_peer_device_id: Some("200000001".to_string()),
+            expected_peer_user_id: Some("user-lan".to_string()),
+        };
+        let rogue_bundle = SessionMtlsBundle {
+            ca_cert_pem: ca.ca_pem.clone(),
+            cert_pem: rogue_cert,
+            key_pem: rogue_key,
+            local_user_id: "attacker".to_string(),
+            expected_peer_device_id: Some("200000001".to_string()),
+            expected_peer_user_id: None,
+        };
+
+        let mut host = HostHandle::spawn(UiHostConfig {
+            listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            password: None,
+            prefer_hardware: false,
+            require_approval: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            mtls_config: Some(host_bundle),
+            accept_mtls_lan: true,
+            ..UiHostConfig::default()
+        })
+        .expect("spawn MtlsLan host");
+
+        // 1) 等待初始 Listening 事件并记录绑定端口。
+        let listen_deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_initial_listening = false;
+        while Instant::now() < listen_deadline {
+            if let Some(HostUpdate::Listening { .. }) = host.try_recv_update() {
+                saw_initial_listening = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_initial_listening, "host must emit initial Listening");
+        let host_addr = host.listen_addr();
+
+        // 2) 非法客户端（不受信任 CA 签发的客户端证书）尝试 mTLS 握手：
+        //    TLS 1.3 客户端在发出 ClientFinished 后可能先返回 Ok，随后立刻收到服务端拒收证书的
+        //    TLS Alert / CONNECTION_CLOSE；无论在 connect 阶段或随后的 poll 阶段都必须被服务端拒连。
+        let dev_id = rc_net::quic::Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM).expect("dev id");
+        let rogue_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Controller, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            &dev_id,
+        )
+        .expect("rogue ep");
+        let rogue_mtls = rogue_bundle.to_quic_mtls_config().expect("rogue mtls cfg");
+        match rogue_ep.connect_mtls(host_addr, &rogue_mtls, "", Duration::from_secs(2)) {
+            Err(_) => {}
+            Ok(mut rogue_t) => {
+                let rej_deadline = Instant::now() + Duration::from_secs(2);
+                let mut rejected = false;
+                while Instant::now() < rej_deadline && !rejected {
+                    match rogue_t.poll(Duration::from_millis(20)) {
+                        Ok(events) => {
+                            if events
+                                .iter()
+                                .any(|ev| matches!(ev, NetEvent::Disconnected { .. }))
+                            {
+                                rejected = true;
+                            }
+                        }
+                        Err(_) => {
+                            rejected = true;
+                        }
+                    }
+                }
+                assert!(
+                    rejected,
+                    "rogue untrusted client must be rejected by MtlsLan server"
+                );
+            }
+        }
+        drop(rogue_ep);
+
+        // 等待短暂窗口，验证 MtlsLan 端点未触发重建（无额外 Listening 重绑事件，也无 ClientConnected，端口保持不变）。
+        thread::sleep(Duration::from_millis(120));
+        let mut rebind_listening_count = 0usize;
+        let mut rogue_connected = false;
+        while let Some(upd) = host.try_recv_update() {
+            match upd {
+                HostUpdate::Listening { .. } => rebind_listening_count += 1,
+                HostUpdate::ClientConnected { .. } | HostUpdate::OwnerConnected { .. } => {
+                    rogue_connected = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !rogue_connected,
+            "rogue untrusted client must never reach ClientConnected"
+        );
+        assert_eq!(
+            rebind_listening_count, 0,
+            "single invalid client handshake must not rebuild MtlsLan endpoint"
+        );
+        assert_eq!(
+            host.listen_addr(),
+            host_addr,
+            "MtlsLan endpoint address must stay unchanged after invalid client"
+        );
+
+        // 3) 随后合法 mTLS 客户端连接到同一地址，必须正常完成 mTLS + Hello/Welcome 握手。
+        let good_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Controller, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            &dev_id,
+        )
+        .expect("good ep");
+        let good_mtls = good_bundle.to_quic_mtls_config().expect("good mtls cfg");
+        let good_transport = good_ep
+            .connect_mtls(host_addr, &good_mtls, "", Duration::from_secs(3))
+            .expect("valid mTLS client must connect to surviving MtlsLan endpoint");
+        assert_eq!(
+            good_transport
+                .peer_mtls_identity()
+                .expect("peer identity")
+                .device_id,
+            "200000001"
+        );
+
+        let mut ccfg = ClientSessionConfig::new(
+            host_addr,
+            SessionParams {
+                width: 640,
+                height: 360,
+                fps: 30,
+                bitrate_bps: 2_000_000,
+            },
+            4242,
+            Box::new(EmptyInput),
+        );
+        ccfg.handshake_timeout = Duration::from_secs(3);
+        ccfg.auth = ClientAuthConfig::default();
+        let placeholder_res = Resolution::new(64, 64);
+        let dummy_dec = rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
+            resolution: placeholder_res,
+            ..rc_decode::FakeDecoderConfig::default()
+        })
+        .expect("dummy dec");
+        let dummy_ren = rc_render::FakeRenderer::new(rc_render::FakeRendererConfig {
+            size: (placeholder_res.width, placeholder_res.height),
+            ..rc_render::FakeRendererConfig::default()
+        })
+        .expect("dummy ren");
+        let cclock: SessionClock = Arc::new(|| 0);
+        let mut client = ClientSession::with_parts(
+            ccfg,
+            Box::new(good_transport),
+            Box::new(dummy_dec),
+            Box::new(dummy_ren),
+            cclock,
+        )
+        .expect("client with_parts");
+        let granted = client
+            .handshake()
+            .expect("valid client session handshake must succeed");
+        assert_eq!(granted.width, 640);
+        assert_eq!(granted.height, 360);
+
+        let conn_deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_connected = false;
+        while Instant::now() < conn_deadline {
+            if let Some(HostUpdate::ClientConnected { remote_addr }) = host.try_recv_update() {
+                assert!(
+                    remote_addr.contains("LAN mTLS"),
+                    "expected LAN mTLS label, got {remote_addr}"
+                );
+                saw_connected = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            saw_connected,
+            "host must report ClientConnected for valid mTLS client"
+        );
+
+        drop(client);
+        drop(good_ep);
+        host.stop();
+    }
+
+    #[test]
+    fn accept_error_backoff_bounds_tight_loop_and_respects_stop_flag() {
+        assert_eq!(accept_error_backoff(0), None);
+        assert_eq!(accept_error_backoff(1), None);
+        assert_eq!(accept_error_backoff(2), None);
+        assert_eq!(accept_error_backoff(3), Some(Duration::from_millis(20)));
+        assert_eq!(accept_error_backoff(4), Some(Duration::from_millis(40)));
+        assert_eq!(accept_error_backoff(5), Some(Duration::from_millis(50)));
+        assert_eq!(accept_error_backoff(100), Some(Duration::from_millis(50)));
+
+        let stop = AtomicBool::new(true);
+        let t0 = Instant::now();
+        sleep_cancelable(Duration::from_secs(2), &stop);
+        assert!(
+            t0.elapsed() < Duration::from_millis(50),
+            "sleep_cancelable must exit immediately when stop_flag is set"
+        );
     }
 }

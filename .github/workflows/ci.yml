@@ -48,3 +48,58 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace -- --test-threads=1
+
+  mobile-check:
+    name: Mobile Check (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ios
+            os: macos-latest
+          - platform: android
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: core-mobile-${{ matrix.platform }}
+      - name: Check iOS targets
+        if: matrix.platform == 'ios'
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+          cargo check --workspace --target aarch64-apple-ios
+          cargo check --workspace --target aarch64-apple-ios-sim
+          cargo check --workspace --target x86_64-apple-ios
+      - name: Check Android target
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-linux-android
+          NDK_HOME="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -z "${NDK_HOME}" ]; then
+            echo "Android NDK environment variable (ANDROID_NDK_LATEST_HOME / ANDROID_NDK_HOME / ANDROID_NDK_ROOT) is not set" >&2
+            exit 1
+          fi
+          NDK_BIN="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC_BIN="${NDK_BIN}/aarch64-linux-android24-clang"
+          if [ ! -x "${CC_BIN}" ]; then
+            CC_BIN="$(find "${NDK_BIN}" -maxdepth 1 -name 'aarch64-linux-android*-clang' -type f | sort -V | head -n 1)"
+          fi
+          AR_BIN="${NDK_BIN}/llvm-ar"
+          if [ -z "${CC_BIN}" ] || [ ! -x "${CC_BIN}" ]; then
+            echo "Android NDK clang not found under ${NDK_BIN}" >&2
+            exit 1
+          fi
+          if [ ! -x "${AR_BIN}" ]; then
+            echo "Android NDK llvm-ar not found under ${NDK_BIN}" >&2
+            exit 1
+          fi
+          export CC_aarch64_linux_android="${CC_BIN}"
+          export AR_aarch64_linux_android="${AR_BIN}"
+          cargo check --workspace --target aarch64-linux-android
