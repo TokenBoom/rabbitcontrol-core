@@ -193,21 +193,22 @@ fn drive(
 ) -> u64 {
     let mut displayed = 0;
     let now = || clock();
-    let tick_push = |host: &mut HostPipeline,
-                     controller: &mut ControllerPipeline,
-                     now: u32,
-                     displayed: &mut u64| {
-        if let Some(datagrams) = host.tick(now).expect("tick ok") {
-            for d in &datagrams {
-                if controller.push_datagram(d, now).expect("push ok") {
-                    *displayed += 1;
+    let tick_push =
+        |host: &mut HostPipeline, controller: &mut ControllerPipeline, displayed: &mut u64| {
+            if let Some(datagrams) = host.tick(now()).expect("tick ok") {
+                // host.tick 内部通过注入时钟给 Mark::Sent 打点；必须在 tick 返回后再采样接收时刻，
+                // 防止共享 CI runner 调度抢占 >1ms 时复用旧 now 造成 Received < Sent 时间倒流。
+                let recv_now = now();
+                for d in &datagrams {
+                    if controller.push_datagram(d, recv_now).expect("push ok") {
+                        *displayed += 1;
+                    }
                 }
+                true
+            } else {
+                false
             }
-            true
-        } else {
-            false
-        }
-    };
+        };
     // 按采集计数驱动（tick 的 Some 也可能是上一帧的编码完成批，
     // 不能当「新帧到达」信号）；上限 n×100ms 防挂死。
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100 * n as u64);
@@ -215,7 +216,7 @@ fn drive(
         if controller.take_keyframe_request() {
             host.request_idr();
         }
-        tick_push(host, controller, now(), &mut displayed);
+        tick_push(host, controller, &mut displayed);
         if host.sched_stats().captured >= n as u64 && !host.has_pending_encodes() {
             break;
         }
@@ -226,7 +227,7 @@ fn drive(
         if host.has_pending_encodes() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        if !tick_push(host, controller, now(), &mut displayed) && !host.has_pending_encodes() {
+        if !tick_push(host, controller, &mut displayed) && !host.has_pending_encodes() {
             break;
         }
     }
