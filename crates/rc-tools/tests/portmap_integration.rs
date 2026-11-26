@@ -431,7 +431,7 @@ fn portmap_window_flow_control_sustains_over_3mib_transfer() {
         let mut stream = TcpStream::connect(("127.0.0.1", local_port)).unwrap();
         stream.set_nodelay(true).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         let mut writer = stream.try_clone().unwrap();
         let w = thread::spawn(move || {
@@ -446,7 +446,8 @@ fn portmap_window_flow_control_sustains_over_3mib_transfer() {
         io_done_flag.store(true, Ordering::Release);
     });
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut idle_spins: u32 = 0;
     while Instant::now() < deadline {
         let moved = pump_step(&mut client, &mut host);
         if io_done.load(Ordering::Acquire)
@@ -455,8 +456,16 @@ fn portmap_window_flow_control_sustains_over_3mib_transfer() {
         {
             break;
         }
-        if !moved {
-            thread::sleep(Duration::from_millis(1));
+        if moved {
+            idle_spins = 0;
+        } else {
+            idle_spins = idle_spins.saturating_add(1);
+            // Windows 默认时钟量子 ~15.6ms：先 yield_now 避免 3MiB 双向流控测试因几百次短空闲累计撞穿超时。
+            if idle_spins <= 16 {
+                thread::yield_now();
+            } else {
+                thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 
