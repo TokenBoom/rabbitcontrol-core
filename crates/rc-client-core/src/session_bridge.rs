@@ -299,6 +299,11 @@ pub enum SessionCommand {
     },
     /// 立即触发一次快速链路探测（切网 2s 快检看门狗）。
     ProbeNow,
+    /// 运行期开关静止画面 Tile 级无损文字锐化补帧（经 `TOOL_CHANNEL_DISPLAY_CTRL` 下发被控端）。
+    SetStillRefinementEnabled {
+        /// `true` = 开启静止无损增强；`false` = 关闭并立即清空本地叠加层与远端待发队列。
+        enabled: bool,
+    },
 }
 
 /// 连接进度（对齐 T18 计时口径：起点 = Endpoint 创建之前）。
@@ -729,6 +734,27 @@ impl Renderer for SharedRenderer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_cursor(pos, visible);
+    }
+
+    fn apply_still_tile(&mut self, patch: &rc_render::StillTilePatch) -> rc_types::Result<()> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply_still_tile(patch)
+    }
+
+    fn invalidate_still_tiles(&mut self, dirty_rects: &[rc_types::Rect]) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate_still_tiles(dirty_rects);
+    }
+
+    fn clear_still_tiles(&mut self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear_still_tiles();
     }
 }
 
@@ -1969,6 +1995,7 @@ pub struct SessionHandle {
     running: Arc<AtomicBool>,
     watch_only: Arc<AtomicBool>,
     tool_permissions: Arc<Mutex<ToolPermissions>>,
+    still_refine_metrics: Arc<Mutex<crate::still_refine::StillRefineMetrics>>,
     encrypt_connection: bool,
     base_config: UiSessionConfig,
     layer_lease: Arc<Mutex<Option<LayerLease>>>,
@@ -2007,6 +2034,9 @@ impl SessionHandle {
         let upgrade_surface = Arc::new(Mutex::new(preallocated_surface));
         let watch_only = Arc::new(AtomicBool::new(cfg.watch_only));
         let tool_permissions = Arc::new(Mutex::new(ToolPermissions::all_allowed()));
+        let still_refine_metrics = Arc::new(Mutex::new(
+            crate::still_refine::StillRefineMetrics::default(),
+        ));
         let encrypt_connection = cfg.encrypt_connection;
         let base_config = cfg.clone();
 
@@ -2023,6 +2053,7 @@ impl SessionHandle {
         let t_running = Arc::clone(&running);
         let t_watch_only = Arc::clone(&watch_only);
         let t_tool_permissions = Arc::clone(&tool_permissions);
+        let t_still_refine_metrics = Arc::clone(&still_refine_metrics);
         let t_layer = Arc::clone(&layer_lease);
         let t_upgrade_surface = Arc::clone(&upgrade_surface);
 
@@ -2050,6 +2081,7 @@ impl SessionHandle {
                         t_portmap_latest,
                         t_watch_only,
                         t_tool_permissions,
+                        t_still_refine_metrics,
                     )
                 }));
                 let end = match res {
@@ -2097,6 +2129,7 @@ impl SessionHandle {
             running,
             watch_only,
             tool_permissions,
+            still_refine_metrics,
             encrypt_connection,
             base_config,
             layer_lease,
@@ -2235,6 +2268,14 @@ impl SessionHandle {
     pub fn tool_permissions(&self) -> ToolPermissions {
         *self
             .tool_permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 查询当前会话静止无损 Tile 补帧的接收端诊断指标快照（`applied_count` / `drop_stale_count` / `avg_tile_bytes`）。
+    pub fn still_refine_metrics(&self) -> crate::still_refine::StillRefineMetrics {
+        *self
+            .still_refine_metrics
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
@@ -2898,6 +2939,7 @@ fn run_session_thread(
     portmap_latest: Arc<Mutex<Option<Vec<PortMapRuleSnapshot>>>>,
     watch_only: Arc<AtomicBool>,
     tool_permissions: Arc<Mutex<ToolPermissions>>,
+    still_refine_metrics: Arc<Mutex<crate::still_refine::StillRefineMetrics>>,
 ) -> Result<SessionEnd, SessionEnd> {
     let _relay_guard = RelayInterruptSlotGuard {
         slot: &relay_interrupt,
@@ -3647,6 +3689,10 @@ fn run_session_thread(
     let mut host_codec_generation: u64 = 1;
     let mut pending_unrecovered_decode_failure: Option<(rc_encode::Codec, u64, String)> = None;
     let mut legacy_hevc_requested = false;
+    let mut still_refinement_enabled = true;
+    let mut pending_still_clear = false;
+    let mut still_receiver =
+        crate::still_refine::StillRefineReceiver::new(1, negotiated.width, negotiated.height);
     if cfg.tools_only {
         client.set_media_paused(true);
         if let Some(payload) =
@@ -3685,6 +3731,14 @@ fn run_session_thread(
     let mut last_local_tool_denied: [Option<Instant>; 8] = [None; 8];
 
     while client.state() != SessionState::Closed {
+        // 若上一拍因异步解码线程持锁争用未能清空静止无损叠加层，每拍开头非阻塞重试直至实际清除完成。
+        if pending_still_clear {
+            try_clear_still_overlay(
+                &renderer_handle,
+                &mut still_receiver,
+                &mut pending_still_clear,
+            );
+        }
         // 1) 处理来自 UI 的控制命令。
         for cmd in cmd_rx.drain_all() {
             match cmd {
@@ -3801,6 +3855,11 @@ fn run_session_thread(
                         if paused {
                             pending_desktop_upgrade = false;
                             client.set_media_paused(true);
+                            try_clear_still_overlay(
+                                &renderer_handle,
+                                &mut still_receiver,
+                                &mut pending_still_clear,
+                            );
                             update_tx.push(SessionUpdate::MediaState { paused: true });
                         } else {
                             // 重连期间缓存桌面升级/恢复意图，待重连回到 Streaming 后立即执行。
@@ -3811,6 +3870,11 @@ fn run_session_thread(
                     if paused {
                         pending_desktop_upgrade = false;
                         client.set_media_paused(true);
+                        try_clear_still_overlay(
+                            &renderer_handle,
+                            &mut still_receiver,
+                            &mut pending_still_clear,
+                        );
                         if let Some(payload) =
                             display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetMediaPaused {
                                 paused: true,
@@ -3841,6 +3905,7 @@ fn run_session_thread(
                                 client_supports_av1: &mut client_supports_av1,
                                 client_decode_caps: &mut client_decode_caps,
                                 user_pinned_codec,
+                                still_refinement_enabled,
                                 prefer_hardware: cfg.prefer_hardware,
                                 hud_width,
                                 hud_height,
@@ -3868,6 +3933,23 @@ fn run_session_thread(
                     if client.state() == SessionState::Streaming {
                         let now_us = u64::from((clock_reader)());
                         let _ = client.trigger_fast_probe(now_us);
+                    }
+                }
+                SessionCommand::SetStillRefinementEnabled { enabled } => {
+                    still_refinement_enabled = enabled;
+                    if !enabled {
+                        try_clear_still_overlay(
+                            &renderer_handle,
+                            &mut still_receiver,
+                            &mut pending_still_clear,
+                        );
+                    }
+                    if let Some(payload) =
+                        display_ctrl::encode_display_ctrl(&DisplayControlMsg::StillRefineConfig {
+                            enabled,
+                        })
+                    {
+                        pending_display_tx.push_back(payload);
                     }
                 }
             }
@@ -3976,6 +4058,23 @@ fn run_session_thread(
                     end_state = classify_stop_reason_end(&stop);
                     break;
                 }
+                if tick_report.frames_displayed_delta > 0 {
+                    let latest_seq = client
+                        .pipeline()
+                        .highest_delivered_seq()
+                        .map(|s| s.0)
+                        .unwrap_or(0);
+                    still_receiver.on_dynamic_frame(latest_seq, &[]);
+                    if still_receiver.has_active_overlay() || pending_still_clear {
+                        // 全屏动态帧覆盖时直接清空所有静止叠加层（防分辨率缩小时边缘残影），
+                        // 若异步解码线程当前持锁，保留 pending_still_clear 在后续每拍重试直至真正清空。
+                        try_clear_still_overlay(
+                            &renderer_handle,
+                            &mut still_receiver,
+                            &mut pending_still_clear,
+                        );
+                    }
+                }
 
                 if let Some(ref mut ctrl) = relay_rtt_ctrl {
                     if client.state() == SessionState::Streaming {
@@ -4057,12 +4156,82 @@ fn run_session_thread(
                             let mut caps_ext_meta: Option<(bool, u64)> = None;
                             match &msg {
                                 DisplayControlMsg::Capabilities {
+                                    current_width,
+                                    current_height,
                                     supports_ext_codec_flags,
                                     codec_generation,
+                                    still_stream_epoch,
                                     ..
                                 } => {
                                     caps_ext_meta =
                                         Some((*supports_ext_codec_flags, *codec_generation));
+                                    let target_w = if *current_width > 0 {
+                                        *current_width
+                                    } else {
+                                        hud_width
+                                    };
+                                    let target_h = if *current_height > 0 {
+                                        *current_height
+                                    } else {
+                                        hud_height
+                                    };
+                                    let dims_changed =
+                                        (target_w, target_h) != still_receiver.dimensions();
+                                    let epoch_changed = *still_stream_epoch > 0
+                                        && *still_stream_epoch != still_receiver.current_epoch();
+                                    if epoch_changed || dims_changed {
+                                        let next_epoch = if *still_stream_epoch > 0 {
+                                            *still_stream_epoch
+                                        } else {
+                                            still_receiver.current_epoch().saturating_add(1)
+                                        };
+                                        still_receiver
+                                            .on_stream_reset(next_epoch, target_w, target_h);
+                                        try_clear_still_overlay(
+                                            &renderer_handle,
+                                            &mut still_receiver,
+                                            &mut pending_still_clear,
+                                        );
+                                    }
+                                }
+                                DisplayControlMsg::StillTileRefine { .. } => {
+                                    suppress_update_emit = true;
+                                    if pending_still_clear {
+                                        try_clear_still_overlay(
+                                            &renderer_handle,
+                                            &mut still_receiver,
+                                            &mut pending_still_clear,
+                                        );
+                                    }
+                                    if pending_still_clear
+                                        || !still_refinement_enabled
+                                        || client.is_media_paused()
+                                    {
+                                        still_receiver.record_dropped();
+                                    } else if let Ok((patch, raw_len)) =
+                                        still_receiver.decode_msg_without_commit(&msg)
+                                    {
+                                        // 绝不在持有渲染器锁期间做 QOI 解码，且以 `try_lock` 非阻塞叠加，
+                                        // 若异步解码线程正在呈现新动态帧则直接让路记丢弃，零阻塞视频主循环。
+                                        let applied = renderer_handle
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .as_ref()
+                                            .is_some_and(|rend| {
+                                                rend.try_lock().is_ok_and(|mut r| {
+                                                    r.apply_still_tile(&patch).is_ok()
+                                                })
+                                            });
+                                        if applied {
+                                            still_receiver.commit_applied(raw_len);
+                                        } else {
+                                            still_receiver.record_dropped();
+                                        }
+                                    }
+                                    *still_refine_metrics
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) =
+                                        still_receiver.metrics();
                                 }
                                 DisplayControlMsg::UpdateChunkAck { next_offset } => {
                                     update_relay.on_chunk_ack(*next_offset);
@@ -4592,6 +4761,18 @@ fn run_session_thread(
                                 current_fps = n.fps;
                             }
                         }
+                        if matches!(outcome, ReconnectOutcome::Rebuilt) {
+                            still_receiver.on_stream_reset(
+                                still_receiver.current_epoch().saturating_add(1),
+                                hud_width,
+                                hud_height,
+                            );
+                            try_clear_still_overlay(
+                                &renderer_handle,
+                                &mut still_receiver,
+                                &mut pending_still_clear,
+                            );
+                        }
                         // M9：重连恢复或重建后若本地处于静音态，重新向主机同步静音控制消息。
                         if audio_muted {
                             pending_audio_ctrl = Some(encode_audio_ctrl_muted(true));
@@ -4619,6 +4800,7 @@ fn run_session_thread(
                                     client_supports_av1: &mut client_supports_av1,
                                     client_decode_caps: &mut client_decode_caps,
                                     user_pinned_codec,
+                                    still_refinement_enabled,
                                     prefer_hardware: cfg.prefer_hardware,
                                     hud_width,
                                     hud_height,
@@ -4697,6 +4879,13 @@ fn run_session_thread(
                             {
                                 pending_display_tx.push_back(payload);
                             }
+                            if !still_refinement_enabled {
+                                if let Some(payload) = display_ctrl::encode_display_ctrl(
+                                    &DisplayControlMsg::StillRefineConfig { enabled: false },
+                                ) {
+                                    pending_display_tx.push_back(payload);
+                                }
+                            }
                         }
                     }
                     ReconnectOutcome::Connecting => {}
@@ -4742,6 +4931,41 @@ fn run_session_thread(
     Ok(end_state)
 }
 
+/// 非阻塞尝试清空渲染器的静止无损 Tile 叠加层，并严格仅在实际执行成功后清零
+/// `pending_still_clear` 与 `still_receiver.clear_active_overlay()`。
+///
+/// 当异步解码线程正在 `present()` 中持有 `renderer_handle` 锁导致 `try_lock()` 返回
+/// `WouldBlock` 时，保留 `*pending_still_clear = true`（且不提前清掉活跃标记），
+/// 供会话循环在后续每拍开头重试直至真正清空，杜绝旧无损层永久残留鬼影。
+fn try_clear_still_overlay(
+    renderer_handle: &Mutex<Option<RendererHandle>>,
+    still_receiver: &mut crate::still_refine::StillRefineReceiver,
+    pending_still_clear: &mut bool,
+) -> bool {
+    *pending_still_clear = true;
+    let rend = renderer_handle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    match rend {
+        None => {
+            *pending_still_clear = false;
+            still_receiver.clear_active_overlay();
+            true
+        }
+        Some(handle) => {
+            if let Ok(mut r) = handle.try_lock() {
+                r.clear_still_tiles();
+                *pending_still_clear = false;
+                still_receiver.clear_active_overlay();
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
 /// 纯工具态原地热升级为桌面控屏的上下文（用于统一 `SetMediaPaused(false)` 与重连回 `Streaming` 补升级）。
 struct DesktopUpgradeCtx<'a> {
     client: &'a mut ClientSession,
@@ -4758,6 +4982,7 @@ struct DesktopUpgradeCtx<'a> {
     client_supports_av1: &'a mut bool,
     client_decode_caps: &'a mut Vec<rc_pipeline::CodecCapability>,
     user_pinned_codec: Option<StreamCodec>,
+    still_refinement_enabled: bool,
     prefer_hardware: bool,
     hud_width: u32,
     hud_height: u32,
@@ -4872,6 +5097,15 @@ where
             ctx.prefer_hardware && *ctx.is_hardware_decoder,
             pref,
         )) {
+            ctx.pending_display_tx.push_back(payload);
+        }
+    }
+    if !ctx.still_refinement_enabled {
+        if let Some(payload) =
+            display_ctrl::encode_display_ctrl(&DisplayControlMsg::StillRefineConfig {
+                enabled: false,
+            })
+        {
             ctx.pending_display_tx.push_back(payload);
         }
     }
@@ -5140,6 +5374,7 @@ fn handle_display_ctrl_msg(
             refinement_caps: _,
             supports_ext_codec_flags: _,
             codec_generation: _,
+            still_stream_epoch: _,
         } => {
             if current_width > 0 && current_height > 0 {
                 *hud_width = current_width;
@@ -5307,7 +5542,9 @@ fn handle_display_ctrl_msg(
         | DisplayControlMsg::SwitchDisplay { .. }
         | DisplayControlMsg::CreateVirtualDisplay { .. }
         | DisplayControlMsg::RemoveVirtualDisplay { .. }
-        | DisplayControlMsg::SetMediaPaused { .. } => None,
+        | DisplayControlMsg::SetMediaPaused { .. }
+        | DisplayControlMsg::StillTileRefine { .. }
+        | DisplayControlMsg::StillRefineConfig { .. } => None,
     }
 }
 
@@ -6023,6 +6260,7 @@ mod tests {
                 refinement_caps: None,
                 supports_ext_codec_flags: false,
                 codec_generation: 0,
+                still_stream_epoch: 0,
             },
             &mut hud_w,
             &mut hud_h,
@@ -6067,6 +6305,7 @@ mod tests {
                 refinement_caps: None,
                 supports_ext_codec_flags: false,
                 codec_generation: 0,
+                still_stream_epoch: 0,
             },
             &mut hud_w,
             &mut hud_h,
@@ -6751,6 +6990,9 @@ mod tests {
             running: Arc::clone(&running),
             watch_only: Arc::new(AtomicBool::new(false)),
             tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
+            still_refine_metrics: Arc::new(Mutex::new(
+                crate::still_refine::StillRefineMetrics::default(),
+            )),
             encrypt_connection: false,
             base_config: UiSessionConfig::default(),
             layer_lease: Arc::new(Mutex::new(None)),
@@ -7063,6 +7305,7 @@ mod tests {
                 client_supports_av1: &mut client_supports_av1,
                 client_decode_caps: &mut client_decode_caps,
                 user_pinned_codec: None,
+                still_refinement_enabled: true,
                 prefer_hardware: false,
                 hud_width: params.width,
                 hud_height: params.height,
@@ -7116,6 +7359,7 @@ mod tests {
                 client_supports_av1: &mut client_supports_av1,
                 client_decode_caps: &mut client_decode_caps,
                 user_pinned_codec: None,
+                still_refinement_enabled: true,
                 prefer_hardware: false,
                 hud_width: params.width,
                 hud_height: params.height,
@@ -7184,6 +7428,7 @@ mod tests {
                 client_supports_av1: &mut client_supports_av1,
                 client_decode_caps: &mut client_decode_caps,
                 user_pinned_codec: None,
+                still_refinement_enabled: true,
                 prefer_hardware: false,
                 hud_width: params.width,
                 hud_height: params.height,
@@ -7300,6 +7545,9 @@ mod tests {
             running: Arc::clone(&running),
             watch_only: Arc::new(AtomicBool::new(false)),
             tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
+            still_refine_metrics: Arc::new(Mutex::new(
+                crate::still_refine::StillRefineMetrics::default(),
+            )),
             encrypt_connection: false,
             base_config: UiSessionConfig::default(),
             layer_lease: Arc::new(Mutex::new(None)),
@@ -7357,6 +7605,9 @@ mod tests {
             running: Arc::clone(&running2),
             watch_only: Arc::new(AtomicBool::new(false)),
             tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
+            still_refine_metrics: Arc::new(Mutex::new(
+                crate::still_refine::StillRefineMetrics::default(),
+            )),
             encrypt_connection: false,
             base_config: UiSessionConfig::default(),
             layer_lease: Arc::new(Mutex::new(None)),
@@ -8648,5 +8899,144 @@ mod tests {
         };
         let (fake_pipe, _) = fake_controller_stack(&pcfg).expect("fake stack");
         assert!(!fake_pipe.config().prefer_hardware);
+    }
+
+    /// 对抗评审 High #2 回归：`rend.try_lock()` 争用期间保留 `pending_still_clear == true` 与
+    /// `has_active_overlay() == true`，锁释放后重试必须真正调用 `clear_still_tiles()` 清除叠加层。
+    #[test]
+    fn try_clear_still_overlay_retries_after_try_lock_contention() {
+        let mut fake =
+            rc_render::FakeRenderer::new(rc_render::FakeRendererConfig::default()).unwrap();
+        let patch = rc_render::StillTilePatch {
+            stream_epoch: 1,
+            base_frame_seq: 1,
+            rect: rc_types::Rect::new(0, 0, 4, 4),
+            format: rc_types::PixelFormat::Bgra8,
+            pixels: vec![0x77; 4 * 4 * 4],
+        };
+        fake.apply_still_tile(&patch).expect("apply initial tile");
+        assert_eq!(fake.active_still_tiles().len(), 1);
+
+        let rend_arc: RendererHandle = Arc::new(Mutex::new(Box::new(fake)));
+        let rend_slot = Mutex::new(Some(Arc::clone(&rend_arc)));
+        let mut receiver = crate::still_refine::StillRefineReceiver::new(1, 1920, 1080);
+        receiver
+            .validate_and_accept(&patch, 32)
+            .expect("accept patch");
+        assert!(receiver.has_active_overlay());
+        let mut pending_still_clear = false;
+
+        // 模拟异步解码线程在 present() 期间持有渲染器锁：try_clear 必须返回 false 且不提前清零标志。
+        let guard = rend_arc.lock().unwrap();
+        assert!(!try_clear_still_overlay(
+            &rend_slot,
+            &mut receiver,
+            &mut pending_still_clear
+        ));
+        assert!(pending_still_clear);
+        assert!(receiver.has_active_overlay());
+        drop(guard);
+
+        // 异步解码线程释放锁后，下一拍重试必须真正清空渲染器叠加层并复原标志。
+        assert!(try_clear_still_overlay(
+            &rend_slot,
+            &mut receiver,
+            &mut pending_still_clear
+        ));
+        assert!(!pending_still_clear);
+        assert!(!receiver.has_active_overlay());
+
+        // 确认底层 FakeRenderer 的活跃叠加层确实已被清空（借用 apply/clear 行为反向验证）。
+        let next_patch = rc_render::StillTilePatch {
+            stream_epoch: 1,
+            base_frame_seq: 2,
+            rect: rc_types::Rect::new(128, 128, 4, 4),
+            format: rc_types::PixelFormat::Bgra8,
+            pixels: vec![0x88; 4 * 4 * 4],
+        };
+        rend_arc
+            .lock()
+            .unwrap()
+            .apply_still_tile(&next_patch)
+            .expect("renderer remains healthy after clear");
+    }
+
+    /// 对抗评审 Medium #4 回归：纯工具态升级桌面且 `still_refinement_enabled == false` 时，
+    /// 必须在发送 `ClientMediaCaps` 后同步补发 `DisplayControlMsg::StillRefineConfig { enabled: false }`。
+    #[test]
+    fn desktop_upgrade_emits_still_refine_disabled_config_when_off() {
+        let params = SessionParams {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_bps: 8_000_000,
+        };
+        let mut client = make_streaming_tools_only_client(params);
+        let real_pipeline_built = AtomicBool::new(false);
+        let want_real_pipeline = AtomicBool::new(false);
+        let is_hw_decoder_slot = AtomicBool::new(false);
+        let mut backend = "tools-only".to_string();
+        let backend_label = Mutex::new(backend.clone());
+        let renderer_handle = Mutex::new(None);
+        let layer_lease = Mutex::new(None);
+        let mut is_hardware_decoder = false;
+        let mut client_supports_hevc = false;
+        let mut client_supports_av1 = false;
+        let mut client_decode_caps = Vec::new();
+        let mut stream_started_at = Instant::now();
+        let mut first_frame_logged = false;
+        let mut decode_error_logged = false;
+        let mut pending_display_tx = VecDeque::new();
+        let update_tx = BoundedUpdateQueue::new(UPDATE_CHANNEL_CAP);
+
+        let ok = try_resume_or_upgrade_desktop(
+            DesktopUpgradeCtx {
+                client: &mut client,
+                real_pipeline_built: &real_pipeline_built,
+                want_real_pipeline: &want_real_pipeline,
+                is_hw_decoder_slot: &is_hw_decoder_slot,
+                backend: &mut backend,
+                backend_label: &backend_label,
+                renderer_handle: &renderer_handle,
+                layer_lease: &layer_lease,
+                active_backend_suffix: None,
+                is_hardware_decoder: &mut is_hardware_decoder,
+                client_supports_hevc: &mut client_supports_hevc,
+                client_supports_av1: &mut client_supports_av1,
+                client_decode_caps: &mut client_decode_caps,
+                user_pinned_codec: None,
+                still_refinement_enabled: false,
+                prefer_hardware: false,
+                hud_width: params.width,
+                hud_height: params.height,
+                current_fps: params.fps,
+                negotiated: params,
+                last_stage_rect: None,
+                stream_started_at: &mut stream_started_at,
+                first_frame_logged: &mut first_frame_logged,
+                decode_error_logged: &mut decode_error_logged,
+                pending_display_tx: &mut pending_display_tx,
+                update_tx: &update_tx,
+            },
+            |pcfg| build_controller_pipeline(pcfg, false, Instant::now(), None),
+        );
+        assert!(ok);
+        let msgs: Vec<DisplayControlMsg> = pending_display_tx
+            .iter()
+            .filter_map(|b| display_ctrl::decode_display_ctrl(b))
+            .collect();
+        let caps_idx = msgs
+            .iter()
+            .position(|m| matches!(m, DisplayControlMsg::ClientMediaCaps { .. }))
+            .expect("must emit ClientMediaCaps on desktop upgrade");
+        let cfg_idx = msgs
+            .iter()
+            .position(|m| matches!(m, DisplayControlMsg::StillRefineConfig { enabled: false }))
+            .expect("must emit StillRefineConfig(false) when still refinement is disabled");
+        assert!(
+            cfg_idx > caps_idx,
+            "StillRefineConfig(false) 必须紧跟在 ClientMediaCaps 之后发送: {msgs:?}"
+        );
+        let _ = client.close(ByeReason::Normal);
     }
 }

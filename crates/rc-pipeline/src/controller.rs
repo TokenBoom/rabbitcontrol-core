@@ -1350,6 +1350,11 @@ impl ControllerPipeline {
         }
     }
 
+    /// 已交付至解码/呈现路径的最高动态帧序号（用于静止无损补帧接收端防“画面倒退”校验）。
+    pub fn highest_delivered_seq(&self) -> Option<FrameSeq> {
+        self.highest_delivered
+    }
+
     /// 会话收尾：在途残帧判 `LostInNetwork`，冲刷解码器。
     pub fn shutdown(&mut self) {
         self.finish_in_flight();

@@ -258,9 +258,16 @@ pub struct AppPrefs {
     /// 是否启用 UPnP IGD / NAT-PMP 自动端口映射以提升 P2P 直连成功率（默认 `true`）。
     #[serde(default = "default_upnp_enabled")]
     pub upnp_enabled: bool,
+    /// 是否开启静止画面 Tile 级无损文字锐化补帧（默认 `true`）。
+    #[serde(default = "default_still_refinement_enabled")]
+    pub still_refinement_enabled: bool,
 }
 
 fn default_upnp_enabled() -> bool {
+    true
+}
+
+fn default_still_refinement_enabled() -> bool {
     true
 }
 
@@ -357,6 +364,7 @@ impl Default for AppPrefs {
             file_transfer_dir: None,
             connection_mode: ConnectionMode::Auto,
             upnp_enabled: default_upnp_enabled(),
+            still_refinement_enabled: default_still_refinement_enabled(),
         }
     }
 }
@@ -2026,6 +2034,32 @@ mod tests {
         save_to_path(&path, &custom).unwrap();
         let reloaded = load_from_path(&path);
         assert!(!reloaded.allow_assist_file_transfer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn still_refinement_enabled_defaults_true_and_legacy_compat() {
+        let def = AppPrefs::default();
+        assert!(def.still_refinement_enabled);
+        let json_val = serde_json::to_value(&def).unwrap();
+        assert_eq!(json_val["stillRefinementEnabled"], true);
+
+        // 旧版配置缺失 stillRefinementEnabled 时默认兼容为 true。
+        let legacy: AppPrefs = serde_json::from_str(r#"{"showHud":false}"#)
+            .expect("legacy prefs without stillRefinementEnabled");
+        assert!(legacy.still_refinement_enabled);
+        assert!(!legacy.show_hud);
+
+        let dir = temp_test_dir("still-refinement");
+        let path = dir.join("prefs.json");
+        fs::create_dir_all(&dir).unwrap();
+        let custom = AppPrefs {
+            still_refinement_enabled: false,
+            ..AppPrefs::default()
+        };
+        save_to_path(&path, &custom).unwrap();
+        let reloaded = load_from_path(&path);
+        assert!(!reloaded.still_refinement_enabled);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -259,6 +259,9 @@ pub enum DisplayControlMsg {
         /// 被控端当前权威编解码代次（供控制端上报 `CodecDecodeFailed` 精确匹配、忽略陈旧回声；旧版缺省为 `0`）。
         #[serde(default, skip_serializing_if = "is_zero_u64")]
         codec_generation: u64,
+        /// 被控端当前静止无损补帧流纪元号（切分辨率/切显示器/重连时递增，供控制端 `StillRefineReceiver` 精确同步；旧版缺省为 `0`）。
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        still_stream_epoch: u64,
     },
     /// 控制端 → 被控端：握手入流后上报本端非对称解码能力、细化能力、选型偏好与扩展包头位支持标志。
     ClientMediaCaps {
@@ -534,6 +537,33 @@ pub enum DisplayControlMsg {
         /// 可选补充原因说明。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// 被控端 → 控制端：推送单个静止无损细化 Tile 补丁（仅双端 `refinement_caps.supported == true` 且模式允许时发送；老端 `decode_display_ctrl` 自动忽略不报错）。
+    StillTileRefine {
+        /// 所属视频流纪元号（切分辨率/切显示器/重连时递增）。
+        stream_epoch: u64,
+        /// 补丁所基于的动态帧序号（防接收端画面倒退）。
+        base_frame_seq: u64,
+        /// Tile 左上角 X 坐标（像素）。
+        x: u32,
+        /// Tile 左上角 Y 坐标（像素）。
+        y: u32,
+        /// Tile 宽度（像素）。
+        width: u32,
+        /// Tile 高度（像素）。
+        height: u32,
+        /// 像素格式标识（`"bgra8"` / `"rgba8"`）。
+        format: String,
+        /// 无损编解码器标识（`"qoi"`）。
+        codec: String,
+        /// Base64 编码的压缩 Tile 载荷（原始压缩字节 `<= 24 KiB`）。
+        data_base64: String,
+    },
+    /// 控制端 → 被控端：运行期动态开关静止无损补帧增强。
+    StillRefineConfig {
+        /// `true` = 开启静止无损增强；`false` = 立即暂停并清空待发队列。
+        #[serde(default = "default_true_bool")]
+        enabled: bool,
     },
 }
 
@@ -1126,6 +1156,7 @@ mod tests {
             refinement_caps: Some(rc_pipeline::RefinementCapability::default()),
             supports_ext_codec_flags: true,
             codec_generation: 3,
+            still_stream_epoch: 2,
         };
         let encoded_caps = encode_display_ctrl(&caps).expect("encode capabilities");
         assert_eq!(decode_display_ctrl(&encoded_caps), Some(caps));
@@ -1163,7 +1194,36 @@ mod tests {
                 refinement_caps: None,
                 supports_ext_codec_flags: false,
                 codec_generation: 0,
+                still_stream_epoch: 0,
             }
+        );
+
+        // 新增 StillTileRefine / StillRefineConfig JSON 编解码与缺省兼容
+        let still_tile = DisplayControlMsg::StillTileRefine {
+            stream_epoch: 4,
+            base_frame_seq: 99,
+            x: 128,
+            y: 256,
+            width: 128,
+            height: 128,
+            format: "bgra8".to_string(),
+            codec: "qoi".to_string(),
+            data_base64: base64_encode(b"qoif-test-payload"),
+        };
+        let enc_still_tile = encode_display_ctrl(&still_tile).expect("encode still_tile_refine");
+        let tile_val: serde_json::Value = serde_json::from_slice(&enc_still_tile).unwrap();
+        assert_eq!(tile_val["kind"], "still_tile_refine");
+        assert_eq!(decode_display_ctrl(&enc_still_tile), Some(still_tile));
+
+        let still_cfg = DisplayControlMsg::StillRefineConfig { enabled: false };
+        let enc_still_cfg = encode_display_ctrl(&still_cfg).expect("encode still_refine_config");
+        let cfg_val: serde_json::Value = serde_json::from_slice(&enc_still_cfg).unwrap();
+        assert_eq!(cfg_val["kind"], "still_refine_config");
+        assert_eq!(cfg_val["enabled"], false);
+        assert_eq!(decode_display_ctrl(&enc_still_cfg), Some(still_cfg));
+        assert_eq!(
+            decode_display_ctrl(br#"{"kind":"still_refine_config"}"#),
+            Some(DisplayControlMsg::StillRefineConfig { enabled: true })
         );
 
         // 新增 ClientMediaCaps / CodecDecodeFailed 往返与旧端缺省字段兼容

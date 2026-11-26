@@ -1642,6 +1642,10 @@ impl rc_capture::CaptureBackend for WallCapture {
     fn display_info(&self) -> rc_capture::DisplayInfo {
         self.inner.display_info()
     }
+
+    fn last_dirty_rects(&self) -> &[rc_types::Rect] {
+        self.inner.last_dirty_rects()
+    }
 }
 
 fn format_display_addr(actual: SocketAddr) -> String {
@@ -2701,7 +2705,8 @@ fn host_supported_codecs(
     out
 }
 
-/// 编码当前被控端 `DisplayControlMsg::Capabilities` 载荷（含非对称能力明细、扩展标志位声明与权威编解码代次）。
+/// 编码当前被控端 `DisplayControlMsg::Capabilities` 载荷（含非对称能力明细、扩展标志位声明、权威编解码代次与静止补帧流纪元）。
+#[allow(clippy::too_many_arguments)]
 fn encode_host_display_caps(
     host: &HostSession,
     native_res: Resolution,
@@ -2710,6 +2715,7 @@ fn encode_host_display_caps(
     hevc_available: bool,
     negotiator: &HostCodecNegotiator,
     hardware_media_active: bool,
+    still_stream_epoch: u64,
 ) -> Option<Vec<u8>> {
     let cur = host.negotiated()?;
     let tier = ResolutionTier::from_dimensions(cur.width, cur.height);
@@ -2739,6 +2745,7 @@ fn encode_host_display_caps(
         refinement_caps,
         supports_ext_codec_flags: true,
         codec_generation: negotiator.codec_generation(),
+        still_stream_epoch,
     })
 }
 
@@ -3251,6 +3258,22 @@ fn drive_ui_host_session_with_audio(
     let hardware_media_active = prefer_hardware && hardware_video_active;
     let host_encode_caps = codec_selector::cached_or_platform_encode_caps(hardware_media_active);
     let mut codec_negotiator = HostCodecNegotiator::new(host_encode_caps.clone());
+    let host_refinement_supported =
+        codec_selector::cached_or_platform_refinement_caps(hardware_media_active).supported;
+    let init_stream_dims = host
+        .negotiated()
+        .map(|n| (n.width, n.height))
+        .unwrap_or((session_native_res.width, session_native_res.height));
+    let mut still_refine = crate::still_refine::HostStillRefineController::new(
+        1,
+        init_stream_dims.0,
+        init_stream_dims.1,
+        host_refinement_supported,
+    );
+    let mut still_loss_window_at = Instant::now();
+    let mut still_window_sent_dgrams: u64 = 0;
+    let mut still_window_dropped_dgrams: u64 = 0;
+    let mut still_last_dropped_total: u64 = host.transport_tx_dropped_datagrams();
     let mut hevc_runtime_failed = false;
     let host_hevc_available =
         |failed: bool| hardware_media_active && !failed && rc_pipeline::platform_supports_hevc();
@@ -3288,6 +3311,7 @@ fn drive_ui_host_session_with_audio(
             host_hevc_available(hevc_runtime_failed),
             &codec_negotiator,
             hardware_media_active,
+            still_refine.stream_epoch(),
         ) {
             pending_display_tx.push_back(payload);
         }
@@ -3375,6 +3399,44 @@ fn drive_ui_host_session_with_audio(
                             continue;
                         }
 
+                        // 修正 #5：收到任意输入事件或产出新动态帧时，毫秒级立即抢占清空待发静止补帧并推进状态机。
+                        if r.events_injected > 0 {
+                            still_refine.on_input_event();
+                        }
+                        if r.datagrams_sent > 0 {
+                            let now_ms = u64::try_from(session_started_at.elapsed().as_millis())
+                                .unwrap_or(u64::MAX);
+                            let seq = host.last_sent_frame_seq().unwrap_or(0);
+                            still_refine.on_dynamic_frame(now_ms, seq, host.last_dirty_rects());
+                            still_window_sent_dgrams =
+                                still_window_sent_dgrams.saturating_add(r.datagrams_sent as u64);
+                        }
+                        let cur_dropped_total = host.transport_tx_dropped_datagrams();
+                        let dropped_delta =
+                            cur_dropped_total.saturating_sub(still_last_dropped_total);
+                        still_last_dropped_total = cur_dropped_total;
+                        still_window_dropped_dgrams =
+                            still_window_dropped_dgrams.saturating_add(dropped_delta);
+                        if still_loss_window_at.elapsed() >= Duration::from_secs(1) {
+                            let total = still_window_sent_dgrams
+                                .saturating_add(still_window_dropped_dgrams);
+                            let loss_rate = if total > 0 {
+                                still_window_dropped_dgrams as f32 / total as f32
+                            } else {
+                                0.0
+                            };
+                            still_refine.update_network(host.current_bitrate_bps(), loss_rate);
+                            still_window_sent_dgrams = 0;
+                            still_window_dropped_dgrams = 0;
+                            still_loss_window_at = Instant::now();
+                        } else if dropped_delta > 0 {
+                            let total = still_window_sent_dgrams
+                                .saturating_add(still_window_dropped_dgrams)
+                                .max(1);
+                            let loss_rate = still_window_dropped_dgrams as f32 / total as f32;
+                            still_refine.update_network(host.current_bitrate_bps(), loss_rate);
+                        }
+
                         // 编码侧连续过载熔断：当前非 H.264 且连续编码过载达到阈值时，立即熔断并顺延下一档。
                         if host.active_codec() != rc_encode::Codec::H264
                             && host.consecutive_encode_overloads()
@@ -3419,6 +3481,9 @@ fn drive_ui_host_session_with_audio(
                                 if host.active_codec() != prev_codec {
                                     codec_negotiator.bump_generation();
                                 }
+                                if let Some(n) = host.negotiated() {
+                                    still_refine.on_stream_reset(n.width, n.height);
+                                }
                                 let (caps_native, presets) = if active_display_id.is_some() {
                                     (
                                         session_native_res,
@@ -3447,6 +3512,7 @@ fn drive_ui_host_session_with_audio(
                                     host_hevc_available(hevc_runtime_failed),
                                     &codec_negotiator,
                                     hardware_media_active,
+                                    still_refine.stream_epoch(),
                                 ) {
                                     pending_display_tx.push_back(cp);
                                 }
@@ -3783,6 +3849,9 @@ fn drive_ui_host_session_with_audio(
                                                 if host.active_codec() != prev_codec {
                                                     codec_negotiator.bump_generation();
                                                 }
+                                                if let Some(n) = host.negotiated() {
+                                                    still_refine.on_stream_reset(n.width, n.height);
+                                                }
                                                 let (caps_native, presets) =
                                                     if active_display_id.is_some() {
                                                         (
@@ -3813,6 +3882,7 @@ fn drive_ui_host_session_with_audio(
                                                     host_hevc_available(hevc_runtime_failed),
                                                     &codec_negotiator,
                                                     hardware_media_active,
+                                                    still_refine.stream_epoch(),
                                                 ) {
                                                     pending_display_tx.push_back(caps_payload);
                                                 }
@@ -3824,8 +3894,13 @@ fn drive_ui_host_session_with_audio(
                                             pref,
                                             supports_ext_codec_flags,
                                         }) => {
+                                            still_refine.on_client_media_caps(
+                                                refinement_caps.as_ref(),
+                                                pref,
+                                            );
                                             if let Some(cur) = host.negotiated() {
                                                 let prev_codec = host.active_codec();
+                                                let prev_dims = (cur.width, cur.height);
                                                 let target = StreamTarget {
                                                     width: cur.width,
                                                     height: cur.height,
@@ -3896,6 +3971,14 @@ fn drive_ui_host_session_with_audio(
                                                     if host.active_codec() != prev_codec {
                                                         codec_negotiator.bump_generation();
                                                     }
+                                                    if let Some(n) = host.negotiated() {
+                                                        if host.active_codec() != prev_codec
+                                                            || (n.width, n.height) != prev_dims
+                                                        {
+                                                            still_refine
+                                                                .on_stream_reset(n.width, n.height);
+                                                        }
+                                                    }
                                                 }
                                             }
                                             let (caps_native, presets) =
@@ -3928,9 +4011,13 @@ fn drive_ui_host_session_with_audio(
                                                 host_hevc_available(hevc_runtime_failed),
                                                 &codec_negotiator,
                                                 hardware_media_active,
+                                                still_refine.stream_epoch(),
                                             ) {
                                                 pending_display_tx.push_back(caps_payload);
                                             }
+                                        }
+                                        Some(DisplayControlMsg::StillRefineConfig { enabled }) => {
+                                            still_refine.on_still_refine_config(enabled);
                                         }
                                         Some(DisplayControlMsg::CodecDecodeFailed {
                                             codec,
@@ -4047,6 +4134,10 @@ fn drive_ui_host_session_with_audio(
                                                                 ),
                                                             )
                                                         };
+                                                    if let Some(n) = host.negotiated() {
+                                                        still_refine
+                                                            .on_stream_reset(n.width, n.height);
+                                                    }
                                                     if let Some(caps_payload) =
                                                         encode_host_display_caps(
                                                             host,
@@ -4058,6 +4149,7 @@ fn drive_ui_host_session_with_audio(
                                                             ),
                                                             &codec_negotiator,
                                                             hardware_media_active,
+                                                            still_refine.stream_epoch(),
                                                         )
                                                     {
                                                         pending_display_tx.push_back(caps_payload);
@@ -4186,6 +4278,10 @@ fn drive_ui_host_session_with_audio(
                                                 }
                                                 if host.active_codec() != prev_codec {
                                                     codec_negotiator.bump_generation();
+                                                    if let Some(n) = host.negotiated() {
+                                                        still_refine
+                                                            .on_stream_reset(n.width, n.height);
+                                                    }
                                                 }
                                             }
                                             // 无论切换成功、幂等或拒绝，均回推最新 Capabilities，让控制端获知权威生效 codec。
@@ -4219,6 +4315,7 @@ fn drive_ui_host_session_with_audio(
                                                 host_hevc_available(hevc_runtime_failed),
                                                 &codec_negotiator,
                                                 hardware_media_active,
+                                                still_refine.stream_epoch(),
                                             ) {
                                                 pending_display_tx.push_back(caps_payload);
                                             }
@@ -4411,6 +4508,9 @@ fn drive_ui_host_session_with_audio(
                                                             ),
                                                         )
                                                     };
+                                                if let Some(n) = host.negotiated() {
+                                                    still_refine.on_stream_reset(n.width, n.height);
+                                                }
                                                 if let Some(cp) = encode_host_display_caps(
                                                     host,
                                                     caps_native,
@@ -4419,6 +4519,7 @@ fn drive_ui_host_session_with_audio(
                                                     host_hevc_available(hevc_runtime_failed),
                                                     &codec_negotiator,
                                                     hardware_media_active,
+                                                    still_refine.stream_epoch(),
                                                 ) {
                                                     pending_display_tx.push_back(cp);
                                                 }
@@ -4553,6 +4654,9 @@ fn drive_ui_host_session_with_audio(
                                                             ),
                                                         )
                                                     };
+                                                if let Some(n) = host.negotiated() {
+                                                    still_refine.on_stream_reset(n.width, n.height);
+                                                }
                                                 if let Some(cp) = encode_host_display_caps(
                                                     host,
                                                     caps_native,
@@ -4561,6 +4665,7 @@ fn drive_ui_host_session_with_audio(
                                                     host_hevc_available(hevc_runtime_failed),
                                                     &codec_negotiator,
                                                     hardware_media_active,
+                                                    still_refine.stream_epoch(),
                                                 ) {
                                                     pending_display_tx.push_back(cp);
                                                 }
@@ -4727,6 +4832,10 @@ fn drive_ui_host_session_with_audio(
                                                                     ),
                                                                 )
                                                         };
+                                                        if let Some(n) = host.negotiated() {
+                                                            still_refine
+                                                                .on_stream_reset(n.width, n.height);
+                                                        }
                                                         if let Some(cp) = encode_host_display_caps(
                                                             host,
                                                             caps_native,
@@ -4737,6 +4846,7 @@ fn drive_ui_host_session_with_audio(
                                                             ),
                                                             &codec_negotiator,
                                                             hardware_media_active,
+                                                            still_refine.stream_epoch(),
                                                         ) {
                                                             pending_display_tx.push_back(cp);
                                                         }
@@ -4886,6 +4996,11 @@ fn drive_ui_host_session_with_audio(
                                                                         session_max_res.width,
                                                                         session_max_res.height,
                                                                     );
+                                                                if let Some(n) = host.negotiated() {
+                                                                    still_refine.on_stream_reset(
+                                                                        n.width, n.height,
+                                                                    );
+                                                                }
                                                                 if let Some(cp) =
                                                                     encode_host_display_caps(
                                                                         host,
@@ -4897,6 +5012,7 @@ fn drive_ui_host_session_with_audio(
                                                                         ),
                                                                         &codec_negotiator,
                                                                         hardware_media_active,
+                                                                        still_refine.stream_epoch(),
                                                                     )
                                                                 {
                                                                     pending_display_tx
@@ -5054,6 +5170,9 @@ fn drive_ui_host_session_with_audio(
                                                     hardware_video_active,
                                                     Some(caps_native),
                                                 );
+                                                if let Some(n) = host.negotiated() {
+                                                    still_refine.on_stream_reset(n.width, n.height);
+                                                }
                                                 if let Some(cp) = encode_host_display_caps(
                                                     host,
                                                     caps_native,
@@ -5062,6 +5181,7 @@ fn drive_ui_host_session_with_audio(
                                                     host_hevc_available(hevc_runtime_failed),
                                                     &codec_negotiator,
                                                     hardware_media_active,
+                                                    still_refine.stream_epoch(),
                                                 ) {
                                                     pending_display_tx.push_back(cp);
                                                 }
@@ -5074,6 +5194,7 @@ fn drive_ui_host_session_with_audio(
                                         }
                                         Some(DisplayControlMsg::SetMediaPaused { paused }) => {
                                             if paused {
+                                                still_refine.on_input_event();
                                                 host.pause_media();
                                                 audio_mgr.pause(&mut audio_silence_gate);
                                                 if let Some(mp) = display_ctrl::encode_display_ctrl(
@@ -5116,6 +5237,10 @@ fn drive_ui_host_session_with_audio(
                                                                     ),
                                                                 )
                                                             };
+                                                        if let Some(n) = host.negotiated() {
+                                                            still_refine
+                                                                .on_stream_reset(n.width, n.height);
+                                                        }
                                                         if let Some(cp) = encode_host_display_caps(
                                                             host,
                                                             caps_native,
@@ -5126,6 +5251,7 @@ fn drive_ui_host_session_with_audio(
                                                             ),
                                                             &codec_negotiator,
                                                             hardware_media_active,
+                                                            still_refine.stream_epoch(),
                                                         ) {
                                                             pending_display_tx.push_back(cp);
                                                         }
@@ -5340,6 +5466,29 @@ fn drive_ui_host_session_with_audio(
                         let stream_a_congested = !pending_file_tx.is_empty()
                             || !pending_portmap_tx.is_empty()
                             || !pending_update_tx.is_empty();
+                        // 3.5) 静止无损 Tile 补帧低优先级限速发送（仅当控制面空闲且无 Stream A 拥塞时最多发送 1 片，
+                        //      保证控制消息、输入与动态视频流零阻塞，且输入/新帧抢占可瞬间清空未发队列）。
+                        if !host.is_media_paused()
+                            && pending_display_tx.is_empty()
+                            && !stream_a_congested
+                            && still_refine.is_active()
+                        {
+                            let now_ms = u64::try_from(session_started_at.elapsed().as_millis())
+                                .unwrap_or(u64::MAX);
+                            if let Some(tile_msg) = still_refine.poll_next_display_ctrl_msg(now_ms)
+                            {
+                                if let Some(tile_payload) =
+                                    display_ctrl::encode_display_ctrl(&tile_msg)
+                                {
+                                    if host
+                                        .send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, tile_payload)
+                                        .is_ok()
+                                    {
+                                        tools_busy = true;
+                                    }
+                                }
+                            }
+                        }
                         let audio_busy = if host.is_media_paused() {
                             false
                         } else {
@@ -5523,6 +5672,7 @@ fn drive_ui_host_session_with_audio(
                                 ),
                             )
                         };
+                        still_refine.on_input_event();
                         if let Some(payload) = encode_host_display_caps(
                             host,
                             caps_native,
@@ -5531,6 +5681,7 @@ fn drive_ui_host_session_with_audio(
                             host_hevc_available(hevc_runtime_failed),
                             &codec_negotiator,
                             hardware_media_active,
+                            still_refine.stream_epoch(),
                         ) {
                             pending_display_tx.push_back(payload);
                         }
@@ -5621,6 +5772,20 @@ fn drive_ui_host_session_with_audio(
                         }
                         hevc_runtime_failed = false;
                         codec_negotiator = HostCodecNegotiator::new(host_encode_caps.clone());
+                        let replaced_dims = host
+                            .negotiated()
+                            .map(|n| (n.width, n.height))
+                            .unwrap_or((session_native_res.width, session_native_res.height));
+                        still_refine = crate::still_refine::HostStillRefineController::new(
+                            1,
+                            replaced_dims.0,
+                            replaced_dims.1,
+                            host_refinement_supported,
+                        );
+                        still_window_sent_dgrams = 0;
+                        still_window_dropped_dgrams = 0;
+                        still_last_dropped_total = host.transport_tx_dropped_datagrams();
+                        still_loss_window_at = Instant::now();
                         user_pinned_resolution = false;
                         auto_hidpi_active = false;
                         last_busy = true;
@@ -5667,6 +5832,7 @@ fn drive_ui_host_session_with_audio(
                             host_hevc_available(hevc_runtime_failed),
                             &codec_negotiator,
                             hardware_media_active,
+                            still_refine.stream_epoch(),
                         ) {
                             pending_display_tx.push_back(payload);
                         }

@@ -2935,6 +2935,16 @@ impl HostSession {
         self.last_remote_probe_bitrate
     }
 
+    /// 最近已发送至网络的最高动态视频帧线序号（供静止无损补帧标记 `base_frame_seq`）。
+    pub fn last_sent_frame_seq(&self) -> Option<u64> {
+        self.last_sent_frame_seq
+    }
+
+    /// 最近一帧采集经 `CaptureBackend::last_dirty_rects` 上报的真实脏区矩形列表（无活跃管线时为空）。
+    pub fn last_dirty_rects(&self) -> &[rc_types::Rect] {
+        self.pipeline.as_ref().map_or(&[], |p| p.last_dirty_rects())
+    }
+
     /// 当前底层传输层的发送队列积压字节数（无活跃传输层时返回 0）。
     pub fn transport_tx_queued_bytes(&self) -> usize {
         self.transport.as_ref().map_or(0, |t| t.tx_queued_bytes())

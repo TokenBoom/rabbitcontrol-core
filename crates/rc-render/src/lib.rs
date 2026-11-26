@@ -38,7 +38,22 @@ pub use fake::{CursorState, FakeRenderer, FakeRendererConfig};
 pub use rc_types::{Error, Result};
 
 use rc_decode::DecodedFrame;
-use rc_types::Timestamp;
+use rc_types::{PixelFormat, Rect, Timestamp};
+
+/// 静止画面局部无损 Tile 补丁（叠加在已呈现动态帧之上，用于文字/UI 细节无损锐化）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StillTilePatch {
+    /// 所属视频流纪元号（分辨率/显示器切换或重连时递增，防止跨流错贴）。
+    pub stream_epoch: u64,
+    /// 补丁采集所基于的动态帧序号（接收端用于防“画面倒退”一致性校验）。
+    pub base_frame_seq: u64,
+    /// 补丁覆盖的目标像素矩形区域（视频帧坐标系）。
+    pub rect: Rect,
+    /// 像素格式（通常为 [`PixelFormat::Bgra8`] 或 [`PixelFormat::Rgba8`]）。
+    pub format: PixelFormat,
+    /// 紧密排列的未压缩像素字节（长度应等于 `rect.width * rect.height * 4`）。
+    pub pixels: Vec<u8>,
+}
 
 /// 帧呈现器。实现必须满足 D2/D6/D7/D8（见 crate 文档）。
 pub trait Renderer: Send {
@@ -63,4 +78,18 @@ pub trait Renderer: Send {
     /// 光标不进视频管线（D7：否则位置滞后一帧）；实现应缓存位置与
     /// 可见性，在呈现层本地叠加。
     fn set_cursor(&mut self, pos: (i32, i32), visible: bool);
+
+    /// 叠加一片静止无损 Tile 补丁到当前画面（默认空操作，平台渲染器按需覆写）。
+    fn apply_still_tile(&mut self, patch: &StillTilePatch) -> Result<()> {
+        let _ = patch;
+        Ok(())
+    }
+
+    /// 按动态帧脏区矩形使相交的静止无损 Tile 叠加层失效（默认空操作）。
+    fn invalidate_still_tiles(&mut self, dirty_rects: &[Rect]) {
+        let _ = dirty_rects;
+    }
+
+    /// 清空全部静止无损 Tile 叠加层（切分辨率/切显示器/重连时调用，默认空操作）。
+    fn clear_still_tiles(&mut self) {}
 }

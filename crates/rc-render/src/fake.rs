@@ -15,9 +15,9 @@
 //! （device lost → 返回错误、上层重建）由平台渲染器实现。
 
 use crate::cursor::CursorShape;
-use crate::Renderer;
+use crate::{Renderer, StillTilePatch};
 use rc_decode::DecodedFrame;
-use rc_types::{Error, Result, Timestamp};
+use rc_types::{Error, PixelFormat, Rect, Result, Timestamp};
 
 /// 默认单帧呈现耗时（微秒）：2ms，对应任务卡的呈现延迟预算。
 pub const DEFAULT_PRESENT_COST_US: u32 = 2_000;
@@ -98,6 +98,14 @@ pub struct FakeRenderer {
     present_ts_history: Vec<Timestamp>,
     /// 最近一帧的尺寸（观测帧确实流过呈现器）。
     last_frame_size: Option<(u32, u32)>,
+    /// 累计收到的静止无损 Tile 补丁记录（供确定性单测观测）。
+    still_tiles_applied: Vec<StillTilePatch>,
+    /// 当前活跃（尚未被失效或清空）的静止无损 Tile 叠加层。
+    active_still_tiles: Vec<StillTilePatch>,
+    /// 累计收到的静止无损 Tile 失效脏区记录（供确定性单测观测）。
+    still_tiles_invalidated: Vec<Rect>,
+    /// `clear_still_tiles` 累计调用次数。
+    still_tiles_cleared: u64,
 }
 
 impl FakeRenderer {
@@ -116,6 +124,10 @@ impl FakeRenderer {
             presents: 0,
             present_ts_history: Vec::new(),
             last_frame_size: None,
+            still_tiles_applied: Vec::new(),
+            active_still_tiles: Vec::new(),
+            still_tiles_invalidated: Vec::new(),
+            still_tiles_cleared: 0,
         })
     }
 
@@ -176,6 +188,26 @@ impl FakeRenderer {
     pub fn last_frame_size(&self) -> Option<(u32, u32)> {
         self.last_frame_size
     }
+
+    /// 累计通过 [`Renderer::apply_still_tile`] 应用的静止无损 Tile 补丁历史。
+    pub fn still_tiles_applied(&self) -> &[StillTilePatch] {
+        &self.still_tiles_applied
+    }
+
+    /// 当前仍活跃（未被脏区失效或清空）的静止无损 Tile 叠加补丁列表。
+    pub fn active_still_tiles(&self) -> &[StillTilePatch] {
+        &self.active_still_tiles
+    }
+
+    /// 累计通过 [`Renderer::invalidate_still_tiles`] 收到的失效脏区矩形列表。
+    pub fn still_tiles_invalidated(&self) -> &[Rect] {
+        &self.still_tiles_invalidated
+    }
+
+    /// [`Renderer::clear_still_tiles`] 的累计调用次数。
+    pub fn still_tiles_cleared_count(&self) -> u64 {
+        self.still_tiles_cleared
+    }
 }
 
 impl Renderer for FakeRenderer {
@@ -207,6 +239,50 @@ impl Renderer for FakeRenderer {
     fn set_cursor(&mut self, pos: (i32, i32), visible: bool) {
         // D7 状态部分：只缓存，不进视频管线。
         self.cursor = CursorState { pos, visible };
+    }
+
+    fn apply_still_tile(&mut self, patch: &StillTilePatch) -> Result<()> {
+        if patch.rect.is_empty() {
+            return Err(Error::InvalidFrame(
+                "still tile patch rect must be non-empty".to_string(),
+            ));
+        }
+        if !matches!(patch.format, PixelFormat::Bgra8 | PixelFormat::Rgba8) {
+            return Err(Error::InvalidFrame(format!(
+                "still tile patch unsupported pixel format: {:?}",
+                patch.format
+            )));
+        }
+        let expected = (patch.rect.width as usize)
+            .checked_mul(patch.rect.height as usize)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| Error::InvalidFrame("still tile patch dimensions overflow".into()))?;
+        if patch.pixels.len() != expected {
+            return Err(Error::InvalidFrame(format!(
+                "still tile patch pixel bytes mismatch: got {}, expected {}",
+                patch.pixels.len(),
+                expected
+            )));
+        }
+        self.still_tiles_applied.push(patch.clone());
+        self.active_still_tiles
+            .retain(|existing| existing.rect != patch.rect);
+        self.active_still_tiles.push(patch.clone());
+        Ok(())
+    }
+
+    fn invalidate_still_tiles(&mut self, dirty_rects: &[Rect]) {
+        self.still_tiles_invalidated.extend_from_slice(dirty_rects);
+        if dirty_rects.is_empty() {
+            return;
+        }
+        self.active_still_tiles
+            .retain(|tile| !dirty_rects.iter().any(|dirty| tile.rect.intersects(dirty)));
+    }
+
+    fn clear_still_tiles(&mut self) {
+        self.active_still_tiles.clear();
+        self.still_tiles_cleared += 1;
     }
 }
 
@@ -336,5 +412,48 @@ mod tests {
             },
             "光标状态应被覆盖更新（缓存语义）"
         );
+    }
+
+    #[test]
+    fn fake_renderer_tracks_still_tile_apply_invalidate_and_clear() {
+        let mut r = FakeRenderer::new(FakeRendererConfig::default()).expect("配置合法");
+        let tile_a = StillTilePatch {
+            stream_epoch: 1,
+            base_frame_seq: 10,
+            rect: Rect::new(0, 0, 4, 4),
+            format: PixelFormat::Bgra8,
+            pixels: vec![0xAA; 4 * 4 * 4],
+        };
+        let tile_b = StillTilePatch {
+            stream_epoch: 1,
+            base_frame_seq: 10,
+            rect: Rect::new(128, 128, 4, 4),
+            format: PixelFormat::Rgba8,
+            pixels: vec![0xBB; 4 * 4 * 4],
+        };
+
+        r.apply_still_tile(&tile_a).expect("tile_a 合法");
+        r.apply_still_tile(&tile_b).expect("tile_b 合法");
+        assert_eq!(r.still_tiles_applied().len(), 2);
+        assert_eq!(r.active_still_tiles().len(), 2);
+
+        // 仅失效与 (0,0,4,4) 相交的脏区，tile_b 必须保持活跃。
+        let dirty = Rect::new(2, 2, 8, 8);
+        r.invalidate_still_tiles(&[dirty]);
+        assert_eq!(r.still_tiles_invalidated(), &[dirty]);
+        assert_eq!(r.active_still_tiles().len(), 1);
+        assert_eq!(r.active_still_tiles()[0].rect, tile_b.rect);
+
+        // clear_still_tiles 清空全部活跃叠加层。
+        r.clear_still_tiles();
+        assert!(r.active_still_tiles().is_empty());
+        assert_eq!(r.still_tiles_cleared_count(), 1);
+
+        // 非法像素字节数必须被拒绝。
+        let bad_tile = StillTilePatch {
+            pixels: vec![0; 12],
+            ..tile_a
+        };
+        assert!(r.apply_still_tile(&bad_tile).is_err());
     }
 }

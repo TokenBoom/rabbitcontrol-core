@@ -73,6 +73,12 @@ pub trait CaptureBackend: Send {
 
     /// 当前捕获的显示器信息。
     fn display_info(&self) -> DisplayInfo;
+
+    /// 最近一帧采集到的平台真实脏区矩形列表（像素坐标，已裁剪到显示器分辨率内；
+    /// 默认返回空切片，供 Tile 级静止无损补帧状态机做局部脏区失效，零破坏既有实现）。
+    fn last_dirty_rects(&self) -> &[Rect] {
+        &[]
+    }
 }
 
 /// 采集到的一帧。
@@ -405,6 +411,11 @@ mod tests {
             Some(Rect::new(1900, 1070, 20, 10)),
             "越界脏区应被裁剪到 1920×1080 内"
         );
+        assert_eq!(
+            b.last_dirty_rects(),
+            &[Rect::new(1900, 1070, 20, 10)],
+            "last_dirty_rects 应同步承载裁剪后的真实脏区矩形"
+        );
 
         // 完全越界：裁剪后为空，应报告为 None（空区域不送编码）。
         let mut b = FakeBackend::new(FakeBackendConfig {
@@ -417,6 +428,10 @@ mod tests {
             .expect("动态内容")
             .expect("必须出帧");
         assert_eq!(frame.dirty, None, "完全越界的脏区裁剪为空后应报 None");
+        assert!(
+            b.last_dirty_rects().is_empty(),
+            "完全越界脏区裁剪为空后 last_dirty_rects 必须为空"
+        );
     }
 
     /// 任务卡 T03：契约 C2——时间戳（内容变化时刻）单调递增。

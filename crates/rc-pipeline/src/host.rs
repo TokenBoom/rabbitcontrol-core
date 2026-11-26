@@ -43,7 +43,7 @@ const CAPTURE_REBUILD_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 /// 采集线程 → 调用方线程的消息。
 enum CapMsg {
-    Frame(Box<CapturedFrame>),
+    Frame(Box<CapturedFrame>, Vec<rc_types::Rect>),
     Invalidated(rc_capture::InvalidationReason),
     Rebuilt,
     RebuildFailed(rc_capture::InvalidationReason),
@@ -392,6 +392,8 @@ pub struct HostPipeline {
     rebuild_retry_at: Option<Instant>,
     /// 连续编码过载/失败计数（成功编码任意一帧即归零；供会话层判定编码器运行时熔断降级）。
     consecutive_encode_overloads: u32,
+    /// 最近一帧采集经 `CaptureBackend::last_dirty_rects` 上报的真实脏区矩形列表。
+    last_dirty_rects: Vec<rc_types::Rect>,
 }
 
 fn signal_wake(wake: &(Mutex<u64>, Condvar)) {
@@ -583,10 +585,11 @@ impl HostPipeline {
                     }
                     match capture.next_frame(timeout) {
                         Ok(Some(frame)) => {
+                            let dirty_rects = capture.last_dirty_rects().to_vec();
                             // 背压发送：快路径无锁 try_send；满时通过 Condvar 等待调用方
                             // 消费通知（微秒级唤醒，5ms 兜底查停机），消除 sleep(1ms) 在
                             // macOS 定时器合并下实睡 2-4ms 抬高 diff 延迟。
-                            match cap_tx.try_send(CapMsg::Frame(Box::new(frame))) {
+                            match cap_tx.try_send(CapMsg::Frame(Box::new(frame), dirty_rects)) {
                                 Ok(()) => signal_wake(&cap_wake),
                                 Err(TrySendError::Full(mut back)) => loop {
                                     if stop_flag.load(Ordering::Acquire) {
@@ -798,6 +801,7 @@ impl HostPipeline {
             capture_invalidation: None,
             rebuild_retry_at: None,
             consecutive_encode_overloads: 0,
+            last_dirty_rects: Vec::new(),
         })
     }
 
@@ -951,8 +955,9 @@ impl HostPipeline {
                     self.pending_idr = true;
                     self.diff.reset();
                 }
-                CapMsg::Frame(frame) => {
+                CapMsg::Frame(frame, dirty_rects) => {
                     saw_frame = true;
+                    self.last_dirty_rects = dirty_rects;
                     if let Some(dgs) = self.process_frame(*frame, now_us)? {
                         out.extend(dgs);
                     }
@@ -1063,6 +1068,11 @@ impl HostPipeline {
     /// 连续编码过载/失败次数（任一帧编码成功即清零，供上层触发编码侧熔断降级）。
     pub fn consecutive_encode_overloads(&self) -> u32 {
         self.consecutive_encode_overloads
+    }
+
+    /// 最近一帧经 [`CaptureBackend::last_dirty_rects`] 上报的真实脏区矩形列表。
+    pub fn last_dirty_rects(&self) -> &[rc_types::Rect] {
+        &self.last_dirty_rects
     }
 
     /// 会话收尾第一步：只停采集线程（不再有新帧进入交接通道）。

@@ -113,6 +113,8 @@ pub struct FakeBackend {
     access_lost: bool,
     /// rebuild 调用次数（观测幂等性）。
     rebuilds: u64,
+    /// 最近一帧裁剪后的真实脏区矩形列表（供 [`CaptureBackend::last_dirty_rects`] 读取）。
+    last_dirty_rects: Vec<Rect>,
 }
 
 impl FakeBackend {
@@ -130,6 +132,7 @@ impl FakeBackend {
             next_seq: 0,
             access_lost: false,
             rebuilds: 0,
+            last_dirty_rects: Vec::new(),
         })
     }
 
@@ -178,6 +181,7 @@ impl FakeBackend {
                 None => Some(Rect::new(0, 0, res.width, res.height)),
             }
         };
+        self.last_dirty_rects = dirty.into_iter().collect();
         let seq = CaptureSeq(self.next_seq);
         self.next_seq += 1;
         CapturedFrame {
@@ -242,5 +246,9 @@ impl CaptureBackend for FakeBackend {
 
     fn display_info(&self) -> DisplayInfo {
         self.cfg.display
+    }
+
+    fn last_dirty_rects(&self) -> &[Rect] {
+        &self.last_dirty_rects
     }
 }
