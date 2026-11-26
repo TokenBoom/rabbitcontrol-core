@@ -121,7 +121,7 @@ mod tests {
             .is_none()
         {
             assert_eq!(core_version(), env!("CARGO_PKG_VERSION"));
-            assert_eq!(core_version(), "0.2.1");
+            assert_eq!(core_version(), "0.2.2");
         }
     }
 }

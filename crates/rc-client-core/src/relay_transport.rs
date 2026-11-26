@@ -814,8 +814,27 @@ impl E2eeRelayTransport {
         outer_mtls: Option<&RelayMtlsConfig>,
         e2ee_mode: RelayE2eeMode,
     ) -> Result<Self> {
+        Self::connect_with_proxy_cancellable(
+            relay_addr, role, token, timeout, cancel, outer_mtls, e2ee_mode, None,
+        )
+    }
+
+    /// 可中断地通过显式出站代理配置连接中继服务器并完成外层 mTLS + 内层 E2EE 握手。
+    ///
+    /// 当 `proxy` 为 `None` 时自动读取进程级活跃代理配置 [`crate::proxy::active_proxy_config`]。
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_with_proxy_cancellable(
+        relay_addr: &str,
+        role: RelayRole,
+        token: &str,
+        timeout: Duration,
+        cancel: Arc<AtomicBool>,
+        outer_mtls: Option<&RelayMtlsConfig>,
+        e2ee_mode: RelayE2eeMode,
+        proxy: Option<&crate::proxy::ProxyConfig>,
+    ) -> Result<Self> {
         let (transport, peer_identity) = connect_relay_internal(
-            relay_addr, role, token, timeout, cancel, outer_mtls, e2ee_mode,
+            relay_addr, role, token, timeout, cancel, outer_mtls, e2ee_mode, proxy,
         )?;
         Ok(Self {
             inner: transport,
@@ -906,6 +925,20 @@ impl TcpRelayTransport {
         timeout: Duration,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self> {
+        Self::connect_with_proxy_cancellable(relay_addr, role, token, timeout, cancel, None)
+    }
+
+    /// 可中断地通过显式出站代理配置连接中继服务器并完成 `RCR1` 握手。
+    ///
+    /// 当 `proxy` 为 `None` 时自动读取进程级活跃代理配置 [`crate::proxy::active_proxy_config`]。
+    pub fn connect_with_proxy_cancellable(
+        relay_addr: &str,
+        role: RelayRole,
+        token: &str,
+        timeout: Duration,
+        cancel: Arc<AtomicBool>,
+        proxy: Option<&crate::proxy::ProxyConfig>,
+    ) -> Result<Self> {
         let (transport, _) = connect_relay_internal(
             relay_addr,
             role,
@@ -914,6 +947,7 @@ impl TcpRelayTransport {
             cancel,
             None,
             RelayE2eeMode::Disabled,
+            proxy,
         )?;
         Ok(transport)
     }
@@ -930,6 +964,23 @@ impl TcpRelayTransport {
         cancel: Arc<AtomicBool>,
         mtls: &RelayMtlsConfig,
     ) -> Result<Self> {
+        Self::connect_mtls_with_proxy_cancellable(
+            relay_addr, role, token, timeout, cancel, mtls, None,
+        )
+    }
+
+    /// 可中断地通过显式出站代理配置以**外层强制 TLS 1.3 双向 mTLS** 连接中继服务器 `:21117`。
+    ///
+    /// 当 `proxy` 为 `None` 时自动读取进程级活跃代理配置 [`crate::proxy::active_proxy_config`]。
+    pub fn connect_mtls_with_proxy_cancellable(
+        relay_addr: &str,
+        role: RelayRole,
+        token: &str,
+        timeout: Duration,
+        cancel: Arc<AtomicBool>,
+        mtls: &RelayMtlsConfig,
+        proxy: Option<&crate::proxy::ProxyConfig>,
+    ) -> Result<Self> {
         let (transport, _) = connect_relay_internal(
             relay_addr,
             role,
@@ -938,6 +989,7 @@ impl TcpRelayTransport {
             cancel,
             Some(mtls),
             RelayE2eeMode::Disabled,
+            proxy,
         )?;
         Ok(transport)
     }
@@ -1859,6 +1911,7 @@ fn connect_relay_internal(
     cancel: Arc<AtomicBool>,
     outer_mtls: Option<&RelayMtlsConfig>,
     e2ee_mode: RelayE2eeMode,
+    proxy_override: Option<&crate::proxy::ProxyConfig>,
 ) -> Result<(TcpRelayTransport, Option<PeerMtlsIdentity>)> {
     let token_bytes = token.as_bytes();
     if token_bytes.is_empty() || token_bytes.len() > MAX_TOKEN_LEN {
@@ -1884,15 +1937,11 @@ fn connect_relay_internal(
 
     let connect_start = Instant::now();
     let deadline = connect_start + timeout;
-    let addrs: Vec<SocketAddr> = relay_addr
-        .to_socket_addrs()
-        .map_err(|e| Error::Network(format!("resolve relay addr {relay_addr:?} failed: {e}")))?
-        .collect();
-    if addrs.is_empty() {
-        return Err(Error::Network(format!(
-            "relay addr {relay_addr:?} resolved to no socket addresses"
-        )));
-    }
+    let effective_proxy = proxy_override
+        .cloned()
+        .unwrap_or_else(crate::proxy::active_proxy_config);
+    let (relay_host, relay_port) = crate::proxy::split_host_port(relay_addr)
+        .map_err(|e| Error::Network(format!("resolve relay addr {relay_addr:?} failed: {e}")))?;
 
     let mut outer_conn = match outer_mtls {
         Some(mtls) => {
@@ -1906,7 +1955,56 @@ fn connect_relay_internal(
         None => None,
     };
 
-    let mut stream = connect_any_with_deadline(&addrs, deadline, timeout, &cancel)?;
+    let use_proxy =
+        crate::proxy::resolve_proxy_for_target(&effective_proxy, &relay_host, relay_port)
+            .map_err(|e| Error::InvalidConfig(format!("proxy config conflict: {e}")))?
+            .is_some();
+
+    let mut stream = if use_proxy {
+        let dial_rem = remaining_or_timeout(deadline, timeout)?;
+        crate::proxy::dial_tcp_with_proxy(
+            &relay_host,
+            relay_port,
+            dial_rem,
+            Some(&cancel),
+            &effective_proxy,
+        )
+        .map_err(|e| match e {
+            crate::proxy::ProxyDialError::Cancelled => {
+                Error::Network("relay connect cancelled".to_string())
+            }
+            crate::proxy::ProxyDialError::Timeout(m) => {
+                Error::Network(format!("connect relay tcp timed out: {m}"))
+            }
+            crate::proxy::ProxyDialError::AuthFailed(m) => {
+                Error::Network(format!("proxy authentication failed (407): {m}"))
+            }
+            crate::proxy::ProxyDialError::Config(m)
+            | crate::proxy::ProxyDialError::ConfigConflict(m) => {
+                Error::InvalidConfig(format!("proxy config conflict: {m}"))
+            }
+            crate::proxy::ProxyDialError::ConnectFailed(m) => {
+                Error::Network(format!("proxy connect failed: {m}"))
+            }
+            crate::proxy::ProxyDialError::DnsFailed(m) => {
+                Error::Network(format!("resolve relay addr {relay_addr:?} failed: {m}"))
+            }
+            crate::proxy::ProxyDialError::TargetConnectFailed(m) => {
+                Error::Network(format!("connect relay failed: {m}"))
+            }
+        })?
+    } else {
+        let addrs: Vec<SocketAddr> = relay_addr
+            .to_socket_addrs()
+            .map_err(|e| Error::Network(format!("resolve relay addr {relay_addr:?} failed: {e}")))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(Error::Network(format!(
+                "relay addr {relay_addr:?} resolved to no socket addresses"
+            )));
+        }
+        connect_any_with_deadline(&addrs, deadline, timeout, &cancel)?
+    };
     let peer_addr = stream.peer_addr()?;
     stream.set_nodelay(true)?;
     configure_tcp_keepalive(&stream);

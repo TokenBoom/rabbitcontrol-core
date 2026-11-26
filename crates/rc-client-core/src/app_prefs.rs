@@ -261,6 +261,12 @@ pub struct AppPrefs {
     /// 是否开启静止画面 Tile 级无损文字锐化补帧（默认 `true`）。
     #[serde(default = "default_still_refinement_enabled")]
     pub still_refinement_enabled: bool,
+    /// 出站网络代理配置（支持 `none` / `system` / `manual` 与 HTTP CONNECT / SOCKS5，默认禁用）。
+    #[serde(default)]
+    pub proxy: crate::proxy::ProxyConfig,
+    /// 是否允许本机作为被控设备接受同账号 Wake-on-LAN 远程开机（默认 `false`）。
+    #[serde(default)]
+    pub allow_wol: bool,
 }
 
 fn default_upnp_enabled() -> bool {
@@ -365,6 +371,8 @@ impl Default for AppPrefs {
             connection_mode: ConnectionMode::Auto,
             upnp_enabled: default_upnp_enabled(),
             still_refinement_enabled: default_still_refinement_enabled(),
+            proxy: crate::proxy::ProxyConfig::default(),
+            allow_wol: false,
         }
     }
 }

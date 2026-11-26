@@ -21,6 +21,7 @@ pub mod lan_discovery;
 pub mod model;
 pub mod p2p;
 pub mod platform;
+pub mod proxy;
 pub mod relay_transport;
 pub mod server_config;
 pub mod session_bridge;
@@ -30,6 +31,7 @@ pub mod ui_error;
 pub mod updater;
 pub mod upnp;
 pub mod version;
+pub mod wol;
 
 pub use version::{core_build_info, core_version, CoreBuildInfo, CORE_ABI_VERSION};
 

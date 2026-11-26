@@ -339,6 +339,50 @@ pub fn apply_mirror_prefix(mirror_url: &str, target_url: &str) -> Result<String,
     validate_update_https_url(&joined)
 }
 
+/// 为给定更新查询/下载 HTTPS URL 解析当前生效的出站代理（自动应用全局活跃代理、回环 Bypass 与 `NO_PROXY`）。
+///
+/// 供平台下载钩子（如 `curl` / `NSURLSession` / WinHTTP）在执行更新元数据拉取与安装包下载时统一复用代理策略。
+pub fn resolve_updater_proxy(
+    target_url: &str,
+) -> Result<Option<crate::proxy::ResolvedProxy>, crate::proxy::ProxyError> {
+    let active = crate::proxy::active_proxy_config();
+    let trimmed = target_url.trim();
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let default_port = if trimmed.starts_with("http://") {
+        80u16
+    } else {
+        443u16
+    };
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        match inner.find(']') {
+            Some(end) => {
+                let h = &inner[..end];
+                let p = inner[end + 1..]
+                    .strip_prefix(':')
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(default_port);
+                (h, p)
+            }
+            None => (authority, default_port),
+        }
+    } else if let Some((h, p_str)) = authority.rsplit_once(':') {
+        match p_str.parse::<u16>() {
+            Ok(p) if !h.contains(':') => (h, p),
+            _ => (authority, default_port),
+        }
+    } else {
+        (authority, default_port)
+    };
+    if host.is_empty() {
+        return crate::proxy::resolve_effective_proxy(&active);
+    }
+    crate::proxy::resolve_proxy_for_target(&active, host, port)
+}
+
 /// 单个 Release 发行资产描述。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -2493,6 +2493,19 @@ pub fn classify_relay_connect_error(
     if lower.contains("relay connect cancelled") || lower.contains("cancelled") {
         return "连接已取消".to_string();
     }
+    if lower.contains("proxy config conflict") || raw.contains("代理配置冲突") {
+        return format!("proxy_config_conflict: 代理配置无效或存在冲突：{raw}");
+    }
+    if lower.contains("proxy authentication failed")
+        || lower.contains("proxy auth")
+        || lower.contains("407")
+        || raw.contains("代理认证")
+    {
+        return format!("代理认证失败 (407)：{raw}");
+    }
+    if lower.contains("proxy connect failed") || raw.contains("代理") {
+        return format!("无法通过代理连接中继服务器：{raw}");
+    }
     if lower.contains("resolve relay addr") || lower.contains("resolved to no socket addresses") {
         return format!("无法解析中继服务器地址，请检查网络或服务器配置：{raw}");
     }
@@ -2808,6 +2821,9 @@ fn is_non_recoverable_error_reason(msg: &str) -> bool {
     msg.contains("用户主动断开")
         || msg.contains("已取消")
         || lower.contains("cancelled")
+        || lower.contains("proxy_config_conflict")
+        || msg.contains("代理配置冲突")
+        || msg.contains("代理认证失败")
         || msg.contains("仅 P2P")
         || msg.contains("远端画面解码失败")
         || msg.contains("密码")
@@ -3231,7 +3247,37 @@ fn run_session_thread(
 
         let mut ready: Option<ReadySignalingSession> = None;
         let mut direct_fail_reasons: Vec<String> = Vec::new();
-        let allow_lan_and_p2p = effective_mode != ConnectionMode::TcpRelay;
+        let active_proxy = crate::proxy::active_proxy_config();
+        let proxy_active_for_relay = match crate::proxy::split_host_port(&grant.relay_addr) {
+            Ok((relay_host, relay_port)) => {
+                match crate::proxy::resolve_proxy_for_target(&active_proxy, &relay_host, relay_port)
+                {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(err) => {
+                        return Err(SessionEnd::fatal(format!(
+                            "proxy_config_conflict: 代理配置无效：{err}"
+                        )));
+                    }
+                }
+            }
+            Err(_) => match crate::proxy::resolve_effective_proxy(&active_proxy) {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(err) => {
+                    return Err(SessionEnd::fatal(format!(
+                        "proxy_config_conflict: 代理配置无效：{err}"
+                    )));
+                }
+            },
+        };
+        if proxy_active_for_relay && effective_mode == ConnectionMode::P2pOnly {
+            return Err(SessionEnd::fatal(
+                "proxy_config_conflict: 当前已启用出站网络代理，与「仅 P2P 直连」模式冲突，请关闭代理或切换为自动/中继模式",
+            ));
+        }
+        let allow_lan_and_p2p =
+            effective_mode != ConnectionMode::TcpRelay && !proxy_active_for_relay;
         if allow_lan_and_p2p && !disconnect_flag.load(Ordering::Acquire) {
             for lan_addr in collect_lan_candidate_addrs(&cfg, grant) {
                 if disconnect_flag.load(Ordering::Acquire) {
@@ -9038,5 +9084,66 @@ mod tests {
             "StillRefineConfig(false) 必须紧跟在 ClientMediaCaps 之后发送: {msgs:?}"
         );
         let _ = client.close(ByeReason::Normal);
+    }
+
+    #[test]
+    fn p2p_only_with_active_proxy_fails_fast_with_proxy_config_conflict() {
+        struct GlobalProxyResetGuard;
+        impl Drop for GlobalProxyResetGuard {
+            fn drop(&mut self) {
+                crate::proxy::set_global_proxy_config(crate::proxy::ProxyConfig::default());
+            }
+        }
+        let _guard = GlobalProxyResetGuard;
+        crate::proxy::set_global_proxy_config(crate::proxy::ProxyConfig {
+            mode: crate::proxy::ProxyMode::Manual,
+            protocol: Some(crate::proxy::ProxyProtocol::Socks5),
+            host: "127.0.0.1".to_string(),
+            port: 1080,
+            username: None,
+            password: None,
+        });
+
+        let session = SessionHandle::spawn(UiSessionConfig {
+            connect_addr: "198.51.100.10:9901".parse().unwrap(),
+            connection_mode: ConnectionMode::P2pOnly,
+            force_relay: false,
+            tools_only: true,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            relay_grant: Some(ConnectGrant {
+                session_id: "sess-proxy-conflict".to_string(),
+                relay_addr: "relay.corp.internal:21117".to_string(),
+                relay_token: "unused".to_string(),
+                target_id: "900000099".to_string(),
+                ..ConnectGrant::default()
+            }),
+            ..UiSessionConfig::default()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut ended_ui_error = None;
+        let mut ended_recoverable = true;
+        while Instant::now() < deadline {
+            if let Some(SessionUpdate::Ended {
+                recoverable,
+                ui_error,
+                ..
+            }) = session.try_recv_update()
+            {
+                ended_recoverable = recoverable;
+                ended_ui_error = ui_error;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            !ended_recoverable,
+            "P2pOnly + Proxy conflict must be fatal (non-recoverable)"
+        );
+        let ui_err = ended_ui_error.expect("SessionUpdate::Ended must include UiError");
+        assert_eq!(ui_err.code, crate::ui_error::codes::PROXY_CONFIG_CONFLICT);
     }
 }

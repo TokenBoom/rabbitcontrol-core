@@ -1,0 +1,129 @@
+name: Core Release Orchestrator
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-core:
+    name: Validate, Publish Release & Dispatch Downstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Verify Git tag matches Cargo.toml version
+        run: |
+          python3 scripts/build-release-manifest.py --verify-tag "${GITHUB_REF_NAME}"
+
+      - name: Verify spec-lock integrity
+        run: |
+          python3 scripts/verify-spec-lock.py
+
+      - name: Self-test release manifest builder
+        run: |
+          python3 scripts/build-release-manifest.py --self-test
+
+      - name: Build initial release-manifest.json
+        id: manifest
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 scripts/build-release-manifest.py \
+            --tag "${GITHUB_REF_NAME}" \
+            --git-commit "${GITHUB_SHA}" \
+            --output dist/release-manifest.json \
+            --write-checksums dist/SHA256SUMS.txt
+          python3 - <<'PY' >> "${GITHUB_OUTPUT}"
+          import json, pathlib
+          data = json.loads(pathlib.Path("dist/release-manifest.json").read_text(encoding="utf-8"))
+          print(f"version={data['coreVersion']}")
+          print(f"abi_version={data['abiVersion']}")
+          print(f"session_proto={data['protocolVersions']['session']}")
+          print(f"punch_proto={data['protocolVersions']['punch']}")
+          print(f"beacon_proto={data['protocolVersions']['beacon']}")
+          PY
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          ASSETS=(dist/release-manifest.json)
+          if [ -s dist/SHA256SUMS.txt ]; then
+            ASSETS+=(dist/SHA256SUMS.txt)
+          fi
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+          else
+            gh release create "${TAG}" \
+              "${ASSETS[@]}" \
+              --title "RabbitControl Core ${TAG}" \
+              --generate-notes
+          fi
+
+      - name: Dispatch downstream platform builds
+        env:
+          DISPATCH_TOKEN: ${{ secrets.CROSS_REPO_DISPATCH_TOKEN }}
+          CORE_TAG: ${{ github.ref_name }}
+          CORE_VERSION: ${{ steps.manifest.outputs.version }}
+          CORE_COMMIT: ${{ github.sha }}
+          CORE_ABI_VERSION: ${{ steps.manifest.outputs.abi_version }}
+          CORE_SESSION_PROTO: ${{ steps.manifest.outputs.session_proto }}
+          CORE_PUNCH_PROTO: ${{ steps.manifest.outputs.punch_proto }}
+          CORE_BEACON_PROTO: ${{ steps.manifest.outputs.beacon_proto }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DISPATCH_TOKEN}" ]; then
+            echo "::warning::CROSS_REPO_DISPATCH_TOKEN is not configured; skipping repository_dispatch for downstream platform repos. Core Release was still published."
+            exit 0
+          fi
+
+          PAYLOAD="$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({
+              "event_type": "rabbitcontrol-core-release",
+              "client_payload": {
+                  "tag": os.environ["CORE_TAG"],
+                  "version": os.environ["CORE_VERSION"],
+                  "commit": os.environ["CORE_COMMIT"],
+                  "abi_version": int(os.environ["CORE_ABI_VERSION"]),
+                  "protocol_versions": {
+                      "session": int(os.environ["CORE_SESSION_PROTO"]),
+                      "punch": int(os.environ["CORE_PUNCH_PROTO"]),
+                      "beacon": int(os.environ["CORE_BEACON_PROTO"]),
+                  },
+                  "core_repo": os.environ["GITHUB_REPOSITORY"],
+              },
+          }))
+          PY
+          )"
+
+          for TARGET_REPO in \
+            "TokenBoom/rabbitcontrol-apple-media" \
+            "TokenBoom/rabbitcontrol-android"; do
+            echo "Dispatching rabbitcontrol-core-release to ${TARGET_REPO}..."
+            if ! HTTP_CODE="$(curl -sS --connect-timeout 10 --max-time 30 \
+              -o /tmp/dispatch_resp.txt -w "%{http_code}" \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${TARGET_REPO}/dispatches" \
+              -d "${PAYLOAD}")"; then
+              echo "::warning::repository_dispatch to ${TARGET_REPO} failed due to network/curl error; continuing."
+              continue
+            fi
+            if [ "${HTTP_CODE}" != "204" ]; then
+              echo "::warning::repository_dispatch to ${TARGET_REPO} returned HTTP ${HTTP_CODE}: $(cat /tmp/dispatch_resp.txt)"
+            fi
+          done

@@ -300,7 +300,14 @@ fn classify_tls_message(msg: &str) -> &'static str {
 
 fn classify_network_message(msg: &str) -> &'static str {
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("407")
+    if lower.contains("proxy_config_conflict")
+        || lower.contains("proxy config conflict")
+        || msg.contains("代理配置冲突")
+        || (msg.contains("代理") && msg.contains("冲突"))
+    {
+        codes::PROXY_CONFIG_CONFLICT
+    } else if lower.contains("407")
+        || lower.contains("proxy_auth_failed")
         || lower.contains("proxy auth")
         || lower.contains("proxy authentication")
         || msg.contains("代理认证")
@@ -597,6 +604,14 @@ pub fn classify_signal_error(raw: &str, platform: ErrorPlatform) -> UiError {
         || trimmed.contains("指纹")
     {
         classify_tls_message(trimmed)
+    } else if lower.contains("proxy_config_conflict")
+        || lower.contains("proxy_auth_failed")
+        || lower.contains("proxy")
+        || lower.contains("socks")
+        || lower.contains("407")
+        || trimmed.contains("代理")
+    {
+        classify_network_message(trimmed)
     } else if lower.contains("unauthorized")
         || lower.contains("auth")
         || trimmed.contains("重新登录")
@@ -607,12 +622,10 @@ pub fn classify_signal_error(raw: &str, platform: ErrorPlatform) -> UiError {
         || lower.contains("timed out")
         || lower.contains("dns")
         || lower.contains("refused")
-        || lower.contains("proxy")
         || trimmed.contains("超时")
         || trimmed.contains("解析")
         || trimmed.contains("拒绝连接")
         || trimmed.contains("连接失败")
-        || trimmed.contains("代理")
     {
         classify_network_message(trimmed)
     } else if lower.contains("register") || trimmed.contains("注册失败") {
@@ -643,6 +656,25 @@ pub fn classify_session_reason(reason: &str, platform: ErrorPlatform) -> UiError
         || lower.contains("cancelled")
     {
         codes::SESSION_CANCELLED
+    } else if lower.contains("proxy_config_conflict")
+        || lower.contains("proxy config conflict")
+        || trimmed.contains("代理配置冲突")
+        || (trimmed.contains("代理") && trimmed.contains("冲突"))
+    {
+        codes::PROXY_CONFIG_CONFLICT
+    } else if lower.contains("proxy_auth_failed")
+        || lower.contains("proxy auth")
+        || lower.contains("proxy authentication")
+        || lower.contains("407")
+        || trimmed.contains("代理认证")
+    {
+        codes::PROXY_AUTH_FAILED
+    } else if lower.contains("proxy_connect_failed")
+        || lower.contains("proxy connect")
+        || trimmed.contains("通过代理")
+        || trimmed.contains("代理服务器")
+    {
+        codes::PROXY_CONNECT_FAILED
     } else if trimmed.contains("审批超时") || lower.contains("approval timeout") {
         codes::SESSION_APPROVAL_TIMEOUT
     } else if trimmed.contains("机主拒绝")
@@ -1125,5 +1157,32 @@ mod tests {
         assert!(!blank_tool.message.contains('{'));
         assert!(!blank_tool.message.contains("「」"));
         assert!(!blank_tool.message.contains("  "));
+    }
+
+    #[test]
+    fn classify_signal_error_maps_proxy_407_and_conflict_before_auth_unauthorized() {
+        let auth_407 = classify_signal_error(
+            "代理认证失败 (407)：HTTP 代理认证失败 (407 Proxy Authentication Required)",
+            ErrorPlatform::Macos,
+        );
+        assert_eq!(auth_407.code, codes::PROXY_AUTH_FAILED);
+
+        let socks_auth = classify_signal_error(
+            "代理认证失败 (407)：SOCKS5 代理用户名或密码认证失败",
+            ErrorPlatform::Generic,
+        );
+        assert_eq!(socks_auth.code, codes::PROXY_AUTH_FAILED);
+
+        let conflict = classify_signal_error(
+            "proxy_config_conflict: 代理配置无效：暂不支持 https:// 加密代理",
+            ErrorPlatform::Macos,
+        );
+        assert_eq!(conflict.code, codes::PROXY_CONFIG_CONFLICT);
+
+        let connect_err = classify_signal_error(
+            "通过代理连接信令服务器 signal.corp.internal:21116 失败：connection refused",
+            ErrorPlatform::Macos,
+        );
+        assert_eq!(connect_err.code, codes::PROXY_CONNECT_FAILED);
     }
 }

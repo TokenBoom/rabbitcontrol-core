@@ -278,6 +278,16 @@ pub trait ClientPlatformHooks: Send + Sync {
     ) -> Result<(), String> {
         Err("当前平台未注册更新安装实现".to_string())
     }
+
+    /// 读取当前操作系统的系统级网络代理配置（未配置或未实现时返回 `None`，由核心层回退环境变量）。
+    fn resolve_system_proxy(&self) -> Option<crate::proxy::ProxyConfig> {
+        None
+    }
+
+    /// 读取当前宿主设备主有线/无线网卡的单播 MAC 地址（供 Wake-on-LAN 上报，未实现时返回 `None`）。
+    fn primary_mac_address(&self) -> Option<String> {
+        None
+    }
 }
 
 static PLATFORM_HOOKS: OnceLock<Arc<dyn ClientPlatformHooks>> = OnceLock::new();
@@ -620,4 +630,14 @@ pub fn install_verified_update(
         ),
         None => Err("当前平台未注册更新安装实现".to_string()),
     }
+}
+
+/// 查询宿主操作系统的系统级网络代理配置（未注册平台钩子或系统未配置时返回 `None`）。
+pub fn resolve_system_proxy() -> Option<crate::proxy::ProxyConfig> {
+    PLATFORM_HOOKS.get().and_then(|h| h.resolve_system_proxy())
+}
+
+/// 查询宿主设备主网卡单播 MAC 地址（供 Wake-on-LAN 上报；未注册钩子或不可用时返回 `None`）。
+pub fn primary_mac_address() -> Option<String> {
+    PLATFORM_HOOKS.get().and_then(|h| h.primary_mac_address())
 }

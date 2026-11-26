@@ -83,8 +83,6 @@ const STATUS_QUEUE_CAP: usize = 32;
 const DEVICE_STATUS_QUEUE_CAP: usize = 128;
 /// 踢线原因通知队列最大容量（满载丢最旧）。
 const KICKED_REASON_QUEUE_CAP: usize = 16;
-/// 多候选地址拨号时的单地址最小超时预算。
-const MIN_ADDR_TIMEOUT: Duration = Duration::from_millis(250);
 /// TCP Keepalive 空闲探测时间（30s）。
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 /// TCP Keepalive 探测间隔（10s）。
@@ -109,6 +107,20 @@ const REMOTE_CTRL_UNSET: u8 = 0;
 const REMOTE_CTRL_FALSE: u8 = 1;
 /// 远控总开关原子编码：允许被远程控制。
 const REMOTE_CTRL_TRUE: u8 = 2;
+
+/// Wake-on-LAN 开关原子编码：未显式设置（沿用服务端已有记录）。
+const WOL_UNSET: u8 = 0;
+/// Wake-on-LAN 开关原子编码：关闭远程开机。
+const WOL_FALSE: u8 = 1;
+/// Wake-on-LAN 开关原子编码：开启远程开机。
+const WOL_TRUE: u8 = 2;
+
+/// 本机代发 `wol_relay` 魔术包的最大并发后台线程数上限。
+const MAX_CONCURRENT_WOL_RELAYS: usize = 4;
+/// 本机代发 `wol_relay` 滑动限流时间窗口（10 秒）。
+const WOL_RELAY_RATE_WINDOW: Duration = Duration::from_secs(10);
+/// 本机代发 `wol_relay` 在滑动窗口内允许的最大次数（防异常或滥用刷包）。
+const WOL_RELAY_RATE_MAX: usize = 10;
 
 /// 服务端推送的入站中继会话请求（本端作为被控端 `host` 接收）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -220,6 +232,41 @@ impl<'de> Deserialize<'de> for DeviceStatusEvent {
     }
 }
 
+/// 同账号设备的 Wake-on-LAN 能力增量状态事件（由 `device_status_changed` 同步解析）。
+///
+/// 独立于 [`DeviceStatusEvent`] 暴露，避免向既有公开结构体新增字段破坏下游字面量构造兼容性。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceWolCapabilityEvent {
+    /// 9 位纯数字设备码。
+    pub device_id: String,
+    /// 设备当前是否在线。
+    pub online: bool,
+    /// 目标设备是否具备远程开机能力（`wol_enabled && valid(mac_addr)`）。
+    #[serde(default)]
+    pub wol_capable: bool,
+}
+
+/// 发起 `wol_request` 后由服务端返回的 Wake-on-LAN 唤醒结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WolAckResult {
+    /// 目标 9 位设备码。
+    pub target_device_id: String,
+    /// 唤醒请求是否成功。
+    pub ok: bool,
+    /// 唤醒方式（`"already_online"` / `"lan_peer"` / `"server"` / `"none"`）。
+    pub method: String,
+    /// 失败时的服务端 wire 错误码（成功时为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// 服务端返回的描述消息。
+    pub message: String,
+    /// 失败时映射后的规范结构化 [`crate::ui_error::UiError`]（成功时为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_error: Option<crate::ui_error::UiError>,
+}
+
 /// 动态 Access Token 提供器类型（由上层接入 `AuthSessionManager::ensure_valid_access_token`）。
 pub type TokenProvider = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
 
@@ -284,15 +331,27 @@ enum OutgoingSignalMsg {
         allow_remote_assist: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         allow_remote_control: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mac_addr: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wol_enabled: Option<bool>,
     },
     Heartbeat {
         lan_addrs: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mac_addr: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wol_enabled: Option<bool>,
     },
     UpdateAssistState {
         #[serde(skip_serializing_if = "Option::is_none")]
         allow_remote_assist: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         allow_remote_control: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mac_addr: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wol_enabled: Option<bool>,
     },
     ConnectRequest {
         target_id: String,
@@ -303,6 +362,10 @@ enum OutgoingSignalMsg {
     RelayAlloc {
         target_id: String,
         session_id: String,
+    },
+    WolRequest {
+        request_id: String,
+        target_device_id: String,
     },
 }
 
@@ -338,6 +401,8 @@ enum IncomingSignalMsg {
         allow_remote_assist: bool,
         #[serde(default)]
         allow_remote_control: Option<bool>,
+        #[serde(default)]
+        wol_capable: bool,
     },
     PunchCoord {
         session_id: String,
@@ -377,6 +442,32 @@ enum IncomingSignalMsg {
     Kicked {
         #[serde(default)]
         reason: String,
+    },
+    WolAck {
+        #[serde(default)]
+        request_id: Option<String>,
+        #[serde(default)]
+        target_device_id: String,
+        #[serde(default)]
+        ok: bool,
+        #[serde(default)]
+        method: String,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        message: String,
+    },
+    WolRelay {
+        #[serde(default)]
+        #[allow(dead_code)]
+        request_id: String,
+        #[serde(default)]
+        #[allow(dead_code)]
+        target_device_id: String,
+        #[serde(default)]
+        mac_addr: String,
+        #[serde(default)]
+        target_lan_addrs: Vec<String>,
     },
     Error {
         #[serde(default)]
@@ -476,6 +567,9 @@ impl SignalWriter {
     }
 }
 
+#[cfg(test)]
+type WolRelayTestSink = Mutex<Option<mpsc::Sender<(String, Vec<String>)>>>;
+
 struct SharedState {
     status: Mutex<ServerStatusSnapshot>,
     status_updates: Mutex<VecDeque<ServerStatusSnapshot>>,
@@ -530,6 +624,18 @@ struct SharedState {
     device_pubkey: Option<String>,
     allow_remote_assist: AtomicU8,
     allow_remote_control: AtomicU8,
+    wol_enabled: AtomicU8,
+    mac_addr: Mutex<Option<String>>,
+    device_wol_events: Mutex<VecDeque<DeviceWolCapabilityEvent>>,
+    device_wol_capable: Mutex<HashMap<String, bool>>,
+    pending_wols:
+        Mutex<HashMap<String, mpsc::SyncSender<Result<WolAckResult, crate::ui_error::UiError>>>>,
+    wol_relay_inflight: Arc<AtomicUsize>,
+    wol_relay_history: Mutex<VecDeque<Instant>>,
+    proxy_override: Mutex<Option<crate::proxy::ProxyConfig>>,
+    proxy_active: AtomicBool,
+    #[cfg(test)]
+    wol_relay_test_sink: WolRelayTestSink,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -630,6 +736,48 @@ impl SharedState {
         }
     }
 
+    fn current_wol_enabled_opt(&self) -> Option<bool> {
+        match self.wol_enabled.load(Ordering::Acquire) {
+            WOL_FALSE => Some(false),
+            WOL_TRUE => Some(true),
+            _ => None,
+        }
+    }
+
+    fn current_mac_addr_opt(&self) -> Option<String> {
+        self.mac_addr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn effective_proxy_config(&self) -> crate::proxy::ProxyConfig {
+        self.proxy_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(crate::proxy::active_proxy_config)
+    }
+
+    fn push_device_wol_event(&self, ev: DeviceWolCapabilityEvent) {
+        let key =
+            parse_device_id_input(&ev.device_id).unwrap_or_else(|| ev.device_id.trim().to_string());
+        if !key.is_empty() {
+            self.device_wol_capable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, ev.wol_capable);
+        }
+        let mut q = self
+            .device_wol_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if q.len() >= DEVICE_STATUS_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(ev);
+    }
+
     fn fail_all_pending(&self, reason: &str) {
         let mut pending = self
             .pending_connects
@@ -637,6 +785,13 @@ impl SharedState {
             .unwrap_or_else(|e| e.into_inner());
         for (_, waiter) in pending.drain() {
             let _ = waiter.tx.try_send(Err(reason.to_string()));
+        }
+        drop(pending);
+        let ui_err =
+            crate::ui_error::classify_signal_error(reason, crate::ui_error::current_platform());
+        let mut pending_wols = self.pending_wols.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, tx) in pending_wols.drain() {
+            let _ = tx.try_send(Err(ui_err.clone()));
         }
     }
 
@@ -657,6 +812,7 @@ impl SharedState {
         self.local_udp_port.store(0, Ordering::Release);
         self.local_udp_is_ipv6.store(false, Ordering::Release);
         self.server_is_loopback.store(false, Ordering::Release);
+        self.proxy_active.store(false, Ordering::Release);
         self.connected_probe_targets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -790,13 +946,21 @@ impl SharedState {
             let port = self.local_udp_port.load(Ordering::Acquire);
             let is_ipv6 = self.local_udp_is_ipv6.load(Ordering::Acquire);
             let is_loopback = self.server_is_loopback.load(Ordering::Acquire);
+            let is_proxied = self.proxy_active.load(Ordering::Acquire);
 
             let next_gen = self.upnp_gen.fetch_add(1, Ordering::AcqRel) + 1;
             self.upnp_heartbeat_needed.store(false, Ordering::Release);
             let old = lease_guard.take();
             *addr_guard = None;
 
-            let (next_status, to_spawn) = if port == 0 {
+            let (next_status, to_spawn) = if is_proxied {
+                (
+                    UpnpStatus::Unavailable {
+                        reason: "已启用网络代理，已跳过 UPnP 网关探测".to_string(),
+                    },
+                    None,
+                )
+            } else if port == 0 {
                 (UpnpStatus::Discovering, None)
             } else if is_ipv6 {
                 (
@@ -1365,6 +1529,20 @@ impl SignalClientHandle {
             device_pubkey,
             allow_remote_assist: AtomicU8::new(initial_assist),
             allow_remote_control: AtomicU8::new(initial_remote_ctrl),
+            wol_enabled: AtomicU8::new(WOL_UNSET),
+            mac_addr: Mutex::new(
+                crate::platform::primary_mac_address()
+                    .and_then(|m| crate::wol::normalize_mac_addr(&m)),
+            ),
+            device_wol_events: Mutex::new(VecDeque::new()),
+            device_wol_capable: Mutex::new(HashMap::new()),
+            pending_wols: Mutex::new(HashMap::new()),
+            wol_relay_inflight: Arc::new(AtomicUsize::new(0)),
+            wol_relay_history: Mutex::new(VecDeque::new()),
+            proxy_override: Mutex::new(None),
+            proxy_active: AtomicBool::new(false),
+            #[cfg(test)]
+            wol_relay_test_sink: Mutex::new(None),
         });
 
         if !active {
@@ -1558,6 +1736,8 @@ impl SignalClientHandle {
         self.shared.send_msg(&OutgoingSignalMsg::UpdateAssistState {
             allow_remote_assist: Some(allow),
             allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
         })
     }
 
@@ -1577,7 +1757,195 @@ impl SignalClientHandle {
         self.shared.send_msg(&OutgoingSignalMsg::UpdateAssistState {
             allow_remote_assist: None,
             allow_remote_control: Some(allow),
+            mac_addr: None,
+            wol_enabled: None,
         })
+    }
+
+    /// 设置或清除本信令客户端的显式出站代理配置（`None` 表示跟随进程级 [`crate::proxy::active_proxy_config`]）。
+    ///
+    /// 调用方可在更新代理配置后配合 [`Self::trigger_reconnect`] 立即切换通道。
+    pub fn set_proxy_config(&self, proxy: Option<crate::proxy::ProxyConfig>) {
+        *self
+            .shared
+            .proxy_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = proxy;
+    }
+
+    /// 实时更新本机 Wake-on-LAN 远程开机开关并向服务端发送 `UpdateAssistState` 同步。
+    pub fn set_wol_enabled(&self, enabled: bool) -> Result<(), String> {
+        let code = if enabled { WOL_TRUE } else { WOL_FALSE };
+        self.shared.wol_enabled.store(code, Ordering::Release);
+        if !self.shared.enabled {
+            return Err("未启用信令服务器".to_string());
+        }
+        let mac_addr = self.shared.current_mac_addr_opt();
+        self.shared.send_msg(&OutgoingSignalMsg::UpdateAssistState {
+            allow_remote_assist: None,
+            allow_remote_control: None,
+            mac_addr,
+            wol_enabled: Some(enabled),
+        })
+    }
+
+    /// 更新本机用于 Wake-on-LAN 上报的主网卡单播 MAC 地址（自动校验并规范化为 `aa:bb:cc:dd:ee:ff`）。
+    ///
+    /// - 传入 `Some(raw)` 时严格校验单播 MAC 格式，合法后缓存并立即经 `UpdateAssistState` 同步至服务端；
+    /// - 传入 `None` 时仅清空本地缓存（不向服务端发送空负载帧）。
+    pub fn set_mac_addr(&self, mac: Option<String>) -> Result<(), String> {
+        let normalized = match mac {
+            Some(raw) => {
+                let norm = crate::wol::normalize_mac_addr(&raw).ok_or_else(|| {
+                    "MAC 地址格式无效（要求冒号或短横线分隔的合法单播 MAC 地址）".to_string()
+                })?;
+                Some(norm)
+            }
+            None => None,
+        };
+        *self
+            .shared
+            .mac_addr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = normalized.clone();
+        let Some(norm_mac) = normalized else {
+            return Ok(());
+        };
+        if !self.shared.enabled {
+            return Err("未启用信令服务器".to_string());
+        }
+        self.shared.send_msg(&OutgoingSignalMsg::UpdateAssistState {
+            allow_remote_assist: None,
+            allow_remote_control: None,
+            mac_addr: Some(norm_mac),
+            wol_enabled: self.shared.current_wol_enabled_opt(),
+        })
+    }
+
+    /// 向服务端发起 Wake-on-LAN 远程开机请求（`wol_request`）并阻塞等待匹配 `request_id` 的 `wol_ack`。
+    ///
+    /// - 服务端返回 `wol_ack` 时返回 `Ok(WolAckResult)`（若 `ok == false`，同步在 `ui_error` 中填充规范
+    ///   [`crate::ui_error::UiError`]，如 `wol.disabled` / `wol.no_relay_peer` / `wol.send_failed` / `network.rate_limited`）；
+    /// - 本地未启用信令、设备码非法、写帧失败、连接断开或等待超时时返回 `Err(UiError)`。
+    #[allow(clippy::result_large_err)]
+    pub fn request_wol(
+        &self,
+        target_device_id: &str,
+        timeout: Duration,
+    ) -> Result<WolAckResult, crate::ui_error::UiError> {
+        let platform = crate::ui_error::current_platform();
+        if !self.shared.enabled {
+            return Err(crate::ui_error::resolve_ui_error(
+                crate::ui_error::codes::NETWORK_UNREACHABLE,
+                platform,
+                &[],
+                None,
+                Some("未启用信令服务器，无法发送远程开机指令".to_string()),
+            ));
+        }
+        let normalized = parse_device_id_input(target_device_id).ok_or_else(|| {
+            crate::ui_error::resolve_ui_error(
+                crate::ui_error::codes::VALIDATION_INVALID_INPUT,
+                platform,
+                &[],
+                None,
+                Some("目标设备码格式无效，请输入 9 位数字设备码".to_string()),
+            )
+        })?;
+
+        let request_id = format!("wol-{}", random_hex(8));
+        let (tx, rx) = mpsc::sync_channel(1);
+        {
+            let mut pending = self
+                .shared
+                .pending_wols
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.shared.stop_flag.load(Ordering::Acquire) {
+                return Err(crate::ui_error::resolve_ui_error(
+                    crate::ui_error::codes::SESSION_CANCELLED,
+                    platform,
+                    &[],
+                    None,
+                    Some("信令客户端已停止".to_string()),
+                ));
+            }
+            pending.insert(request_id.clone(), tx);
+        }
+
+        let msg = OutgoingSignalMsg::WolRequest {
+            request_id: request_id.clone(),
+            target_device_id: normalized,
+        };
+        if let Err(err) = self.shared.send_msg(&msg) {
+            self.shared
+                .pending_wols
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request_id);
+            return Err(crate::ui_error::classify_signal_error(&err, platform));
+        }
+
+        match rx.recv_timeout(timeout) {
+            Ok(res) => res,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.shared
+                    .pending_wols
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_id);
+                Err(crate::ui_error::resolve_ui_error(
+                    crate::ui_error::codes::NETWORK_TIMEOUT,
+                    platform,
+                    &[],
+                    None,
+                    Some("等待服务器返回远程开机响应超时".to_string()),
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.shared
+                    .pending_wols
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_id);
+                Err(crate::ui_error::resolve_ui_error(
+                    crate::ui_error::codes::SESSION_DISCONNECTED,
+                    platform,
+                    &[],
+                    None,
+                    Some("信令连接已断开".to_string()),
+                ))
+            }
+        }
+    }
+
+    /// 查询最近一次 `device_status_changed` 广播记录的目标设备 `wol_capable` 状态。
+    pub fn device_wol_capable(&self, device_id: &str) -> Option<bool> {
+        let key = parse_device_id_input(device_id).unwrap_or_else(|| device_id.trim().to_string());
+        self.shared
+            .device_wol_capable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+    }
+
+    /// 返回当前已缓存的同账号设备 `wol_capable` 状态快照（键为 9 位规范设备码）。
+    pub fn device_wol_capable_snapshot(&self) -> HashMap<String, bool> {
+        self.shared
+            .device_wol_capable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 非阻塞拉取一条同账号设备 Wake-on-LAN 能力增量状态事件（有界队列）。
+    pub fn try_recv_device_wol_status(&self) -> Option<DeviceWolCapabilityEvent> {
+        self.shared
+            .device_wol_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
     }
 
     /// 返回当前信令连接状态快照。
@@ -1776,11 +2144,25 @@ pub fn build_udp_probe_packet(
 }
 
 /// 测试信令端口与中继端口的 TCP 连通性，并返回含实测 RTT（毫秒）的可读结果文案。
+///
+/// 自动遵循进程级活跃出站代理配置 [`crate::proxy::active_proxy_config`]。
 pub fn probe_server_connectivity(
     host: &str,
     signal_port: u16,
     relay_port: u16,
     timeout: Duration,
+) -> Result<String, String> {
+    let proxy = crate::proxy::active_proxy_config();
+    probe_server_connectivity_with_proxy(host, signal_port, relay_port, timeout, &proxy)
+}
+
+/// 使用显式出站代理配置测试信令端口与中继端口的 TCP 连通性，返回含实测 RTT（毫秒）的可读结果文案。
+pub fn probe_server_connectivity_with_proxy(
+    host: &str,
+    signal_port: u16,
+    relay_port: u16,
+    timeout: Duration,
+    proxy: &crate::proxy::ProxyConfig,
 ) -> Result<String, String> {
     let (clean_host, effective_signal_port) = parse_server_input(host, signal_port)?;
     if effective_signal_port == 0 || relay_port == 0 {
@@ -1790,9 +2172,9 @@ pub fn probe_server_connectivity(
     let signal_addr = format_host_port(&clean_host, effective_signal_port);
     let relay_addr = format_host_port(&clean_host, relay_port);
 
-    let signal_ms = tcp_probe_once(&signal_addr, timeout)
+    let signal_ms = tcp_probe_once(&clean_host, effective_signal_port, timeout, proxy)
         .map_err(|e| format!("信令端口 {signal_addr} 不可达：{e}"))?;
-    let relay_ms = tcp_probe_once(&relay_addr, timeout).map_err(|e| {
+    let relay_ms = tcp_probe_once(&clean_host, relay_port, timeout, proxy).map_err(|e| {
         format!("信令端口可达 ({signal_ms}ms)，但中继端口 {relay_addr} 不可达：{e}")
     })?;
 
@@ -1801,39 +2183,17 @@ pub fn probe_server_connectivity(
     ))
 }
 
-fn per_addr_timeout(remaining: Duration, remaining_addrs: usize) -> Duration {
-    let count = remaining_addrs.max(1) as u32;
-    (remaining / count).max(MIN_ADDR_TIMEOUT).min(remaining)
-}
-
-fn tcp_probe_once(addr_str: &str, timeout: Duration) -> Result<u128, String> {
-    let addrs: Vec<SocketAddr> = addr_str
-        .to_socket_addrs()
-        .map_err(|e| format!("地址解析失败：{e}"))?
-        .collect();
-    if addrs.is_empty() {
-        return Err("未解析到任何可用 IP 地址".to_string());
-    }
+fn tcp_probe_once(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    proxy: &crate::proxy::ProxyConfig,
+) -> Result<u128, String> {
     let start = Instant::now();
-    let deadline = start + timeout;
-    let mut last_err: Option<io::Error> = None;
-    for (idx, addr) in addrs.iter().enumerate() {
-        let now = Instant::now();
-        if now >= deadline {
-            return Err("连接超时".to_string());
-        }
-        let budget = per_addr_timeout(deadline - now, addrs.len() - idx);
-        match TcpStream::connect_timeout(addr, budget) {
-            Ok(stream) => {
-                let _ = stream.shutdown(Shutdown::Both);
-                return Ok(start.elapsed().as_millis());
-            }
-            Err(err) => last_err = Some(err),
-        }
-    }
-    Err(last_err
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| "连接失败".to_string()))
+    let stream = crate::proxy::dial_tcp_with_proxy(host, port, timeout, None, proxy)
+        .map_err(|e| e.to_string())?;
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(start.elapsed().as_millis())
 }
 
 fn should_reset_backoff(
@@ -2217,11 +2577,13 @@ fn run_single_connection(
     }
     let mut sent_access_token = access_token.clone();
 
-    let stream = match dial_tcp_with_epoch(
+    let effective_proxy = shared.effective_proxy_config();
+    let (stream, used_proxy) = match dial_tcp_with_epoch_and_proxy(
         default_signal_addr,
         HANDSHAKE_TIMEOUT,
         &shared.stop_flag,
         Some((&shared.reconnect_epoch, conn_reconnect_epoch)),
+        &effective_proxy,
     ) {
         Ok(s) => s,
         Err(DialError::Stopped) => return ConnectionOutcome::Stopped,
@@ -2230,6 +2592,7 @@ fn run_single_connection(
         }
         Err(DialError::Failed(err)) => return ConnectionOutcome::ConnectFailed(err),
     };
+    shared.proxy_active.store(used_proxy, Ordering::Release);
     if shared.stop_flag.load(Ordering::Acquire) {
         let _ = stream.shutdown(Shutdown::Both);
         return ConnectionOutcome::Stopped;
@@ -2357,6 +2720,8 @@ fn run_single_connection(
         device_pubkey: shared.device_pubkey.clone(),
         allow_remote_assist: shared.current_allow_assist_opt(),
         allow_remote_control: shared.current_allow_remote_control_opt(),
+        mac_addr: shared.current_mac_addr_opt(),
+        wol_enabled: shared.current_wol_enabled_opt(),
     };
     let send_reg_res = match &reader {
         SignalReader::Plain(_) => match &writer_template {
@@ -2493,9 +2858,26 @@ fn run_single_connection(
     let connected_at = Instant::now();
     let mut last_server_activity = connected_at;
     shared.clear_last_server_activity();
-    // 在 Registered 时一次性解析 UDP 探测目标（优先匹配 TCP 对端地址族），避免每 10s 阻塞 DNS。
-    let udp_probe_target = resolve_udp_probe_target(&effective_udp_probe_addr, peer_addr);
-    let server_is_loopback = peer_addr.is_some_and(|addr| canonicalize_ip(addr.ip()).is_loopback());
+
+    // 先判定是否启用出站代理：代理激活时完全跳过 UDP 探测目标 DNS 解析、UDP `RCSP` 绑定与 UPnP，
+    // 杜绝无公网 DNS 环境阻塞或域名泄露，且 `server_is_loopback` 必须按真实目标主机判定而非代理地址。
+    let proxy_active = used_proxy
+        || crate::proxy::is_proxy_active_for_target(
+            &effective_proxy,
+            &cfg.server_host,
+            cfg.signal_port,
+        );
+    shared.proxy_active.store(proxy_active, Ordering::Release);
+
+    let (udp_probe_target, server_is_loopback) = if proxy_active {
+        (None, is_loopback_host(&cfg.server_host))
+    } else {
+        // 在 Registered 时一次性解析 UDP 探测目标（优先匹配 TCP 对端地址族），避免每 10s 阻塞 DNS。
+        (
+            resolve_udp_probe_target(&effective_udp_probe_addr, peer_addr),
+            peer_addr.is_some_and(|addr| canonicalize_ip(addr.ip()).is_loopback()),
+        )
+    };
     shared
         .server_is_loopback
         .store(server_is_loopback, Ordering::Release);
@@ -2505,9 +2887,11 @@ fn run_single_connection(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         targets.clear();
-        for cand in [udp_probe_target, peer_addr].into_iter().flatten() {
-            if !targets.contains(&cand) {
-                targets.push(cand);
+        if !proxy_active {
+            for cand in [udp_probe_target, peer_addr].into_iter().flatten() {
+                if !targets.contains(&cand) {
+                    targets.push(cand);
+                }
             }
         }
     }
@@ -2515,7 +2899,11 @@ fn run_single_connection(
     // 注册成功后绑定持久化 UDP 探测套接字（SO_REUSEADDR + SO_REUSEPORT 且已 connect 至信令端口），
     // 记录本地端口并立即发送一次 `RCSP` 探测包与携带改写后 `lan_addrs` 的 `Heartbeat`，
     // 确保在对外宣告 `Connected` 前，服务端与本地均已同步正确的 P2P 本地端口。
-    let udp_probe = udp_probe_target.and_then(PersistentUdpProbe::bind);
+    let udp_probe = if proxy_active {
+        None
+    } else {
+        udp_probe_target.and_then(PersistentUdpProbe::bind)
+    };
     let bound_udp_port = udp_probe.as_ref().map_or(0, PersistentUdpProbe::local_port);
     let bound_udp_is_ipv6 = udp_probe.as_ref().is_some_and(PersistentUdpProbe::is_ipv6);
     shared
@@ -2549,13 +2937,24 @@ fn run_single_connection(
         }
     }
 
-    // 异步非阻塞启动 UPnP / NAT-PMP 端口映射（绝不阻塞注册、心跳与 Connected 宣告）。
-    trigger_upnp_for_bound_udp(
-        shared,
-        bound_udp_port,
-        bound_udp_is_ipv6,
-        server_is_loopback,
-    );
+    // 异步非阻塞启动 UPnP / NAT-PMP 端口映射（绝不阻塞注册、心跳与 Connected 宣告）；代理激活时跳过。
+    if proxy_active {
+        if shared.upnp_enabled.load(Ordering::Acquire) {
+            let _ = shared.prepare_upnp_if_enabled(
+                None,
+                UpnpStatus::Unavailable {
+                    reason: "已启用网络代理，已跳过 UPnP 网关探测".to_string(),
+                },
+            );
+        }
+    } else {
+        trigger_upnp_for_bound_udp(
+            shared,
+            bound_udp_port,
+            bound_udp_is_ipv6,
+            server_is_loopback,
+        );
+    }
 
     shared.set_status(
         ServerStatusSnapshot {
@@ -2732,6 +3131,7 @@ fn handle_incoming_message(
             arch,
             allow_remote_assist,
             allow_remote_control,
+            wol_capable,
         } => {
             let allow_remote_control = allow_remote_control
                 .unwrap_or_else(|| crate::default_allow_remote_control_for_os(&os));
@@ -2760,6 +3160,11 @@ fn handle_incoming_message(
                     Ordering::Release,
                 );
             }
+            shared.push_device_wol_event(DeviceWolCapabilityEvent {
+                device_id: device_id.clone(),
+                online,
+                wol_capable,
+            });
             shared.push_device_status(DeviceStatusEvent {
                 device_id,
                 online,
@@ -2863,6 +3268,51 @@ fn handle_incoming_message(
                     let _ = waiter.tx.try_send(Err(err_msg));
                 }
             }
+            IncomingAction::Continue
+        }
+        IncomingSignalMsg::WolAck {
+            request_id,
+            target_device_id,
+            ok,
+            method,
+            code,
+            message,
+        } => {
+            let norm_code = code.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+            let ui_error = if ok {
+                None
+            } else {
+                Some(map_wol_ack_error(norm_code.as_deref(), &message))
+            };
+            let result = WolAckResult {
+                target_device_id,
+                ok,
+                method,
+                code: norm_code,
+                message,
+                ui_error,
+            };
+            let mut pending = shared
+                .pending_wols
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(req_id) = request_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(tx) = pending.remove(req_id) {
+                    let _ = tx.try_send(Ok(result));
+                }
+            }
+            IncomingAction::Continue
+        }
+        IncomingSignalMsg::WolRelay {
+            mac_addr,
+            target_lan_addrs,
+            ..
+        } => {
+            handle_incoming_wol_relay(shared, &mac_addr, target_lan_addrs);
             IncomingAction::Continue
         }
         IncomingSignalMsg::Error { code, message } => {
@@ -3096,8 +3546,108 @@ fn resolve_udp_probe_target(
 }
 
 fn send_heartbeat_frame(shared: &SharedState, lan_addrs: Vec<String>) -> Result<(), String> {
-    let hb = OutgoingSignalMsg::Heartbeat { lan_addrs };
+    let hb = OutgoingSignalMsg::Heartbeat {
+        lan_addrs,
+        mac_addr: shared.current_mac_addr_opt(),
+        wol_enabled: shared.current_wol_enabled_opt(),
+    };
     shared.send_msg(&hb)
+}
+
+fn map_wol_ack_error(code: Option<&str>, message: &str) -> crate::ui_error::UiError {
+    let platform = crate::ui_error::current_platform();
+    let detail = if message.trim().is_empty() {
+        code.map(|c| c.to_string())
+    } else {
+        Some(message.trim().to_string())
+    };
+    let canonical = match code.map(|c| c.trim().to_ascii_lowercase()).as_deref() {
+        Some("wol_disabled") => crate::ui_error::codes::WOL_DISABLED,
+        Some("wol_no_relay_peer") => crate::ui_error::codes::WOL_NO_RELAY_PEER,
+        Some("wol_send_failed") => crate::ui_error::codes::WOL_SEND_FAILED,
+        Some("rate_limited") => crate::ui_error::codes::NETWORK_RATE_LIMITED,
+        Some("unauthorized") => crate::ui_error::codes::AUTH_UNAUTHORIZED,
+        Some("forbidden") => crate::ui_error::codes::AUTH_FORBIDDEN,
+        Some("device_not_found") => crate::ui_error::codes::SIGNAL_PEER_NOT_FOUND,
+        Some("device_disabled") => crate::ui_error::codes::DEVICE_DISABLED,
+        Some("invalid_input") => crate::ui_error::codes::VALIDATION_INVALID_INPUT,
+        Some(other) => crate::ui_error::resolve_wire_alias(other)
+            .unwrap_or(crate::ui_error::codes::WOL_SEND_FAILED),
+        None => crate::ui_error::codes::WOL_SEND_FAILED,
+    };
+    crate::ui_error::resolve_ui_error(canonical, platform, &[], None, detail)
+}
+
+struct WolRelayInflightGuard(Arc<AtomicUsize>);
+
+impl Drop for WolRelayInflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn handle_incoming_wol_relay(shared: &SharedState, mac_addr: &str, target_lan_addrs: Vec<String>) {
+    let Some(norm_mac) = crate::wol::normalize_mac_addr(mac_addr) else {
+        return;
+    };
+    let clean_addrs = sanitize_lan_addrs(&target_lan_addrs);
+
+    // 滑动时间窗频率限制（每 10 秒最多 10 次）防恶意或异常刷包。
+    {
+        let now = Instant::now();
+        let mut hist = shared
+            .wol_relay_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while let Some(&front) = hist.front() {
+            if now.saturating_duration_since(front) >= WOL_RELAY_RATE_WINDOW {
+                hist.pop_front();
+            } else {
+                break;
+            }
+        }
+        if hist.len() >= WOL_RELAY_RATE_MAX {
+            return;
+        }
+        hist.push_back(now);
+    }
+
+    // 并发线程数上限控制（最多 4 个在途代发线程），CAS 原子占位。
+    let inflight = Arc::clone(&shared.wol_relay_inflight);
+    loop {
+        let cur = inflight.load(Ordering::Acquire);
+        if cur >= MAX_CONCURRENT_WOL_RELAYS {
+            return;
+        }
+        if inflight
+            .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+
+    #[cfg(test)]
+    let test_sink = shared
+        .wol_relay_test_sink
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
+    let spawn_res = thread::Builder::new()
+        .name("rc-wol-relay".to_string())
+        .spawn(move || {
+            let _guard = WolRelayInflightGuard(inflight);
+            #[cfg(test)]
+            if let Some(sink) = test_sink {
+                let _ = sink.send((norm_mac, clean_addrs));
+                return;
+            }
+            let _ = crate::wol::send_magic_packet(&norm_mac, &clean_addrs);
+        });
+    if spawn_res.is_err() {
+        shared.wol_relay_inflight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// 持久化 UDP `RCSP` 探测套接字：以 `SO_REUSEADDR` + `SO_REUSEPORT` 绑定一次并 `connect` 至信令端口，
@@ -3210,13 +3760,6 @@ enum DialError {
     Failed(String),
 }
 
-enum SingleConnectErr {
-    Stopped,
-    Reconnecting,
-    TimedOut,
-    Io(io::Error),
-}
-
 /// 判断非阻塞 `connect()` 返回的 `io::Error` 是否表示握手仍在进行中（`EINPROGRESS` / `EALREADY` / `WSAEWOULDBLOCK` 等）。
 pub(crate) fn is_connect_in_progress(err: &io::Error) -> bool {
     matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) || {
@@ -3254,179 +3797,65 @@ pub(crate) fn is_connect_in_progress(err: &io::Error) -> bool {
     }
 }
 
-fn connect_single_interruptible(
-    addr: SocketAddr,
-    timeout: Duration,
-    stop_flag: &AtomicBool,
-    reconnect_epoch: Option<(&AtomicU64, u64)>,
-) -> Result<TcpStream, SingleConnectErr> {
-    if stop_flag.load(Ordering::Acquire) {
-        return Err(SingleConnectErr::Stopped);
-    }
-    if reconnect_epoch.is_some_and(|(atom, expected)| atom.load(Ordering::Acquire) != expected) {
-        return Err(SingleConnectErr::Reconnecting);
-    }
-
-    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
-        .map_err(SingleConnectErr::Io)?;
-    socket.set_nonblocking(true).map_err(SingleConnectErr::Io)?;
-
-    let sock_addr = SockAddr::from(addr);
-    match socket.connect(&sock_addr) {
-        Ok(()) => {}
-        Err(err) if is_connect_in_progress(&err) => {
-            let deadline = Instant::now() + timeout;
-            let mut sleep_ms = 5u64;
-            loop {
-                if stop_flag.load(Ordering::Acquire) {
-                    return Err(SingleConnectErr::Stopped);
-                }
-                if reconnect_epoch
-                    .is_some_and(|(atom, expected)| atom.load(Ordering::Acquire) != expected)
-                {
-                    return Err(SingleConnectErr::Reconnecting);
-                }
-                if let Some(so_err) = socket.take_error().map_err(SingleConnectErr::Io)? {
-                    return Err(SingleConnectErr::Io(so_err));
-                }
-                #[cfg(not(windows))]
-                match socket.peer_addr() {
-                    Ok(_) => {
-                        if let Some(so_err) = socket.take_error().map_err(SingleConnectErr::Io)? {
-                            return Err(SingleConnectErr::Io(so_err));
-                        }
-                        break;
-                    }
-                    Err(err) => {
-                        if let Some(so_err) = socket.take_error().map_err(SingleConnectErr::Io)? {
-                            return Err(SingleConnectErr::Io(so_err));
-                        }
-                        if !matches!(
-                            err.kind(),
-                            ErrorKind::NotConnected
-                                | ErrorKind::WouldBlock
-                                | ErrorKind::Interrupted
-                        ) {
-                            return Err(SingleConnectErr::Io(err));
-                        }
-                    }
-                }
-                #[cfg(windows)]
-                {
-                    let mut probe = [std::mem::MaybeUninit::<u8>::uninit(); 1];
-                    match socket.peek(&mut probe) {
-                        Ok(_) => {
-                            if let Some(so_err) =
-                                socket.take_error().map_err(SingleConnectErr::Io)?
-                            {
-                                return Err(SingleConnectErr::Io(so_err));
-                            }
-                            break;
-                        }
-                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                            if let Some(so_err) =
-                                socket.take_error().map_err(SingleConnectErr::Io)?
-                            {
-                                return Err(SingleConnectErr::Io(so_err));
-                            }
-                            break;
-                        }
-                        Err(err) => {
-                            if let Some(so_err) =
-                                socket.take_error().map_err(SingleConnectErr::Io)?
-                            {
-                                return Err(SingleConnectErr::Io(so_err));
-                            }
-                            if !matches!(
-                                err.kind(),
-                                ErrorKind::NotConnected | ErrorKind::Interrupted
-                            ) {
-                                return Err(SingleConnectErr::Io(err));
-                            }
-                        }
-                    }
-                }
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(SingleConnectErr::TimedOut);
-                }
-                let step = Duration::from_millis(sleep_ms).min(deadline - now);
-                thread::sleep(step);
-                sleep_ms = (sleep_ms * 2).min(50);
-            }
-        }
-        Err(err) => return Err(SingleConnectErr::Io(err)),
-    }
-
-    socket
-        .set_nonblocking(false)
-        .map_err(SingleConnectErr::Io)?;
-    Ok(socket.into())
-}
-
 #[cfg(test)]
 fn dial_tcp(
     addr_str: &str,
     timeout: Duration,
     stop_flag: &AtomicBool,
 ) -> Result<TcpStream, DialError> {
-    dial_tcp_with_epoch(addr_str, timeout, stop_flag, None)
+    let proxy = crate::proxy::ProxyConfig::default();
+    dial_tcp_with_epoch_and_proxy(addr_str, timeout, stop_flag, None, &proxy).map(|(s, _)| s)
 }
 
-fn dial_tcp_with_epoch(
+fn dial_tcp_with_epoch_and_proxy(
     addr_str: &str,
     timeout: Duration,
     stop_flag: &AtomicBool,
     reconnect_epoch: Option<(&AtomicU64, u64)>,
-) -> Result<TcpStream, DialError> {
+    proxy: &crate::proxy::ProxyConfig,
+) -> Result<(TcpStream, bool), DialError> {
     if stop_flag.load(Ordering::Acquire) {
         return Err(DialError::Stopped);
     }
     if reconnect_epoch.is_some_and(|(atom, expected)| atom.load(Ordering::Acquire) != expected) {
         return Err(DialError::Reconnecting);
     }
-    let addrs: Vec<SocketAddr> = addr_str
-        .to_socket_addrs()
-        .map_err(|e| DialError::Failed(format!("解析信令地址 {addr_str} 失败：{e}")))?
-        .collect();
-    if addrs.is_empty() {
-        return Err(DialError::Failed(format!(
-            "信令地址 {addr_str} 未解析到可用 IP"
-        )));
+    let (host, port) = crate::proxy::split_host_port(addr_str)
+        .map_err(|e| DialError::Failed(format!("解析信令地址 {addr_str} 失败：{e}")))?;
+
+    match crate::proxy::dial_tcp_with_proxy_interruptible(&host, port, timeout, proxy, || {
+        stop_flag.load(Ordering::Acquire)
+            || reconnect_epoch
+                .is_some_and(|(atom, expected)| atom.load(Ordering::Acquire) != expected)
+    }) {
+        Ok(res) => Ok(res),
+        Err(crate::proxy::ProxyDialError::Cancelled) => {
+            if stop_flag.load(Ordering::Acquire) {
+                Err(DialError::Stopped)
+            } else {
+                Err(DialError::Reconnecting)
+            }
+        }
+        Err(crate::proxy::ProxyDialError::Timeout(msg)) => Err(DialError::Failed(format!(
+            "连接信令服务器 {addr_str} 超时：{msg}"
+        ))),
+        Err(crate::proxy::ProxyDialError::AuthFailed(msg)) => {
+            Err(DialError::Failed(format!("代理认证失败 (407)：{msg}")))
+        }
+        Err(crate::proxy::ProxyDialError::Config(msg))
+        | Err(crate::proxy::ProxyDialError::ConfigConflict(msg)) => Err(DialError::Failed(
+            format!("proxy_config_conflict: 代理配置无效：{msg}"),
+        )),
+        Err(crate::proxy::ProxyDialError::ConnectFailed(msg)) => Err(DialError::Failed(format!(
+            "通过代理连接信令服务器 {addr_str} 失败：{msg}"
+        ))),
+        Err(crate::proxy::ProxyDialError::DnsFailed(msg)) => Err(DialError::Failed(format!(
+            "解析信令地址 {addr_str} 失败：{msg}"
+        ))),
+        Err(crate::proxy::ProxyDialError::TargetConnectFailed(msg)) => Err(DialError::Failed(
+            format!("连接信令服务器 {addr_str} 失败：{msg}"),
+        )),
     }
-    let deadline = Instant::now() + timeout;
-    let mut last_err: Option<io::Error> = None;
-    let mut timed_out_any = false;
-    for (idx, &addr) in addrs.iter().enumerate() {
-        if stop_flag.load(Ordering::Acquire) {
-            return Err(DialError::Stopped);
-        }
-        if reconnect_epoch.is_some_and(|(atom, expected)| atom.load(Ordering::Acquire) != expected)
-        {
-            return Err(DialError::Reconnecting);
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(DialError::Failed(format!("连接信令服务器 {addr_str} 超时")));
-        }
-        let budget = per_addr_timeout(deadline - now, addrs.len() - idx);
-        match connect_single_interruptible(addr, budget, stop_flag, reconnect_epoch) {
-            Ok(stream) => return Ok(stream),
-            Err(SingleConnectErr::Stopped) => return Err(DialError::Stopped),
-            Err(SingleConnectErr::Reconnecting) => return Err(DialError::Reconnecting),
-            Err(SingleConnectErr::TimedOut) => timed_out_any = true,
-            Err(SingleConnectErr::Io(err)) => last_err = Some(err),
-        }
-    }
-    if last_err.is_none() && timed_out_any {
-        return Err(DialError::Failed(format!("连接信令服务器 {addr_str} 超时")));
-    }
-    Err(DialError::Failed(format!(
-        "连接信令服务器 {addr_str} 失败：{}",
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "未知错误".to_string())
-    )))
 }
 
 fn encode_outgoing_signal_frame(msg: &OutgoingSignalMsg) -> Result<Vec<u8>, String> {
@@ -4147,6 +4576,16 @@ mod tests {
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
             allow_remote_control: AtomicU8::new(REMOTE_CTRL_UNSET),
+            wol_enabled: AtomicU8::new(WOL_UNSET),
+            mac_addr: Mutex::new(None),
+            device_wol_events: Mutex::new(VecDeque::new()),
+            device_wol_capable: Mutex::new(HashMap::new()),
+            pending_wols: Mutex::new(HashMap::new()),
+            wol_relay_inflight: Arc::new(AtomicUsize::new(0)),
+            wol_relay_history: Mutex::new(VecDeque::new()),
+            proxy_override: Mutex::new(None),
+            proxy_active: AtomicBool::new(false),
+            wol_relay_test_sink: Mutex::new(None),
         };
 
         let (tx1, rx1) = mpsc::sync_channel(1);
@@ -4589,6 +5028,16 @@ mod tests {
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
             allow_remote_control: AtomicU8::new(REMOTE_CTRL_UNSET),
+            wol_enabled: AtomicU8::new(WOL_UNSET),
+            mac_addr: Mutex::new(None),
+            device_wol_events: Mutex::new(VecDeque::new()),
+            device_wol_capable: Mutex::new(HashMap::new()),
+            pending_wols: Mutex::new(HashMap::new()),
+            wol_relay_inflight: Arc::new(AtomicUsize::new(0)),
+            wol_relay_history: Mutex::new(VecDeque::new()),
+            proxy_override: Mutex::new(None),
+            proxy_active: AtomicBool::new(false),
+            wol_relay_test_sink: Mutex::new(None),
         });
 
         let (tx, rx) = mpsc::sync_channel(1);
@@ -4789,6 +5238,16 @@ mod tests {
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
             allow_remote_control: AtomicU8::new(REMOTE_CTRL_UNSET),
+            wol_enabled: AtomicU8::new(WOL_UNSET),
+            mac_addr: Mutex::new(None),
+            device_wol_events: Mutex::new(VecDeque::new()),
+            device_wol_capable: Mutex::new(HashMap::new()),
+            pending_wols: Mutex::new(HashMap::new()),
+            wol_relay_inflight: Arc::new(AtomicUsize::new(0)),
+            wol_relay_history: Mutex::new(VecDeque::new()),
+            proxy_override: Mutex::new(None),
+            proxy_active: AtomicBool::new(false),
+            wol_relay_test_sink: Mutex::new(None),
         };
 
         let static_addrs = vec![
@@ -4904,6 +5363,16 @@ mod tests {
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
             allow_remote_control: AtomicU8::new(REMOTE_CTRL_UNSET),
+            wol_enabled: AtomicU8::new(WOL_UNSET),
+            mac_addr: Mutex::new(None),
+            device_wol_events: Mutex::new(VecDeque::new()),
+            device_wol_capable: Mutex::new(HashMap::new()),
+            pending_wols: Mutex::new(HashMap::new()),
+            wol_relay_inflight: Arc::new(AtomicUsize::new(0)),
+            wol_relay_history: Mutex::new(VecDeque::new()),
+            proxy_override: Mutex::new(None),
+            proxy_active: AtomicBool::new(false),
+            wol_relay_test_sink: Mutex::new(None),
         };
         shared.local_udp_port.store(
             failed.as_ref().map_or(0, PersistentUdpProbe::local_port),
@@ -5532,6 +6001,8 @@ mod tests {
             device_pubkey: None,
             allow_remote_assist: Some(false),
             allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
         })
         .unwrap();
         assert!(
@@ -5552,6 +6023,8 @@ mod tests {
             device_pubkey: None,
             allow_remote_assist: Some(false),
             allow_remote_control: Some(false),
+            mac_addr: None,
+            wol_enabled: None,
         })
         .unwrap();
         assert_eq!(reg_false["allow_remote_control"], false);
@@ -5559,6 +6032,8 @@ mod tests {
         let upd_assist_only = serde_json::to_value(&OutgoingSignalMsg::UpdateAssistState {
             allow_remote_assist: Some(true),
             allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
         })
         .unwrap();
         assert_eq!(upd_assist_only["allow_remote_assist"], true);
@@ -5567,6 +6042,8 @@ mod tests {
         let upd_ctrl_only = serde_json::to_value(&OutgoingSignalMsg::UpdateAssistState {
             allow_remote_assist: None,
             allow_remote_control: Some(true),
+            mac_addr: None,
+            wol_enabled: None,
         })
         .unwrap();
         assert!(upd_ctrl_only.get("allow_remote_assist").is_none());
@@ -6519,6 +6996,16 @@ mod tests {
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
             allow_remote_control: AtomicU8::new(REMOTE_CTRL_UNSET),
+            wol_enabled: AtomicU8::new(WOL_UNSET),
+            mac_addr: Mutex::new(None),
+            device_wol_events: Mutex::new(VecDeque::new()),
+            device_wol_capable: Mutex::new(HashMap::new()),
+            pending_wols: Mutex::new(HashMap::new()),
+            wol_relay_inflight: Arc::new(AtomicUsize::new(0)),
+            wol_relay_history: Mutex::new(VecDeque::new()),
+            proxy_override: Mutex::new(None),
+            proxy_active: AtomicBool::new(false),
+            wol_relay_test_sink: Mutex::new(None),
         };
 
         // 1) 追加 UPnP 外网地址且保留其外网端口（不改写为 local_udp_port）
@@ -6926,5 +7413,391 @@ mod tests {
             .is_none());
 
         client.stop();
+    }
+
+    fn try_read_test_frame(stream: &mut TcpStream) -> Option<serde_json::Value> {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).ok()?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).ok()?;
+        serde_json::from_slice(&body).ok()
+    }
+
+    #[test]
+    fn wol_request_ack_mapping_relay_dispatch_and_device_wol_status_e2e() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock wol signal");
+        let addr = listener.local_addr().unwrap();
+        let received_updates = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let updates_srv = Arc::clone(&received_updates);
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+            // 1) 读取 Register 并回 Registered
+            let reg = read_test_frame(&mut stream);
+            assert_eq!(reg["type"], "register");
+            write_test_frame(
+                &mut stream,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "100000001",
+                    "formatted_id": "100 000 001",
+                    "relay_addr": format!("127.0.0.1:{}", addr.port()),
+                    "udp_probe_addr": format!("127.0.0.1:{}", addr.port()),
+                }),
+            );
+
+            // 2) 推送带 wol_capable 的 DeviceStatusChanged 与 2 条 wol_relay（1 条合法，1 条非法多播应忽略）
+            write_test_frame(
+                &mut stream,
+                &serde_json::json!({
+                    "type": "device_status_changed",
+                    "device_id": "200000002",
+                    "online": false,
+                    "hostname": "Office-Mac",
+                    "alias": "",
+                    "os": "macos",
+                    "allow_remote_assist": false,
+                    "allow_remote_control": true,
+                    "wol_capable": true
+                }),
+            );
+            write_test_frame(
+                &mut stream,
+                &serde_json::json!({
+                    "type": "wol_relay",
+                    "request_id": "relay-bad-1",
+                    "target_device_id": "200000002",
+                    "mac_addr": "01:00:5e:00:00:01",
+                    "target_lan_addrs": ["192.168.1.20:50000"]
+                }),
+            );
+            write_test_frame(
+                &mut stream,
+                &serde_json::json!({
+                    "type": "wol_relay",
+                    "request_id": "relay-ok-1",
+                    "target_device_id": "200000002",
+                    "mac_addr": "AA-BB-CC-DD-EE-FF",
+                    "target_lan_addrs": ["192.168.1.20:50000"]
+                }),
+            );
+
+            // 3) 处理后续 update_assist_state 与 5 个 wol_request（依次返回 ok / wol_disabled / wol_no_relay_peer / wol_send_failed / rate_limited）
+            let mut wol_count = 0usize;
+            while let Some(frame) = try_read_test_frame(&mut stream) {
+                match frame["type"].as_str() {
+                    Some("heartbeat") => {
+                        write_test_frame(
+                            &mut stream,
+                            &serde_json::json!({"type": "heartbeat_ack"}),
+                        );
+                    }
+                    Some("update_assist_state") => {
+                        updates_srv.lock().unwrap().push(frame);
+                    }
+                    Some("wol_request") => {
+                        let req_id = frame["request_id"].as_str().unwrap_or("").to_string();
+                        let target_id =
+                            frame["target_device_id"].as_str().unwrap_or("").to_string();
+                        wol_count += 1;
+                        let ack = match wol_count {
+                            1 => serde_json::json!({
+                                "type": "wol_ack",
+                                "request_id": req_id,
+                                "target_device_id": target_id,
+                                "ok": true,
+                                "method": "lan_peer",
+                                "message": "relayed via same-LAN peer"
+                            }),
+                            2 => serde_json::json!({
+                                "type": "wol_ack",
+                                "request_id": req_id,
+                                "target_device_id": target_id,
+                                "ok": false,
+                                "method": "none",
+                                "code": "wol_disabled",
+                                "message": "target wol disabled"
+                            }),
+                            3 => serde_json::json!({
+                                "type": "wol_ack",
+                                "request_id": req_id,
+                                "target_device_id": target_id,
+                                "ok": false,
+                                "method": "none",
+                                "code": "wol_no_relay_peer",
+                                "message": "no online peer in same LAN"
+                            }),
+                            4 => serde_json::json!({
+                                "type": "wol_ack",
+                                "request_id": req_id,
+                                "target_device_id": target_id,
+                                "ok": false,
+                                "method": "none",
+                                "code": "wol_send_failed",
+                                "message": "udp send failed"
+                            }),
+                            _ => serde_json::json!({
+                                "type": "wol_ack",
+                                "request_id": req_id,
+                                "target_device_id": target_id,
+                                "ok": false,
+                                "method": "none",
+                                "code": "rate_limited",
+                                "message": "too many requests"
+                            }),
+                        };
+                        write_test_frame(&mut stream, &ack);
+                        if wol_count >= 5 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: addr.port(),
+            relay_port: addr.port(),
+            use_https: false,
+            ..ServerConfig::default()
+        };
+        let mut client = SignalClientHandle::spawn_with_options(
+            cfg,
+            "wol-tester".to_string(),
+            Vec::new(),
+            SignalClientOptions::default(),
+            |_| {},
+        );
+        let (relay_tx, relay_rx) = mpsc::channel();
+        *client.shared.wol_relay_test_sink.lock().unwrap() = Some(relay_tx);
+
+        // 等待 Connected
+        let wait_conn = Instant::now() + Duration::from_secs(3);
+        while client.status().state != ServerConnectionState::Connected
+            && Instant::now() < wait_conn
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(client.status().state, ServerConnectionState::Connected);
+
+        // 验证 wol_relay 仅投递合法规范化 MAC（忽略非法多播）
+        let (relayed_mac, relayed_addrs) = relay_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("must receive relayed WOL task");
+        assert_eq!(relayed_mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(relayed_addrs, vec!["192.168.1.20:50000".to_string()]);
+        assert!(
+            relay_rx.try_recv().is_err(),
+            "multicast wol_relay must be ignored"
+        );
+
+        // 验证 DeviceStatusChanged 的 wol_capable 解析与查询 API
+        let wait_wol = Instant::now() + Duration::from_secs(2);
+        while client.device_wol_capable("200000002").is_none() && Instant::now() < wait_wol {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(client.device_wol_capable("200 000 002"), Some(true));
+        let wol_ev = client
+            .try_recv_device_wol_status()
+            .expect("must enqueue DeviceWolCapabilityEvent");
+        assert_eq!(wol_ev.device_id, "200000002");
+        assert!(wol_ev.wol_capable);
+
+        // 验证 set_mac_addr 拒绝非法 MAC，接受合法 MAC 并与 set_wol_enabled 同步
+        assert!(client
+            .set_mac_addr(Some("ff:ff:ff:ff:ff:ff".into()))
+            .is_err());
+        client
+            .set_mac_addr(Some("02-11-22-33-44-55".into()))
+            .expect("valid mac");
+        client.set_wol_enabled(true).expect("enable wol");
+
+        // 验证 5 种 wol_ack 结果与 UiError 映射
+        let ok_ack = client
+            .request_wol("200 000 002", Duration::from_secs(2))
+            .expect("wol ok");
+        assert!(ok_ack.ok);
+        assert_eq!(ok_ack.method, "lan_peer");
+        assert!(ok_ack.ui_error.is_none());
+
+        let expected_codes = [
+            ("wol_disabled", crate::ui_error::codes::WOL_DISABLED),
+            (
+                "wol_no_relay_peer",
+                crate::ui_error::codes::WOL_NO_RELAY_PEER,
+            ),
+            ("wol_send_failed", crate::ui_error::codes::WOL_SEND_FAILED),
+            ("rate_limited", crate::ui_error::codes::NETWORK_RATE_LIMITED),
+        ];
+        for (wire, canonical) in expected_codes {
+            let ack = client
+                .request_wol("200000002", Duration::from_secs(2))
+                .expect("wol_ack should decode cleanly");
+            assert!(!ack.ok);
+            assert_eq!(ack.code.as_deref(), Some(wire));
+            let ui_err = ack.ui_error.expect("failed wol_ack must attach UiError");
+            assert_eq!(ui_err.code, canonical);
+        }
+
+        client.stop();
+        server.join().unwrap();
+
+        let updates = received_updates.lock().unwrap();
+        assert!(
+            updates.iter().any(|u| u["mac_addr"] == "02:11:22:33:44:55"),
+            "expected normalized mac_addr in update_assist_state: {updates:?}"
+        );
+        assert!(
+            updates.iter().any(|u| u["wol_enabled"] == true),
+            "expected wol_enabled=true in update_assist_state: {updates:?}"
+        );
+    }
+
+    #[test]
+    fn signal_client_with_active_proxy_skips_udp_probe_and_upnp() {
+        // 1) 本地 Mock 信令服务器
+        let sig_listener = TcpListener::bind("127.0.0.1:0").expect("bind mock signal");
+        let sig_addr = sig_listener.local_addr().unwrap();
+        let sig_srv = thread::spawn(move || {
+            let (mut s, _) = sig_listener.accept().expect("accept via proxy");
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let reg = read_test_frame(&mut s);
+            assert_eq!(reg["type"], "register");
+            write_test_frame(
+                &mut s,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "300000003",
+                    "formatted_id": "300 000 003",
+                    "relay_addr": "signal.corp.internal:21117",
+                    "udp_probe_addr": "signal.corp.internal:21116"
+                }),
+            );
+            // 保持连接直到客户端断开
+            let _ = try_read_test_frame(&mut s);
+        });
+
+        // 2) 本地 Mock SOCKS5 代理，将不存在的 `signal.corp.internal` 隧道转发至 sig_addr
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").expect("bind mock socks5");
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_srv = thread::spawn(move || {
+            let (mut c, _) = proxy_listener.accept().expect("accept socks5");
+            let mut g = [0u8; 3];
+            c.read_exact(&mut g).unwrap();
+            c.write_all(&[0x05, 0x00]).unwrap();
+            let mut hdr = [0u8; 4];
+            c.read_exact(&mut hdr).unwrap();
+            assert_eq!(hdr[3], 0x03); // 必须域名透传
+            let mut l = [0u8; 1];
+            c.read_exact(&mut l).unwrap();
+            let mut dom = vec![0u8; usize::from(l[0])];
+            c.read_exact(&mut dom).unwrap();
+            let mut port = [0u8; 2];
+            c.read_exact(&mut port).unwrap();
+            assert_eq!(&dom, b"signal.corp.internal");
+            c.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .unwrap();
+
+            let mut backend = TcpStream::connect(sig_addr).expect("connect mock signal");
+            let mut c_r = c.try_clone().unwrap();
+            let mut b_w = backend.try_clone().unwrap();
+            let t = thread::spawn(move || {
+                let _ = io::copy(&mut c_r, &mut b_w);
+                let _ = b_w.shutdown(Shutdown::Write);
+            });
+            let _ = io::copy(&mut backend, &mut c);
+            let _ = c.shutdown(Shutdown::Write);
+            let _ = t.join();
+        });
+
+        struct GlobalProxyResetGuard;
+        impl Drop for GlobalProxyResetGuard {
+            fn drop(&mut self) {
+                crate::proxy::set_global_proxy_config(crate::proxy::ProxyConfig::default());
+            }
+        }
+        let _guard = GlobalProxyResetGuard;
+        crate::proxy::set_global_proxy_config(crate::proxy::ProxyConfig {
+            mode: crate::proxy::ProxyMode::Manual,
+            protocol: Some(crate::proxy::ProxyProtocol::Socks5),
+            host: "127.0.0.1".to_string(),
+            port: proxy_addr.port(),
+            username: None,
+            password: None,
+        });
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "signal.corp.internal".to_string(),
+            signal_port: 21116,
+            relay_port: 21117,
+            use_https: false,
+            ..ServerConfig::default()
+        };
+        let mut client = SignalClientHandle::spawn_with_options(
+            cfg,
+            "proxied-host".to_string(),
+            Vec::new(),
+            SignalClientOptions {
+                upnp_enabled: true,
+                ..SignalClientOptions::default()
+            },
+            |_| {},
+        );
+
+        let wait_conn = Instant::now() + Duration::from_secs(3);
+        while client.status().state != ServerConnectionState::Connected
+            && Instant::now() < wait_conn
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(client.status().state, ServerConnectionState::Connected);
+        assert_eq!(
+            client.shared.local_udp_port.load(Ordering::Acquire),
+            0,
+            "proxy active must skip UDP RCSP probe binding"
+        );
+        assert!(
+            matches!(client.upnp_status(), UpnpStatus::Unavailable { ref reason } if reason.contains("代理")),
+            "proxy active must skip UPnP and report Unavailable: {:?}",
+            client.upnp_status()
+        );
+        assert!(
+            client.shared.connected_probe_targets.lock().unwrap().is_empty(),
+            "proxy active must skip UDP probe DNS resolution and leave connected_probe_targets empty"
+        );
+        assert!(
+            !client.shared.server_is_loopback.load(Ordering::Acquire),
+            "proxy active must derive server_is_loopback from cfg.server_host instead of proxy socket peer_addr"
+        );
+
+        // Low 2: 验证 WolAck 携带显式 JSON null 的 request_id 时可正常反序列化不触发协议报错
+        let null_req_ack: IncomingSignalMsg = serde_json::from_value(serde_json::json!({
+            "type": "wol_ack",
+            "request_id": null,
+            "target_device_id": "300000003",
+            "ok": false,
+            "method": "none",
+            "code": "wol_disabled",
+            "message": "disabled"
+        }))
+        .expect("WolAck with null request_id must deserialize cleanly");
+        assert!(matches!(
+            null_req_ack,
+            IncomingSignalMsg::WolAck {
+                request_id: None,
+                ..
+            }
+        ));
+
+        client.stop();
+        let _ = proxy_srv.join();
+        let _ = sig_srv.join();
     }
 }

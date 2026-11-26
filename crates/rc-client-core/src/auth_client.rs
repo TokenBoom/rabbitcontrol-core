@@ -12,7 +12,7 @@
 use std::fmt;
 use std::fs;
 use std::io::{BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -558,6 +558,7 @@ pub struct AuthHttpClient {
     ca_cert_pem: Option<String>,
     connect_timeout: Duration,
     io_timeout: Duration,
+    proxy: Option<crate::proxy::ProxyConfig>,
 }
 
 impl AuthHttpClient {
@@ -581,6 +582,7 @@ impl AuthHttpClient {
                 .filter(|s| !s.is_empty()),
             connect_timeout: HTTP_CONNECT_TIMEOUT,
             io_timeout: HTTP_IO_TIMEOUT,
+            proxy: None,
         })
     }
 
@@ -607,7 +609,25 @@ impl AuthHttpClient {
                 .filter(|s| !s.is_empty()),
             connect_timeout: HTTP_CONNECT_TIMEOUT,
             io_timeout: HTTP_IO_TIMEOUT,
+            proxy: None,
         })
+    }
+
+    /// 为本 HTTP 客户端绑定显式出站代理配置（覆盖进程级活跃代理配置）。
+    pub fn with_proxy(mut self, proxy: crate::proxy::ProxyConfig) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
+    /// 动态设置或清除本 HTTP 客户端的显式出站代理配置（`None` 表示跟随进程级活跃代理配置）。
+    pub fn set_proxy(&mut self, proxy: Option<crate::proxy::ProxyConfig>) {
+        self.proxy = proxy;
+    }
+
+    fn effective_proxy(&self) -> crate::proxy::ProxyConfig {
+        self.proxy
+            .clone()
+            .unwrap_or_else(crate::proxy::active_proxy_config)
     }
 
     /// 首次配置探测：拉取 `/api/v1/pki/ca` 与 `/api/v1/health`（及可选 `/api/v1/auth/config`）。
@@ -635,12 +655,13 @@ impl AuthHttpClient {
                     Err(AuthClientError::Api { status: 404, .. }) => None,
                     Err(err) => return Err(err),
                 };
-                let client = Self::new(
+                let mut client = Self::new(
                     self.server_host.clone(),
                     self.api_port,
                     true,
                     Some(anchored_pem.clone()),
                 )?;
+                client.set_proxy(self.proxy.clone());
                 (ca, None, client)
             } else {
                 let (resp, captured) =
@@ -649,12 +670,13 @@ impl AuthHttpClient {
                 verify_ca_bundle_integrity(&bundle, expected_fp.as_deref())?;
                 verify_captured_tls_against_ca(&self.server_host, &captured, &bundle.ca_cert_pem)?;
                 let leaf_fp = sha256_hex(&captured.end_entity_der);
-                let client = Self::new(
+                let mut client = Self::new(
                     self.server_host.clone(),
                     self.api_port,
                     true,
                     Some(bundle.ca_cert_pem.clone()),
                 )?;
+                client.set_proxy(self.proxy.clone());
                 (Some(bundle), Some(leaf_fp), client)
             }
         } else {
@@ -965,11 +987,13 @@ impl AuthHttpClient {
         bearer_token: Option<&str>,
         body: Option<&[u8]>,
     ) -> Result<RawHttpResponse, AuthClientError> {
+        let proxy = self.effective_proxy();
         let stream = connect_tcp_with_timeout(
             &self.server_host,
             self.api_port,
             self.connect_timeout,
             self.io_timeout,
+            &proxy,
         )?;
         let host_header = format_http_host_header(&self.server_host, self.api_port);
         let req_bytes = build_http_request(method, path, &host_header, bearer_token, body);
@@ -997,11 +1021,13 @@ impl AuthHttpClient {
         bearer_token: Option<&str>,
         body: Option<&[u8]>,
     ) -> Result<(RawHttpResponse, CapturedTlsChain), AuthClientError> {
+        let proxy = self.effective_proxy();
         let stream = connect_tcp_with_timeout(
             &self.server_host,
             self.api_port,
             self.connect_timeout,
             self.io_timeout,
+            &proxy,
         )?;
         let host_header = format_http_host_header(&self.server_host, self.api_port);
         let req_bytes = build_http_request(method, path, &host_header, bearer_token, body);
@@ -2287,44 +2313,38 @@ fn connect_tcp_with_timeout(
     port: u16,
     connect_timeout: Duration,
     io_timeout: Duration,
+    proxy: &crate::proxy::ProxyConfig,
 ) -> Result<TcpStream, AuthClientError> {
-    let clean = host
-        .trim()
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(host.trim());
-    let addrs: Vec<SocketAddr> = (clean, port)
-        .to_socket_addrs()
-        .map_err(|e| AuthClientError::Network(format!("解析 {clean}:{port} 失败：{e}")))?
-        .collect();
-    if addrs.is_empty() {
-        return Err(AuthClientError::Network(format!(
-            "未能解析到 {clean}:{port} 的任何地址"
-        )));
-    }
-
-    let mut last_err = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, connect_timeout) {
-            Ok(stream) => {
-                stream
-                    .set_read_timeout(Some(io_timeout))
-                    .map_err(|e| AuthClientError::Network(format!("设置读超时失败：{e}")))?;
-                stream
-                    .set_write_timeout(Some(io_timeout))
-                    .map_err(|e| AuthClientError::Network(format!("设置写超时失败：{e}")))?;
-                return Ok(stream);
+    let stream = crate::proxy::dial_tcp_with_proxy(host, port, connect_timeout, None, proxy)
+        .map_err(|err| match err {
+            crate::proxy::ProxyDialError::Config(m)
+            | crate::proxy::ProxyDialError::ConfigConflict(m) => {
+                AuthClientError::Config(format!("代理配置冲突：{m}"))
             }
-            Err(err) => last_err = Some(err),
-        }
-    }
-
-    Err(AuthClientError::Network(format!(
-        "连接 {clean}:{port} 失败：{}",
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "未知错误".to_string())
-    )))
+            crate::proxy::ProxyDialError::AuthFailed(m) => {
+                AuthClientError::Network(format!("代理认证失败 (407)：{m}"))
+            }
+            crate::proxy::ProxyDialError::ConnectFailed(m) => {
+                AuthClientError::Network(format!("代理连接失败：{m}"))
+            }
+            crate::proxy::ProxyDialError::Timeout(m) => {
+                AuthClientError::Network(format!("连接超时：{m}"))
+            }
+            crate::proxy::ProxyDialError::DnsFailed(m) => {
+                AuthClientError::Network(format!("域名解析失败：{m}"))
+            }
+            crate::proxy::ProxyDialError::TargetConnectFailed(m) => AuthClientError::Network(m),
+            crate::proxy::ProxyDialError::Cancelled => {
+                AuthClientError::Network("连接已取消".to_string())
+            }
+        })?;
+    stream
+        .set_read_timeout(Some(io_timeout))
+        .map_err(|e| AuthClientError::Network(format!("设置读超时失败：{e}")))?;
+    stream
+        .set_write_timeout(Some(io_timeout))
+        .map_err(|e| AuthClientError::Network(format!("设置写超时失败：{e}")))?;
+    Ok(stream)
 }
 
 fn format_http_host_header(host: &str, port: u16) -> String {

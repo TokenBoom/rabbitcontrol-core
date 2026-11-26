@@ -6296,8 +6296,19 @@ fn serve_relay_incoming(
         None
     };
 
-    // 1) 优先尝试 P2P UDP 打洞 + QUIC 直连；若 QUIC 建连成功但应用层握手前断连/超时（H4 分裂脑：
-    //    控制端 P2P 刚好超时已切中继），释放死 P2P 会话并自动回退至 TCP 中继重试握手。
+    // 1) 优先尝试 P2P UDP 打洞 + QUIC 直连；若当前启用了针对中继目标的有效出站代理则直接跳过 UDP P2P
+    //    走 TCP 中继隧道；否则若 QUIC 建连成功但应用层握手前断连/超时（H4 分裂脑：控制端 P2P 刚好超时已切中继），
+    //    释放死 P2P 会话并自动回退至 TCP 中继重试握手。
+    let active_proxy = crate::proxy::active_proxy_config();
+    let skip_p2p_for_proxy = match crate::proxy::split_host_port(&incoming.relay_addr) {
+        Ok((relay_host, relay_port)) => {
+            crate::proxy::is_proxy_active_for_target(&active_proxy, &relay_host, relay_port)
+        }
+        Err(_) => matches!(
+            crate::proxy::resolve_effective_proxy(&active_proxy),
+            Ok(Some(_))
+        ),
+    };
     let candidates = P2pCandidates {
         session_id: incoming.session_id.clone(),
         peer_public_addr: incoming.peer_public_addr.clone(),
@@ -6306,7 +6317,8 @@ fn serve_relay_incoming(
     };
     let mut established: Option<EstablishedIncomingHost> = None;
 
-    if !p2p::parse_candidate_addrs(&candidates).is_empty()
+    if !skip_p2p_for_proxy
+        && !p2p::parse_candidate_addrs(&candidates).is_empty()
         && !stop_flag.load(Ordering::Acquire)
         && !disconnect_flag.load(Ordering::Acquire)
     {
