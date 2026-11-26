@@ -479,6 +479,9 @@ pub struct HostAuthConfig {
     pub iterations: u32,
     /// 人工确认超时（微秒，会话钟）；超时按拒绝处理。
     pub approval_timeout_us: u64,
+    /// 是否允许本机被远程控制（含同账号本人凭 `OwnerTicket` 自控及他人远程协助的总门控）。
+    /// 默认 `true` 以保持现有 CLI/单测与桌面端行为不变；置 `false` 时即使合法 `OwnerTicket` 也会被立即拒绝。
+    pub allow_owner_control: bool,
     /// 是否允许远程协助（`AuthMethod::None` / `AuthMethod::Password`）。
     /// 默认 `true` 以保持现有 CLI/单测行为不变；UI 层应按开关传入实际值。
     pub allow_remote_assist: bool,
@@ -496,6 +499,7 @@ impl fmt::Debug for HostAuthConfig {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("iterations", &self.iterations)
             .field("approval_timeout_us", &self.approval_timeout_us)
+            .field("allow_owner_control", &self.allow_owner_control)
             .field("allow_remote_assist", &self.allow_remote_assist)
             .field("owner_verifier", &self.owner_verifier.is_some())
             .field("replay_cache", &self.replay_cache.is_some())
@@ -510,6 +514,7 @@ impl Default for HostAuthConfig {
             password: None,
             iterations: DEFAULT_AUTH_ITERATIONS,
             approval_timeout_us: DEFAULT_AUTH_TIMEOUT_US,
+            allow_owner_control: true,
             allow_remote_assist: true,
             owner_verifier: None,
             replay_cache: None,
@@ -781,6 +786,9 @@ impl HostAuthenticator {
         self.authenticated_owner = None;
 
         if hello.auth_method == AuthMethod::OwnerTicket {
+            if !self.cfg.allow_owner_control {
+                return self.reject("owner remote control is disabled".into());
+            }
             if hello.auth_payload.is_empty()
                 || hello.auth_payload.len() > MAX_OWNER_TICKET_PAYLOAD_LEN
             {
@@ -825,10 +833,10 @@ impl HostAuthenticator {
             });
         }
 
-        if !self.cfg.allow_remote_assist {
+        if !self.cfg.allow_owner_control || !self.cfg.allow_remote_assist {
             return self.reject(format!(
-                "remote assist is disabled; {:?} auth is not allowed",
-                hello.auth_method
+                "remote control or assist is disabled (allow_owner_control={}, allow_remote_assist={}); {:?} auth is not allowed",
+                self.cfg.allow_owner_control, self.cfg.allow_remote_assist, hello.auth_method
             ));
         }
 

@@ -126,9 +126,11 @@ pub struct UiHostConfig {
     pub clipboard_enabled: bool,
     /// 是否启用系统音频采集与编码串流（仅 `prefer_hardware == true` 时采集真实系统音频）。
     pub audio_enabled: bool,
+    /// 是否允许本机被远程控制（含同账号本人凭 `OwnerTicket` 自控及他人远程协助的总门控，默认 `true`）。
+    pub allow_owner_control: bool,
     /// 是否允许非同账号他人的远程协助（`false` 时仅允许已登录同账号凭 `OwnerTicket` PoP 自控）。
     pub allow_remote_assist: bool,
-    /// 同账号本人自控 `OwnerTicket` 公钥验签器（无论 `allow_remote_assist` 均允许本人免密免审批直通）。
+    /// 同账号本人自控 `OwnerTicket` 公钥验签器（当 `allow_owner_control == true` 时允许本人免密免审批直通）。
     pub owner_verifier: Option<Arc<dyn OwnerTicketVerifier>>,
     /// 双向 mTLS 证书与身份校验束（用于外层 `:21117` 中转、P2P mTLS、内层 E2EE 及可选 LAN mTLS）。
     pub mtls_config: Option<SessionMtlsBundle>,
@@ -152,6 +154,7 @@ impl Default for UiHostConfig {
             auto_rotate_password: false,
             clipboard_enabled: true,
             audio_enabled: true,
+            allow_owner_control: true,
             allow_remote_assist: true,
             owner_verifier: None,
             mtls_config: None,
@@ -174,6 +177,7 @@ impl fmt::Debug for UiHostConfig {
             .field("auto_rotate_password", &self.auto_rotate_password)
             .field("clipboard_enabled", &self.clipboard_enabled)
             .field("audio_enabled", &self.audio_enabled)
+            .field("allow_owner_control", &self.allow_owner_control)
             .field("allow_remote_assist", &self.allow_remote_assist)
             .field("has_owner_verifier", &self.owner_verifier.is_some())
             .field("has_mtls_config", &self.mtls_config.is_some())
@@ -347,6 +351,7 @@ struct PasswordState {
 
 #[derive(Clone)]
 struct AuthRuntimeState {
+    allow_owner_control: bool,
     allow_remote_assist: bool,
     owner_verifier: Option<Arc<dyn OwnerTicketVerifier>>,
     owner_replay_cache: Arc<Mutex<rc_session::OwnerReplayCache>>,
@@ -967,6 +972,7 @@ fn default_host_session_config(
     password: Option<String>,
     approval_timeout_us: u64,
     prefer_hardware: bool,
+    allow_owner_control: bool,
     allow_remote_assist: bool,
     owner_verifier: Option<Arc<dyn OwnerTicketVerifier>>,
     owner_replay_cache: Arc<Mutex<rc_session::OwnerReplayCache>>,
@@ -1011,6 +1017,7 @@ fn default_host_session_config(
             password,
             iterations: DEFAULT_AUTH_ITERATIONS,
             approval_timeout_us,
+            allow_owner_control,
             allow_remote_assist,
             owner_verifier,
             replay_cache: Some(owner_replay_cache),
@@ -1194,6 +1201,7 @@ fn build_host_session(
     approval_timeout_us: u64,
     prefer_hardware: bool,
     clipboard_enabled: bool,
+    allow_owner_control: bool,
     allow_remote_assist: bool,
     owner_verifier: Option<Arc<dyn OwnerTicketVerifier>>,
     owner_replay_cache: Arc<Mutex<rc_session::OwnerReplayCache>>,
@@ -1205,6 +1213,7 @@ fn build_host_session(
         password,
         approval_timeout_us,
         prefer_hardware,
+        allow_owner_control,
         allow_remote_assist,
         owner_verifier,
         owner_replay_cache,
@@ -1260,6 +1269,7 @@ fn build_transport_host_session(
     approval_timeout_us: u64,
     prefer_hardware: bool,
     clipboard_enabled: bool,
+    allow_owner_control: bool,
     allow_remote_assist: bool,
     owner_verifier: Option<Arc<dyn OwnerTicketVerifier>>,
     owner_replay_cache: Arc<Mutex<rc_session::OwnerReplayCache>>,
@@ -1271,6 +1281,7 @@ fn build_transport_host_session(
         password,
         approval_timeout_us,
         prefer_hardware,
+        allow_owner_control,
         allow_remote_assist,
         owner_verifier,
         owner_replay_cache,
@@ -1513,7 +1524,7 @@ impl HostHandle {
         let approver = UiApprover::new(
             Arc::clone(&updates),
             cfg.auto_accept_with_password,
-            cfg.allow_remote_assist,
+            cfg.allow_owner_control && cfg.allow_remote_assist,
         );
         let password_state = Arc::new(Mutex::new(PasswordState {
             password: cfg.password.clone(),
@@ -1522,6 +1533,7 @@ impl HostHandle {
         let password_version = Arc::new(AtomicU64::new(0));
         let shared_owner_replay = Arc::new(Mutex::new(rc_session::OwnerReplayCache::new()));
         let auth_state = Arc::new(Mutex::new(AuthRuntimeState {
+            allow_owner_control: cfg.allow_owner_control,
             allow_remote_assist: cfg.allow_remote_assist,
             owner_verifier: cfg.owner_verifier.clone(),
             owner_replay_cache: Arc::clone(&shared_owner_replay),
@@ -1593,7 +1605,8 @@ impl HostHandle {
                 }
             }
         } else {
-            let initial_allow_remote = cfg.allow_remote_assist
+            let initial_allow_remote = cfg.allow_owner_control
+                && cfg.allow_remote_assist
                 && (!cfg.forbid_passwordless_auto_approve
                     || cfg.require_approval
                     || cfg.password.is_some());
@@ -1603,6 +1616,7 @@ impl HostHandle {
                 cfg.approval_timeout_us,
                 cfg.prefer_hardware,
                 cfg.clipboard_enabled,
+                cfg.allow_owner_control,
                 initial_allow_remote,
                 cfg.owner_verifier.clone(),
                 Arc::clone(&shared_owner_replay),
@@ -1620,6 +1634,7 @@ impl HostHandle {
                     cfg.approval_timeout_us,
                     cfg.prefer_hardware,
                     cfg.clipboard_enabled,
+                    cfg.allow_owner_control,
                     initial_allow_remote,
                     cfg.owner_verifier.clone(),
                     Arc::clone(&shared_owner_replay),
@@ -1637,6 +1652,7 @@ impl HostHandle {
                         cfg.approval_timeout_us,
                         cfg.prefer_hardware,
                         cfg.clipboard_enabled,
+                        cfg.allow_owner_control,
                         initial_allow_remote,
                         cfg.owner_verifier.clone(),
                         Arc::clone(&shared_owner_replay),
@@ -1793,15 +1809,30 @@ impl HostHandle {
         self.password_version.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// 运行时切换是否允许他人远程协助（对下一次新握手生效，关闭时同步拒收在途审批，本人同账号自控不受影响）。
-    pub fn set_allow_remote_assist(&self, allow: bool) {
-        {
+    /// 运行时切换是否允许本机被远程控制（含同账号本人自控与他人远程协助总门控；对下一次新握手生效，关闭时同步拒收在途审批）。
+    pub fn set_allow_owner_control(&self, allow: bool) {
+        let effective_assist = {
             let mut st = self.auth_state.lock().unwrap_or_else(|e| e.into_inner());
-            st.allow_remote_assist = allow;
-        }
-        self.approver.set_remote_assist_enabled(allow);
+            st.allow_owner_control = allow;
+            st.allow_owner_control && st.allow_remote_assist
+        };
+        self.approver.set_remote_assist_enabled(effective_assist);
         self.config_version.fetch_add(1, Ordering::AcqRel);
         if !allow {
+            self.approver.reject_in_flight();
+        }
+    }
+
+    /// 运行时切换是否允许他人远程协助（对下一次新握手生效，关闭时同步拒收在途审批，本人同账号自控不受影响）。
+    pub fn set_allow_remote_assist(&self, allow: bool) {
+        let effective_assist = {
+            let mut st = self.auth_state.lock().unwrap_or_else(|e| e.into_inner());
+            st.allow_remote_assist = allow;
+            st.allow_owner_control && st.allow_remote_assist
+        };
+        self.approver.set_remote_assist_enabled(effective_assist);
+        self.config_version.fetch_add(1, Ordering::AcqRel);
+        if !effective_assist {
             self.approver.reject_in_flight();
         }
     }
@@ -2399,7 +2430,7 @@ fn trigger_host_lock_screen(lock_screen_count: &AtomicU64, prefer_hardware: bool
 /// - `stop_flag` 或 `disconnect_flag` 置位；
 /// - `Streaming` 期收到对端 `Bye`（`r.closed.is_some()`）；
 /// - `Detached` 期重连窗口到期拆除管线（`DetachOutcome::TornDown`）；
-/// - `Detached` 期密码版本发生变更（`password_version != observed_pw_ver`），需重建以使新密码生效。
+/// - `Detached` 期密码版本（`password_version != observed_pw_ver`）或鉴权配置版本（`config_version != observed_cfg_ver`）发生变更，需重建以使新配置生效。
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn drive_ui_host_session(
@@ -2408,6 +2439,8 @@ fn drive_ui_host_session(
     updates: &BoundedHostUpdateQueue,
     password_version: &AtomicU64,
     observed_pw_ver: u64,
+    config_version: &AtomicU64,
+    observed_cfg_ver: u64,
     disconnect_flag: &AtomicBool,
     stop_flag: &AtomicBool,
 ) -> String {
@@ -2422,6 +2455,8 @@ fn drive_ui_host_session(
         updates,
         password_version,
         observed_pw_ver,
+        config_version,
+        observed_cfg_ver,
         disconnect_flag,
         stop_flag,
         &close_reason,
@@ -2569,6 +2604,8 @@ fn drive_ui_host_session_inner(
     updates: &BoundedHostUpdateQueue,
     password_version: &AtomicU64,
     observed_pw_ver: u64,
+    config_version: &AtomicU64,
+    observed_cfg_ver: u64,
     disconnect_flag: &AtomicBool,
     stop_flag: &AtomicBool,
     close_reason: &AtomicU8,
@@ -4182,6 +4219,10 @@ fn drive_ui_host_session_inner(
                     detached_reason = Some("密码已变更，重置监听".to_string());
                     break;
                 }
+                if config_version.load(Ordering::Acquire) != observed_cfg_ver {
+                    detached_reason = Some("鉴权配置已变更，重置监听".to_string());
+                    break;
+                }
                 let now_us = u64::from(clock());
                 match host.tick_detached(now_us) {
                     Ok(DetachOutcome::TornDown) => {
@@ -4484,6 +4525,7 @@ struct EstablishedIncomingHost {
     built: Box<BuiltUiHost>,
     streaming_started: Arc<AtomicBool>,
     live_pw_ver: u64,
+    live_cfg_ver: u64,
     transport_kind: HostTransportKind,
     peer_label: String,
 }
@@ -4493,6 +4535,7 @@ enum HandshakeTransportOutcome {
         built: Box<BuiltUiHost>,
         streaming_started: Arc<AtomicBool>,
         live_pw_ver: u64,
+        live_cfg_ver: u64,
     },
     Failed(rc_types::Error),
     BuildError,
@@ -4509,6 +4552,7 @@ fn build_and_handshake_transport(
     password_state: &Mutex<PasswordState>,
     password_version: &AtomicU64,
     auth_state: &Mutex<AuthRuntimeState>,
+    config_version: &AtomicU64,
     disconnect_flag: &Arc<AtomicBool>,
     stop_flag: &Arc<AtomicBool>,
 ) -> HandshakeTransportOutcome {
@@ -4521,6 +4565,7 @@ fn build_and_handshake_transport(
     });
 
     let live_pw_ver = password_version.load(Ordering::Acquire);
+    let live_cfg_ver = config_version.load(Ordering::Acquire);
     let live_pw = password_state
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -4535,7 +4580,8 @@ fn build_and_handshake_transport(
         Box::new(AutoApprover)
     };
 
-    let effective_allow_remote = live_auth.allow_remote_assist
+    let effective_allow_remote = live_auth.allow_owner_control
+        && live_auth.allow_remote_assist
         && (!opts.forbid_passwordless_auto_approve || opts.require_approval || live_pw.is_some());
     let mut built = match build_transport_host_session(
         actual_addr,
@@ -4544,6 +4590,7 @@ fn build_and_handshake_transport(
         opts.approval_timeout_us,
         opts.prefer_hardware,
         opts.clipboard_enabled,
+        live_auth.allow_owner_control,
         effective_allow_remote,
         live_auth.owner_verifier,
         live_auth.owner_replay_cache,
@@ -4570,6 +4617,7 @@ fn build_and_handshake_transport(
             built: Box::new(built),
             streaming_started,
             live_pw_ver,
+            live_cfg_ver,
         },
         Err(err) => {
             // 显式释放已失效的 HostSession（自动取消在途审批并关闭底层传输）。
@@ -4694,6 +4742,7 @@ fn serve_relay_incoming(
     password_state: &Mutex<PasswordState>,
     password_version: &AtomicU64,
     auth_state: &Mutex<AuthRuntimeState>,
+    config_version: &AtomicU64,
     active_relay_interrupt: &Mutex<Option<ActiveRelayInterrupt>>,
     disconnect_flag: &Arc<AtomicBool>,
     stop_flag: &Arc<AtomicBool>,
@@ -4800,6 +4849,7 @@ fn serve_relay_incoming(
                 password_state,
                 password_version,
                 auth_state,
+                config_version,
                 disconnect_flag,
                 stop_flag,
             ) {
@@ -4807,11 +4857,13 @@ fn serve_relay_incoming(
                     built,
                     streaming_started,
                     live_pw_ver,
+                    live_cfg_ver,
                 } => {
                     established = Some(EstablishedIncomingHost {
                         built,
                         streaming_started,
                         live_pw_ver,
+                        live_cfg_ver,
                         transport_kind: HostTransportKind::P2p,
                         peer_label,
                     });
@@ -4848,6 +4900,7 @@ fn serve_relay_incoming(
         built,
         streaming_started,
         live_pw_ver,
+        live_cfg_ver,
         transport_kind,
         peer_label,
     } = match established {
@@ -4878,6 +4931,7 @@ fn serve_relay_incoming(
                 password_state,
                 password_version,
                 auth_state,
+                config_version,
                 disconnect_flag,
                 stop_flag,
             ) {
@@ -4885,10 +4939,12 @@ fn serve_relay_incoming(
                     built,
                     streaming_started,
                     live_pw_ver,
+                    live_cfg_ver,
                 } => EstablishedIncomingHost {
                     built,
                     streaming_started,
                     live_pw_ver,
+                    live_cfg_ver,
                     transport_kind,
                     peer_label,
                 },
@@ -4918,6 +4974,8 @@ fn serve_relay_incoming(
         updates,
         password_version,
         live_pw_ver,
+        config_version,
+        live_cfg_ver,
         disconnect_flag,
         stop_flag,
         close_reason,
@@ -5039,7 +5097,8 @@ fn run_host_worker(
                             } else {
                                 Box::new(AutoApprover)
                             };
-                            let effective_allow_remote = cur_auth.allow_remote_assist
+                            let effective_allow_remote = cur_auth.allow_owner_control
+                                && cur_auth.allow_remote_assist
                                 && (!opts.forbid_passwordless_auto_approve
                                     || opts.require_approval
                                     || cur_pw.is_some());
@@ -5049,6 +5108,7 @@ fn run_host_worker(
                                 opts.approval_timeout_us,
                                 opts.prefer_hardware,
                                 opts.clipboard_enabled,
+                                cur_auth.allow_owner_control,
                                 effective_allow_remote,
                                 cur_auth.owner_verifier.clone(),
                                 Arc::clone(&cur_auth.owner_replay_cache),
@@ -5088,7 +5148,8 @@ fn run_host_worker(
                             } else {
                                 Box::new(AutoApprover)
                             };
-                            let effective_allow_remote = cur_auth.allow_remote_assist
+                            let effective_allow_remote = cur_auth.allow_owner_control
+                                && cur_auth.allow_remote_assist
                                 && (!opts.forbid_passwordless_auto_approve
                                     || opts.require_approval
                                     || cur_pw.is_some());
@@ -5098,6 +5159,7 @@ fn run_host_worker(
                                 opts.approval_timeout_us,
                                 opts.prefer_hardware,
                                 opts.clipboard_enabled,
+                                cur_auth.allow_owner_control,
                                 effective_allow_remote,
                                 cur_auth.owner_verifier.clone(),
                                 Arc::clone(&cur_auth.owner_replay_cache),
@@ -5213,6 +5275,7 @@ fn run_host_worker(
                             &password_state,
                             &password_version,
                             &auth_state,
+                            &config_version,
                             &active_relay_interrupt,
                             &disconnect_flag,
                             &stop_flag,
@@ -5271,6 +5334,8 @@ fn run_host_worker(
                     &updates,
                     &password_version,
                     observed_pw_ver,
+                    &config_version,
+                    observed_cfg_ver,
                     &disconnect_flag,
                     &stop_flag,
                     &close_reason,
@@ -5354,6 +5419,7 @@ fn run_host_worker(
                             &password_state,
                             &password_version,
                             &auth_state,
+                            &config_version,
                             &active_relay_interrupt,
                             &disconnect_flag,
                             &stop_flag,
@@ -5396,6 +5462,7 @@ fn run_host_worker(
                                 &password_state,
                                 &password_version,
                                 &auth_state,
+                                &config_version,
                                 &disconnect_flag,
                                 &stop_flag,
                             ) {
@@ -5403,6 +5470,7 @@ fn run_host_worker(
                                     built,
                                     streaming_started,
                                     live_pw_ver,
+                                    live_cfg_ver,
                                 } => {
                                     let BuiltUiHost {
                                         mut host,
@@ -5420,6 +5488,8 @@ fn run_host_worker(
                                         &updates,
                                         &password_version,
                                         live_pw_ver,
+                                        &config_version,
+                                        live_cfg_ver,
                                         &disconnect_flag,
                                         &stop_flag,
                                         &close_reason,
@@ -5763,6 +5833,7 @@ mod tests {
 
         let updates_a = BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP);
         let pw_ver_a = AtomicU64::new(0);
+        let cfg_ver_a = AtomicU64::new(0);
         let disc_a = AtomicBool::new(false);
         let stop_a = AtomicBool::new(false);
         let reason_a = drive_ui_host_session(
@@ -5770,6 +5841,8 @@ mod tests {
             &clk_a,
             &updates_a,
             &pw_ver_a,
+            0,
+            &cfg_ver_a,
             0,
             &disc_a,
             &stop_a,
@@ -5788,6 +5861,7 @@ mod tests {
 
         let updates_b = BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP);
         let pw_ver_b = AtomicU64::new(1); // 与 observed_pw_ver = 0 不一致
+        let cfg_ver_b = AtomicU64::new(0);
         let disc_b = AtomicBool::new(false);
         let stop_b = AtomicBool::new(false);
         let reason_b = drive_ui_host_session(
@@ -5795,6 +5869,8 @@ mod tests {
             &clk_b,
             &updates_b,
             &pw_ver_b,
+            0,
+            &cfg_ver_b,
             0,
             &disc_b,
             &stop_b,
@@ -5804,6 +5880,34 @@ mod tests {
             "Detached 期间密码变更应立即跳出，实际: {reason_b}"
         );
         assert_eq!(host_b.state(), SessionState::Closed);
+
+        // 场景 C：Detached 期间鉴权配置版本变更（如 set_allow_owner_control(false)），立即跳出以便重建监听并拦截后续重连。
+        let clk_c: SessionClock = Arc::new(|| 10_000);
+        let mut host_c = build_handshaken_offline(Arc::clone(&clk_c));
+        host_c.on_disconnected(10_000);
+        assert_eq!(host_c.state(), SessionState::Detached);
+
+        let updates_c = BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP);
+        let pw_ver_c = AtomicU64::new(0);
+        let cfg_ver_c = AtomicU64::new(1); // 与 observed_cfg_ver = 0 不一致
+        let disc_c = AtomicBool::new(false);
+        let stop_c = AtomicBool::new(false);
+        let reason_c = drive_ui_host_session(
+            &mut host_c,
+            &clk_c,
+            &updates_c,
+            &pw_ver_c,
+            0,
+            &cfg_ver_c,
+            0,
+            &disc_c,
+            &stop_c,
+        );
+        assert!(
+            reason_c.contains("鉴权配置已变更"),
+            "Detached 期间鉴权配置变更应立即跳出，实际: {reason_c}"
+        );
+        assert_eq!(host_c.state(), SessionState::Closed);
     }
 
     /// 回归测试（U-M1）：`HostHandle::spawn` 返回后立即调用 `set_password`，
@@ -6530,5 +6634,173 @@ mod tests {
         assert!(!driver3.maybe_spawn(drain_at + Duration::from_secs(2), || (Ok(None), false)));
         replace_wake_guard(&unread_slot, None);
         assert_eq!(drops_unread.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn set_allow_owner_control_updates_state_and_rejects_in_flight_approval() {
+        let def = UiHostConfig::default();
+        assert!(def.allow_owner_control);
+        assert!(format!("{def:?}").contains("allow_owner_control: true"));
+
+        let mut host = HostHandle::spawn(UiHostConfig {
+            listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            require_approval: true,
+            allow_owner_control: true,
+            allow_remote_assist: true,
+            ..UiHostConfig::default()
+        })
+        .expect("spawn host");
+
+        // Submit a synthetic in-flight approval via the shared approver
+        let mut approver_clone = host.approver.clone();
+        approver_clone.submit(&ApprovalRequest {
+            session_id: 42,
+            remote_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 54321)),
+            requested: SessionParams {
+                width: 1280,
+                height: 720,
+                fps: 60,
+                bitrate_bps: 4_000_000,
+            },
+            auth_method: rc_session::proto::AuthMethod::None,
+            password_verified: false,
+        });
+
+        // Turning off allow_owner_control must immediately reject in-flight approval and gate future submits
+        host.set_allow_owner_control(false);
+        assert!(!host.auth_state.lock().unwrap().allow_owner_control);
+        assert_eq!(
+            approver_clone.poll_verdict(),
+            Some(ApprovalVerdict::Rejected)
+        );
+
+        // Even if set_allow_remote_assist(true) is called while allow_owner_control == false,
+        // approver must remain closed until allow_owner_control is re-enabled.
+        host.set_allow_remote_assist(true);
+        approver_clone.submit(&ApprovalRequest {
+            session_id: 43,
+            remote_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 54322)),
+            requested: SessionParams {
+                width: 1280,
+                height: 720,
+                fps: 60,
+                bitrate_bps: 4_000_000,
+            },
+            auth_method: rc_session::proto::AuthMethod::None,
+            password_verified: false,
+        });
+        assert_eq!(
+            approver_clone.poll_verdict(),
+            Some(ApprovalVerdict::Rejected)
+        );
+
+        // Re-enabling allow_owner_control restores allow_remote_assist gating
+        host.set_allow_owner_control(true);
+        assert!(host.auth_state.lock().unwrap().allow_owner_control);
+        assert!(host.approver.state.lock().unwrap().remote_assist_enabled);
+
+        host.stop();
+    }
+
+    #[test]
+    fn detached_set_allow_owner_control_false_rebuilds_listener_and_blocks_reconnect() {
+        use rc_input::{InputCapture, InputEvent};
+        use rc_session::{ClientAuthConfig, ClientSession, ClientSessionConfig};
+
+        struct EmptyInput;
+        impl InputCapture for EmptyInput {
+            fn next_events(&mut self, _timeout: Duration) -> rc_types::Result<Vec<InputEvent>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let mut host = HostHandle::spawn(UiHostConfig {
+            listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            password: None,
+            require_approval: false,
+            allow_owner_control: true,
+            allow_remote_assist: true,
+            ..UiHostConfig::default()
+        })
+        .expect("spawn host");
+        let addr = host.listen_addr();
+
+        let connect_once = |sid: u64| {
+            let mut ccfg = ClientSessionConfig::new(
+                addr,
+                SessionParams {
+                    width: 64,
+                    height: 64,
+                    fps: 30,
+                    bitrate_bps: 1_000_000,
+                },
+                sid,
+                Box::new(EmptyInput),
+            );
+            ccfg.handshake_timeout = Duration::from_secs(3);
+            ccfg.connect_timeout = Duration::from_secs(3);
+            ccfg.auth = ClientAuthConfig::default();
+            let clock: SessionClock = Arc::new(|| 0);
+            let mut client = ClientSession::new(
+                ccfg,
+                DEV_CERT_PEM,
+                DEV_KEY_PEM,
+                DEV_CERT_PEM,
+                "rabbitcontrol",
+                clock,
+            )
+            .expect("client new");
+            client.connect_and_handshake().map(|_| client)
+        };
+
+        // 1) Initial connection succeeds, then abrupt drop (without Bye) pushes host into Detached
+        let client1 = connect_once(7701).expect("initial handshake must succeed");
+        let conn_deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_connected = false;
+        while Instant::now() < conn_deadline {
+            if matches!(
+                host.try_recv_update(),
+                Some(HostUpdate::ClientConnected { .. })
+            ) {
+                saw_connected = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_connected, "host must observe initial ClientConnected");
+
+        // Drop client without Bye so host transitions into Detached instead of Closed
+        drop(client1);
+        thread::sleep(Duration::from_millis(80));
+
+        // 2) Flip allow_owner_control=false while Detached -> must break Detached and rebuild HostSession
+        host.set_allow_owner_control(false);
+
+        let rebuild_deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_disconnected = false;
+        let mut saw_rebuilt_listening = false;
+        while Instant::now() < rebuild_deadline {
+            match host.try_recv_update() {
+                Some(HostUpdate::ClientDisconnected { .. }) => saw_disconnected = true,
+                Some(HostUpdate::Listening { .. }) if saw_disconnected => {
+                    saw_rebuilt_listening = true;
+                    break;
+                }
+                Some(_) => {}
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert!(
+            saw_disconnected && saw_rebuilt_listening,
+            "set_allow_owner_control(false) during Detached must promptly tear down and rebuild listener (disconnected={saw_disconnected}, listening={saw_rebuilt_listening})"
+        );
+
+        // 3) Reconnect attempt after rebuild must be rejected
+        assert!(
+            connect_once(7702).is_err(),
+            "connection after allow_owner_control=false must be rejected"
+        );
+
+        host.stop();
     }
 }

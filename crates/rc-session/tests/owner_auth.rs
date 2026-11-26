@@ -1264,3 +1264,159 @@ fn shared_replay_cache_blocks_ticket_reuse_across_host_sessions() {
         Err(Error::Protocol { .. } | Error::Network(_))
     ));
 }
+
+#[test]
+fn owner_control_disabled_rejects_valid_owner_ticket_without_consuming_replay_cache() {
+    use rc_session::OwnerReplayCache;
+
+    let shared_cache = Arc::new(Mutex::new(OwnerReplayCache::new()));
+    let verifier: Arc<dyn OwnerTicketVerifier> = Arc::new(TestOwnerVerifier {
+        expected_target_device_id: "999888777".into(),
+    });
+    let spec = sample_spec("ticket-owner-ctrl-off", 2_000);
+    let signer: Arc<dyn OwnerTicketSigner> = Arc::new(TestOwnerSigner::from_spec(&spec));
+
+    // 1. allow_owner_control = false: 即使提供合法有效 OwnerTicket + PoP 也直接拒绝
+    let (h1_t, c1_t) = pair();
+    let mut h1 = make_host_parts(
+        Box::new(YieldingTransport(h1_t)),
+        HostAuthConfig {
+            allow_owner_control: false,
+            allow_remote_assist: true,
+            owner_verifier: Some(Arc::clone(&verifier)),
+            replay_cache: Some(Arc::clone(&shared_cache)),
+            unix_time_fn: Some(Arc::new(|| 1_000)),
+            ..HostAuthConfig::default()
+        },
+        Box::new(AutoApprover),
+    );
+    let mut c1 = make_client_parts(
+        Box::new(YieldingTransport(c1_t)),
+        0xA001,
+        ClientAuthConfig {
+            owner_signer: Some(Arc::clone(&signer)),
+            ..ClientAuthConfig::default()
+        },
+    );
+    let j1 = thread::spawn(move || {
+        let res = h1.handshake();
+        (h1.state(), h1.authenticated_owner().cloned(), res)
+    });
+    let c1_err = c1
+        .handshake()
+        .expect_err("allow_owner_control=false 必须拒绝合法 OwnerTicket");
+    assert!(matches!(c1_err, Error::Protocol { .. }), "{c1_err}");
+    assert_eq!(c1.state(), SessionState::Closed);
+
+    let (h1_state, h1_owner, h1_res) = j1.join().unwrap();
+    assert!(matches!(h1_res, Err(Error::Protocol { .. })));
+    assert_eq!(h1_state, SessionState::Closed);
+    assert!(h1_owner.is_none());
+
+    // 2. 拒绝时绝不消费 replay_cache：当 allow_owner_control 切回 true 后同票据仍可正常使用
+    let (h2_t, c2_t) = pair();
+    let mut h2 = make_host_parts(
+        Box::new(YieldingTransport(h2_t)),
+        HostAuthConfig {
+            allow_owner_control: true,
+            allow_remote_assist: false,
+            owner_verifier: Some(verifier),
+            replay_cache: Some(shared_cache),
+            unix_time_fn: Some(Arc::new(|| 1_000)),
+            ..HostAuthConfig::default()
+        },
+        Box::new(DenyApprover),
+    );
+    let mut c2 = make_client_parts(
+        Box::new(YieldingTransport(c2_t)),
+        0xA002,
+        ClientAuthConfig {
+            owner_signer: Some(signer),
+            ..ClientAuthConfig::default()
+        },
+    );
+    let j2 = thread::spawn(move || {
+        h2.handshake()
+            .expect("未消费的票据在 allow_owner_control=true 后应可正常认证");
+        h2
+    });
+    c2.handshake()
+        .expect("allow_owner_control=true, allow_remote_assist=false 应放行 OwnerTicket");
+    let mut h2 = j2.join().unwrap();
+    assert_eq!(
+        h2.authenticated_owner().map(|o| o.ticket_id.as_str()),
+        Some("ticket-owner-ctrl-off")
+    );
+    let _ = c2.close(ByeReason::Normal);
+    let _ = h2.close(ByeReason::Normal);
+}
+
+#[test]
+fn owner_control_disabled_rejects_none_and_password_even_when_assist_enabled() {
+    // 1. allow_owner_control = false, allow_remote_assist = true -> 拒绝 AuthMethod::None
+    {
+        let (host_t, client_t) = pair();
+        let mut host = make_host_parts(
+            Box::new(YieldingTransport(host_t)),
+            HostAuthConfig {
+                password: None,
+                allow_owner_control: false,
+                allow_remote_assist: true,
+                ..HostAuthConfig::default()
+            },
+            Box::new(AutoApprover),
+        );
+        let mut client = make_client_parts(
+            Box::new(YieldingTransport(client_t)),
+            0xB001,
+            ClientAuthConfig::default(),
+        );
+        let h_thread = thread::spawn(move || host.handshake());
+        let c_err = client.handshake().expect_err(
+            "allow_owner_control=false 时即使 allow_remote_assist=true 也必须拒绝 None",
+        );
+        assert!(matches!(c_err, Error::Protocol { .. }), "{c_err}");
+        assert!(matches!(
+            h_thread.join().unwrap(),
+            Err(Error::Protocol { .. })
+        ));
+    }
+
+    // 2. allow_owner_control = false, allow_remote_assist = true -> 拒绝正确 Password
+    {
+        let (host_t, client_t) = pair();
+        let mut host = make_host_parts(
+            Box::new(YieldingTransport(host_t)),
+            HostAuthConfig {
+                password: Some("correct-pw".into()),
+                iterations: 64,
+                allow_owner_control: false,
+                allow_remote_assist: true,
+                ..HostAuthConfig::default()
+            },
+            Box::new(AutoApprover),
+        );
+        let mut client = make_client_parts(
+            Box::new(YieldingTransport(client_t)),
+            0xB002,
+            ClientAuthConfig {
+                password: Some("correct-pw".into()),
+                ..ClientAuthConfig::default()
+            },
+        );
+        let h_thread = thread::spawn(move || host.handshake());
+        let c_err = client
+            .handshake()
+            .expect_err("allow_owner_control=false 时即使密码正确也必须拒绝");
+        assert!(matches!(c_err, Error::Protocol { .. }), "{c_err}");
+        assert!(matches!(
+            h_thread.join().unwrap(),
+            Err(Error::Protocol { .. })
+        ));
+    }
+
+    // 3. HostAuthConfig Debug 输出包含 allow_owner_control，默认值为 true
+    let def = HostAuthConfig::default();
+    assert!(def.allow_owner_control);
+    assert!(format!("{def:?}").contains("allow_owner_control: true"));
+}

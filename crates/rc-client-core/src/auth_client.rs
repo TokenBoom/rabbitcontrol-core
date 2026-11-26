@@ -325,50 +325,115 @@ pub struct BindDeviceRequest {
     pub allow_remote_assist: Option<bool>,
 }
 
+/// 更新已绑定设备属性的请求参数（`PATCH /api/v1/me/devices/{id}`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateDeviceRequest {
+    /// 可选新设备别名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// 可选是否允许他人远程协助。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_remote_assist: Option<bool>,
+    /// 可选是否允许被远程控制（含同账号本人自控）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_remote_control: Option<bool>,
+}
+
 /// 服务端返回的当前用户设备信息。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MyDeviceInfo {
     /// 9 位纯数字设备码。
     pub device_id: String,
     /// 格式化设备码（如 `"604 928 235"`）。
-    #[serde(default)]
     pub formatted_id: String,
     /// 主机名。
-    #[serde(default)]
     pub hostname: String,
     /// 操作系统。
-    #[serde(default)]
     pub os: String,
     /// 应用版本号（旧服务端未返回时为空串）。
-    #[serde(default)]
     pub app_version: String,
     /// CPU 架构（旧服务端未返回时为空串）。
-    #[serde(default)]
     pub arch: String,
     /// 用户自定义设备别名。
-    #[serde(default)]
     pub alias: String,
     /// 设备 Ed25519 公钥 hex。
-    #[serde(default)]
     pub device_pubkey: String,
     /// 是否允许他人远程协助。
-    #[serde(default)]
     pub allow_remote_assist: bool,
+    /// 是否允许被远程控制（含同账号本人自控；老服务端未返回该字段时按 `os` 安全推导）。
+    pub allow_remote_control: bool,
     /// 设备是否已被禁用。
-    #[serde(default)]
     pub disabled: bool,
     /// 是否在线。
-    #[serde(default)]
     pub online: bool,
     /// 是否处于会话中。
-    #[serde(default)]
     pub in_session: bool,
     /// 绑定时间。
-    #[serde(default)]
     pub bound_at: Option<String>,
     /// 最近活跃时间。
-    #[serde(default)]
     pub last_seen_at: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for MyDeviceInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawMyDeviceInfo {
+            device_id: String,
+            #[serde(default)]
+            formatted_id: String,
+            #[serde(default)]
+            hostname: String,
+            #[serde(default)]
+            os: String,
+            #[serde(default)]
+            app_version: String,
+            #[serde(default)]
+            arch: String,
+            #[serde(default)]
+            alias: String,
+            #[serde(default)]
+            device_pubkey: String,
+            #[serde(default)]
+            allow_remote_assist: bool,
+            #[serde(default)]
+            allow_remote_control: Option<bool>,
+            #[serde(default)]
+            disabled: bool,
+            #[serde(default)]
+            online: bool,
+            #[serde(default)]
+            in_session: bool,
+            #[serde(default)]
+            bound_at: Option<String>,
+            #[serde(default)]
+            last_seen_at: Option<String>,
+        }
+
+        let raw = RawMyDeviceInfo::deserialize(deserializer)?;
+        let allow_remote_control = raw
+            .allow_remote_control
+            .unwrap_or_else(|| crate::default_allow_remote_control_for_os(&raw.os));
+        Ok(Self {
+            device_id: raw.device_id,
+            formatted_id: raw.formatted_id,
+            hostname: raw.hostname,
+            os: raw.os,
+            app_version: raw.app_version,
+            arch: raw.arch,
+            alias: raw.alias,
+            device_pubkey: raw.device_pubkey,
+            allow_remote_assist: raw.allow_remote_assist,
+            allow_remote_control,
+            disabled: raw.disabled,
+            online: raw.online,
+            in_session: raw.in_session,
+            bound_at: raw.bound_at,
+            last_seen_at: raw.last_seen_at,
+        })
+    }
 }
 
 /// 登录 / 注册 / 刷新 / 改密返回的令牌与用户负载。
@@ -776,6 +841,18 @@ impl AuthHttpClient {
         Ok(resp.into_device())
     }
 
+    /// 按需增量更新已绑定设备的别名、远程协助或允许远控开关（`PATCH /api/v1/me/devices/{id}`）。
+    pub fn update_device(
+        &self,
+        access_token: &str,
+        device_id: &str,
+        req: &UpdateDeviceRequest,
+    ) -> Result<MyDeviceInfo, AuthClientError> {
+        let path = device_subpath(device_id)?;
+        let resp: DevicePatchPayload = self.patch_json(&path, Some(access_token), req)?;
+        Ok(resp.into_device())
+    }
+
     /// 更新已绑定设备的「允许他人远程协助」开关（`PATCH /api/v1/me/devices/{id}`）。
     pub fn set_device_allow_remote_assist(
         &self,
@@ -783,19 +860,31 @@ impl AuthHttpClient {
         device_id: &str,
         allow_remote_assist: bool,
     ) -> Result<MyDeviceInfo, AuthClientError> {
-        #[derive(Serialize)]
-        struct Body {
-            allow_remote_assist: bool,
-        }
-        let path = device_subpath(device_id)?;
-        let resp: DevicePatchPayload = self.patch_json(
-            &path,
-            Some(access_token),
-            &Body {
-                allow_remote_assist,
+        self.update_device(
+            access_token,
+            device_id,
+            &UpdateDeviceRequest {
+                allow_remote_assist: Some(allow_remote_assist),
+                ..UpdateDeviceRequest::default()
             },
-        )?;
-        Ok(resp.into_device())
+        )
+    }
+
+    /// 更新已绑定设备的「允许被远程控制（含本人自控）」开关（`PATCH /api/v1/me/devices/{id}`）。
+    pub fn set_device_allow_remote_control(
+        &self,
+        access_token: &str,
+        device_id: &str,
+        allow_remote_control: bool,
+    ) -> Result<MyDeviceInfo, AuthClientError> {
+        self.update_device(
+            access_token,
+            device_id,
+            &UpdateDeviceRequest {
+                allow_remote_control: Some(allow_remote_control),
+                ..UpdateDeviceRequest::default()
+            },
+        )
     }
 
     /// 从当前账号解绑并移除指定设备（`DELETE /api/v1/me/devices/{id}`）。
@@ -3963,5 +4052,105 @@ mod tests {
         assert_eq!(sess.refresh_token, "ref-recovered");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn my_device_info_allow_remote_control_serde_and_patch_request() {
+        // 1. Legacy server omits allow_remote_control -> android/ios => false, macos/windows => true
+        let legacy_android: MyDeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": "100000001",
+            "os": "android",
+            "allow_remote_assist": false
+        }))
+        .unwrap();
+        assert!(!legacy_android.allow_remote_control);
+        let ser_android = serde_json::to_value(&legacy_android).unwrap();
+        assert_eq!(ser_android["allow_remote_control"], false);
+
+        let legacy_ios: MyDeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": "100000002",
+            "os": "iOS 18",
+            "allow_remote_assist": false
+        }))
+        .unwrap();
+        assert!(!legacy_ios.allow_remote_control);
+
+        let legacy_macos: MyDeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": "100000003",
+            "os": "macos",
+            "allow_remote_assist": false
+        }))
+        .unwrap();
+        assert!(legacy_macos.allow_remote_control);
+        let ser_macos = serde_json::to_value(&legacy_macos).unwrap();
+        assert_eq!(ser_macos["allow_remote_control"], true);
+
+        // 2. New server explicit allow_remote_control overrides OS default
+        let enabled_android: MyDeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": "100000004",
+            "os": "android",
+            "allow_remote_assist": false,
+            "allow_remote_control": true
+        }))
+        .unwrap();
+        assert!(enabled_android.allow_remote_control);
+
+        let disabled_macos: MyDeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": "100000005",
+            "os": "macos",
+            "allow_remote_assist": false,
+            "allow_remote_control": false
+        }))
+        .unwrap();
+        assert!(!disabled_macos.allow_remote_control);
+
+        // 3. UpdateDeviceRequest skips None fields
+        let patch_only_rc = serde_json::to_value(&UpdateDeviceRequest {
+            allow_remote_control: Some(true),
+            ..UpdateDeviceRequest::default()
+        })
+        .unwrap();
+        assert_eq!(
+            patch_only_rc,
+            serde_json::json!({ "allow_remote_control": true })
+        );
+
+        // 4. AuthHttpClient::set_device_allow_remote_control sends PATCH /api/v1/me/devices/{id}
+        let server = spawn_mock_server(None, |method, path, headers, body| {
+            assert_eq!(method, "PATCH");
+            assert_eq!(path, "/api/v1/me/devices/604928235");
+            assert_eq!(
+                headers.get("authorization").map(String::as_str),
+                Some("Bearer acc-patch-test")
+            );
+            let req_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(
+                req_json,
+                serde_json::json!({ "allow_remote_control": true })
+            );
+            (
+                200,
+                false,
+                serde_json::to_vec(&serde_json::json!({
+                    "device": {
+                        "device_id": "604928235",
+                        "formatted_id": "604 928 235",
+                        "hostname": "Pixel",
+                        "os": "android",
+                        "allow_remote_assist": false,
+                        "allow_remote_control": true
+                    }
+                }))
+                .unwrap(),
+            )
+        });
+        let client = AuthHttpClient::new("127.0.0.1", server.port, false, None).unwrap();
+        let updated = client
+            .set_device_allow_remote_control("acc-patch-test", "604 928 235", true)
+            .expect("set_device_allow_remote_control must succeed");
+        assert_eq!(updated.device_id, "604928235");
+        assert_eq!(updated.os, "android");
+        assert!(updated.allow_remote_control);
+        assert!(!updated.allow_remote_assist);
     }
 }

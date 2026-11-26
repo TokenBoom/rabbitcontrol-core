@@ -88,6 +88,13 @@ const ASSIST_FALSE: u8 = 1;
 /// 协助开关原子编码：允许他人远程协助。
 const ASSIST_TRUE: u8 = 2;
 
+/// 远控总开关原子编码：未显式设置（沿用服务端按平台推导或已有记录）。
+const REMOTE_CTRL_UNSET: u8 = 0;
+/// 远控总开关原子编码：禁止被远程控制（含同账号本人自控）。
+const REMOTE_CTRL_FALSE: u8 = 1;
+/// 远控总开关原子编码：允许被远程控制。
+const REMOTE_CTRL_TRUE: u8 = 2;
+
 /// 服务端推送的入站中继会话请求（本端作为被控端 `host` 接收）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RelayIncoming {
@@ -135,7 +142,7 @@ pub struct ConnectGrant {
 }
 
 /// 同账号其他设备的上下线与远程协助状态变更通知（由信令服务端广播）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceStatusEvent {
     /// 9 位纯数字设备码。
     pub device_id: String,
@@ -148,13 +155,52 @@ pub struct DeviceStatusEvent {
     /// 操作系统名称。
     pub os: String,
     /// 设备应用版本号（旧服务端未推送时为空串）。
-    #[serde(default)]
     pub app_version: String,
     /// 设备 CPU 架构（旧服务端未推送时为空串）。
-    #[serde(default)]
     pub arch: String,
     /// 是否允许他人远程协助。
     pub allow_remote_assist: bool,
+    /// 是否允许被远程控制（含同账号本人自控；老服务端未推送时按操作系统推导）。
+    pub allow_remote_control: bool,
+}
+
+impl<'de> Deserialize<'de> for DeviceStatusEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawDeviceStatusEvent {
+            device_id: String,
+            online: bool,
+            hostname: String,
+            alias: String,
+            os: String,
+            #[serde(default)]
+            app_version: String,
+            #[serde(default)]
+            arch: String,
+            allow_remote_assist: bool,
+            #[serde(default)]
+            allow_remote_control: Option<bool>,
+        }
+
+        let raw = RawDeviceStatusEvent::deserialize(deserializer)?;
+        let allow_remote_control = raw
+            .allow_remote_control
+            .unwrap_or_else(|| crate::default_allow_remote_control_for_os(&raw.os));
+        Ok(Self {
+            device_id: raw.device_id,
+            online: raw.online,
+            hostname: raw.hostname,
+            alias: raw.alias,
+            os: raw.os,
+            app_version: raw.app_version,
+            arch: raw.arch,
+            allow_remote_assist: raw.allow_remote_assist,
+            allow_remote_control,
+        })
+    }
 }
 
 /// 动态 Access Token 提供器类型（由上层接入 `AuthSessionManager::ensure_valid_access_token`）。
@@ -164,7 +210,7 @@ pub type TokenProvider = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
 /// （入参为刚被拒绝的过期令牌，由上层接入 `AuthSessionManager::refresh_after_unauthorized`）。
 pub type TokenRefresher = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
-/// 信令客户端启动扩展参数（注入动态 Token 提供器、设备公钥、远程协助与动态局域网探测开关）。
+/// 信令客户端启动扩展参数（注入动态 Token 提供器、设备公钥、远程控制/协助与动态局域网探测开关）。
 #[derive(Clone, Default)]
 pub struct SignalClientOptions {
     /// 可选动态 Access Token 提供器；每次建连与断线重连注册时自动拉取最新（必要时已轮换的）令牌。
@@ -175,6 +221,8 @@ pub struct SignalClientOptions {
     pub device_pubkey: Option<String>,
     /// 初始是否允许他人远程协助（默认 `false`）。
     pub allow_remote_assist: bool,
+    /// 可选初始「允许被远程控制（含本人自控）」状态（`None` 时注册帧不携带，由服务端按平台/已有记录处理）。
+    pub allow_remote_control: Option<bool>,
     /// 是否按信令出向路由动态探测本机局域网 IPv4 候选并前置于静态 `lan_addrs`（默认 `false`）。
     pub dynamic_lan_discovery: bool,
 }
@@ -186,6 +234,7 @@ impl fmt::Debug for SignalClientOptions {
             .field("has_token_refresher", &self.token_refresher.is_some())
             .field("device_pubkey", &self.device_pubkey)
             .field("allow_remote_assist", &self.allow_remote_assist)
+            .field("allow_remote_control", &self.allow_remote_control)
             .field("dynamic_lan_discovery", &self.dynamic_lan_discovery)
             .finish()
     }
@@ -213,12 +262,17 @@ enum OutgoingSignalMsg {
         device_pubkey: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         allow_remote_assist: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allow_remote_control: Option<bool>,
     },
     Heartbeat {
         lan_addrs: Vec<String>,
     },
     UpdateAssistState {
-        allow_remote_assist: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allow_remote_assist: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allow_remote_control: Option<bool>,
     },
     ConnectRequest {
         target_id: String,
@@ -258,6 +312,8 @@ enum IncomingSignalMsg {
         arch: String,
         #[serde(default)]
         allow_remote_assist: bool,
+        #[serde(default)]
+        allow_remote_control: Option<bool>,
     },
     PunchCoord {
         session_id: String,
@@ -425,6 +481,7 @@ struct SharedState {
     token_refresher: Option<TokenRefresher>,
     device_pubkey: Option<String>,
     allow_remote_assist: AtomicU8,
+    allow_remote_control: AtomicU8,
 }
 
 fn snapshots_same_payload(a: &ServerStatusSnapshot, b: &ServerStatusSnapshot) -> bool {
@@ -505,6 +562,14 @@ impl SharedState {
         match self.allow_remote_assist.load(Ordering::Acquire) {
             ASSIST_FALSE => Some(false),
             ASSIST_TRUE => Some(true),
+            _ => None,
+        }
+    }
+
+    fn current_allow_remote_control_opt(&self) -> Option<bool> {
+        match self.allow_remote_control.load(Ordering::Acquire) {
+            REMOTE_CTRL_FALSE => Some(false),
+            REMOTE_CTRL_TRUE => Some(true),
             _ => None,
         }
     }
@@ -736,28 +801,40 @@ impl SignalClientHandle {
             cfg.disabled_snapshot()
         };
 
-        let (token_provider, token_refresher, device_pubkey, initial_assist, dynamic_lan_discovery) =
-            match options {
-                Some(opts) => {
-                    let pubkey = opts
-                        .device_pubkey
-                        .map(|s| s.trim().to_ascii_lowercase())
-                        .filter(|s| !s.is_empty());
-                    let assist = if opts.allow_remote_assist {
-                        ASSIST_TRUE
-                    } else {
-                        ASSIST_FALSE
-                    };
-                    (
-                        opts.token_provider,
-                        opts.token_refresher,
-                        pubkey,
-                        assist,
-                        opts.dynamic_lan_discovery,
-                    )
-                }
-                None => (None, None, None, ASSIST_UNSET, false),
-            };
+        let (
+            token_provider,
+            token_refresher,
+            device_pubkey,
+            initial_assist,
+            initial_remote_ctrl,
+            dynamic_lan_discovery,
+        ) = match options {
+            Some(opts) => {
+                let pubkey = opts
+                    .device_pubkey
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty());
+                let assist = if opts.allow_remote_assist {
+                    ASSIST_TRUE
+                } else {
+                    ASSIST_FALSE
+                };
+                let remote_ctrl = match opts.allow_remote_control {
+                    Some(true) => REMOTE_CTRL_TRUE,
+                    Some(false) => REMOTE_CTRL_FALSE,
+                    None => REMOTE_CTRL_UNSET,
+                };
+                (
+                    opts.token_provider,
+                    opts.token_refresher,
+                    pubkey,
+                    assist,
+                    remote_ctrl,
+                    opts.dynamic_lan_discovery,
+                )
+            }
+            None => (None, None, None, ASSIST_UNSET, REMOTE_CTRL_UNSET, false),
+        };
 
         let shared = Arc::new(SharedState {
             status: Mutex::new(initial_snapshot.clone()),
@@ -782,6 +859,7 @@ impl SignalClientHandle {
             token_refresher,
             device_pubkey,
             allow_remote_assist: AtomicU8::new(initial_assist),
+            allow_remote_control: AtomicU8::new(initial_remote_ctrl),
         });
 
         if !active {
@@ -890,7 +968,7 @@ impl SignalClientHandle {
         }
     }
 
-    /// 实时更新本机「允许他人远程协助」状态并同步发送 `UpdateAssistState` 信令帧。
+    /// 实时更新本机「允许他人远程协助」状态并同步发送 `UpdateAssistState` 信令帧（不覆写远端 `allow_remote_control`）。
     pub fn set_allow_remote_assist(&self, allow: bool) -> Result<(), String> {
         let code = if allow { ASSIST_TRUE } else { ASSIST_FALSE };
         self.shared
@@ -900,7 +978,27 @@ impl SignalClientHandle {
             return Err("未启用信令服务器".to_string());
         }
         self.shared.send_msg(&OutgoingSignalMsg::UpdateAssistState {
-            allow_remote_assist: allow,
+            allow_remote_assist: Some(allow),
+            allow_remote_control: None,
+        })
+    }
+
+    /// 实时更新本机「允许被远程控制（含本人自控）」状态并同步发送 `UpdateAssistState` 信令帧（不覆写远端 `allow_remote_assist`）。
+    pub fn set_allow_remote_control(&self, allow: bool) -> Result<(), String> {
+        let code = if allow {
+            REMOTE_CTRL_TRUE
+        } else {
+            REMOTE_CTRL_FALSE
+        };
+        self.shared
+            .allow_remote_control
+            .store(code, Ordering::Release);
+        if !self.shared.enabled {
+            return Err("未启用信令服务器".to_string());
+        }
+        self.shared.send_msg(&OutgoingSignalMsg::UpdateAssistState {
+            allow_remote_assist: None,
+            allow_remote_control: Some(allow),
         })
     }
 
@@ -1618,6 +1716,7 @@ fn run_single_connection(
         access_token,
         device_pubkey: shared.device_pubkey.clone(),
         allow_remote_assist: shared.current_allow_assist_opt(),
+        allow_remote_control: shared.current_allow_remote_control_opt(),
     };
     let send_reg_res = match &reader {
         SignalReader::Plain(_) => match &writer_template {
@@ -1872,6 +1971,7 @@ fn run_single_connection(
                 last_server_activity = Instant::now();
                 match handle_incoming_message(
                     shared,
+                    &assigned_id,
                     *msg,
                     &cfg.server_host,
                     cfg.relay_port,
@@ -1897,6 +1997,7 @@ fn run_single_connection(
 
 fn handle_incoming_message(
     shared: &SharedState,
+    local_device_id: &str,
     msg: IncomingSignalMsg,
     server_host: &str,
     relay_port: u16,
@@ -1916,7 +2017,35 @@ fn handle_incoming_message(
             app_version,
             arch,
             allow_remote_assist,
+            allow_remote_control,
         } => {
+            let allow_remote_control = allow_remote_control
+                .unwrap_or_else(|| crate::default_allow_remote_control_for_os(&os));
+            let same_local_device = match (
+                parse_device_id_input(&device_id),
+                parse_device_id_input(local_device_id),
+            ) {
+                (Some(a), Some(b)) => a == b,
+                _ => !local_device_id.is_empty() && device_id.trim() == local_device_id.trim(),
+            };
+            if same_local_device {
+                shared.allow_remote_assist.store(
+                    if allow_remote_assist {
+                        ASSIST_TRUE
+                    } else {
+                        ASSIST_FALSE
+                    },
+                    Ordering::Release,
+                );
+                shared.allow_remote_control.store(
+                    if allow_remote_control {
+                        REMOTE_CTRL_TRUE
+                    } else {
+                        REMOTE_CTRL_FALSE
+                    },
+                    Ordering::Release,
+                );
+            }
             shared.push_device_status(DeviceStatusEvent {
                 device_id,
                 online,
@@ -1926,6 +2055,7 @@ fn handle_incoming_message(
                 app_version,
                 arch,
                 allow_remote_assist,
+                allow_remote_control,
             });
             IncomingAction::Continue
         }
@@ -2020,11 +2150,7 @@ fn handle_incoming_message(
             IncomingAction::Continue
         }
         IncomingSignalMsg::Error { code, message } => {
-            let detail = if message.is_empty() {
-                format!("服务器返回错误 ({code})")
-            } else {
-                format!("服务器拒绝请求 ({code})：{message}")
-            };
+            let detail = format_signal_error(&code, &message);
             shared.fail_all_pending(&detail);
             IncomingAction::Continue
         }
@@ -2040,6 +2166,23 @@ fn handle_incoming_message(
                 }
             }
         }
+    }
+}
+
+fn format_signal_error(code: &str, message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        match code {
+            "remote_control_disabled" => {
+                "服务器拒绝请求 (remote_control_disabled)：对方未开启允许远程控制".to_string()
+            }
+            "assist_disabled" => {
+                "服务器拒绝请求 (assist_disabled)：对方未开启允许他人远程协助".to_string()
+            }
+            _ => format!("服务器返回错误 ({code})"),
+        }
+    } else {
+        format!("服务器拒绝请求 ({code})：{trimmed}")
     }
 }
 
@@ -3238,6 +3381,7 @@ mod tests {
             token_refresher: None,
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
+            allow_remote_control: AtomicU8::new(REMOTE_CTRL_UNSET),
         };
 
         let (tx1, rx1) = mpsc::sync_channel(1);
@@ -3288,6 +3432,7 @@ mod tests {
         // H5: PeerOffline 携带不匹配的 session_id 不得误杀 sess-A
         handle_incoming_message(
             &shared,
+            "111222333",
             IncomingSignalMsg::PeerOffline {
                 target_id: "987654321".to_string(),
                 session_id: "sess-OTHER".to_string(),
@@ -3616,6 +3761,7 @@ mod tests {
             token_refresher: None,
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
+            allow_remote_control: AtomicU8::new(REMOTE_CTRL_UNSET),
         });
 
         let (tx, rx) = mpsc::sync_channel(1);
@@ -3803,6 +3949,7 @@ mod tests {
             token_refresher: None,
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
+            allow_remote_control: AtomicU8::new(REMOTE_CTRL_UNSET),
         };
 
         let static_addrs = vec![
@@ -3905,6 +4052,7 @@ mod tests {
             token_refresher: None,
             device_pubkey: None,
             allow_remote_assist: AtomicU8::new(ASSIST_UNSET),
+            allow_remote_control: AtomicU8::new(REMOTE_CTRL_UNSET),
         };
         shared.local_udp_port.store(
             failed.as_ref().map_or(0, PersistentUdpProbe::local_port),
@@ -4512,6 +4660,507 @@ mod tests {
             refresh_attempts.lock().unwrap().as_slice(),
             &["stale-tok", "stale-tok"]
         );
+        client.stop();
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn allow_remote_control_wire_serialization_and_reconnect_and_legacy_status_fallback() {
+        // 1. OutgoingSignalMsg::Register & UpdateAssistState serialization (None omitted, Some included)
+        let reg_none = serde_json::to_value(&OutgoingSignalMsg::Register {
+            device_id: None,
+            device_key: "k".repeat(64),
+            hostname: "phone".into(),
+            os: "android".into(),
+            app_version: String::new(),
+            arch: String::new(),
+            device_group: "default".into(),
+            lan_addrs: Vec::new(),
+            access_token: None,
+            device_pubkey: None,
+            allow_remote_assist: Some(false),
+            allow_remote_control: None,
+        })
+        .unwrap();
+        assert!(
+            reg_none.get("allow_remote_control").is_none(),
+            "None 时 Register 不得序列化 allow_remote_control"
+        );
+
+        let reg_false = serde_json::to_value(&OutgoingSignalMsg::Register {
+            device_id: None,
+            device_key: "k".repeat(64),
+            hostname: "phone".into(),
+            os: "android".into(),
+            app_version: String::new(),
+            arch: String::new(),
+            device_group: "default".into(),
+            lan_addrs: Vec::new(),
+            access_token: None,
+            device_pubkey: None,
+            allow_remote_assist: Some(false),
+            allow_remote_control: Some(false),
+        })
+        .unwrap();
+        assert_eq!(reg_false["allow_remote_control"], false);
+
+        let upd_assist_only = serde_json::to_value(&OutgoingSignalMsg::UpdateAssistState {
+            allow_remote_assist: Some(true),
+            allow_remote_control: None,
+        })
+        .unwrap();
+        assert_eq!(upd_assist_only["allow_remote_assist"], true);
+        assert!(upd_assist_only.get("allow_remote_control").is_none());
+
+        let upd_ctrl_only = serde_json::to_value(&OutgoingSignalMsg::UpdateAssistState {
+            allow_remote_assist: None,
+            allow_remote_control: Some(true),
+        })
+        .unwrap();
+        assert!(upd_ctrl_only.get("allow_remote_assist").is_none());
+        assert_eq!(upd_ctrl_only["allow_remote_control"], true);
+
+        // DeviceStatusEvent direct JSON deserialization derives missing allow_remote_control from os
+        let direct_android: DeviceStatusEvent = serde_json::from_value(serde_json::json!({
+            "device_id": "200000010",
+            "online": true,
+            "hostname": "Pixel",
+            "alias": "Phone",
+            "os": "android",
+            "allow_remote_assist": false
+        }))
+        .unwrap();
+        assert!(!direct_android.allow_remote_control);
+        let direct_ios: DeviceStatusEvent = serde_json::from_value(serde_json::json!({
+            "device_id": "200000011",
+            "online": true,
+            "hostname": "iPhone",
+            "alias": "iOS",
+            "os": "iOS 18",
+            "allow_remote_assist": false
+        }))
+        .unwrap();
+        assert!(!direct_ios.allow_remote_control);
+        let direct_macos: DeviceStatusEvent = serde_json::from_value(serde_json::json!({
+            "device_id": "200000012",
+            "online": true,
+            "hostname": "Mac",
+            "alias": "Desktop",
+            "os": "macos",
+            "allow_remote_assist": false
+        }))
+        .unwrap();
+        assert!(direct_macos.allow_remote_control);
+        let direct_android_explicit: DeviceStatusEvent =
+            serde_json::from_value(serde_json::json!({
+                "device_id": "200000013",
+                "online": true,
+                "hostname": "Pixel",
+                "alias": "PhoneOn",
+                "os": "android",
+                "allow_remote_assist": false,
+                "allow_remote_control": true
+            }))
+            .unwrap();
+        assert!(direct_android_explicit.allow_remote_control);
+
+        // 2. End-to-end TCP signal server:
+        //    - Round 1: initial Register carries allow_remote_control = false
+        //    - Push DeviceStatusChanged (new server explicit false/true + legacy missing field android->false, macos->true)
+        //    - Call set_allow_remote_control(true) & set_allow_remote_assist(true) -> both carry allow_remote_control=true
+        //    - request_connect receives Error { code: "remote_control_disabled" } -> clear error returned
+        //    - Kick with server_shutdown -> Round 2 Register carries latest allow_remote_control = true
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let round2_registered = Arc::new(AtomicBool::new(false));
+        let round2_registered_srv = Arc::clone(&round2_registered);
+
+        let server_thread = thread::spawn(move || {
+            // Round 1
+            {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+                let reg1 = read_test_frame(&mut s);
+                assert_eq!(reg1["type"], "register");
+                assert_eq!(reg1["allow_remote_assist"], false);
+                assert_eq!(reg1["allow_remote_control"], false);
+
+                write_test_frame(
+                    &mut s,
+                    &serde_json::json!({
+                        "type": "registered",
+                        "device_id": "111222333",
+                        "formatted_id": "111 222 333",
+                        "udp_probe_addr": "",
+                        "relay_addr": ""
+                    }),
+                );
+
+                // Push 4 DeviceStatusChanged frames:
+                // (a) legacy server missing field + android -> false
+                write_test_frame(
+                    &mut s,
+                    &serde_json::json!({
+                        "type": "device_status_changed",
+                        "device_id": "200000001",
+                        "online": true,
+                        "hostname": "Pixel",
+                        "alias": "AndroidLegacy",
+                        "os": "android",
+                        "allow_remote_assist": false
+                    }),
+                );
+                // (b) legacy server missing field + macos -> true
+                write_test_frame(
+                    &mut s,
+                    &serde_json::json!({
+                        "type": "device_status_changed",
+                        "device_id": "200000002",
+                        "online": true,
+                        "hostname": "Mac",
+                        "alias": "MacLegacy",
+                        "os": "macos",
+                        "allow_remote_assist": false
+                    }),
+                );
+                // (c) new server explicit true on android -> true
+                write_test_frame(
+                    &mut s,
+                    &serde_json::json!({
+                        "type": "device_status_changed",
+                        "device_id": "200000003",
+                        "online": true,
+                        "hostname": "Pixel2",
+                        "alias": "AndroidEnabled",
+                        "os": "android",
+                        "allow_remote_assist": false,
+                        "allow_remote_control": true
+                    }),
+                );
+                // (d) new server explicit false on macos -> false
+                write_test_frame(
+                    &mut s,
+                    &serde_json::json!({
+                        "type": "device_status_changed",
+                        "device_id": "200000004",
+                        "online": true,
+                        "hostname": "Mac2",
+                        "alias": "MacDisabled",
+                        "os": "macos",
+                        "allow_remote_assist": false,
+                        "allow_remote_control": false
+                    }),
+                );
+
+                let read_non_hb = |stream: &mut TcpStream| -> serde_json::Value {
+                    for _ in 0..16 {
+                        let m = read_test_frame(stream);
+                        if m["type"] != "heartbeat" {
+                            return m;
+                        }
+                    }
+                    panic!("too many heartbeats");
+                };
+
+                // set_allow_remote_control(true) sends ONLY allow_remote_control (decoupled from allow_remote_assist)
+                let upd1 = read_non_hb(&mut s);
+                assert_eq!(upd1["type"], "update_assist_state");
+                assert!(upd1.get("allow_remote_assist").is_none());
+                assert_eq!(upd1["allow_remote_control"], true);
+
+                // set_allow_remote_assist(true) sends ONLY allow_remote_assist (decoupled from allow_remote_control)
+                let upd2 = read_non_hb(&mut s);
+                assert_eq!(upd2["type"], "update_assist_state");
+                assert_eq!(upd2["allow_remote_assist"], true);
+                assert!(upd2.get("allow_remote_control").is_none());
+
+                // ConnectRequest #1 -> error with message
+                let req1 = read_non_hb(&mut s);
+                assert_eq!(req1["type"], "connect_request");
+                write_test_frame(
+                    &mut s,
+                    &serde_json::json!({
+                        "type": "error",
+                        "code": "remote_control_disabled",
+                        "message": "对方未开启允许远程控制"
+                    }),
+                );
+
+                // ConnectRequest #2 -> error with empty message (fallback Chinese message)
+                let req2 = read_non_hb(&mut s);
+                assert_eq!(req2["type"], "connect_request");
+                write_test_frame(
+                    &mut s,
+                    &serde_json::json!({
+                        "type": "error",
+                        "code": "remote_control_disabled",
+                        "message": ""
+                    }),
+                );
+
+                // Kick to trigger reconnect
+                write_test_frame(
+                    &mut s,
+                    &serde_json::json!({
+                        "type": "kicked",
+                        "reason": "server_shutdown"
+                    }),
+                );
+            }
+
+            // Round 2: reconnect Register must carry updated allow_remote_control=true & allow_remote_assist=true
+            {
+                let (mut s2, _) = listener.accept().unwrap();
+                let _ = s2.set_read_timeout(Some(Duration::from_secs(3)));
+                let reg2 = read_test_frame(&mut s2);
+                assert_eq!(reg2["type"], "register");
+                assert_eq!(reg2["allow_remote_assist"], true);
+                assert_eq!(reg2["allow_remote_control"], true);
+                write_test_frame(
+                    &mut s2,
+                    &serde_json::json!({
+                        "type": "registered",
+                        "device_id": "111222333",
+                        "formatted_id": "111 222 333",
+                        "udp_probe_addr": "",
+                        "relay_addr": ""
+                    }),
+                );
+                round2_registered_srv.store(true, Ordering::Release);
+                let _ = s2.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut sink = [0u8; 64];
+                while matches!(s2.read(&mut sink), Ok(n) if n > 0) {}
+            }
+        });
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: addr.port(),
+            relay_port: 21117,
+            use_https: false,
+            device_key: crate::server_config::generate_device_key(),
+            ..ServerConfig::default()
+        };
+        let opts = SignalClientOptions {
+            allow_remote_assist: false,
+            allow_remote_control: Some(false),
+            ..SignalClientOptions::default()
+        };
+        let fast_timing = SignalTiming {
+            heartbeat_interval: Duration::from_secs(30),
+            activity_timeout: Duration::from_secs(75),
+            stable_threshold: Duration::from_secs(30),
+            backoffs: [
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+            ],
+        };
+        let mut client = SignalClientHandle::spawn_with_timing(
+            cfg,
+            "perm-test".to_string(),
+            Vec::new(),
+            Some(opts),
+            fast_timing,
+            |_| {},
+        );
+
+        let snap = wait_until_connected(&client, Duration::from_secs(4));
+        assert_eq!(snap.device_id.as_deref(), Some("111222333"));
+
+        // Collect all 4 DeviceStatusEvent notifications
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while events.len() < 4 && Instant::now() < deadline {
+            if let Some(ev) = client.try_recv_device_status() {
+                events.push(ev);
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].device_id, "200000001");
+        assert!(!events[0].allow_remote_control);
+        assert_eq!(events[1].device_id, "200000002");
+        assert!(events[1].allow_remote_control);
+        assert_eq!(events[2].device_id, "200000003");
+        assert!(events[2].allow_remote_control);
+        assert_eq!(events[3].device_id, "200000004");
+        assert!(!events[3].allow_remote_control);
+
+        client.set_allow_remote_control(true).unwrap();
+        client.set_allow_remote_assist(true).unwrap();
+
+        let err1 = client
+            .request_connect("200000001", Duration::from_secs(3))
+            .expect_err("remote_control_disabled must fail request_connect");
+        assert!(err1.contains("remote_control_disabled"), "err1={err1}");
+        assert!(err1.contains("对方未开启允许远程控制"), "err1={err1}");
+
+        let err2 = client
+            .request_connect("200000001", Duration::from_secs(3))
+            .expect_err("remote_control_disabled with empty msg must fail with Chinese fallback");
+        assert!(err2.contains("remote_control_disabled"), "err2={err2}");
+        assert!(err2.contains("对方未开启允许远程控制"), "err2={err2}");
+
+        // Wait until Round 2 actually completes Register + Registered on the server before stopping
+        let reconnect_deadline = Instant::now() + Duration::from_secs(5);
+        while !round2_registered.load(Ordering::Acquire) && Instant::now() < reconnect_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            round2_registered.load(Ordering::Acquire),
+            "client must reconnect and send updated allow_remote_control=true in Round 2 Register"
+        );
+
+        client.stop();
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn self_device_status_changed_syncs_cached_policy_for_reconnect_register() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let round2_registered = Arc::new(AtomicBool::new(false));
+        let round2_registered_srv = Arc::clone(&round2_registered);
+
+        let server_thread = thread::spawn(move || {
+            // Round 1: client initially registers with allow_remote_control=true, allow_remote_assist=true.
+            // Server then pushes self DeviceStatusChanged (simulating REST PATCH disabling both) and kicks.
+            {
+                let (mut s1, _) = listener.accept().unwrap();
+                let _ = s1.set_read_timeout(Some(Duration::from_secs(3)));
+                let reg1 = read_test_frame(&mut s1);
+                assert_eq!(reg1["type"], "register");
+                assert_eq!(reg1["allow_remote_control"], true);
+                assert_eq!(reg1["allow_remote_assist"], true);
+
+                write_test_frame(
+                    &mut s1,
+                    &serde_json::json!({
+                        "type": "registered",
+                        "device_id": "555666777",
+                        "formatted_id": "555 666 777",
+                        "udp_probe_addr": "",
+                        "relay_addr": ""
+                    }),
+                );
+
+                // Push another device's status change first (must NOT affect local cache)
+                write_test_frame(
+                    &mut s1,
+                    &serde_json::json!({
+                        "type": "device_status_changed",
+                        "device_id": "999888777",
+                        "online": true,
+                        "hostname": "Other",
+                        "alias": "Other",
+                        "os": "android",
+                        "allow_remote_assist": false,
+                        "allow_remote_control": false
+                    }),
+                );
+
+                // Push self DeviceStatusChanged (with formatted spaces to test normalization)
+                write_test_frame(
+                    &mut s1,
+                    &serde_json::json!({
+                        "type": "device_status_changed",
+                        "device_id": "555 666 777",
+                        "online": true,
+                        "hostname": "Self",
+                        "alias": "Self",
+                        "os": "macos",
+                        "allow_remote_assist": false,
+                        "allow_remote_control": false
+                    }),
+                );
+
+                write_test_frame(
+                    &mut s1,
+                    &serde_json::json!({
+                        "type": "kicked",
+                        "reason": "server_shutdown"
+                    }),
+                );
+            }
+
+            // Round 2: reconnect Register MUST send synced allow_remote_control=false & allow_remote_assist=false
+            {
+                let (mut s2, _) = listener.accept().unwrap();
+                let _ = s2.set_read_timeout(Some(Duration::from_secs(3)));
+                let reg2 = read_test_frame(&mut s2);
+                assert_eq!(reg2["type"], "register");
+                assert_eq!(
+                    reg2["allow_remote_control"], false,
+                    "重连 Register 必须上报经自身 DeviceStatusChanged 同步后的 allow_remote_control=false"
+                );
+                assert_eq!(
+                    reg2["allow_remote_assist"], false,
+                    "重连 Register 必须上报经自身 DeviceStatusChanged 同步后的 allow_remote_assist=false"
+                );
+                write_test_frame(
+                    &mut s2,
+                    &serde_json::json!({
+                        "type": "registered",
+                        "device_id": "555666777",
+                        "formatted_id": "555 666 777",
+                        "udp_probe_addr": "",
+                        "relay_addr": ""
+                    }),
+                );
+                round2_registered_srv.store(true, Ordering::Release);
+                let _ = s2.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut sink = [0u8; 64];
+                while matches!(s2.read(&mut sink), Ok(n) if n > 0) {}
+            }
+        });
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: addr.port(),
+            relay_port: 21117,
+            use_https: false,
+            device_key: crate::server_config::generate_device_key(),
+            ..ServerConfig::default()
+        };
+        let opts = SignalClientOptions {
+            allow_remote_assist: true,
+            allow_remote_control: Some(true),
+            ..SignalClientOptions::default()
+        };
+        let fast_timing = SignalTiming {
+            heartbeat_interval: Duration::from_secs(30),
+            activity_timeout: Duration::from_secs(75),
+            stable_threshold: Duration::from_secs(30),
+            backoffs: [
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+            ],
+        };
+        let mut client = SignalClientHandle::spawn_with_timing(
+            cfg,
+            "self-sync-test".to_string(),
+            Vec::new(),
+            Some(opts),
+            fast_timing,
+            |_| {},
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !round2_registered.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            round2_registered.load(Ordering::Acquire),
+            "client must reconnect and complete Round 2 Register with synced policy"
+        );
+
         client.stop();
         server_thread.join().unwrap();
     }

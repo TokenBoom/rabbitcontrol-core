@@ -1726,9 +1726,10 @@ impl HostSession {
     /// 新到达的连接（真网络由 `tick_detached` accept；测试经
     /// [`HostSession::offer_transport`] 注入）。
     pub fn handle_reconnect(&mut self, req: &ReconnectRequest, now_us: u64) -> Result<Welcome> {
-        // H1：启用密码鉴权、自控免密会话或禁用远程协助时拒绝未鉴权的快速 resume，
-        // 迫使对端降级到全新 Hello 走完整鉴权；仅无密码且允许远程协助的会话保留 T17 快速 resume。
-        let hit = self.cfg.auth.allow_remote_assist
+        // H1：启用密码鉴权、自控免密会话、关闭远控总开关或禁用远程协助时拒绝未鉴权的快速 resume，
+        // 迫使对端降级到全新 Hello 走完整鉴权；仅无密码且允许远控与协助的会话保留 T17 快速 resume。
+        let hit = self.cfg.auth.allow_owner_control
+            && self.cfg.auth.allow_remote_assist
             && self.cfg.auth.password.is_none()
             && self.authenticated_owner.is_none()
             && req.resume
@@ -6124,5 +6125,46 @@ mod tests {
             true,
         );
         assert_eq!(bad.width, 0);
+    }
+
+    #[test]
+    fn handle_reconnect_rejects_fast_resume_when_allow_owner_control_disabled() {
+        let mut t = MockTransport::new();
+        t.deliver_reliable(&ControlMessage::Hello(Hello {
+            version: PROTOCOL_VERSION,
+            session_id: 777,
+            requested: caps(),
+            auth_method: crate::proto::AuthMethod::None,
+            auth_payload: Vec::new(),
+        }));
+        let mut host = HostSession::with_parts(
+            host_cfg(Box::new(RecordingInjector::new().0)),
+            Box::new(t),
+            fake_capture(FakeContent::Static),
+            fake_encoder(),
+            zero_clock(),
+        )
+        .expect("host with_parts");
+        host.handshake().expect("initial handshake");
+        host.on_disconnected(1_000);
+        assert_eq!(host.state(), SessionState::Detached);
+
+        // Simulate allow_owner_control flipped to false while Detached -> fast resume must miss
+        host.cfg.auth.allow_owner_control = false;
+        let cand = MockTransport::new();
+        host.offer_transport(Box::new(cand)).expect("offer cand");
+        let w = host
+            .handle_reconnect(
+                &ReconnectRequest {
+                    session_id: 777,
+                    resume: true,
+                },
+                2_000,
+            )
+            .expect("handle_reconnect");
+        assert!(
+            !w.host_flags.resume_accepted(),
+            "allow_owner_control=false 必须拒绝快速 resume"
+        );
     }
 }
