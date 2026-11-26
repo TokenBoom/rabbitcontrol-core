@@ -368,6 +368,8 @@ pub struct MyDeviceInfo {
     pub online: bool,
     /// 是否处于会话中。
     pub in_session: bool,
+    /// 是否支持通过 Wake-on-LAN 远程开机（旧服务端未返回时为 `false`）。
+    pub wol_capable: bool,
     /// 绑定时间。
     pub bound_at: Option<String>,
     /// 最近活跃时间。
@@ -407,6 +409,8 @@ impl<'de> Deserialize<'de> for MyDeviceInfo {
             #[serde(default)]
             in_session: bool,
             #[serde(default)]
+            wol_capable: bool,
+            #[serde(default)]
             bound_at: Option<String>,
             #[serde(default)]
             last_seen_at: Option<String>,
@@ -430,6 +434,7 @@ impl<'de> Deserialize<'de> for MyDeviceInfo {
             disabled: raw.disabled,
             online: raw.online,
             in_session: raw.in_session,
+            wol_capable: raw.wol_capable,
             bound_at: raw.bound_at,
             last_seen_at: raw.last_seen_at,
         })
@@ -4084,8 +4089,10 @@ mod tests {
         }))
         .unwrap();
         assert!(!legacy_android.allow_remote_control);
+        assert!(!legacy_android.wol_capable);
         let ser_android = serde_json::to_value(&legacy_android).unwrap();
         assert_eq!(ser_android["allow_remote_control"], false);
+        assert_eq!(ser_android["wol_capable"], false);
 
         let legacy_ios: MyDeviceInfo = serde_json::from_value(serde_json::json!({
             "device_id": "100000002",
@@ -4119,10 +4126,16 @@ mod tests {
             "device_id": "100000005",
             "os": "macos",
             "allow_remote_assist": false,
-            "allow_remote_control": false
+            "allow_remote_control": false,
+            "wol_capable": true
         }))
         .unwrap();
         assert!(!disabled_macos.allow_remote_control);
+        assert!(disabled_macos.wol_capable);
+        assert_eq!(
+            serde_json::to_value(&disabled_macos).unwrap()["wol_capable"],
+            true
+        );
 
         // 3. UpdateDeviceRequest skips None fields
         let patch_only_rc = serde_json::to_value(&UpdateDeviceRequest {
