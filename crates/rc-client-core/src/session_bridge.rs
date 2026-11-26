@@ -49,6 +49,7 @@ use rc_types::Resolution;
 
 use crate::app_prefs::ConnectionMode;
 use crate::cert_manager::OwnerGrantPayload;
+use crate::codec_selector::{self, CodecSelectionPref};
 use crate::display_ctrl::{
     self, DisplayControlMsg, DisplayDescriptor, DisplayPreset, HighRefreshAdvisory, StreamCodec,
 };
@@ -61,7 +62,7 @@ use crate::relay_transport::{
     E2eeRelayTransport, RelayE2eeMode, RelayRole, RelayShutdownHandle, TcpRelayTransport,
 };
 use crate::signal_client::ConnectGrant;
-use crate::ui_error::UiError;
+use crate::ui_error::{IntoUiError, UiError};
 
 /// 命令通道容量上限（T21 U6 / 铁律 1 UI 侧延伸）。
 pub const COMMAND_CHANNEL_CAP: usize = 64;
@@ -3626,11 +3627,26 @@ fn run_session_thread(
     let mut pending_portmap_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_display_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_update_tx: VecDeque<(bool, Vec<u8>)> = VecDeque::new();
-    let mut client_supports_hevc =
-        cfg.prefer_hardware && is_hardware_decoder && rc_pipeline::platform_supports_hevc();
+    let mut client_decode_caps =
+        codec_selector::cached_or_platform_decode_caps(cfg.prefer_hardware && is_hardware_decoder);
+    let mut client_supports_hevc = cfg.prefer_hardware
+        && is_hardware_decoder
+        && (rc_pipeline::platform_supports_hevc()
+            || client_decode_caps
+                .iter()
+                .any(|c| c.codec == rc_encode::Codec::Hevc && c.hardware));
+    let mut client_supports_av1 = cfg.prefer_hardware
+        && is_hardware_decoder
+        && client_decode_caps
+            .iter()
+            .any(|c| c.codec == rc_encode::Codec::Av1 && c.hardware);
     let mut active_codec = StreamCodec::H264;
     let mut user_pinned_codec: Option<StreamCodec> = None;
     let mut host_supports_hevc = false;
+    let mut host_supports_ext_codec_flags = false;
+    let mut host_codec_generation: u64 = 1;
+    let mut pending_unrecovered_decode_failure: Option<(rc_encode::Codec, u64, String)> = None;
+    let mut legacy_hevc_requested = false;
     if cfg.tools_only {
         client.set_media_paused(true);
         if let Some(payload) =
@@ -3638,13 +3654,12 @@ fn run_session_thread(
         {
             pending_display_tx.push_back(payload);
         }
-    } else if client_supports_hevc {
-        if let Some(payload) = display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetCodec {
-            codec: "hevc".to_string(),
-        }) {
-            pending_display_tx.push_back(payload);
-            active_codec = StreamCodec::Hevc;
-        }
+    } else if let Some(payload) = display_ctrl::encode_display_ctrl(&build_client_media_caps_msg(
+        &client_decode_caps,
+        cfg.prefer_hardware && is_hardware_decoder,
+        CodecSelectionPref::Auto,
+    )) {
+        pending_display_tx.push_back(payload);
     }
     let mut hud_width = negotiated.width;
     let mut hud_height = negotiated.height;
@@ -3759,6 +3774,11 @@ fn run_session_thread(
                     if codec == StreamCodec::Hevc && !client_supports_hevc {
                         continue;
                     }
+                    if codec == StreamCodec::Av1
+                        && (!client_supports_av1 || !host_supports_ext_codec_flags)
+                    {
+                        continue;
+                    }
                     user_pinned_codec = Some(codec);
                     if let Some(payload) =
                         display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetCodec {
@@ -3818,7 +3838,8 @@ fn run_session_thread(
                                 active_backend_suffix,
                                 is_hardware_decoder: &mut is_hardware_decoder,
                                 client_supports_hevc: &mut client_supports_hevc,
-                                active_codec: &mut active_codec,
+                                client_supports_av1: &mut client_supports_av1,
+                                client_decode_caps: &mut client_decode_caps,
                                 user_pinned_codec,
                                 prefer_hardware: cfg.prefer_hardware,
                                 hud_width,
@@ -4033,7 +4054,16 @@ fn run_session_thread(
                     } else if channel == TOOL_CHANNEL_DISPLAY_CTRL {
                         if let Some(msg) = display_ctrl::decode_display_ctrl(&payload) {
                             let mut suppress_update_emit = false;
+                            let mut caps_ext_meta: Option<(bool, u64)> = None;
                             match &msg {
+                                DisplayControlMsg::Capabilities {
+                                    supports_ext_codec_flags,
+                                    codec_generation,
+                                    ..
+                                } => {
+                                    caps_ext_meta =
+                                        Some((*supports_ext_codec_flags, *codec_generation));
+                                }
                                 DisplayControlMsg::UpdateChunkAck { next_offset } => {
                                     update_relay.on_chunk_ack(*next_offset);
                                 }
@@ -4133,6 +4163,50 @@ fn run_session_thread(
                                             StreamCodec::parse_lossy(c) == Some(StreamCodec::Hevc)
                                         }) || reported_codec
                                             == Some(StreamCodec::Hevc);
+                                        if let Some((ext_flags, codec_gen)) = caps_ext_meta {
+                                            host_supports_ext_codec_flags = ext_flags;
+                                            if codec_gen > 0 {
+                                                host_codec_generation = codec_gen;
+                                            }
+                                            if let Some(reemit) =
+                                                reconcile_decode_failure_on_capabilities(
+                                                    &mut pending_unrecovered_decode_failure,
+                                                    active_codec.into(),
+                                                    host_codec_generation,
+                                                )
+                                            {
+                                                if let Some(payload) =
+                                                    display_ctrl::encode_display_ctrl(&reemit)
+                                                {
+                                                    pending_display_tx.push_front(payload);
+                                                    tools_busy = true;
+                                                }
+                                            }
+                                            // 兼容老版被控端（不支持 ClientMediaCaps / supports_ext_codec_flags == false）：
+                                            // 若双端支持 HEVC 且当前仍为 H.264，则按旧协议发送 SetCodec("hevc")。
+                                            if !ext_flags
+                                                && !client.is_media_paused()
+                                                && client_supports_hevc
+                                                && host_supports_hevc
+                                                && active_codec == StreamCodec::H264
+                                                && user_pinned_codec != Some(StreamCodec::H264)
+                                                && !legacy_hevc_requested
+                                            {
+                                                legacy_hevc_requested = true;
+                                                if let Some(payload) =
+                                                    display_ctrl::encode_display_ctrl(
+                                                        &DisplayControlMsg::SetCodec {
+                                                            codec: StreamCodec::Hevc
+                                                                .as_str()
+                                                                .to_string(),
+                                                        },
+                                                    )
+                                                {
+                                                    pending_display_tx.push_back(payload);
+                                                    active_codec = StreamCodec::Hevc;
+                                                }
+                                            }
+                                        }
                                     }
                                     update_tx.push(upd);
                                 }
@@ -4140,6 +4214,39 @@ fn run_session_thread(
                         }
                     } else {
                         non_file_incoming.push((channel, payload));
+                    }
+                }
+
+                // 在 `drain_tool_messages()` 更新 `host_codec_generation` 之后再消费控制端管线热切/解码失败事件，
+                // 避免同拍抵达的 UDP 新 codec 帧与 Stream A `Capabilities` 出现代次倒置，并记录未恢复失败态以便晚到 Capabilities 补发。
+                let mut decode_failure_busy = false;
+                while let Some(failure) = client.take_decode_failure() {
+                    let ui_err = rc_types::Error::Decoder(format!(
+                        "codec {} decode failed (gen={}): {}",
+                        failure.codec.as_str(),
+                        host_codec_generation,
+                        failure.reason
+                    ))
+                    .to_ui_error(crate::ui_error::current_platform());
+                    eprintln!(
+                        "rc-ui: [{}] {} (codec={}, gen={}, detail={})",
+                        ui_err.code,
+                        ui_err.title,
+                        failure.codec.as_str(),
+                        host_codec_generation,
+                        failure.reason
+                    );
+                    pending_unrecovered_decode_failure =
+                        Some((failure.codec, host_codec_generation, failure.reason.clone()));
+                    if let Some(payload) =
+                        display_ctrl::encode_display_ctrl(&DisplayControlMsg::CodecDecodeFailed {
+                            codec: failure.codec.as_str().to_string(),
+                            generation: host_codec_generation,
+                            reason: failure.reason,
+                        })
+                    {
+                        pending_display_tx.push_front(payload);
+                        decode_failure_busy = true;
                     }
                 }
 
@@ -4329,7 +4436,7 @@ fn run_session_thread(
                     terminal_events.push_drop_oldest(ev);
                 }
 
-                last_busy = tick_report.busy || tools_busy || audio_busy;
+                last_busy = tick_report.busy || tools_busy || audio_busy || decode_failure_busy;
 
                 // 3) 首帧诊断与 1s 节流推送 HUD 快照。
                 let displayed_now = client.pipeline().displayed();
@@ -4446,10 +4553,25 @@ fn run_session_thread(
                                 .unwrap_or_else(|e| e.into_inner())
                                 .clone();
                             is_hardware_decoder = is_hw_decoder_slot.load(Ordering::Acquire);
+                            client_decode_caps = codec_selector::cached_or_platform_decode_caps(
+                                cfg.prefer_hardware && is_hardware_decoder,
+                            );
                             client_supports_hevc = cfg.prefer_hardware
                                 && is_hardware_decoder
-                                && rc_pipeline::platform_supports_hevc();
+                                && (rc_pipeline::platform_supports_hevc()
+                                    || client_decode_caps
+                                        .iter()
+                                        .any(|c| c.codec == rc_encode::Codec::Hevc && c.hardware));
+                            client_supports_av1 = cfg.prefer_hardware
+                                && is_hardware_decoder
+                                && client_decode_caps
+                                    .iter()
+                                    .any(|c| c.codec == rc_encode::Codec::Av1 && c.hardware);
                             active_codec = StreamCodec::H264;
+                            host_supports_ext_codec_flags = false;
+                            host_codec_generation = 1;
+                            pending_unrecovered_decode_failure = None;
+                            legacy_hevc_requested = false;
                             if let Some((w, h)) = last_stage_rect {
                                 if let Some(rend) = renderer_handle
                                     .lock()
@@ -4494,7 +4616,8 @@ fn run_session_thread(
                                     active_backend_suffix,
                                     is_hardware_decoder: &mut is_hardware_decoder,
                                     client_supports_hevc: &mut client_supports_hevc,
-                                    active_codec: &mut active_codec,
+                                    client_supports_av1: &mut client_supports_av1,
+                                    client_decode_caps: &mut client_decode_caps,
                                     user_pinned_codec,
                                     prefer_hardware: cfg.prefer_hardware,
                                     hud_width,
@@ -4561,16 +4684,18 @@ fn run_session_thread(
                         if matches!(outcome, ReconnectOutcome::Rebuilt)
                             && !upgraded_after_reconnect
                             && !client.is_media_paused()
-                            && client_supports_hevc
-                            && user_pinned_codec != Some(StreamCodec::H264)
                         {
+                            let pref = user_pinned_codec
+                                .map(|c| CodecSelectionPref::Manual(c.into()))
+                                .unwrap_or(CodecSelectionPref::Auto);
                             if let Some(payload) =
-                                display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetCodec {
-                                    codec: StreamCodec::Hevc.as_str().to_string(),
-                                })
+                                display_ctrl::encode_display_ctrl(&build_client_media_caps_msg(
+                                    &client_decode_caps,
+                                    cfg.prefer_hardware && is_hardware_decoder,
+                                    pref,
+                                ))
                             {
                                 pending_display_tx.push_back(payload);
-                                active_codec = StreamCodec::Hevc;
                             }
                         }
                     }
@@ -4630,7 +4755,8 @@ struct DesktopUpgradeCtx<'a> {
     active_backend_suffix: Option<&'static str>,
     is_hardware_decoder: &'a mut bool,
     client_supports_hevc: &'a mut bool,
-    active_codec: &'a mut StreamCodec,
+    client_supports_av1: &'a mut bool,
+    client_decode_caps: &'a mut Vec<rc_pipeline::CodecCapability>,
     user_pinned_codec: Option<StreamCodec>,
     prefer_hardware: bool,
     hud_width: u32,
@@ -4721,19 +4847,32 @@ where
         *ctx.decode_error_logged = false;
         ctx.real_pipeline_built.store(true, Ordering::Release);
         ctx.want_real_pipeline.store(true, Ordering::Release);
+        *ctx.client_decode_caps = codec_selector::cached_or_platform_decode_caps(
+            ctx.prefer_hardware && *ctx.is_hardware_decoder,
+        );
         *ctx.client_supports_hevc = ctx.prefer_hardware
             && *ctx.is_hardware_decoder
-            && rc_pipeline::platform_supports_hevc();
-        if *ctx.client_supports_hevc
-            && *ctx.active_codec != StreamCodec::Hevc
-            && ctx.user_pinned_codec != Some(StreamCodec::H264)
-        {
-            if let Some(payload) = display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetCodec {
-                codec: StreamCodec::Hevc.as_str().to_string(),
-            }) {
-                ctx.pending_display_tx.push_back(payload);
-                *ctx.active_codec = StreamCodec::Hevc;
-            }
+            && (rc_pipeline::platform_supports_hevc()
+                || ctx
+                    .client_decode_caps
+                    .iter()
+                    .any(|c| c.codec == rc_encode::Codec::Hevc && c.hardware));
+        *ctx.client_supports_av1 = ctx.prefer_hardware
+            && *ctx.is_hardware_decoder
+            && ctx
+                .client_decode_caps
+                .iter()
+                .any(|c| c.codec == rc_encode::Codec::Av1 && c.hardware);
+        let pref = ctx
+            .user_pinned_codec
+            .map(|c| CodecSelectionPref::Manual(c.into()))
+            .unwrap_or(CodecSelectionPref::Auto);
+        if let Some(payload) = display_ctrl::encode_display_ctrl(&build_client_media_caps_msg(
+            ctx.client_decode_caps,
+            ctx.prefer_hardware && *ctx.is_hardware_decoder,
+            pref,
+        )) {
+            ctx.pending_display_tx.push_back(payload);
         }
     }
     *ctx.stream_started_at = Instant::now();
@@ -4842,9 +4981,37 @@ fn fake_controller_stack(
     let wrapper = SharedRenderer {
         inner: Arc::clone(&shared),
     };
+    let mut fake_cfg = pcfg.clone();
+    // 明确关闭假后端管线内部的 prefer_hardware，避免热切不同 codec 时误调硬件工厂报错锁死。
+    fake_cfg.prefer_hardware = false;
     let pipeline =
-        ControllerPipeline::with_backends(pcfg.clone(), Box::new(decoder), Box::new(wrapper))?;
+        ControllerPipeline::with_backends(fake_cfg, Box::new(decoder), Box::new(wrapper))?;
     Ok((pipeline, shared))
+}
+
+/// 当晚到的 `Capabilities` 抵达时校准未恢复的解码失败记录：
+/// - 若被控端已切至其他编解码器（`reported_codec != failed_codec`），清除未恢复标记；
+/// - 若被控端仍处于 `failed_codec` 且携带更新的 `codec_generation > reported_gen`，
+///   补发一次带最新代次的 `CodecDecodeFailed` 防止跨通道竞态黑屏。
+fn reconcile_decode_failure_on_capabilities(
+    pending: &mut Option<(rc_encode::Codec, u64, String)>,
+    reported_codec: rc_encode::Codec,
+    reported_generation: u64,
+) -> Option<DisplayControlMsg> {
+    let (failed_codec, reported_gen, reason) = pending.as_mut()?;
+    if reported_codec != *failed_codec {
+        *pending = None;
+        return None;
+    }
+    if reported_generation > *reported_gen {
+        *reported_gen = reported_generation;
+        return Some(DisplayControlMsg::CodecDecodeFailed {
+            codec: failed_codec.as_str().to_string(),
+            generation: reported_generation,
+            reason: reason.clone(),
+        });
+    }
+    None
 }
 
 /// 统计控制端 trace 环形缓冲中 `Outcome::DecodeError` 的帧数。
@@ -4932,6 +5099,22 @@ fn compute_recent_e2e_p50_ms(client: &ClientSession) -> Option<f64> {
     Some(samples_ms[samples_ms.len() / 2])
 }
 
+/// 构造控制端入流后上报给被控端的 `ClientMediaCaps` 协商消息（只读非阻塞缓存，不阻塞首帧）。
+fn build_client_media_caps_msg(
+    decode_caps: &[rc_pipeline::CodecCapability],
+    prefer_hardware: bool,
+    pref: CodecSelectionPref,
+) -> DisplayControlMsg {
+    DisplayControlMsg::ClientMediaCaps {
+        decode_caps: decode_caps.to_vec(),
+        refinement_caps: Some(codec_selector::cached_or_platform_refinement_caps(
+            prefer_hardware,
+        )),
+        pref,
+        supports_ext_codec_flags: true,
+    }
+}
+
 /// 解析控制端收到的 [`DisplayControlMsg`]，同步更新 HUD 尺寸并产出对应的 [`SessionUpdate`]。
 fn handle_display_ctrl_msg(
     msg: DisplayControlMsg,
@@ -4952,6 +5135,11 @@ fn handle_display_ctrl_msg(
             presets,
             current_codec,
             supported_codecs,
+            encode_caps: _,
+            decode_caps: _,
+            refinement_caps: _,
+            supports_ext_codec_flags: _,
+            codec_generation: _,
         } => {
             if current_width > 0 && current_height > 0 {
                 *hud_width = current_width;
@@ -5103,6 +5291,8 @@ fn handle_display_ctrl_msg(
         DisplayControlMsg::SetStream { .. }
         | DisplayControlMsg::LockScreen
         | DisplayControlMsg::SetCodec { .. }
+        | DisplayControlMsg::ClientMediaCaps { .. }
+        | DisplayControlMsg::CodecDecodeFailed { .. }
         | DisplayControlMsg::SetPrivacyMode { .. }
         | DisplayControlMsg::SetHostMute { .. }
         | DisplayControlMsg::SetMouseMode { .. }
@@ -5828,6 +6018,11 @@ mod tests {
                 presets: custom_presets.clone(),
                 current_codec: Some("h264".to_string()),
                 supported_codecs: vec!["hevc".to_string(), "h264".to_string()],
+                encode_caps: Vec::new(),
+                decode_caps: Vec::new(),
+                refinement_caps: None,
+                supports_ext_codec_flags: false,
+                codec_generation: 0,
             },
             &mut hud_w,
             &mut hud_h,
@@ -5867,6 +6062,11 @@ mod tests {
                 presets: Vec::new(),
                 current_codec: None,
                 supported_codecs: Vec::new(),
+                encode_caps: Vec::new(),
+                decode_caps: Vec::new(),
+                refinement_caps: None,
+                supports_ext_codec_flags: false,
+                codec_generation: 0,
             },
             &mut hud_w,
             &mut hud_h,
@@ -6839,7 +7039,8 @@ mod tests {
         let layer_lease = Mutex::new(None);
         let mut is_hardware_decoder = false;
         let mut client_supports_hevc = false;
-        let mut active_codec = StreamCodec::H264;
+        let mut client_supports_av1 = false;
+        let mut client_decode_caps = Vec::new();
         let mut stream_started_at = Instant::now();
         let mut first_frame_logged = false;
         let mut decode_error_logged = false;
@@ -6859,7 +7060,8 @@ mod tests {
                 active_backend_suffix: None,
                 is_hardware_decoder: &mut is_hardware_decoder,
                 client_supports_hevc: &mut client_supports_hevc,
-                active_codec: &mut active_codec,
+                client_supports_av1: &mut client_supports_av1,
+                client_decode_caps: &mut client_decode_caps,
                 user_pinned_codec: None,
                 prefer_hardware: false,
                 hud_width: params.width,
@@ -6911,7 +7113,8 @@ mod tests {
                 active_backend_suffix: None,
                 is_hardware_decoder: &mut is_hardware_decoder,
                 client_supports_hevc: &mut client_supports_hevc,
-                active_codec: &mut active_codec,
+                client_supports_av1: &mut client_supports_av1,
+                client_decode_caps: &mut client_decode_caps,
                 user_pinned_codec: None,
                 prefer_hardware: false,
                 hud_width: params.width,
@@ -6955,7 +7158,8 @@ mod tests {
         let layer_lease = Mutex::new(None);
         let mut is_hardware_decoder = false;
         let mut client_supports_hevc = false;
-        let mut active_codec = StreamCodec::H264;
+        let mut client_supports_av1 = false;
+        let mut client_decode_caps = Vec::new();
         let mut stream_started_at = Instant::now();
         let mut first_frame_logged = false;
         let mut decode_error_logged = false;
@@ -6977,7 +7181,8 @@ mod tests {
                 active_backend_suffix: None,
                 is_hardware_decoder: &mut is_hardware_decoder,
                 client_supports_hevc: &mut client_supports_hevc,
-                active_codec: &mut active_codec,
+                client_supports_av1: &mut client_supports_av1,
+                client_decode_caps: &mut client_decode_caps,
                 user_pinned_codec: None,
                 prefer_hardware: false,
                 hud_width: params.width,
@@ -8380,5 +8585,68 @@ mod tests {
         session.join();
         host.stop();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn client_media_caps_builder_and_av1_command_roundtrip() {
+        let caps = rc_pipeline::default_codec_capabilities(true);
+        let msg = build_client_media_caps_msg(&caps, true, CodecSelectionPref::OfficeClear);
+        match msg {
+            DisplayControlMsg::ClientMediaCaps {
+                decode_caps,
+                pref,
+                supports_ext_codec_flags,
+                ..
+            } => {
+                assert_eq!(decode_caps, caps);
+                assert_eq!(pref, CodecSelectionPref::OfficeClear);
+                assert!(supports_ext_codec_flags);
+            }
+            other => panic!("expected ClientMediaCaps, got {other:?}"),
+        }
+
+        let cmd = SessionCommand::SetCodec {
+            codec: StreamCodec::Av1,
+        };
+        let copy_cmd = cmd;
+        let json = serde_json::to_string(&copy_cmd).expect("serialize SetCodec(Av1)");
+        let parsed: SessionCommand = serde_json::from_str(&json).expect("deserialize SetCodec");
+        assert_eq!(parsed, cmd);
+
+        // 晚到 Capabilities 补发 CodecDecodeFailed 及降级恢复后清除
+        let mut pending = Some((
+            rc_encode::Codec::Av1,
+            1u64,
+            "vt av1 unsupported".to_string(),
+        ));
+        // 同代不重复补发
+        assert!(
+            reconcile_decode_failure_on_capabilities(&mut pending, rc_encode::Codec::Av1, 1)
+                .is_none()
+        );
+        // 晚到的新代次 Capabilities 仍在 AV1 -> 补发带新 gen=2 的 CodecDecodeFailed
+        assert_eq!(
+            reconcile_decode_failure_on_capabilities(&mut pending, rc_encode::Codec::Av1, 2),
+            Some(DisplayControlMsg::CodecDecodeFailed {
+                codec: "av1".to_string(),
+                generation: 2,
+                reason: "vt av1 unsupported".to_string(),
+            })
+        );
+        // 被控端切至 HEVC 后清除未恢复状态
+        assert!(
+            reconcile_decode_failure_on_capabilities(&mut pending, rc_encode::Codec::Hevc, 3)
+                .is_none()
+        );
+        assert!(pending.is_none());
+
+        // fake_controller_stack 必须关闭内部 prefer_hardware 防止误调硬件热切
+        let pcfg = PipelineConfig {
+            resolution: Resolution::new(64, 64),
+            prefer_hardware: true,
+            ..PipelineConfig::default()
+        };
+        let (fake_pipe, _) = fake_controller_stack(&pcfg).expect("fake stack");
+        assert!(!fake_pipe.config().prefer_hardware);
     }
 }

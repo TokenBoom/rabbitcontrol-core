@@ -39,6 +39,7 @@
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
+pub use rc_encode::Codec;
 use rc_types::{Error, FrameKind, FrameSeq, Result, Timestamp};
 
 /// 包头魔数。字节表示为 ASCII `RCV1`。
@@ -65,8 +66,13 @@ impl HeaderFlags {
     pub const HAS_DIRTY: u8 = 0b0000_0100;
     /// bit3: 本包是 FEC 冗余包（不是数据包）
     pub const PARITY: u8 = 0b0000_1000;
-    /// bit4: 该帧码流采用 HEVC（H.265）编码（未置位时默认 H.264）。
+    /// bit4: 编解码标识低位（与 [`Self::CODEC_EXT`] 组合为 2-bit 编解码编码：`00`=H.264、`01`=HEVC、`10`=AV1、`11`=预留）。
     pub const HEVC: u8 = 0b0001_0000;
+    /// bit5: 编解码标识扩展高位（`1 << 5`）。
+    ///
+    /// **互操作约束**：仅当控制面已确认对端支持扩展编解码标志位（`supports_ext_codec_flags == true`）时，
+    /// 发送端才允许置位 `bit5`（如 `Codec::Av1`），避免旧接收端忽略 `bit5` 造成误解码。
+    pub const CODEC_EXT: u8 = 1 << 5;
 
     /// 空标志。
     pub const fn empty() -> Self {
@@ -103,9 +109,36 @@ impl HeaderFlags {
         self.has(Self::PARITY)
     }
 
-    /// 是否采用 HEVC（H.265）编码。
+    /// 解析 2-bit 编解码标识（`bit5:bit4`）：
+    /// - `00` => `Some(Codec::H264)`
+    /// - `01` => `Some(Codec::Hevc)`
+    /// - `10` => `Some(Codec::Av1)`
+    /// - `11` => `None`（预留未知编码，接收端不得误当 HEVC/H.264）
+    pub const fn codec(&self) -> Option<Codec> {
+        match (self.has(Self::CODEC_EXT), self.has(Self::HEVC)) {
+            (false, false) => Some(Codec::H264),
+            (false, true) => Some(Codec::Hevc),
+            (true, false) => Some(Codec::Av1),
+            (true, true) => None,
+        }
+    }
+
+    /// 返回写入指定编解码器 2-bit 标志（`bit5:bit4`）后的新 [`HeaderFlags`]（保留其余标志位）。
+    ///
+    /// **互操作约束**：仅在控制面确认对端支持扩展 codec 位时才允许传入 `Codec::Av1`（会置位 `bit5`）。
+    pub const fn with_codec(self, codec: Codec) -> Self {
+        let cleared = self.0 & !(Self::HEVC | Self::CODEC_EXT);
+        let bits = match codec {
+            Codec::H264 => 0,
+            Codec::Hevc => Self::HEVC,
+            Codec::Av1 => Self::CODEC_EXT,
+        };
+        HeaderFlags(cleared | bits)
+    }
+
+    /// 是否采用 HEVC（H.265）编码（仅当 `bit5 == 0 && bit4 == 1` 时为 `true`，兼容旧调用方且不将预留 `11` 误判为 HEVC）。
     pub const fn is_hevc(self) -> bool {
-        self.has(Self::HEVC)
+        !self.has(Self::CODEC_EXT) && self.has(Self::HEVC)
     }
 
     /// 由 `FrameKind` 构造。
@@ -656,6 +689,57 @@ mod tests {
         let (hdr, body) = MediaHeader::parse_datagram(&dgrams[0]).unwrap();
         assert!(hdr.is_idr());
         assert!(hdr.flags.is_hevc());
+        assert_eq!(hdr.flags.codec(), Some(Codec::Hevc));
         assert_eq!(body, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn header_flags_codec_2bit_all_four_states_and_compat() {
+        // 00 => H264
+        let f_h264 = HeaderFlags::empty().with_codec(Codec::H264);
+        assert_eq!(f_h264.0, 0);
+        assert_eq!(f_h264.codec(), Some(Codec::H264));
+        assert!(!f_h264.is_hevc());
+
+        // 01 => HEVC
+        let f_hevc = HeaderFlags(HeaderFlags::IDR | HeaderFlags::LAST).with_codec(Codec::Hevc);
+        assert!(f_hevc.is_idr());
+        assert!(f_hevc.is_last());
+        assert!(f_hevc.has(HeaderFlags::HEVC));
+        assert!(!f_hevc.has(HeaderFlags::CODEC_EXT));
+        assert_eq!(f_hevc.codec(), Some(Codec::Hevc));
+        assert!(f_hevc.is_hevc());
+
+        // 10 => AV1（经 with_codec 覆写会清掉旧 HEVC bit4 并保留其他位）
+        let f_av1 = f_hevc.with_codec(Codec::Av1);
+        assert!(f_av1.is_idr());
+        assert!(f_av1.is_last());
+        assert!(!f_av1.has(HeaderFlags::HEVC));
+        assert!(f_av1.has(HeaderFlags::CODEC_EXT));
+        assert_eq!(f_av1.codec(), Some(Codec::Av1));
+        assert!(!f_av1.is_hevc());
+
+        // 11 => 预留未知，codec() 返回 None 且 is_hevc() 必须为 false（不误当 HEVC）
+        let f_reserved = HeaderFlags(HeaderFlags::HEVC | HeaderFlags::CODEC_EXT | HeaderFlags::IDR);
+        assert!(f_reserved.is_idr());
+        assert_eq!(f_reserved.codec(), None);
+        assert!(!f_reserved.is_hevc());
+
+        // 确认 32B 包头往返保持 AV1 flags 零改动
+        let dgrams = split_frame_with_flags(
+            FrameSeq(99),
+            FrameKind::Idr,
+            HeaderFlags::empty().with_codec(Codec::Av1),
+            Timestamp(123),
+            Timestamp(456),
+            1,
+            &[0x12, 0x00, 0x0a, 0x0a],
+            1200,
+        );
+        assert_eq!(dgrams[0].len(), HEADER_LEN + 4);
+        let (hdr, body) = MediaHeader::parse_datagram(&dgrams[0]).unwrap();
+        assert_eq!(hdr.flags.codec(), Some(Codec::Av1));
+        assert!(!hdr.flags.is_hevc());
+        assert_eq!(body, &[0x12, 0x00, 0x0a, 0x0a]);
     }
 }

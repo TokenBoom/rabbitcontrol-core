@@ -16,3 +16,4 @@ rc-diff = { path = "../rc-diff" }
 rc-sched = { path = "../rc-sched" }
 rc-proto = { path = "../rc-proto" }
 rc-trace = { path = "../rc-trace" }
+serde = { version = "1", features = ["derive"] }

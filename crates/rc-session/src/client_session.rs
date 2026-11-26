@@ -2471,6 +2471,11 @@ impl ClientSession {
             .expect("pipeline exists after handshake (state == Streaming)")
     }
 
+    /// 取出控制端管线最近一次待上报的编解码热切/解码失败事件（供上层发送 `CodecDecodeFailed` 触发被控端熔断降级）。
+    pub fn take_decode_failure(&mut self) -> Option<rc_pipeline::CodecDecodeFailure> {
+        self.pipeline.as_mut().and_then(|p| p.take_decode_failure())
+    }
+
     // ─────────────────────────────────────────────────────────────
     // 私有实现
     // ─────────────────────────────────────────────────────────────

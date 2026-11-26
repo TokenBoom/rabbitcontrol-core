@@ -22,7 +22,7 @@
 pub mod controller;
 pub mod host;
 
-pub use controller::ControllerPipeline;
+pub use controller::{CodecDecodeFailure, ControllerPipeline};
 pub use host::HostPipeline;
 
 use rc_capture::{CaptureBackend, FakeBackend, FakeBackendConfig, FakeContent};
@@ -133,6 +133,108 @@ impl Default for PipelineConfig {
     }
 }
 
+/// 色度子采样格式（用于编解码与静帧细化能力声明）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromaSubsampling {
+    /// 4:2:0 色度子采样（主流低延迟硬件管线默认格式）。
+    Yuv420,
+    /// 4:2:2 色度子采样。
+    Yuv422,
+    /// 4:4:4 全色度子采样（无损/文字锐利模式）。
+    Yuv444,
+}
+
+/// 编解码后端的实时延迟档位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LatencyTier {
+    /// 超低延迟硬件管线（如 NVENC / VideoToolbox 实时 H.264/HEVC 路径）。
+    UltraLow,
+    /// 低延迟硬件管线（如具备硬件加速但略高于超低延迟档的 AV1 路径）。
+    Low,
+    /// 常规延迟（通常用于软件编解码回退或非超低延迟管线）。
+    Normal,
+}
+
+/// 单项编解码器能力描述符（编码端与解码端可非对称独立声明）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct CodecCapability {
+    /// 编解码器类型（`h264` / `hevc` / `av1`）。
+    pub codec: rc_encode::Codec,
+    /// 是否为硬件加速路径（`false` 表示软件回退）。
+    pub hardware: bool,
+    /// 支持的最大单帧宽度（像素）。
+    pub max_width: u32,
+    /// 支持的最大单帧高度（像素）。
+    pub max_height: u32,
+    /// 低延迟满帧推荐最大像素吞吐率（px/s，即 `width * height * fps`）。
+    pub max_pixel_rate: u64,
+    /// 是否支持屏幕内容编码工具（如 AV1 Screen Content Tools / Palette / IBC）。
+    #[serde(default)]
+    pub screen_content_tools: bool,
+    /// 支持的色度子采样格式。
+    pub chroma: ChromaSubsampling,
+    /// 实时延迟档位。
+    pub latency_tier: LatencyTier,
+}
+
+/// 静帧无损/近无损文字锐化细化能力描述符（预留静帧细化协议握手）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+pub struct RefinementCapability {
+    /// 是否支持静帧细化通道。
+    #[serde(default)]
+    pub supported: bool,
+    /// 采集端是否支持真 RGB 采集（无 YUV420 前置损耗）。
+    #[serde(default)]
+    pub true_rgb_capture: bool,
+    /// 支持的静帧细化编码格式标识列表（如 `["webp_lossless", "qoi", "png"]`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<String>,
+}
+
+/// 基于既有 `supports_hevc` 布尔能力推导默认硬件编解码能力清单（零破坏兼容未覆写的新增 trait 方法）。
+pub fn default_codec_capabilities(supports_hevc: bool) -> Vec<CodecCapability> {
+    let mut caps = Vec::with_capacity(2);
+    if supports_hevc {
+        caps.push(CodecCapability {
+            codec: rc_encode::Codec::Hevc,
+            hardware: true,
+            max_width: 5120,
+            max_height: 2880,
+            max_pixel_rate: 600_000_000,
+            screen_content_tools: false,
+            chroma: ChromaSubsampling::Yuv420,
+            latency_tier: LatencyTier::UltraLow,
+        });
+    }
+    caps.push(CodecCapability {
+        codec: rc_encode::Codec::H264,
+        hardware: true,
+        max_width: 4096,
+        max_height: 2304,
+        max_pixel_rate: 280_000_000,
+        screen_content_tools: false,
+        chroma: ChromaSubsampling::Yuv420,
+        latency_tier: LatencyTier::UltraLow,
+    });
+    caps
+}
+
+/// 未注册平台硬件提供者时的软件兜底能力清单（仅 H.264 软件路径）。
+pub fn default_software_codec_capabilities() -> Vec<CodecCapability> {
+    vec![CodecCapability {
+        codec: rc_encode::Codec::H264,
+        hardware: false,
+        max_width: 4096,
+        max_height: 2304,
+        max_pixel_rate: 280_000_000,
+        screen_content_tools: false,
+        chroma: ChromaSubsampling::Yuv420,
+        latency_tier: LatencyTier::Normal,
+    }]
+}
+
 /// 平台硬件媒体提供者（由平台实现 crate 在进程启动时通过 [`register_platform_provider`] 注册）。
 ///
 /// 核心管线（`rc-pipeline`）保持 100% 平台无关；各系统适配器通过实现本 trait
@@ -146,6 +248,21 @@ pub trait PlatformMediaProvider: Send + Sync {
     /// 当前平台硬件编解码后端是否支持 HEVC（H.265）低延迟路径。
     fn supports_hevc(&self) -> bool {
         false
+    }
+
+    /// 查询当前平台编码端编解码器能力清单（默认基于 [`Self::supports_hevc`] 推导，零破坏既有实现）。
+    fn encode_capabilities(&self) -> Vec<CodecCapability> {
+        default_codec_capabilities(self.supports_hevc())
+    }
+
+    /// 查询当前平台解码端编解码器能力清单（默认基于 [`Self::supports_hevc`] 推导，零破坏既有实现）。
+    fn decode_capabilities(&self) -> Vec<CodecCapability> {
+        default_codec_capabilities(self.supports_hevc())
+    }
+
+    /// 查询当前平台静帧无损/文字细化能力（默认不支持）。
+    fn refinement_capability(&self) -> RefinementCapability {
+        RefinementCapability::default()
     }
 
     /// 提升当前工作线程（采集 / 编码）至平台低延迟实时 QoS。
@@ -342,6 +459,22 @@ pub fn select_decoder_labeled(cfg: &PipelineConfig) -> Result<(Box<dyn Decoder>,
     Ok((Box::new(fake), "fake"))
 }
 
+/// 严格按配置向已注册平台硬件提供者构造解码器（失败直接返回 `Err`，绝不静默回退假解码器）。
+///
+/// 专用于运行期编解码器热切路径（[`ControllerPipeline`]），确保硬件解码器创建失败时
+/// 立即触发 `CodecDecodeFailure` 向上游熔断降级，而非悄悄回落到假解码器产出黑屏。
+pub fn select_hardware_decoder_labeled(
+    cfg: &PipelineConfig,
+) -> Result<(Box<dyn Decoder>, &'static str)> {
+    let provider = PLATFORM_MEDIA_PROVIDER.get().ok_or_else(|| {
+        Error::Decoder(format!(
+            "no hardware decoder provider registered for codec {}",
+            cfg.codec.as_str()
+        ))
+    })?;
+    provider.create_decoder(cfg)
+}
+
 /// 按 P8 选择呈现后端。T08 契约只列了三个工厂；呈现是控制端管线的
 /// 第四个必需部件，本函数是同一规则的延伸。
 pub fn select_renderer(cfg: &PipelineConfig) -> Result<Box<dyn Renderer>> {
@@ -405,14 +538,39 @@ pub fn platform_supports_hevc() -> bool {
         .is_some_and(|provider| provider.supports_hevc())
 }
 
+/// 查询已注册平台后端的编码能力清单；未注册硬件提供者时返回软件兜底能力。
+pub fn platform_encode_capabilities() -> Vec<CodecCapability> {
+    PLATFORM_MEDIA_PROVIDER
+        .get()
+        .map(|provider| provider.encode_capabilities())
+        .unwrap_or_else(default_software_codec_capabilities)
+}
+
+/// 查询已注册平台后端的解码能力清单；未注册硬件提供者时返回软件兜底能力。
+pub fn platform_decode_capabilities() -> Vec<CodecCapability> {
+    PLATFORM_MEDIA_PROVIDER
+        .get()
+        .map(|provider| provider.decode_capabilities())
+        .unwrap_or_else(default_software_codec_capabilities)
+}
+
+/// 查询已注册平台后端的静帧细化能力；未注册硬件提供者时返回默认不支持。
+pub fn platform_refinement_capability() -> RefinementCapability {
+    PLATFORM_MEDIA_PROVIDER
+        .get()
+        .map(|provider| provider.refinement_capability())
+        .unwrap_or_default()
+}
+
 /// 由 [`PipelineConfig`] 构造低延迟编码器标准配置（零 B 帧、按需 IDR；
-/// H.264 用 `Fastest` 压低编码尾延迟，HEVC 用 `Balanced` 兼顾更高画质密度与更低码率）。
+/// H.264 用 `Fastest` 压低编码尾延迟，HEVC/AV1 用 `Balanced` 兼顾更高画质密度与更低码率）。
 pub fn default_encoder_config(cfg: &PipelineConfig) -> EncoderConfig {
     let preset = match cfg.codec {
         // Apple Silicon 真机实测：HEVC Balanced 较 Fastest 码率低 ~8% 且 4K@120 编码反而更快；
-        // H.264 保持 Fastest（PrioritizeEncodingSpeedOverQuality=true）压低 P95/P99。
-        rc_encode::Codec::Hevc => rc_encode::Preset::Balanced,
-        _ => rc_encode::Preset::Fastest,
+        // H.264 保持 Fastest（PrioritizeEncodingSpeedOverQuality=true）压低 P95/P99；
+        // AV1 采用 Balanced 兼顾屏幕内容压缩效率与实时编码预算。
+        rc_encode::Codec::Hevc | rc_encode::Codec::Av1 => rc_encode::Preset::Balanced,
+        rc_encode::Codec::H264 => rc_encode::Preset::Fastest,
     };
     EncoderConfig {
         codec: cfg.codec,

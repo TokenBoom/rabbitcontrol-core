@@ -10,6 +10,7 @@
 pub mod app_prefs;
 pub mod auth_client;
 pub mod cert_manager;
+pub mod codec_selector;
 pub mod config_paths;
 pub mod display_ctrl;
 pub mod generated;

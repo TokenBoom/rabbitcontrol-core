@@ -14,10 +14,22 @@ use rc_render::Renderer;
 use rc_trace::{Mark, Outcome, TraceCollector};
 use rc_types::{Error, FrameKind, FrameSeq, Result, Timestamp};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// 控制端热切解码器失败或收到无法解码的编解码器时向上层上报的结构化诊断事件。
+///
+/// 上层（如 `session_bridge`）通过 [`ControllerPipeline::take_decode_failure`] 消费后，
+/// 立即向被控端发送 `DisplayControlMsg::CodecDecodeFailed` 触发熔断降级（如 `AV1 → HEVC → H.264`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodecDecodeFailure {
+    /// 失败的目标编解码器。
+    pub codec: rc_encode::Codec,
+    /// 人类可读的失败原因（来自硬件解码器构造错误或协议校验）。
+    pub reason: String,
+}
 
 /// 重组中的帧。
 struct Partial {
@@ -29,10 +41,14 @@ struct Partial {
     #[allow(dead_code)]
     encode_done_ts: Timestamp,
     kind: FrameKind,
-    is_hevc: bool,
+    codec: rc_encode::Codec,
 }
 
 type ClockSlot = Arc<Mutex<Option<Arc<dyn Fn() -> u32 + Send + Sync>>>>;
+/// 控制端解码器热切工厂类型（输入目标 [`PipelineConfig`]，返回对应解码器实例或错误）。
+pub type DecoderSwapFactory =
+    Arc<dyn Fn(&PipelineConfig) -> Result<Box<dyn Decoder>> + Send + Sync>;
+type DecoderSwapSlot = Arc<Mutex<Option<DecoderSwapFactory>>>;
 
 struct PendingAsyncFrame {
     seq: FrameSeq,
@@ -40,7 +56,7 @@ struct PendingAsyncFrame {
     capture_ts: Timestamp,
     received_ts: Timestamp,
     kind: FrameKind,
-    is_hevc: bool,
+    codec: rc_encode::Codec,
 }
 
 enum AsyncFrameOutcome {
@@ -57,7 +73,26 @@ enum AsyncFrameOutcome {
 #[derive(Default)]
 struct AsyncSharedState {
     completed: VecDeque<AsyncFrameOutcome>,
+    decode_failures: VecDeque<CodecDecodeFailure>,
     fatal_error: Option<Error>,
+}
+
+const fn encode_failed_codec_u8(codec: Option<rc_encode::Codec>) -> u8 {
+    match codec {
+        None => 0,
+        Some(rc_encode::Codec::H264) => 1,
+        Some(rc_encode::Codec::Hevc) => 2,
+        Some(rc_encode::Codec::Av1) => 3,
+    }
+}
+
+const fn decode_failed_codec_u8(code: u8) -> Option<rc_encode::Codec> {
+    match code {
+        1 => Some(rc_encode::Codec::H264),
+        2 => Some(rc_encode::Codec::Hevc),
+        3 => Some(rc_encode::Codec::Av1),
+        _ => None,
+    }
 }
 
 enum ControllerExecMode {
@@ -65,12 +100,17 @@ enum ControllerExecMode {
         decoder: Box<dyn Decoder>,
         renderer: Box<dyn Renderer>,
         active_codec: rc_encode::Codec,
+        failed_codec: Option<rc_encode::Codec>,
     },
     Async {
         slot: Arc<(Mutex<VecDeque<PendingAsyncFrame>>, Condvar)>,
         stop: Arc<AtomicBool>,
         shared: Arc<Mutex<AsyncSharedState>>,
         need_keyframe: Arc<AtomicBool>,
+        /// 当前被抑制的失败编解码器编码（`0=None, 1=H264, 2=Hevc, 3=Av1`）。
+        /// 主线程收到任意 `codec != failed_codec` 的降级帧（含首 IDR 丢包后的 P 帧）时立即清零，
+        /// 解除对 [`ControllerPipeline::take_keyframe_request`] 的抑制，杜绝断链死锁黑屏。
+        failed_codec_code: Arc<AtomicU8>,
         displayed: Arc<AtomicU64>,
         in_flight_len: Arc<AtomicUsize>,
         worker: Option<JoinHandle<()>>,
@@ -99,6 +139,10 @@ pub struct ControllerPipeline {
     /// 逻辑时钟，真后端的时间基准也不保证与会话同轴。`None` 时退化为
     /// 调用方传入的 `now_us`（decode/present 段退化为 0，诚实可解释）。
     clock: ClockSlot,
+    /// 待上层通过 [`Self::take_decode_failure`] 消费的编解码切换失败事件队列。
+    pending_decode_failures: VecDeque<CodecDecodeFailure>,
+    /// 可选自定义解码器热切工厂（离线测试注入；生产路径默认为 `None`，走平台严格硬件解码器工厂）。
+    swap_factory: DecoderSwapSlot,
 }
 
 /// 重组表的容量上限（对应 TASK.md 铁律 1：任意并发重组帧上限 = 2，与
@@ -415,57 +459,119 @@ fn read_clock(clock: &ClockSlot, fallback_us: u32) -> Timestamp {
     Timestamp(guard.as_ref().map_or(fallback_us, |c| c()))
 }
 
+enum SwapStatus {
+    /// 目标编解码器与当前解码器一致或已完成热切，可安全送入本帧。
+    Ready,
+    /// 首次热切至目标编解码器失败：必须拒喂旧解码器并立即向上层上报失败事件。
+    FailedNow(CodecDecodeFailure),
+    /// 目标编解码器已处于失败熔断等待态：继续拒喂旧解码器（防止 `NeedKeyframe` 风暴）。
+    Blocked,
+    /// 异步排空旧解码器在途帧期间遇到致命错误（仅异步路径返回）。
+    Fatal,
+}
+
+fn create_swap_decoder(
+    cfg: &PipelineConfig,
+    target: rc_encode::Codec,
+    swap_factory: &DecoderSwapSlot,
+) -> Option<Result<Box<dyn Decoder>>> {
+    let mut next_cfg = cfg.clone();
+    next_cfg.codec = target;
+    let custom = swap_factory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(factory) = custom {
+        return Some(factory(&next_cfg));
+    }
+    if cfg.prefer_hardware {
+        return Some(crate::select_hardware_decoder_labeled(&next_cfg).map(|(d, _)| d));
+    }
+    None
+}
+
 fn maybe_swap_decoder_for_codec(
     cfg: &PipelineConfig,
     active_codec: &mut rc_encode::Codec,
+    failed_codec: &mut Option<rc_encode::Codec>,
     decoder: &mut Box<dyn Decoder>,
-    is_hevc: bool,
-) {
-    let target = if is_hevc {
-        rc_encode::Codec::Hevc
-    } else {
-        rc_encode::Codec::H264
-    };
-    if target == *active_codec || !cfg.prefer_hardware {
-        return;
+    swap_factory: &DecoderSwapSlot,
+    target: rc_encode::Codec,
+) -> SwapStatus {
+    if target == *active_codec {
+        *failed_codec = None;
+        return SwapStatus::Ready;
     }
-    let mut next_cfg = cfg.clone();
-    next_cfg.codec = target;
-    if let Ok((new_dec, _)) = crate::select_decoder_labeled(&next_cfg) {
-        let _ = decoder.flush();
-        *decoder = new_dec;
-        *active_codec = target;
+    if *failed_codec == Some(target) {
+        return SwapStatus::Blocked;
+    }
+    match create_swap_decoder(cfg, target, swap_factory) {
+        None => {
+            *active_codec = target;
+            *failed_codec = None;
+            SwapStatus::Ready
+        }
+        Some(Ok(new_dec)) => {
+            let _ = decoder.flush();
+            *decoder = new_dec;
+            *active_codec = target;
+            *failed_codec = None;
+            SwapStatus::Ready
+        }
+        Some(Err(err)) => {
+            *failed_codec = Some(target);
+            SwapStatus::FailedNow(CodecDecodeFailure {
+                codec: target,
+                reason: err.to_string(),
+            })
+        }
     }
 }
 
-/// 异步模式编解码切换：仅当确实需要切换且新解码器成功创建时才排空旧解码器在途帧，
-/// 避免 `!prefer_hardware` 或新解码器构造失败时每帧多余同步排空；返回 `true` 表示排空期间遇致命错误。
+/// 异步模式编解码切换：仅当确实需要切换且新解码器成功创建时才排空旧解码器在途帧；
+/// 创建失败时严禁把新码流喂给旧解码器，而是标记 `failed_codec` 并立即产出 [`CodecDecodeFailure`]。
 #[allow(clippy::too_many_arguments)]
 fn maybe_swap_async_decoder_for_codec(
     cfg: &PipelineConfig,
     active_codec: &mut rc_encode::Codec,
+    failed_codec: &mut Option<rc_encode::Codec>,
+    failed_codec_code_w: &AtomicU8,
     decoder: &mut Box<dyn Decoder>,
     renderer: &mut dyn Renderer,
+    swap_factory: &DecoderSwapSlot,
     in_flight: &mut VecDeque<InFlightDecodeMeta>,
     in_flight_len_w: &AtomicUsize,
     clock_w: &ClockSlot,
     shared_w: &Mutex<AsyncSharedState>,
     need_kf_w: &AtomicBool,
     disp_w: &AtomicU64,
-    is_hevc: bool,
-) -> bool {
-    let target = if is_hevc {
-        rc_encode::Codec::Hevc
-    } else {
-        rc_encode::Codec::H264
-    };
-    if target == *active_codec || !cfg.prefer_hardware {
-        return false;
+    target: rc_encode::Codec,
+) -> SwapStatus {
+    if target == *active_codec {
+        *failed_codec = None;
+        failed_codec_code_w.store(0, Ordering::Release);
+        return SwapStatus::Ready;
     }
-    let mut next_cfg = cfg.clone();
-    next_cfg.codec = target;
-    let Ok((new_dec, _)) = crate::select_decoder_labeled(&next_cfg) else {
-        return false;
+    if *failed_codec == Some(target) {
+        return SwapStatus::Blocked;
+    }
+    let new_dec = match create_swap_decoder(cfg, target, swap_factory) {
+        None => {
+            *active_codec = target;
+            *failed_codec = None;
+            failed_codec_code_w.store(0, Ordering::Release);
+            return SwapStatus::Ready;
+        }
+        Some(Ok(d)) => d,
+        Some(Err(err)) => {
+            *failed_codec = Some(target);
+            failed_codec_code_w.store(encode_failed_codec_u8(Some(target)), Ordering::Release);
+            need_kf_w.store(false, Ordering::Release);
+            return SwapStatus::FailedNow(CodecDecodeFailure {
+                codec: target,
+                reason: err.to_string(),
+            });
+        }
     };
     if !in_flight.is_empty()
         && drain_pipelined_in_flight(
@@ -481,19 +587,25 @@ fn maybe_swap_async_decoder_for_codec(
             disp_w,
         )
     {
-        return true;
+        return SwapStatus::Fatal;
     }
     let _ = decoder.flush();
     *decoder = new_dec;
     *active_codec = target;
-    false
+    *failed_codec = None;
+    failed_codec_code_w.store(0, Ordering::Release);
+    SwapStatus::Ready
 }
 
 impl ControllerPipeline {
     /// 用工厂后端创建（auto 模式）。
-    pub fn new(cfg: PipelineConfig) -> Result<Self> {
+    pub fn new(mut cfg: PipelineConfig) -> Result<Self> {
         cfg.validate()?;
         let (_capture, _encoder, decoder, renderer, labels) = select_all(&cfg)?;
+        if labels.decoder == "fake" {
+            // 降级到 FakeDecoder 后关闭内部硬件热切标志，防止热切不同 codec 时误调硬件工厂报错锁死。
+            cfg.prefer_hardware = false;
+        }
         eprintln!(
             "rc-pipeline: controller backends decoder={} renderer={}",
             labels.decoder, labels.renderer
@@ -510,6 +622,7 @@ impl ControllerPipeline {
         cfg.validate()?;
         let trace = TraceCollector::new(cfg.trace_capacity);
         let clock: ClockSlot = Arc::new(Mutex::new(None));
+        let swap_factory: DecoderSwapSlot = Arc::new(Mutex::new(None));
         let active_codec = cfg.codec;
         let mode = if cfg.async_decode {
             let slot = Arc::new((
@@ -521,6 +634,7 @@ impl ControllerPipeline {
             let stop = Arc::new(AtomicBool::new(false));
             let shared = Arc::new(Mutex::new(AsyncSharedState::default()));
             let need_keyframe = Arc::new(AtomicBool::new(false));
+            let failed_codec_code = Arc::new(AtomicU8::new(0));
             let displayed = Arc::new(AtomicU64::new(0));
             let in_flight_len = Arc::new(AtomicUsize::new(0));
 
@@ -528,11 +642,14 @@ impl ControllerPipeline {
             let stop_w = Arc::clone(&stop);
             let shared_w = Arc::clone(&shared);
             let need_kf_w = Arc::clone(&need_keyframe);
+            let failed_codec_code_w = Arc::clone(&failed_codec_code);
             let disp_w = Arc::clone(&displayed);
             let in_flight_len_w = Arc::clone(&in_flight_len);
             let clock_w = Arc::clone(&clock);
+            let swap_factory_w = Arc::clone(&swap_factory);
             let cfg_w = cfg.clone();
             let mut active_codec_w = active_codec;
+            let mut failed_codec_w: Option<rc_encode::Codec> = None;
 
             let worker = std::thread::Builder::new()
                 .name("rc-ctrl-decode".into())
@@ -610,23 +727,47 @@ impl ControllerPipeline {
                             popped_any = true;
                             did_work = true;
 
-                            if maybe_swap_async_decoder_for_codec(
+                            match maybe_swap_async_decoder_for_codec(
                                 &cfg_w,
                                 &mut active_codec_w,
+                                &mut failed_codec_w,
+                                &failed_codec_code_w,
                                 &mut decoder,
                                 renderer.as_mut(),
+                                &swap_factory_w,
                                 &mut in_flight,
                                 &in_flight_len_w,
                                 &clock_w,
                                 &shared_w,
                                 &need_kf_w,
                                 &disp_w,
-                                frame.is_hevc,
+                                frame.codec,
                             ) {
-                                finish_aborted_frame(&frame, &shared_w);
-                                in_flight_len_w.store(in_flight.len(), Ordering::Release);
-                                let _ = decoder.flush();
-                                return;
+                                SwapStatus::Ready => {}
+                                SwapStatus::FailedNow(failure) => {
+                                    {
+                                        let mut s =
+                                            shared_w.lock().unwrap_or_else(|e| e.into_inner());
+                                        if s.decode_failures.len() >= 8 {
+                                            s.decode_failures.pop_front();
+                                        }
+                                        s.decode_failures.push_back(failure);
+                                    }
+                                    finish_aborted_frame(&frame, &shared_w);
+                                    in_flight_len_w.store(in_flight.len(), Ordering::Release);
+                                    continue;
+                                }
+                                SwapStatus::Blocked => {
+                                    finish_aborted_frame(&frame, &shared_w);
+                                    in_flight_len_w.store(in_flight.len(), Ordering::Release);
+                                    continue;
+                                }
+                                SwapStatus::Fatal => {
+                                    finish_aborted_frame(&frame, &shared_w);
+                                    in_flight_len_w.store(in_flight.len(), Ordering::Release);
+                                    let _ = decoder.flush();
+                                    return;
+                                }
                             }
 
                             let now_us = read_clock(&clock_w, frame.received_ts.0).0;
@@ -818,6 +959,7 @@ impl ControllerPipeline {
                 stop,
                 shared,
                 need_keyframe,
+                failed_codec_code,
                 displayed,
                 in_flight_len,
                 worker: Some(worker),
@@ -827,6 +969,7 @@ impl ControllerPipeline {
                 decoder,
                 renderer,
                 active_codec,
+                failed_codec: None,
             }
         };
 
@@ -841,6 +984,8 @@ impl ControllerPipeline {
             async_chain_broken: false,
             displayed: 0,
             clock,
+            pending_decode_failures: VecDeque::new(),
+            swap_factory,
         })
     }
 
@@ -849,16 +994,34 @@ impl ControllerPipeline {
         *self.clock.lock().unwrap_or_else(|e| e.into_inner()) = Some(clock);
     }
 
+    /// 注入自定义解码器热切工厂（用于确定性测试或自定义解码后端注入；不触碰全局注册表）。
+    pub fn set_decoder_swap_factory(&mut self, factory: DecoderSwapFactory) {
+        *self.swap_factory.lock().unwrap_or_else(|e| e.into_inner()) = Some(factory);
+    }
+
+    /// 取出最近一次待上报的编解码切换/解码失败事件（供上层发送 `CodecDecodeFailed` 触发被控端熔断降级）。
+    pub fn take_decode_failure(&mut self) -> Option<CodecDecodeFailure> {
+        let _ = self.drain_async_completions();
+        self.pending_decode_failures.pop_front()
+    }
+
     fn drain_async_completions(&mut self) -> Result<bool> {
-        let (pending_outcomes, fatal) = match &self.mode {
+        let (pending_outcomes, pending_failures, fatal) = match &self.mode {
             ControllerExecMode::Sync { .. } => return Ok(false),
             ControllerExecMode::Async { shared, .. } => {
                 let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
                 let items: Vec<AsyncFrameOutcome> = s.completed.drain(..).collect();
+                let failures: Vec<CodecDecodeFailure> = s.decode_failures.drain(..).collect();
                 let fatal = s.fatal_error.take();
-                (items, fatal)
+                (items, failures, fatal)
             }
         };
+        for failure in pending_failures {
+            if self.pending_decode_failures.len() >= 8 {
+                self.pending_decode_failures.pop_front();
+            }
+            self.pending_decode_failures.push_back(failure);
+        }
         let mut presented_any = false;
         for item in pending_outcomes {
             match item {
@@ -897,6 +1060,15 @@ impl ControllerPipeline {
     pub fn push_datagram(&mut self, data: &[u8], now_us: u32) -> Result<bool> {
         let mut presented_now = self.drain_async_completions()?;
         let (header, payload) = MediaHeader::parse_datagram(data)?;
+        let Some(frame_codec) = header.flags.codec() else {
+            return Err(Error::Protocol {
+                offset: 26,
+                msg: format!(
+                    "unsupported reserved codec flags (flags=0x{:02x})",
+                    header.flags.0
+                ),
+            });
+        };
         let seq = header.frame_seq;
         let idx = header.packet_idx;
 
@@ -926,7 +1098,7 @@ impl ControllerPipeline {
                 } else {
                     FrameKind::P
                 },
-                is_hevc: header.flags.is_hevc(),
+                codec: frame_codec,
             });
             if idx >= partial.cnt {
                 return Err(Error::Protocol {
@@ -965,7 +1137,7 @@ impl ControllerPipeline {
         }
         let capture_ts = partial.capture_ts;
         let kind = partial.kind;
-        let is_hevc = partial.is_hevc;
+        let codec = partial.codec;
         self.highest_delivered = Some(seq);
 
         match &mut self.mode {
@@ -973,12 +1145,40 @@ impl ControllerPipeline {
                 decoder,
                 renderer,
                 active_codec,
+                failed_codec,
             } => {
                 let slot = self.trace.begin(seq);
                 slot.mark(Mark::Captured, capture_ts);
                 slot.mark(Mark::Received, Timestamp(now_us));
 
-                maybe_swap_decoder_for_codec(&self.cfg, active_codec, decoder, is_hevc);
+                match maybe_swap_decoder_for_codec(
+                    &self.cfg,
+                    active_codec,
+                    failed_codec,
+                    decoder,
+                    &self.swap_factory,
+                    codec,
+                ) {
+                    SwapStatus::Ready => {}
+                    SwapStatus::FailedNow(failure) => {
+                        if self.pending_decode_failures.len() >= 8 {
+                            self.pending_decode_failures.pop_front();
+                        }
+                        self.pending_decode_failures.push_back(failure);
+                        self.need_keyframe = false;
+                        if let Some(f) = self.trace.get_mut(seq) {
+                            f.finish(Outcome::DecodeError);
+                        }
+                        return Ok(false);
+                    }
+                    SwapStatus::Blocked | SwapStatus::Fatal => {
+                        self.need_keyframe = false;
+                        if let Some(f) = self.trace.get_mut(seq) {
+                            f.finish(Outcome::DecodeError);
+                        }
+                        return Ok(false);
+                    }
+                }
                 let budget = frame_decode_budget_us(&self.cfg, kind);
                 match decoder.decode(&payload_all, kind, Timestamp(now_us.saturating_add(budget))) {
                     Ok(DecodeOutput::NeedKeyframe) => {
@@ -1020,10 +1220,17 @@ impl ControllerPipeline {
             }
             ControllerExecMode::Async {
                 slot,
+                failed_codec_code,
                 in_flight_len,
                 ..
             } => {
                 let received_ts = Timestamp(now_us);
+                // 若此前在失败 codec（如 AV1）上抑制了关键帧请求，但此刻已收到对端降级后的其他 codec 帧
+                //（即使首张降级 IDR 丢包、只收到后续 P 帧），立即解除抑制，使断链路径可立刻索取关键帧恢复出画。
+                let cur_failed = decode_failed_codec_u8(failed_codec_code.load(Ordering::Acquire));
+                if cur_failed.is_some_and(|fc| fc != codec) {
+                    failed_codec_code.store(0, Ordering::Release);
+                }
                 if kind == FrameKind::Idr {
                     self.async_chain_broken = false;
                     // 若刚抵达的是完整 IDR，覆盖本次 evict_stale 因旧残帧而置位的关键帧请求，
@@ -1046,7 +1253,7 @@ impl ControllerPipeline {
                     capture_ts,
                     received_ts,
                     kind,
-                    is_hevc,
+                    codec,
                 };
                 let dropped_frames: Vec<(FrameSeq, Timestamp, Timestamp)> = {
                     let (lock, cv) = &**slot;
@@ -1092,15 +1299,34 @@ impl ControllerPipeline {
 
     /// 是否需要向对端请求关键帧（取走即清「请求」标志；参考链是否恢复
     /// 由解码器自己跟踪，解出 IDR 前它会让本标志再次置位）。
+    ///
+    /// 当目标编解码器热切失败等待对端降级时返回 `false`，避免在旧解码器上制造 `NeedKeyframe` 风暴。
     pub fn take_keyframe_request(&mut self) -> bool {
         let _ = self.drain_async_completions();
         match &self.mode {
-            ControllerExecMode::Sync { decoder, .. } => {
+            ControllerExecMode::Sync {
+                decoder,
+                failed_codec,
+                ..
+            } => {
+                if failed_codec.is_some() {
+                    self.need_keyframe = false;
+                    return false;
+                }
                 let kf = self.need_keyframe || decoder.needs_keyframe();
                 self.need_keyframe = false;
                 kf
             }
-            ControllerExecMode::Async { need_keyframe, .. } => {
+            ControllerExecMode::Async {
+                need_keyframe,
+                failed_codec_code,
+                ..
+            } => {
+                if failed_codec_code.load(Ordering::Acquire) != 0 {
+                    need_keyframe.store(false, Ordering::Release);
+                    self.need_keyframe = false;
+                    return false;
+                }
                 let async_kf = need_keyframe.swap(false, Ordering::AcqRel);
                 let kf = self.need_keyframe || async_kf;
                 self.need_keyframe = false;
@@ -1666,5 +1892,339 @@ mod tests {
             max_obs.load(Ordering::SeqCst) <= MAX_PIPELINED_DECODE_IN_FLIGHT,
             "在途帧数不得超过铁律 1 上限 2"
         );
+    }
+
+    struct CountingDecoder {
+        calls: Arc<AtomicUsize>,
+        inner: rc_decode::FakeDecoder,
+    }
+
+    impl CountingDecoder {
+        fn new(calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                calls,
+                inner: rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
+                    resolution: rc_types::Resolution::new(64, 64),
+                    decode_cost_us: 100,
+                    ..rc_decode::FakeDecoderConfig::default()
+                })
+                .expect("fake decoder"),
+            }
+        }
+    }
+
+    impl Decoder for CountingDecoder {
+        fn decode(
+            &mut self,
+            data: &[u8],
+            kind: FrameKind,
+            deadline_ts: Timestamp,
+        ) -> Result<DecodeOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.decode(data, kind, deadline_ts)
+        }
+
+        fn needs_keyframe(&self) -> bool {
+            self.inner.needs_keyframe()
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    fn push_frame_with_flags(
+        ctrl: &mut ControllerPipeline,
+        seq: u64,
+        kind: FrameKind,
+        flags: HeaderFlags,
+    ) -> Result<bool> {
+        let pkts = split_frame_with_flags(
+            FrameSeq(seq),
+            kind,
+            flags,
+            Timestamp((seq as u32) * 16_000),
+            Timestamp((seq as u32) * 16_000 + 100),
+            seq as u16,
+            &[0, 0, 0, 1, 0x65, seq as u8],
+            1200,
+        );
+        let mut presented = false;
+        for d in &pkts {
+            if ctrl.push_datagram(d, (seq as u32) * 16_000 + 200)? {
+                presented = true;
+            }
+        }
+        Ok(presented)
+    }
+
+    #[test]
+    fn reserved_codec_flags_11_rejected_without_feeding_decoder() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dec = CountingDecoder::new(Arc::clone(&calls));
+        let ren = FakeRenderer::new(FakeRendererConfig::default()).expect("fake renderer");
+        let cfg = PipelineConfig {
+            resolution: rc_types::Resolution::new(64, 64),
+            async_decode: false,
+            ..PipelineConfig::default()
+        };
+        let mut ctrl = ControllerPipeline::with_backends(cfg, Box::new(dec), Box::new(ren))
+            .expect("controller init");
+
+        let reserved_flags = HeaderFlags(HeaderFlags::HEVC | HeaderFlags::CODEC_EXT);
+        let err = push_frame_with_flags(&mut ctrl, 1, FrameKind::Idr, reserved_flags)
+            .expect_err("预留 11 codec 标志位必须明确报协议错误");
+        assert!(
+            matches!(err, Error::Protocol { offset: 26, .. }),
+            "应指向 flags 字节偏移 26，实际 {err:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "预留 11 绝不可喂入解码器");
+    }
+
+    #[test]
+    fn sync_codec_swap_failure_blocks_old_decoder_and_reports_failure_until_fallback() {
+        let old_calls = Arc::new(AtomicUsize::new(0));
+        let dec = CountingDecoder::new(Arc::clone(&old_calls));
+        let ren = FakeRenderer::new(FakeRendererConfig::default()).expect("fake renderer");
+        let cfg = PipelineConfig {
+            resolution: rc_types::Resolution::new(64, 64),
+            prefer_hardware: true,
+            async_decode: false,
+            codec: rc_encode::Codec::H264,
+            ..PipelineConfig::default()
+        };
+        let mut ctrl = ControllerPipeline::with_backends(cfg, Box::new(dec), Box::new(ren))
+            .expect("controller init");
+        let swap_attempts = Arc::new(AtomicUsize::new(0));
+        let swap_attempts_c = Arc::clone(&swap_attempts);
+        ctrl.set_decoder_swap_factory(Arc::new(move |next_cfg| {
+            swap_attempts_c.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Decoder(format!(
+                "codec {} unsupported on this GPU",
+                next_cfg.codec.as_str()
+            )))
+        }));
+
+        // 1) 首帧 H.264 正常上屏。
+        let ok = push_frame_with_flags(
+            &mut ctrl,
+            1,
+            FrameKind::Idr,
+            HeaderFlags::empty().with_codec(rc_encode::Codec::H264),
+        )
+        .expect("h264 frame");
+        assert!(ok);
+        assert_eq!(old_calls.load(Ordering::SeqCst), 1);
+
+        // 2) 对端切到 AV1 但本端创建 AV1 解码器失败：拒喂旧 H.264 解码器、不制造 NeedKeyframe 风暴、稳定上报 CodecDecodeFailure。
+        let av1_flags = HeaderFlags::empty().with_codec(rc_encode::Codec::Av1);
+        assert!(!push_frame_with_flags(&mut ctrl, 2, FrameKind::Idr, av1_flags).expect("av1 idr"));
+        assert!(!push_frame_with_flags(&mut ctrl, 3, FrameKind::P, av1_flags).expect("av1 p"));
+        assert_eq!(
+            old_calls.load(Ordering::SeqCst),
+            1,
+            "热切失败后绝不能把 AV1 码流喂给旧 H.264 解码器"
+        );
+        assert_eq!(
+            swap_attempts.load(Ordering::SeqCst),
+            1,
+            "同一失败 codec 不应每帧重复创建解码器"
+        );
+        assert!(
+            !ctrl.take_keyframe_request(),
+            "热切失败熔断期不得触发 NeedKeyframe 风暴"
+        );
+
+        let failure = ctrl
+            .take_decode_failure()
+            .expect("必须向上层产出 CodecDecodeFailure");
+        assert_eq!(failure.codec, rc_encode::Codec::Av1);
+        assert!(failure.reason.contains("av1"));
+        assert!(ctrl.take_decode_failure().is_none(), "单次失败不重复刷屏");
+
+        // 3) 对端降级回 H.264 后无缝恢复解码上屏。
+        assert!(push_frame_with_flags(
+            &mut ctrl,
+            4,
+            FrameKind::Idr,
+            HeaderFlags::empty().with_codec(rc_encode::Codec::H264),
+        )
+        .expect("fallback h264 idr"));
+        assert_eq!(old_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(ctrl.displayed(), 2);
+
+        ctrl.shutdown();
+        let sum = ctrl.trace().summary();
+        assert_eq!(sum.unfinished, 0);
+        assert_eq!(sum.decode_errors, 2);
+    }
+
+    #[test]
+    fn async_codec_swap_failure_blocks_old_decoder_and_reports_failure() {
+        let old_calls = Arc::new(AtomicUsize::new(0));
+        let dec = CountingDecoder::new(Arc::clone(&old_calls));
+        let ren = FakeRenderer::new(FakeRendererConfig::default()).expect("fake renderer");
+        let cfg = PipelineConfig {
+            resolution: rc_types::Resolution::new(64, 64),
+            prefer_hardware: true,
+            async_decode: true,
+            codec: rc_encode::Codec::H264,
+            ..PipelineConfig::default()
+        };
+        let mut ctrl = ControllerPipeline::with_backends(cfg, Box::new(dec), Box::new(ren))
+            .expect("controller init");
+        ctrl.set_decoder_swap_factory(Arc::new(|next_cfg| {
+            Err(Error::Decoder(format!(
+                "async decoder {} unavailable",
+                next_cfg.codec.as_str()
+            )))
+        }));
+
+        push_frame_with_flags(
+            &mut ctrl,
+            1,
+            FrameKind::Idr,
+            HeaderFlags::empty().with_codec(rc_encode::Codec::H264),
+        )
+        .expect("h264 idr");
+        let dl = Instant::now() + Duration::from_secs(1);
+        while ctrl.displayed() < 1 && Instant::now() < dl {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ctrl.displayed(), 1);
+
+        let av1_flags = HeaderFlags::empty().with_codec(rc_encode::Codec::Av1);
+        push_frame_with_flags(&mut ctrl, 2, FrameKind::Idr, av1_flags).expect("av1 idr");
+        push_frame_with_flags(&mut ctrl, 3, FrameKind::P, av1_flags).expect("av1 p");
+
+        let dl2 = Instant::now() + Duration::from_secs(1);
+        let mut got_failure = None;
+        while Instant::now() < dl2 {
+            if let Some(f) = ctrl.take_decode_failure() {
+                got_failure = Some(f);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let failure = got_failure.expect("异步模式也必须稳定产出 CodecDecodeFailure");
+        assert_eq!(failure.codec, rc_encode::Codec::Av1);
+        assert!(!ctrl.take_keyframe_request());
+        assert_eq!(
+            old_calls.load(Ordering::SeqCst),
+            1,
+            "异步模式热切失败同样严禁将 AV1 码流喂给旧解码器"
+        );
+
+        ctrl.shutdown();
+        let sum = ctrl.trace().summary();
+        assert_eq!(sum.unfinished, 0);
+    }
+
+    #[test]
+    fn async_codec_swap_failure_recovers_after_downgrade_idr_packet_loss() {
+        let old_calls = Arc::new(AtomicUsize::new(0));
+        let dec = CountingDecoder::new(Arc::clone(&old_calls));
+        let ren = FakeRenderer::new(FakeRendererConfig::default()).expect("fake renderer");
+        let cfg = PipelineConfig {
+            resolution: rc_types::Resolution::new(64, 64),
+            prefer_hardware: true,
+            async_decode: true,
+            codec: rc_encode::Codec::H264,
+            ..PipelineConfig::default()
+        };
+        let mut ctrl = ControllerPipeline::with_backends(cfg, Box::new(dec), Box::new(ren))
+            .expect("controller init");
+        ctrl.set_decoder_swap_factory(Arc::new(|next_cfg| {
+            Err(Error::Decoder(format!(
+                "async decoder {} unsupported",
+                next_cfg.codec.as_str()
+            )))
+        }));
+
+        // 1) 首帧 H.264 正常上屏。
+        let h264_flags = HeaderFlags::empty().with_codec(rc_encode::Codec::H264);
+        push_frame_with_flags(&mut ctrl, 1, FrameKind::Idr, h264_flags).expect("h264 idr 1");
+        let dl1 = Instant::now() + Duration::from_secs(1);
+        while ctrl.displayed() < 1 && Instant::now() < dl1 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ctrl.displayed(), 1);
+
+        // 2) 切入 AV1 失败，置位 failed_codec_code = AV1 并抑制关键帧请求。
+        let av1_flags = HeaderFlags::empty().with_codec(rc_encode::Codec::Av1);
+        push_frame_with_flags(&mut ctrl, 2, FrameKind::Idr, av1_flags).expect("av1 idr");
+        let dl2 = Instant::now() + Duration::from_secs(1);
+        let mut saw_fail = false;
+        while Instant::now() < dl2 {
+            if let Some(f) = ctrl.take_decode_failure() {
+                assert_eq!(f.codec, rc_encode::Codec::Av1);
+                saw_fail = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_fail);
+        assert!(!ctrl.take_keyframe_request());
+
+        // 3) 对端降级回 H.264，但首张降级 IDR（2 片）丢失第 2 片，随后 H.264 P 帧到达淘汰残帧触发断链：
+        //    主线程必须在收到 H.264 P 帧时立即解除 AV1 对 take_keyframe_request 的抑制，避免死锁黑屏！
+        let big_idr_payload = vec![0x65u8; 1500];
+        let lost_idr_pkts = split_frame_with_flags(
+            FrameSeq(3),
+            FrameKind::Idr,
+            h264_flags,
+            Timestamp(3 * 16_000),
+            Timestamp(3 * 16_000 + 100),
+            3,
+            &big_idr_payload,
+            1200,
+        );
+        assert_eq!(lost_idr_pkts.len(), 2);
+        // 仅送达第 0 片，第 1 片模拟 UDP 丢包
+        ctrl.push_datagram(&lost_idr_pkts[0], 3 * 16_000 + 200)
+            .expect("partial lost idr pkt0");
+        // 后续降级 H.264 P 帧抵达，淘汰残帧 seq=3 置 async_chain_broken=true
+        push_frame_with_flags(&mut ctrl, 4, FrameKind::P, h264_flags).expect("downgraded h264 p");
+        assert!(
+            ctrl.take_keyframe_request(),
+            "降级回 H.264 后即便首 IDR 丢包断链，也必须解除抑制并立刻触发关键帧请求"
+        );
+
+        // 4) 对端响应关键帧请求补发新 H.264 IDR -> 成功解码上屏。
+        push_frame_with_flags(&mut ctrl, 5, FrameKind::Idr, h264_flags).expect("recovery h264 idr");
+        let dl3 = Instant::now() + Duration::from_secs(1);
+        while ctrl.displayed() < 2 && Instant::now() < dl3 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ctrl.displayed(), 2, "补发 H.264 IDR 后必须恢复出画");
+
+        ctrl.shutdown();
+        let sum = ctrl.trace().summary();
+        assert_eq!(sum.unfinished, 0);
+    }
+
+    #[test]
+    fn controller_new_fake_fallback_disables_strict_hw_swap_on_codec_change() {
+        let cfg = PipelineConfig {
+            resolution: rc_types::Resolution::new(64, 64),
+            prefer_hardware: true,
+            async_decode: false,
+            codec: rc_encode::Codec::H264,
+            ..PipelineConfig::default()
+        };
+        let mut ctrl = ControllerPipeline::new(cfg).expect("fake fallback init");
+        assert!(
+            !ctrl.config().prefer_hardware,
+            "降级到 FakeDecoder 时必须关闭 prefer_hardware 防止热切误调硬件工厂"
+        );
+        assert!(push_frame_with_flags(
+            &mut ctrl,
+            1,
+            FrameKind::Idr,
+            HeaderFlags::empty().with_codec(rc_encode::Codec::Av1),
+        )
+        .expect("fake decoder accepts av1 synthetic frame"));
+        assert!(ctrl.take_decode_failure().is_none());
+        ctrl.shutdown();
     }
 }

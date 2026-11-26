@@ -8,5 +8,6 @@ description = "媒体包头的手写二进制编解码。逐字节规格见 docs
 
 [dependencies]
 rc-types = { path = "../rc-types" }
+rc-encode = { path = "../rc-encode" }
 
 [dev-dependencies]

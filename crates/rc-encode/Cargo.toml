@@ -9,3 +9,4 @@ description = "编码抽象层：Encoder trait、EncodedFrame/EncoderCaps 与假
 [dependencies]
 rc-types = { path = "../rc-types" }
 rc-capture = { path = "../rc-capture" }
+serde = { version = "1", features = ["derive"] }

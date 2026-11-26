@@ -143,6 +143,15 @@ impl HostSessionConfig {
     }
 }
 
+/// 给定目标编解码器构造失败时的会话层安全回退梯队（如 `AV1 → HEVC → H.264`，`HEVC → H.264`）。
+const fn encoder_fallback_ladder(target: rc_encode::Codec) -> &'static [rc_encode::Codec] {
+    match target {
+        rc_encode::Codec::Av1 => &[rc_encode::Codec::Hevc, rc_encode::Codec::H264],
+        rc_encode::Codec::Hevc => &[rc_encode::Codec::H264],
+        rc_encode::Codec::H264 => &[],
+    }
+}
+
 /// 握手期在途鉴权上下文（`Hello` 已收、尚未终局前暂存，保证 A6：
 /// 鉴权未终局前零管线启动）。
 struct PendingAuth {
@@ -1301,23 +1310,37 @@ impl HostSession {
             self.cfg.pace_capture,
         ) {
             Ok(p) => p,
-            Err(hevc_err) if target_codec == rc_encode::Codec::Hevc => {
-                let mut h264_cfg = pcfg.clone();
-                h264_cfg.codec = rc_encode::Codec::H264;
-                actual_codec = rc_encode::Codec::H264;
-                build_pipeline(
-                    &h264_cfg,
-                    &mut self.pipeline_factory_for,
-                    &mut self.pipeline_factory,
-                    self.cfg.pace_capture,
-                )
-                .map_err(|h264_err| {
-                    Error::Encoder(format!(
-                        "HEVC 恢复失败 ({hevc_err})；回退 H.264 亦失败 ({h264_err})"
-                    ))
-                })?
+            Err(primary_err) => {
+                let mut recovered = None;
+                let mut last_err = primary_err;
+                for &fallback_codec in encoder_fallback_ladder(target_codec) {
+                    let mut fb_cfg = pcfg.clone();
+                    fb_cfg.codec = fallback_codec;
+                    match build_pipeline(
+                        &fb_cfg,
+                        &mut self.pipeline_factory_for,
+                        &mut self.pipeline_factory,
+                        self.cfg.pace_capture,
+                    ) {
+                        Ok(p) => {
+                            actual_codec = fallback_codec;
+                            recovered = Some(p);
+                            break;
+                        }
+                        Err(err) => {
+                            last_err = Error::Encoder(format!(
+                                "{} 恢复失败 ({last_err})；回退 {} 亦失败 ({err})",
+                                target_codec.as_str(),
+                                fallback_codec.as_str()
+                            ));
+                        }
+                    }
+                }
+                match recovered {
+                    Some(p) => p,
+                    None => return Err(last_err),
+                }
             }
-            Err(e) => return Err(e),
         };
         pipeline.set_clock(Arc::clone(&self.clock));
         pipeline.request_idr();
@@ -1389,6 +1412,14 @@ impl HostSession {
     /// 当前生效视频编码器（默认 `Codec::H264`，热切换后同步更新）。
     pub fn active_codec(&self) -> rc_encode::Codec {
         self.active_codec
+    }
+
+    /// 当前在线管线的连续编码过载/失败计数（无活动管线时返回 `0`）。
+    pub fn consecutive_encode_overloads(&self) -> u32 {
+        self.pipeline
+            .as_ref()
+            .filter(|_| self.pipeline_alive)
+            .map_or(0, HostPipeline::consecutive_encode_overloads)
     }
 
     /// 在握手前刷新被控端当前显示器的逻辑分辨率能力（防止空闲监听期切换外接屏/分辨率后使用陈旧能力）。
@@ -1601,29 +1632,42 @@ impl HostSession {
             self.cfg.pace_capture,
         ) {
             Ok(p) => p,
-            Err(hevc_err) if target_codec == rc_encode::Codec::Hevc => {
-                // HEVC 初始化失败时在会话层显式回退 H.264，保证 active_codec、HeaderFlags 与真实码流一致。
-                let mut h264_cfg = pcfg.clone();
-                h264_cfg.codec = rc_encode::Codec::H264;
-                actual_codec = rc_encode::Codec::H264;
-                match build_pipeline(
-                    &h264_cfg,
-                    &mut self.pipeline_factory_for,
-                    &mut self.pipeline_factory,
-                    self.cfg.pace_capture,
-                ) {
-                    Ok(p) => p,
-                    Err(h264_err) => {
-                        try_restore_prev(self, Some(rc_encode::Codec::H264));
-                        return Err(Error::Encoder(format!(
-                            "HEVC 重建失败 ({hevc_err})；回退 H.264 亦失败 ({h264_err})"
-                        )));
+            Err(primary_err) => {
+                // 目标编解码器初始化失败时按回退梯队（AV1 → HEVC → H.264）顺延，保证 active_codec、HeaderFlags 与真实码流一致。
+                let mut recovered = None;
+                let mut last_err = primary_err;
+                let mut last_tried = target_codec;
+                for &fallback_codec in encoder_fallback_ladder(target_codec) {
+                    let mut fb_cfg = pcfg.clone();
+                    fb_cfg.codec = fallback_codec;
+                    last_tried = fallback_codec;
+                    match build_pipeline(
+                        &fb_cfg,
+                        &mut self.pipeline_factory_for,
+                        &mut self.pipeline_factory,
+                        self.cfg.pace_capture,
+                    ) {
+                        Ok(p) => {
+                            actual_codec = fallback_codec;
+                            recovered = Some(p);
+                            break;
+                        }
+                        Err(err) => {
+                            last_err = Error::Encoder(format!(
+                                "{} 重建失败 ({last_err})；回退 {} 亦失败 ({err})",
+                                target_codec.as_str(),
+                                fallback_codec.as_str()
+                            ));
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                try_restore_prev(self, Some(target_codec));
-                return Err(e);
+                match recovered {
+                    Some(p) => p,
+                    None => {
+                        try_restore_prev(self, Some(last_tried));
+                        return Err(last_err);
+                    }
+                }
             }
         };
         pipeline.set_clock(Arc::clone(&self.clock));

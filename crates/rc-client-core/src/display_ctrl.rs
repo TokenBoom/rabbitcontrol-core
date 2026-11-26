@@ -45,6 +45,9 @@ pub const HEVC_HIGH_REFRESH_MAX_PIXEL_RATE: u64 = 600_000_000;
 /// `3024×1964@120`（713M px/s → ~60fps）超出 H.264 满帧甜点。
 pub const H264_HIGH_REFRESH_MAX_PIXEL_RATE: u64 = 280_000_000;
 
+/// AV1 在低延迟硬件管线下的默认推荐高刷满帧像素率上限（px/s，实际由双方 [`rc_pipeline::CodecCapability::max_pixel_rate`] 裁定）。
+pub const AV1_HIGH_REFRESH_MAX_PIXEL_RATE: u64 = 500_000_000;
+
 /// 视频流编解码器选择（纯值枚举，保持 `SessionCommand: Copy` 语义）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,24 +56,29 @@ pub enum StreamCodec {
     H264,
     /// H.265 / HEVC。
     Hevc,
+    /// AV1（需双端控制面确认 `supports_ext_codec_flags == true` 后启用）。
+    Av1,
 }
 
 impl StreamCodec {
-    /// 转为协议标准小写名称（`"h264"` / `"hevc"`）。
+    /// 转为协议标准小写名称（`"h264"` / `"hevc"` / `"av1"`）。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::H264 => "h264",
             Self::Hevc => "hevc",
+            Self::Av1 => "av1",
         }
     }
 
-    /// 大小写不敏感解析协议编码器名称（兼容 `"h265"` 别名）。
+    /// 大小写不敏感解析协议编码器名称（兼容 `"h265"` / `"avc"` 别名）。
     pub fn parse_lossy(raw: &str) -> Option<Self> {
         let trimmed = raw.trim();
         if trimmed.eq_ignore_ascii_case("hevc") || trimmed.eq_ignore_ascii_case("h265") {
             Some(Self::Hevc)
         } else if trimmed.eq_ignore_ascii_case("h264") || trimmed.eq_ignore_ascii_case("avc") {
             Some(Self::H264)
+        } else if trimmed.eq_ignore_ascii_case("av1") {
+            Some(Self::Av1)
         } else {
             None
         }
@@ -81,6 +89,27 @@ impl StreamCodec {
         match self {
             Self::Hevc => HEVC_HIGH_REFRESH_MAX_PIXEL_RATE,
             Self::H264 => H264_HIGH_REFRESH_MAX_PIXEL_RATE,
+            Self::Av1 => AV1_HIGH_REFRESH_MAX_PIXEL_RATE,
+        }
+    }
+}
+
+impl From<rc_encode::Codec> for StreamCodec {
+    fn from(codec: rc_encode::Codec) -> Self {
+        match codec {
+            rc_encode::Codec::H264 => Self::H264,
+            rc_encode::Codec::Hevc => Self::Hevc,
+            rc_encode::Codec::Av1 => Self::Av1,
+        }
+    }
+}
+
+impl From<StreamCodec> for rc_encode::Codec {
+    fn from(codec: StreamCodec) -> Self {
+        match codec {
+            StreamCodec::H264 => Self::H264,
+            StreamCodec::Hevc => Self::Hevc,
+            StreamCodec::Av1 => Self::Av1,
         }
     }
 }
@@ -209,12 +238,52 @@ pub enum DisplayControlMsg {
         /// 被控端权威计算或上报的可选分辨率预设列表（为空时由控制端按原生宽高比回退生成）。
         #[serde(default)]
         presets: Vec<DisplayPreset>,
-        /// 当前生效视频编码器（`"hevc"` 或 `"h264"`；旧版被控端未上报时为 `None`）。
+        /// 当前生效视频编码器（`"hevc"` / `"h264"` / `"av1"`；旧版被控端未上报时为 `None`）。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         current_codec: Option<String>,
-        /// 被控端支持的硬件视频编码器列表（如 `["hevc", "h264"]`；旧版未上报时为空）。
+        /// 被控端支持的硬件视频编码器列表（如 `["av1", "hevc", "h264"]`；旧版未上报时为空）。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         supported_codecs: Vec<String>,
+        /// 被控端非对称编码能力明细（旧版未上报时为空，零破坏兼容）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        encode_caps: Vec<rc_pipeline::CodecCapability>,
+        /// 被控端非对称解码能力明细（旧版未上报时为空，零破坏兼容）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        decode_caps: Vec<rc_pipeline::CodecCapability>,
+        /// 被控端静帧无损细化能力（旧版未上报时为 `None`）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refinement_caps: Option<rc_pipeline::RefinementCapability>,
+        /// 被控端是否支持 32B 媒体头扩展 codec 位（`HeaderFlags::CODEC_EXT` / `bit5`；旧版缺省为 `false`）。
+        #[serde(default)]
+        supports_ext_codec_flags: bool,
+        /// 被控端当前权威编解码代次（供控制端上报 `CodecDecodeFailed` 精确匹配、忽略陈旧回声；旧版缺省为 `0`）。
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        codec_generation: u64,
+    },
+    /// 控制端 → 被控端：握手入流后上报本端非对称解码能力、细化能力、选型偏好与扩展包头位支持标志。
+    ClientMediaCaps {
+        /// 控制端解码能力清单。
+        #[serde(default)]
+        decode_caps: Vec<rc_pipeline::CodecCapability>,
+        /// 控制端静帧无损细化接收能力。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refinement_caps: Option<rc_pipeline::RefinementCapability>,
+        /// 用户编解码选型偏好模式。
+        #[serde(default)]
+        pref: crate::codec_selector::CodecSelectionPref,
+        /// 控制端是否支持解析 32B 媒体头扩展 codec 位（`HeaderFlags::CODEC_EXT` / `bit5`）。
+        #[serde(default)]
+        supports_ext_codec_flags: bool,
+    },
+    /// 控制端 → 被控端：上报当前代次编解码器解码/热切失败，触发被控端熔断并无黑屏顺延下一档。
+    CodecDecodeFailed {
+        /// 失败的编解码器名称（`"av1"` / `"hevc"` / `"h264"`）。
+        codec: String,
+        /// 对应的被控端编解码代次（与被控端当前代次不匹配时视为过期消息忽略）。
+        generation: u64,
+        /// 失败原因诊断信息。
+        #[serde(default)]
+        reason: String,
     },
     /// 控制端 → 被控端：请求热切换视频流的分辨率与帧率（可选附带目标编解码器实现单次原子重建）。
     SetStream {
@@ -772,6 +841,20 @@ pub fn evaluate_high_refresh_advisory(
                 }
             }
         }
+        StreamCodec::Av1 => {
+            if pixel_rate <= AV1_HIGH_REFRESH_MAX_PIXEL_RATE {
+                HighRefreshAdvisory::default()
+            } else {
+                let rec = select_recommended_preset(presets, fps, StreamCodec::Av1);
+                HighRefreshAdvisory {
+                    level: HighRefreshLevel::AboveSweetSpot,
+                    reason: HighRefreshReason::HevcOverBudget,
+                    can_enable_hevc: false,
+                    recommended_width: rec.map(|(w, _)| w),
+                    recommended_height: rec.map(|(_, h)| h),
+                }
+            }
+        }
         StreamCodec::H264 => {
             if pixel_rate <= H264_HIGH_REFRESH_MAX_PIXEL_RATE {
                 HighRefreshAdvisory::default()
@@ -1038,11 +1121,16 @@ mod tests {
             presets: build_resolution_presets(1512, 982, 3024, 1964),
             current_codec: Some("hevc".to_string()),
             supported_codecs: vec!["hevc".to_string(), "h264".to_string()],
+            encode_caps: rc_pipeline::default_codec_capabilities(true),
+            decode_caps: rc_pipeline::default_codec_capabilities(true),
+            refinement_caps: Some(rc_pipeline::RefinementCapability::default()),
+            supports_ext_codec_flags: true,
+            codec_generation: 3,
         };
         let encoded_caps = encode_display_ctrl(&caps).expect("encode capabilities");
         assert_eq!(decode_display_ctrl(&encoded_caps), Some(caps));
 
-        // 兼容旧版缺少 `presets` / `current_codec` / `supported_codecs` 字段的 JSON
+        // 兼容旧版缺少 `presets` / `current_codec` / `supported_codecs` 及非对称能力扩展字段的 JSON
         let legacy_json = serde_json::json!({
             "kind": "capabilities",
             "current_width": 1920,
@@ -1070,8 +1158,43 @@ mod tests {
                 presets: Vec::new(),
                 current_codec: None,
                 supported_codecs: Vec::new(),
+                encode_caps: Vec::new(),
+                decode_caps: Vec::new(),
+                refinement_caps: None,
+                supports_ext_codec_flags: false,
+                codec_generation: 0,
             }
         );
+
+        // 新增 ClientMediaCaps / CodecDecodeFailed 往返与旧端缺省字段兼容
+        let client_caps = DisplayControlMsg::ClientMediaCaps {
+            decode_caps: rc_pipeline::default_codec_capabilities(true),
+            refinement_caps: Some(rc_pipeline::RefinementCapability {
+                supported: true,
+                true_rgb_capture: false,
+                formats: vec!["webp_lossless".to_string()],
+            }),
+            pref: crate::codec_selector::CodecSelectionPref::OfficeClear,
+            supports_ext_codec_flags: true,
+        };
+        let enc_client_caps = encode_display_ctrl(&client_caps).expect("encode client_media_caps");
+        assert_eq!(decode_display_ctrl(&enc_client_caps), Some(client_caps));
+
+        let decode_failed = DisplayControlMsg::CodecDecodeFailed {
+            codec: "av1".to_string(),
+            generation: 5,
+            reason: "vt av1 unsupported".to_string(),
+        };
+        let enc_failed = encode_display_ctrl(&decode_failed).expect("encode codec_decode_failed");
+        assert_eq!(decode_display_ctrl(&enc_failed), Some(decode_failed));
+
+        assert_eq!(StreamCodec::parse_lossy("AV1"), Some(StreamCodec::Av1));
+        assert_eq!(StreamCodec::Av1.as_str(), "av1");
+        assert_eq!(
+            rc_encode::Codec::from(StreamCodec::Av1),
+            rc_encode::Codec::Av1
+        );
+        assert_eq!(StreamCodec::from(rc_encode::Codec::Av1), StreamCodec::Av1);
 
         let set_stream = DisplayControlMsg::SetStream {
             width: 2218,

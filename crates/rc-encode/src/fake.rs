@@ -162,11 +162,15 @@ impl Encoder for FakeEncoder {
     }
 
     fn capabilities(&self) -> EncoderCaps {
+        let bitstream_format = match self.cfg.codec {
+            crate::Codec::Av1 => BitstreamFormat::Obu,
+            crate::Codec::H264 | crate::Codec::Hevc => BitstreamFormat::AnnexB,
+        };
         EncoderCaps {
             codec: self.cfg.codec,
             hardware: false,
             max_resolution: Resolution::new(4096, 4096),
-            bitstream_format: BitstreamFormat::AnnexB,
+            bitstream_format,
             profiles: &[66], // baseline
         }
     }

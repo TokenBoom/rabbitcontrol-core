@@ -49,6 +49,7 @@ use rc_session::{
 use rc_tools::{FileHostEngine, PortMapHostEngine, TerminalHostEngine};
 use rc_types::Resolution;
 
+use crate::codec_selector::{self, HostCodecNegotiator, NetworkHint, ResolutionTier, StreamTarget};
 use crate::display_ctrl::{self, DisplayControlMsg, DisplayDescriptor, DisplayPreset};
 use crate::lan_discovery;
 use crate::p2p::{self, P2pCandidates};
@@ -2680,28 +2681,47 @@ fn build_hardware_display_presets(
     presets
 }
 
-/// 计算当前被控端对外声明支持的视频编解码器列表（硬件路径且平台/运行时支持 HEVC 时优先列出 `"hevc"`）。
-fn host_supported_codecs(hevc_available: bool) -> Vec<String> {
-    if hevc_available {
-        vec!["hevc".to_string(), "h264".to_string()]
-    } else {
-        vec!["h264".to_string()]
+/// 编码器连续过载/丢帧触发被控端会话级熔断降级的阈值（连续失败 N 帧且当前非 H.264 时降级下一档）。
+const HOST_ENCODE_OVERLOAD_TRIP_LIMIT: u32 = 15;
+
+/// 计算当前被控端对外声明支持的视频编解码器列表（按当前分辨率档位排除已熔断项）。
+fn host_supported_codecs(
+    negotiator: &HostCodecNegotiator,
+    tier: ResolutionTier,
+    hevc_available: bool,
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(3);
+    if negotiator.is_codec_selectable(rc_encode::Codec::Av1, tier) {
+        out.push("av1".to_string());
     }
+    if hevc_available && negotiator.is_codec_selectable(rc_encode::Codec::Hevc, tier) {
+        out.push("hevc".to_string());
+    }
+    out.push("h264".to_string());
+    out
 }
 
-/// 编码当前被控端 `DisplayControlMsg::Capabilities` 载荷。
+/// 编码当前被控端 `DisplayControlMsg::Capabilities` 载荷（含非对称能力明细、扩展标志位声明与权威编解码代次）。
 fn encode_host_display_caps(
     host: &HostSession,
     native_res: Resolution,
     max_res: Resolution,
     mut presets: Vec<DisplayPreset>,
     hevc_available: bool,
+    negotiator: &HostCodecNegotiator,
+    hardware_media_active: bool,
 ) -> Option<Vec<u8>> {
     let cur = host.negotiated()?;
+    let tier = ResolutionTier::from_dimensions(cur.width, cur.height);
     let max_fps = host.caps().fps.max(1);
     let current_codec = Some(host.active_codec().as_str().to_string());
-    let supported_codecs = host_supported_codecs(hevc_available);
+    let supported_codecs = host_supported_codecs(negotiator, tier, hevc_available);
     ensure_hevc_hidpi_preset(&mut presets, native_res, max_res, cur.fps, hevc_available);
+    let encode_caps = negotiator.host_encode_caps().to_vec();
+    let decode_caps = codec_selector::cached_or_platform_decode_caps(hardware_media_active);
+    let refinement_caps = Some(codec_selector::cached_or_platform_refinement_caps(
+        hardware_media_active,
+    ));
     display_ctrl::encode_display_ctrl(&DisplayControlMsg::Capabilities {
         current_width: cur.width,
         current_height: cur.height,
@@ -2714,6 +2734,11 @@ fn encode_host_display_caps(
         presets,
         current_codec,
         supported_codecs,
+        encode_caps,
+        decode_caps,
+        refinement_caps,
+        supports_ext_codec_flags: true,
+        codec_generation: negotiator.codec_generation(),
     })
 }
 
@@ -3223,9 +3248,17 @@ fn drive_ui_host_session_with_audio(
         None
     };
 
+    let hardware_media_active = prefer_hardware && hardware_video_active;
+    let host_encode_caps = codec_selector::cached_or_platform_encode_caps(hardware_media_active);
+    let mut codec_negotiator = HostCodecNegotiator::new(host_encode_caps.clone());
     let mut hevc_runtime_failed = false;
-    let host_hevc_available = |failed: bool| {
-        prefer_hardware && hardware_video_active && !failed && rc_pipeline::platform_supports_hevc()
+    let host_hevc_available =
+        |failed: bool| hardware_media_active && !failed && rc_pipeline::platform_supports_hevc();
+    let current_net_hint = |host: &HostSession| NetworkHint {
+        is_relay: transport_kind == HostTransportKind::Relay,
+        is_lan: transport_kind == HostTransportKind::Lan,
+        estimated_bitrate_bps: host.current_bitrate_bps(),
+        rtt_us: 0,
     };
 
     let mut last_reported_screen_state: Option<(bool, bool)> = None;
@@ -3253,6 +3286,8 @@ fn drive_ui_host_session_with_audio(
             session_max_res,
             presets,
             host_hevc_available(hevc_runtime_failed),
+            &codec_negotiator,
+            hardware_media_active,
         ) {
             pending_display_tx.push_back(payload);
         }
@@ -3338,6 +3373,84 @@ fn drive_ui_host_session_with_audio(
                         }
                         if host.state() != SessionState::Streaming {
                             continue;
+                        }
+
+                        // 编码侧连续过载熔断：当前非 H.264 且连续编码过载达到阈值时，立即熔断并顺延下一档。
+                        if host.active_codec() != rc_encode::Codec::H264
+                            && host.consecutive_encode_overloads()
+                                >= HOST_ENCODE_OVERLOAD_TRIP_LIMIT
+                        {
+                            if let Some(cur) = host.negotiated() {
+                                let failed_codec = host.active_codec();
+                                let target = StreamTarget {
+                                    width: cur.width,
+                                    height: cur.height,
+                                    fps: cur.fps,
+                                };
+                                let fb_plan = codec_negotiator.on_encode_failure(
+                                    failed_codec,
+                                    "consecutive encoder overload",
+                                    failed_codec,
+                                    target,
+                                    current_net_hint(host),
+                                );
+                                if failed_codec == rc_encode::Codec::Hevc {
+                                    hevc_runtime_failed = true;
+                                }
+                                let (tw, th) = if fb_plan.codec == rc_encode::Codec::H264
+                                    && !user_pinned_resolution
+                                    && active_display_id.is_none()
+                                    && (cur.width > session_native_res.width
+                                        || cur.height > session_native_res.height)
+                                {
+                                    auto_hidpi_active = false;
+                                    (session_native_res.width, session_native_res.height)
+                                } else {
+                                    (cur.width, cur.height)
+                                };
+                                let prev_codec = host.active_codec();
+                                let _ = host.reconfigure_stream_with_codec(
+                                    tw,
+                                    th,
+                                    Some(cur.fps),
+                                    Some(session_max_res),
+                                    Some(fb_plan.codec),
+                                );
+                                if host.active_codec() != prev_codec {
+                                    codec_negotiator.bump_generation();
+                                }
+                                let (caps_native, presets) = if active_display_id.is_some() {
+                                    (
+                                        session_native_res,
+                                        display_ctrl::build_resolution_presets(
+                                            session_native_res.width,
+                                            session_native_res.height,
+                                            session_max_res.width,
+                                            session_max_res.height,
+                                        ),
+                                    )
+                                } else {
+                                    (
+                                        original_native_res.unwrap_or(session_native_res),
+                                        build_hardware_display_presets(
+                                            prefer_hardware,
+                                            hardware_video_active,
+                                            original_native_res,
+                                        ),
+                                    )
+                                };
+                                if let Some(cp) = encode_host_display_caps(
+                                    host,
+                                    caps_native,
+                                    session_max_res,
+                                    presets,
+                                    host_hevc_available(hevc_runtime_failed),
+                                    &codec_negotiator,
+                                    hardware_media_active,
+                                ) {
+                                    pending_display_tx.push_back(cp);
+                                }
+                            }
                         }
 
                         if let Some(ref mut ctrl) = relay_bitrate_ctrl {
@@ -3477,12 +3590,30 @@ fn drive_ui_host_session_with_audio(
                                         }) => {
                                             if let Some(cur) = host.negotiated() {
                                                 let target_fps = (fps > 0).then_some(fps);
+                                                let prev_codec = host.active_codec();
+                                                if width > 0 && height > 0 {
+                                                    codec_negotiator
+                                                        .reset_breaker_on_manual_or_res_change();
+                                                    hevc_runtime_failed = false;
+                                                }
+                                                let cur_tier = ResolutionTier::from_dimensions(
+                                                    if width > 0 { width } else { cur.width },
+                                                    if height > 0 { height } else { cur.height },
+                                                );
                                                 let requested_codec = codec
                                                     .as_deref()
                                                     .and_then(
                                                         display_ctrl::StreamCodec::parse_lossy,
                                                     )
                                                     .and_then(|c| match c {
+                                                        display_ctrl::StreamCodec::Av1 => {
+                                                            codec_negotiator
+                                                                .is_codec_selectable(
+                                                                    rc_encode::Codec::Av1,
+                                                                    cur_tier,
+                                                                )
+                                                                .then_some(rc_encode::Codec::Av1)
+                                                        }
                                                         display_ctrl::StreamCodec::Hevc => {
                                                             host_hevc_available(hevc_runtime_failed)
                                                                 .then_some(rc_encode::Codec::Hevc)
@@ -3612,12 +3743,27 @@ fn drive_ui_host_session_with_audio(
                                                         }
                                                     }
                                                 }
-                                                if attempted_codec == rc_encode::Codec::Hevc
-                                                    && host.active_codec() != rc_encode::Codec::Hevc
+                                                if attempted_codec != rc_encode::Codec::H264
+                                                    && host.active_codec() != attempted_codec
                                                 {
-                                                    hevc_runtime_failed = true;
+                                                    let fail_target = StreamTarget {
+                                                        width: cur.width,
+                                                        height: cur.height,
+                                                        fps: target_fps.unwrap_or(cur.fps),
+                                                    };
+                                                    let _ = codec_negotiator.on_encode_failure(
+                                                        attempted_codec,
+                                                        "reconfigure stream encoder init failed",
+                                                        host.active_codec(),
+                                                        fail_target,
+                                                        current_net_hint(host),
+                                                    );
+                                                    if attempted_codec == rc_encode::Codec::Hevc {
+                                                        hevc_runtime_failed = true;
+                                                    }
                                                     auto_hidpi_active = false;
-                                                    if !user_pinned_resolution
+                                                    if host.active_codec() == rc_encode::Codec::H264
+                                                        && !user_pinned_resolution
                                                         && active_display_id.is_none()
                                                         && host.negotiated().is_some_and(|n| {
                                                             n.width > session_native_res.width
@@ -3633,6 +3779,9 @@ fn drive_ui_host_session_with_audio(
                                                             Some(rc_encode::Codec::H264),
                                                         );
                                                     }
+                                                }
+                                                if host.active_codec() != prev_codec {
+                                                    codec_negotiator.bump_generation();
                                                 }
                                                 let (caps_native, presets) =
                                                     if active_display_id.is_some() {
@@ -3662,8 +3811,257 @@ fn drive_ui_host_session_with_audio(
                                                     session_max_res,
                                                     presets,
                                                     host_hevc_available(hevc_runtime_failed),
+                                                    &codec_negotiator,
+                                                    hardware_media_active,
                                                 ) {
                                                     pending_display_tx.push_back(caps_payload);
+                                                }
+                                            }
+                                        }
+                                        Some(DisplayControlMsg::ClientMediaCaps {
+                                            decode_caps,
+                                            refinement_caps,
+                                            pref,
+                                            supports_ext_codec_flags,
+                                        }) => {
+                                            if let Some(cur) = host.negotiated() {
+                                                let prev_codec = host.active_codec();
+                                                let target = StreamTarget {
+                                                    width: cur.width,
+                                                    height: cur.height,
+                                                    fps: cur.fps,
+                                                };
+                                                let plan = codec_negotiator.on_client_media_caps(
+                                                    decode_caps,
+                                                    refinement_caps,
+                                                    pref,
+                                                    supports_ext_codec_flags,
+                                                    target,
+                                                    current_net_hint(host),
+                                                );
+                                                if plan.codec != prev_codec {
+                                                    let (target_w, target_h, next_auto_hidpi) =
+                                                        if !user_pinned_resolution
+                                                            && active_display_id.is_none()
+                                                            && prefer_hardware
+                                                            && hardware_video_active
+                                                        {
+                                                            resolve_auto_hidpi_resolution(
+                                                                cur.width,
+                                                                cur.height,
+                                                                session_native_res,
+                                                                session_max_res,
+                                                                cur.fps,
+                                                                plan.codec,
+                                                                auto_hidpi_active,
+                                                            )
+                                                        } else {
+                                                            (
+                                                                cur.width,
+                                                                cur.height,
+                                                                auto_hidpi_active,
+                                                            )
+                                                        };
+                                                    match host.reconfigure_stream_with_codec(
+                                                        target_w,
+                                                        target_h,
+                                                        Some(cur.fps),
+                                                        Some(session_max_res),
+                                                        Some(plan.codec),
+                                                    ) {
+                                                        Ok(_) => {
+                                                            auto_hidpi_active = next_auto_hidpi
+                                                                && host.active_codec()
+                                                                    == rc_encode::Codec::Hevc;
+                                                        }
+                                                        Err(err) => {
+                                                            eprintln!(
+                                                                "[rc-ui-host] ClientMediaCaps 自动选型切换 ({:?}) 失败: {err}",
+                                                                plan.codec
+                                                            );
+                                                        }
+                                                    }
+                                                    if host.active_codec() != plan.codec {
+                                                        let _ = codec_negotiator.on_encode_failure(
+                                                            plan.codec,
+                                                            "selected codec encoder init failed",
+                                                            host.active_codec(),
+                                                            target,
+                                                            current_net_hint(host),
+                                                        );
+                                                        if plan.codec == rc_encode::Codec::Hevc {
+                                                            hevc_runtime_failed = true;
+                                                        }
+                                                    }
+                                                    if host.active_codec() != prev_codec {
+                                                        codec_negotiator.bump_generation();
+                                                    }
+                                                }
+                                            }
+                                            let (caps_native, presets) =
+                                                if active_display_id.is_some() {
+                                                    (
+                                                        session_native_res,
+                                                        display_ctrl::build_resolution_presets(
+                                                            session_native_res.width,
+                                                            session_native_res.height,
+                                                            session_max_res.width,
+                                                            session_max_res.height,
+                                                        ),
+                                                    )
+                                                } else {
+                                                    (
+                                                        original_native_res
+                                                            .unwrap_or(session_native_res),
+                                                        build_hardware_display_presets(
+                                                            prefer_hardware,
+                                                            hardware_video_active,
+                                                            original_native_res,
+                                                        ),
+                                                    )
+                                                };
+                                            if let Some(caps_payload) = encode_host_display_caps(
+                                                host,
+                                                caps_native,
+                                                session_max_res,
+                                                presets,
+                                                host_hevc_available(hevc_runtime_failed),
+                                                &codec_negotiator,
+                                                hardware_media_active,
+                                            ) {
+                                                pending_display_tx.push_back(caps_payload);
+                                            }
+                                        }
+                                        Some(DisplayControlMsg::CodecDecodeFailed {
+                                            codec,
+                                            generation,
+                                            reason,
+                                        }) => {
+                                            if let (Some(failed_codec), Some(cur)) = (
+                                                rc_encode::Codec::parse_lossy(&codec),
+                                                host.negotiated(),
+                                            ) {
+                                                let target = StreamTarget {
+                                                    width: cur.width,
+                                                    height: cur.height,
+                                                    fps: cur.fps,
+                                                };
+                                                let prev_codec = host.active_codec();
+                                                if let Some(fallback_plan) = codec_negotiator
+                                                    .on_codec_decode_failed(
+                                                        failed_codec,
+                                                        generation,
+                                                        reason,
+                                                        prev_codec,
+                                                        target,
+                                                        current_net_hint(host),
+                                                    )
+                                                {
+                                                    if failed_codec == rc_encode::Codec::Hevc {
+                                                        hevc_runtime_failed = true;
+                                                    }
+                                                    let (tw, th) = if fallback_plan.codec
+                                                        == rc_encode::Codec::H264
+                                                        && !user_pinned_resolution
+                                                        && active_display_id.is_none()
+                                                        && (cur.width > session_native_res.width
+                                                            || cur.height
+                                                                > session_native_res.height)
+                                                    {
+                                                        auto_hidpi_active = false;
+                                                        (
+                                                            session_native_res.width,
+                                                            session_native_res.height,
+                                                        )
+                                                    } else {
+                                                        (cur.width, cur.height)
+                                                    };
+                                                    let _ = host.reconfigure_stream_with_codec(
+                                                        tw,
+                                                        th,
+                                                        Some(cur.fps),
+                                                        Some(session_max_res),
+                                                        Some(fallback_plan.codec),
+                                                    );
+                                                    // 若降级目标（如 HEVC）在编码侧同样构造失败并被 HostSession 内部顺延 H.264，
+                                                    // 同步记录熔断、更新 hevc_runtime_failed 并按需回退自动 HiDPI 分辨率。
+                                                    if fallback_plan.codec != rc_encode::Codec::H264
+                                                        && host.active_codec()
+                                                            != fallback_plan.codec
+                                                    {
+                                                        let _ = codec_negotiator.on_encode_failure(
+                                                            fallback_plan.codec,
+                                                            "fallback codec encoder init failed",
+                                                            host.active_codec(),
+                                                            target,
+                                                            current_net_hint(host),
+                                                        );
+                                                        if fallback_plan.codec
+                                                            == rc_encode::Codec::Hevc
+                                                        {
+                                                            hevc_runtime_failed = true;
+                                                        }
+                                                        auto_hidpi_active = false;
+                                                        if host.active_codec()
+                                                            == rc_encode::Codec::H264
+                                                            && !user_pinned_resolution
+                                                            && active_display_id.is_none()
+                                                            && host.negotiated().is_some_and(|n| {
+                                                                n.width > session_native_res.width
+                                                                    || n.height
+                                                                        > session_native_res.height
+                                                            })
+                                                        {
+                                                            let _ = host
+                                                                .reconfigure_stream_with_codec(
+                                                                    session_native_res.width,
+                                                                    session_native_res.height,
+                                                                    Some(cur.fps),
+                                                                    Some(session_max_res),
+                                                                    Some(rc_encode::Codec::H264),
+                                                                );
+                                                        }
+                                                    }
+                                                    if host.active_codec() != prev_codec {
+                                                        codec_negotiator.bump_generation();
+                                                    }
+                                                    let (caps_native, presets) =
+                                                        if active_display_id.is_some() {
+                                                            (
+                                                                session_native_res,
+                                                                display_ctrl::build_resolution_presets(
+                                                                    session_native_res.width,
+                                                                    session_native_res.height,
+                                                                    session_max_res.width,
+                                                                    session_max_res.height,
+                                                                ),
+                                                            )
+                                                        } else {
+                                                            (
+                                                                original_native_res
+                                                                    .unwrap_or(session_native_res),
+                                                                build_hardware_display_presets(
+                                                                    prefer_hardware,
+                                                                    hardware_video_active,
+                                                                    original_native_res,
+                                                                ),
+                                                            )
+                                                        };
+                                                    if let Some(caps_payload) =
+                                                        encode_host_display_caps(
+                                                            host,
+                                                            caps_native,
+                                                            session_max_res,
+                                                            presets,
+                                                            host_hevc_available(
+                                                                hevc_runtime_failed,
+                                                            ),
+                                                            &codec_negotiator,
+                                                            hardware_media_active,
+                                                        )
+                                                    {
+                                                        pending_display_tx.push_back(caps_payload);
+                                                    }
                                                 }
                                             }
                                         }
@@ -3674,9 +4072,28 @@ fn drive_ui_host_session_with_audio(
                                             );
                                         }
                                         Some(DisplayControlMsg::SetCodec { codec }) => {
+                                            codec_negotiator
+                                                .reset_breaker_on_manual_or_res_change();
+                                            hevc_runtime_failed = false;
+                                            let cur_tier = host.negotiated().map_or(
+                                                ResolutionTier::Fhd1080,
+                                                |n| {
+                                                    ResolutionTier::from_dimensions(
+                                                        n.width, n.height,
+                                                    )
+                                                },
+                                            );
                                             let target_codec =
                                                 display_ctrl::StreamCodec::parse_lossy(&codec)
                                                     .and_then(|c| match c {
+                                                        display_ctrl::StreamCodec::Av1 => {
+                                                            codec_negotiator
+                                                                .is_codec_selectable(
+                                                                    rc_encode::Codec::Av1,
+                                                                    cur_tier,
+                                                                )
+                                                                .then_some(rc_encode::Codec::Av1)
+                                                        }
                                                         display_ctrl::StreamCodec::Hevc => {
                                                             host_hevc_available(hevc_runtime_failed)
                                                                 .then_some(rc_encode::Codec::Hevc)
@@ -3688,6 +4105,8 @@ fn drive_ui_host_session_with_audio(
                                             if let (Some(c), Some(cur)) =
                                                 (target_codec, host.negotiated())
                                             {
+                                                codec_negotiator.set_manual_pref(c);
+                                                let prev_codec = host.active_codec();
                                                 // 双端协商切入 HEVC 且用户尚未手动固定分辨率时，在同一次管线重建中一步升级到
                                                 // Retina HiDPI 2K 甜点（满足当前 fps 的 HEVC 高刷预算）；切回 H.264 时若此前自动升过级，
                                                 // 同步回退到原生逻辑分辨率，避免非 HEVC/H.264 掉帧。
@@ -3727,13 +4146,28 @@ fn drive_ui_host_session_with_audio(
                                                         );
                                                     }
                                                 }
-                                                if c == rc_encode::Codec::Hevc
-                                                    && host.active_codec() != rc_encode::Codec::Hevc
+                                                if c != rc_encode::Codec::H264
+                                                    && host.active_codec() != c
                                                 {
-                                                    hevc_runtime_failed = true;
+                                                    let fail_target = StreamTarget {
+                                                        width: cur.width,
+                                                        height: cur.height,
+                                                        fps: cur.fps,
+                                                    };
+                                                    let _ = codec_negotiator.on_encode_failure(
+                                                        c,
+                                                        "manual SetCodec encoder init failed",
+                                                        host.active_codec(),
+                                                        fail_target,
+                                                        current_net_hint(host),
+                                                    );
+                                                    if c == rc_encode::Codec::Hevc {
+                                                        hevc_runtime_failed = true;
+                                                    }
                                                     auto_hidpi_active = false;
-                                                    // 若 HEVC 启动失败且管线回退为 H.264 但分辨率已被升至 2K，立即回退到原生逻辑分辨率。
-                                                    if !user_pinned_resolution
+                                                    // 若 HEVC/AV1 启动失败且管线回退为 H.264 但分辨率已被升至 2K，立即回退到原生逻辑分辨率。
+                                                    if host.active_codec() == rc_encode::Codec::H264
+                                                        && !user_pinned_resolution
                                                         && active_display_id.is_none()
                                                         && host.negotiated().is_some_and(|n| {
                                                             n.width > session_native_res.width
@@ -3749,6 +4183,9 @@ fn drive_ui_host_session_with_audio(
                                                             Some(rc_encode::Codec::H264),
                                                         );
                                                     }
+                                                }
+                                                if host.active_codec() != prev_codec {
+                                                    codec_negotiator.bump_generation();
                                                 }
                                             }
                                             // 无论切换成功、幂等或拒绝，均回推最新 Capabilities，让控制端获知权威生效 codec。
@@ -3780,6 +4217,8 @@ fn drive_ui_host_session_with_audio(
                                                 session_max_res,
                                                 presets,
                                                 host_hevc_available(hevc_runtime_failed),
+                                                &codec_negotiator,
+                                                hardware_media_active,
                                             ) {
                                                 pending_display_tx.push_back(caps_payload);
                                             }
@@ -3978,6 +4417,8 @@ fn drive_ui_host_session_with_audio(
                                                     session_max_res,
                                                     presets,
                                                     host_hevc_available(hevc_runtime_failed),
+                                                    &codec_negotiator,
+                                                    hardware_media_active,
                                                 ) {
                                                     pending_display_tx.push_back(cp);
                                                 }
@@ -4118,6 +4559,8 @@ fn drive_ui_host_session_with_audio(
                                                     session_max_res,
                                                     presets,
                                                     host_hevc_available(hevc_runtime_failed),
+                                                    &codec_negotiator,
+                                                    hardware_media_active,
                                                 ) {
                                                     pending_display_tx.push_back(cp);
                                                 }
@@ -4292,6 +4735,8 @@ fn drive_ui_host_session_with_audio(
                                                             host_hevc_available(
                                                                 hevc_runtime_failed,
                                                             ),
+                                                            &codec_negotiator,
+                                                            hardware_media_active,
                                                         ) {
                                                             pending_display_tx.push_back(cp);
                                                         }
@@ -4450,6 +4895,8 @@ fn drive_ui_host_session_with_audio(
                                                                         host_hevc_available(
                                                                             hevc_runtime_failed,
                                                                         ),
+                                                                        &codec_negotiator,
+                                                                        hardware_media_active,
                                                                     )
                                                                 {
                                                                     pending_display_tx
@@ -4613,6 +5060,8 @@ fn drive_ui_host_session_with_audio(
                                                     session_max_res,
                                                     presets,
                                                     host_hevc_available(hevc_runtime_failed),
+                                                    &codec_negotiator,
+                                                    hardware_media_active,
                                                 ) {
                                                     pending_display_tx.push_back(cp);
                                                 }
@@ -4675,6 +5124,8 @@ fn drive_ui_host_session_with_audio(
                                                             host_hevc_available(
                                                                 hevc_runtime_failed,
                                                             ),
+                                                            &codec_negotiator,
+                                                            hardware_media_active,
                                                         ) {
                                                             pending_display_tx.push_back(cp);
                                                         }
@@ -5078,6 +5529,8 @@ fn drive_ui_host_session_with_audio(
                             session_max_res,
                             presets,
                             host_hevc_available(hevc_runtime_failed),
+                            &codec_negotiator,
+                            hardware_media_active,
                         ) {
                             pending_display_tx.push_back(payload);
                         }
@@ -5167,6 +5620,7 @@ fn drive_ui_host_session_with_audio(
                             );
                         }
                         hevc_runtime_failed = false;
+                        codec_negotiator = HostCodecNegotiator::new(host_encode_caps.clone());
                         user_pinned_resolution = false;
                         auto_hidpi_active = false;
                         last_busy = true;
@@ -5211,6 +5665,8 @@ fn drive_ui_host_session_with_audio(
                             session_max_res,
                             presets,
                             host_hevc_available(hevc_runtime_failed),
+                            &codec_negotiator,
+                            hardware_media_active,
                         ) {
                             pending_display_tx.push_back(payload);
                         }
@@ -9687,5 +10143,183 @@ mod tests {
         drop(t2);
         drop(ep);
         let _ = host_thread.join().expect("join host_thread");
+    }
+
+    #[test]
+    fn host_bridge_client_media_caps_and_codec_decode_failed_generation_handling() {
+        let clock: SessionClock = Arc::new(|| 10_000);
+        let (mut host, in_tx, out_rx, _out_dgrams) =
+            build_streaming_channel_host(Arc::clone(&clock));
+        let audio_mgr = HostAudioManager::with_creator(
+            false,
+            None,
+            Arc::new(|| Ok(Box::new(rc_audio::FakeAudioCapture::new()))),
+        );
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop_flag);
+        let t_clock = Arc::clone(&clock);
+        let driver = thread::spawn(move || {
+            let updates = BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP);
+            let pw_ver = AtomicU64::new(0);
+            let cfg_ver = AtomicU64::new(0);
+            let disc = AtomicBool::new(false);
+            let close_reason = AtomicU8::new(ByeReason::Normal as u8);
+            let lock_cnt = AtomicU64::new(0);
+            let mut owner_terms = PersistentOwnerTerminals::new();
+            let wake_guard: SharedWakeGuard = Arc::new(Mutex::new(None));
+            let ft_dir: SharedFileTransferDir = Arc::new(RwLock::new(None));
+            let allow_assist_ft = AtomicBool::new(true);
+            drive_ui_host_session_with_audio(
+                &mut host,
+                &t_clock,
+                None,
+                &updates,
+                &pw_ver,
+                0,
+                &cfg_ver,
+                0,
+                &disc,
+                &t_stop,
+                &close_reason,
+                HostTransportKind::Lan,
+                false,
+                false,
+                &lock_cnt,
+                None,
+                &mut owner_terms,
+                wake_guard,
+                ft_dir,
+                &allow_assist_ft,
+                None,
+                None,
+                Instant::now(),
+                audio_mgr,
+            )
+        });
+
+        // 1) 初始 Capabilities 必须携带 supports_ext_codec_flags=true、codec_generation=1 及非空 encode_caps/decode_caps。
+        let init_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(m, DisplayControlMsg::Capabilities { .. })
+        });
+        let init_gen = init_msgs
+            .iter()
+            .find_map(|m| match m {
+                DisplayControlMsg::Capabilities {
+                    supports_ext_codec_flags,
+                    codec_generation,
+                    encode_caps,
+                    decode_caps,
+                    ..
+                } => {
+                    assert!(
+                        *supports_ext_codec_flags,
+                        "新版被控端必须声明 supports_ext_codec_flags=true"
+                    );
+                    assert!(!encode_caps.is_empty());
+                    assert!(!decode_caps.is_empty());
+                    Some(*codec_generation)
+                }
+                _ => None,
+            })
+            .expect("must receive initial Capabilities");
+        assert_eq!(init_gen, 1);
+
+        // 2) 发送 supports_ext_codec_flags=false 的 ClientMediaCaps：不启用 AV1 且正常回传 Capabilities。
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::ClientMediaCaps {
+                decode_caps: rc_pipeline::default_codec_capabilities(true),
+                refinement_caps: None,
+                pref: crate::codec_selector::CodecSelectionPref::OfficeClear,
+                supports_ext_codec_flags: false,
+            },
+        );
+        let caps_after_client = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(m, DisplayControlMsg::Capabilities { .. })
+        });
+        let cur_gen = caps_after_client
+            .iter()
+            .find_map(|m| match m {
+                DisplayControlMsg::Capabilities {
+                    current_codec,
+                    codec_generation,
+                    ..
+                } => {
+                    assert_ne!(
+                        current_codec.as_deref(),
+                        Some("av1"),
+                        "supports_ext_codec_flags=false 时绝不允许启用 AV1"
+                    );
+                    Some(*codec_generation)
+                }
+                _ => None,
+            })
+            .expect("must emit Capabilities after ClientMediaCaps");
+
+        // 3) 发送过期 generation 的 CodecDecodeFailed：必须被忽略（不产生新 Capabilities 递增）。
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::CodecDecodeFailed {
+                codec: "av1".to_string(),
+                generation: cur_gen + 99,
+                reason: "stale generation".to_string(),
+            },
+        );
+        let stale_msgs = recv_display_ctrl_until(&out_rx, Duration::from_millis(120), |m| {
+            matches!(m, DisplayControlMsg::Capabilities { .. })
+        });
+        assert!(
+            stale_msgs
+                .iter()
+                .all(|m| !matches!(m, DisplayControlMsg::Capabilities { .. })),
+            "过期 generation 的 CodecDecodeFailed 不得触发降级重推: {stale_msgs:?}"
+        );
+
+        // 4) 发送不匹配 active_codec（当前 H.264）的 CodecDecodeFailed(hevc)：按严格回声拦截被忽略。
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::CodecDecodeFailed {
+                codec: "hevc".to_string(),
+                generation: cur_gen,
+                reason: "mismatched codec echo".to_string(),
+            },
+        );
+        let mismatch_msgs = recv_display_ctrl_until(&out_rx, Duration::from_millis(120), |m| {
+            matches!(m, DisplayControlMsg::Capabilities { .. })
+        });
+        assert!(
+            mismatch_msgs
+                .iter()
+                .all(|m| !matches!(m, DisplayControlMsg::Capabilities { .. })),
+            "与当前 active_codec 不符的 CodecDecodeFailed 必须忽略: {mismatch_msgs:?}"
+        );
+
+        // 5) 发送匹配当前 active_codec=h264 且匹配 generation 的 CodecDecodeFailed：
+        //    保持 H.264（绝不反向升级至 HEVC）且因 active_codec 未变更不虚增 codec_generation，回推权威 Capabilities。
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::CodecDecodeFailed {
+                codec: "h264".to_string(),
+                generation: cur_gen,
+                reason: "simulated h264 decode failure".to_string(),
+            },
+        );
+        let fb_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(m, DisplayControlMsg::Capabilities { .. })
+        });
+        assert!(
+            fb_msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_codec: Some(c),
+                    codec_generation,
+                    ..
+                } if c == "h264" && *codec_generation == cur_gen
+            )),
+            "H.264 兜底态收到匹配 CodecDecodeFailed 应保持 h264 且不虚增 generation: {fb_msgs:?}"
+        );
+
+        stop_flag.store(true, Ordering::Release);
+        let _ = driver.join().expect("join host driver");
     }
 }

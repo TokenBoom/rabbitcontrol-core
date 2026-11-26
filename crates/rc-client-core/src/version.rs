@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Core 跨平台运行时与 FFI 契约 ABI 版本号。
-pub const CORE_ABI_VERSION: u32 = 1;
+pub const CORE_ABI_VERSION: u32 = 2;
 
 const CORE_VERSION_STR: &str = env!("RC_CORE_EFFECTIVE_VERSION");
 const GIT_COMMIT_STR: &str = env!("RC_CORE_GIT_COMMIT");
@@ -68,7 +68,7 @@ mod tests {
         assert_eq!(info.punch_version, crate::p2p::PUNCH_VERSION);
         assert_eq!(info.beacon_version, crate::lan_discovery::BEACON_VERSION);
         assert_eq!(info.abi_version, CORE_ABI_VERSION);
-        assert_eq!(CORE_ABI_VERSION, 1);
+        assert_eq!(CORE_ABI_VERSION, 2);
 
         let value = serde_json::to_value(&info).expect("serialize CoreBuildInfo");
         let obj = value.as_object().expect("CoreBuildInfo JSON object");
@@ -121,7 +121,7 @@ mod tests {
             .is_none()
         {
             assert_eq!(core_version(), env!("CARGO_PKG_VERSION"));
-            assert_eq!(core_version(), "0.1.27");
+            assert_eq!(core_version(), "0.2.0");
         }
     }
 }

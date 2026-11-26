@@ -390,6 +390,8 @@ pub struct HostPipeline {
     capture_invalidation: Option<rc_capture::InvalidationReason>,
     /// 下一次发送 `CapCmd::Rebuild` 的退避截止时刻（重建可恢复失败时置位）。
     rebuild_retry_at: Option<Instant>,
+    /// 连续编码过载/失败计数（成功编码任意一帧即归零；供会话层判定编码器运行时熔断降级）。
+    consecutive_encode_overloads: u32,
 }
 
 fn signal_wake(wake: &(Mutex<u64>, Condvar)) {
@@ -795,6 +797,7 @@ impl HostPipeline {
             last_wake_gen: 0,
             capture_invalidation: None,
             rebuild_retry_at: None,
+            consecutive_encode_overloads: 0,
         })
     }
 
@@ -853,11 +856,8 @@ impl HostPipeline {
                         self.no_idr_yet = false;
                         self.pending_idr = false;
                     }
-                    let extra_flags = if self.cfg.codec == rc_encode::Codec::Hevc {
-                        HeaderFlags(HeaderFlags::HEVC)
-                    } else {
-                        HeaderFlags::empty()
-                    };
+                    self.consecutive_encode_overloads = 0;
+                    let extra_flags = HeaderFlags::empty().with_codec(self.cfg.codec);
                     let datagrams = split_frame_with_flags(
                         seq,
                         frame.kind,
@@ -893,6 +893,13 @@ impl HostPipeline {
                             _ => Outcome::DecodeError,
                         };
                         f.finish(outcome);
+                    }
+                    if matches!(
+                        err,
+                        Error::EncoderDroppedFrame { .. } | Error::Timeout(_) | Error::Encoder(_)
+                    ) {
+                        self.consecutive_encode_overloads =
+                            self.consecutive_encode_overloads.saturating_add(1);
                     }
                     if err.is_fatal() {
                         return Err(err);
@@ -1051,6 +1058,11 @@ impl HostPipeline {
     /// 当前采集是否处于挂起/待恢复态（如锁屏、显示器休眠或权限暂失）。
     pub fn is_capture_suspended(&self) -> bool {
         self.capture_invalidation.is_some()
+    }
+
+    /// 连续编码过载/失败次数（任一帧编码成功即清零，供上层触发编码侧熔断降级）。
+    pub fn consecutive_encode_overloads(&self) -> u32 {
+        self.consecutive_encode_overloads
     }
 
     /// 会话收尾第一步：只停采集线程（不再有新帧进入交接通道）。

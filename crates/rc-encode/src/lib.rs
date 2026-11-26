@@ -210,13 +210,16 @@ impl EncoderConfig {
 }
 
 /// 编解码器。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Codec {
     /// H.264 / AVC。兼容性与解码端覆盖面最好，实时管线的默认选择。
     H264,
     /// H.265 / HEVC。同画质省约 30% 码率，老控制端硬解覆盖不如 H.264。
     Hevc,
-    /// AV1。码率最优但实时硬编目前只在少数平台可用，作为前瞻选项。
+    /// AV1。码率最优并支持屏幕内容编码工具，适合办公清晰与弱网/中继场景。
     Av1,
 }
 
@@ -227,6 +230,20 @@ impl Codec {
             Codec::H264 => "h264",
             Codec::Hevc => "hevc",
             Codec::Av1 => "av1",
+        }
+    }
+
+    /// 大小写不敏感解析编解码器名称（兼容 `"avc"` / `"h265"` 别名）。
+    pub fn parse_lossy(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("h264") || trimmed.eq_ignore_ascii_case("avc") {
+            Some(Self::H264)
+        } else if trimmed.eq_ignore_ascii_case("hevc") || trimmed.eq_ignore_ascii_case("h265") {
+            Some(Self::Hevc)
+        } else if trimmed.eq_ignore_ascii_case("av1") {
+            Some(Self::Av1)
+        } else {
+            None
         }
     }
 }
@@ -252,14 +269,18 @@ pub enum Preset {
     Slowest,
 }
 
-/// 压缩码流的 NAL 封装格式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// 压缩码流的封装格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BitstreamFormat {
     /// Annex-B：每个 NAL 前有 4 字节起始码 `00 00 00 01`。
-    /// openh264 与多数硬件编码器的原生输出。
+    /// openh264 与多数 H.264/HEVC 硬件编码器的原生输出。
     AnnexB,
     /// AVCC：每个 NAL 前有长度前缀（大端）。MP4 风格封装。
     Avcc,
+    /// OBU（Open Bitstream Unit）：AV1 Sequence Header OBU + Frame OBU 封装，
+    /// 与 H.264/HEVC 的 [`BitstreamFormat::AnnexB`] 清晰分离。
+    Obu,
 }
 
 impl BitstreamFormat {
@@ -268,6 +289,7 @@ impl BitstreamFormat {
         match self {
             BitstreamFormat::AnnexB => "annexb",
             BitstreamFormat::Avcc => "avcc",
+            BitstreamFormat::Obu => "obu",
         }
     }
 }
@@ -339,8 +361,15 @@ mod tests {
         assert_eq!(Codec::H264.as_str(), "h264");
         assert_eq!(Codec::Hevc.as_str(), "hevc");
         assert_eq!(Codec::Av1.as_str(), "av1");
+        assert_eq!(Codec::parse_lossy("H264"), Some(Codec::H264));
+        assert_eq!(Codec::parse_lossy("avc"), Some(Codec::H264));
+        assert_eq!(Codec::parse_lossy("h265"), Some(Codec::Hevc));
+        assert_eq!(Codec::parse_lossy("HEVC"), Some(Codec::Hevc));
+        assert_eq!(Codec::parse_lossy("av1"), Some(Codec::Av1));
+        assert_eq!(Codec::parse_lossy("vp9"), None);
         assert_eq!(BitstreamFormat::AnnexB.as_str(), "annexb");
         assert_eq!(BitstreamFormat::Avcc.as_str(), "avcc");
+        assert_eq!(BitstreamFormat::Obu.as_str(), "obu");
     }
 
     /// 默认流水线编码方法对非流水线编码器保持安全退化语义。
