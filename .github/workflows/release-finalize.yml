@@ -1,0 +1,205 @@
+name: Finalize Core Release
+
+on:
+  repository_dispatch:
+    types:
+      - rabbitcontrol-core-platform-ready
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Core release tag (vX.Y.Z)"
+        required: true
+        type: string
+      expected_platforms:
+        description: "Comma-separated expected platforms before auto-publish"
+        required: false
+        default: "ios,android"
+        type: string
+      publish:
+        description: "Publish draft release once all expected platforms are verified"
+        required: false
+        default: true
+        type: boolean
+      release_id:
+        description: "Optional GitHub release ID to cross-check"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-finalize-${{ github.event.client_payload.tag || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    name: Verify Platform Artifacts & Finalize Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate finalize parameters & tag worktree
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
+          PAYLOAD_PLATFORM: ${{ github.event.client_payload.platform }}
+          PAYLOAD_COMMIT: ${{ github.event.client_payload.commit }}
+          PAYLOAD_RELEASE_ID: ${{ github.event.client_payload.release_id }}
+          PAYLOAD_EXPECTED_PLATFORMS_JSON: ${{ toJson(github.event.client_payload.expected_platforms) }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_EXPECTED_PLATFORMS: ${{ inputs.expected_platforms }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          INPUT_RELEASE_ID: ${{ inputs.release_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "${GITHUB_OUTPUT}"
+          import json
+          import os
+          import re
+          import subprocess
+          import tempfile
+
+          event_name = os.environ["EVENT_NAME"]
+          raw_tag = (
+              os.environ["INPUT_TAG"]
+              if event_name == "workflow_dispatch"
+              else os.environ["PAYLOAD_TAG"]
+          ).strip()
+
+          tag_re = re.compile(
+              r"^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$"
+          )
+          if not tag_re.match(raw_tag):
+              raise SystemExit(f"ERROR: invalid release tag {raw_tag!r}")
+
+          payload_platform = os.environ.get("PAYLOAD_PLATFORM", "").strip().lower()
+          if payload_platform and not re.fullmatch(r"[a-z0-9]+", payload_platform):
+              raise SystemExit(f"ERROR: invalid payload platform {payload_platform!r}")
+
+          payload_commit = os.environ.get("PAYLOAD_COMMIT", "").strip().lower()
+          if payload_commit and not re.fullmatch(r"[0-9a-f]{40}", payload_commit):
+              raise SystemExit(f"ERROR: invalid payload commit {payload_commit!r}")
+
+          if event_name == "workflow_dispatch":
+              raw_expected: object = os.environ.get("INPUT_EXPECTED_PLATFORMS", "").strip() or "ios,android"
+              raw_release_id = os.environ.get("INPUT_RELEASE_ID", "").strip()
+              publish_flag = "--publish" if os.environ.get("INPUT_PUBLISH", "true").lower() == "true" else ""
+          else:
+              payload_exp_raw = os.environ.get("PAYLOAD_EXPECTED_PLATFORMS_JSON", "").strip()
+              parsed_exp = json.loads(payload_exp_raw) if payload_exp_raw else None
+              raw_expected = parsed_exp if parsed_exp is not None else "ios,android"
+              raw_release_id = os.environ.get("PAYLOAD_RELEASE_ID", "").strip()
+              publish_flag = "--publish"
+
+          if isinstance(raw_expected, list):
+              items = [str(x) for x in raw_expected]
+          elif isinstance(raw_expected, str):
+              items = raw_expected.split(",")
+          else:
+              raise SystemExit(f"ERROR: invalid expected_platforms payload: {raw_expected!r}")
+
+          expected_list: list[str] = []
+          for item in items:
+              plat = item.strip().lower()
+              if not plat:
+                  continue
+              if not re.fullmatch(r"[a-z0-9]+", plat):
+                  raise SystemExit(f"ERROR: invalid expected platform {plat!r}")
+              if plat not in expected_list:
+                  expected_list.append(plat)
+          if not expected_list:
+              raise SystemExit("ERROR: expected_platforms must not be empty")
+
+          release_id = ""
+          if raw_release_id and raw_release_id.lower() != "null":
+              if not re.fullmatch(r"[0-9]+", raw_release_id) or int(raw_release_id) <= 0:
+                  raise SystemExit(f"ERROR: invalid release_id {raw_release_id!r}")
+              release_id = raw_release_id
+
+          proc = subprocess.run(
+              ["git", "rev-list", "-n", "1", f"refs/tags/{raw_tag}"],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          tag_commit = proc.stdout.strip() if proc.returncode == 0 else ""
+          if not re.fullmatch(r"[0-9a-fA-F]{40}", tag_commit):
+              raise SystemExit(
+                  f"ERROR: failed to resolve 40-hex commit for refs/tags/{raw_tag}: {proc.stderr.strip()}"
+              )
+          tag_commit = tag_commit.lower()
+
+          if payload_commit and payload_commit != tag_commit:
+              raise SystemExit(
+                  f"ERROR: payload commit {payload_commit} != tag commit {tag_commit} for {raw_tag}"
+              )
+
+          runner_temp = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
+          worktree = tempfile.mkdtemp(prefix="tag-worktree.", dir=runner_temp)
+          wt_proc = subprocess.run(
+              ["git", "worktree", "add", "--detach", worktree, f"refs/tags/{raw_tag}"],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          if wt_proc.returncode != 0:
+              raise SystemExit(
+                  f"ERROR: git worktree add failed for {raw_tag}: {wt_proc.stderr.strip()}"
+              )
+
+          print(f"tag={raw_tag}")
+          print(f"tag_commit={tag_commit}")
+          print(f"worktree={worktree}")
+          print(f"expected_csv={','.join(expected_list)}")
+          print(f"release_id={release_id}")
+          print(f"publish_flag={publish_flag}")
+          PY
+
+      - name: Self-test release finalizer
+        env:
+          TAG_WORKTREE: ${{ steps.resolve.outputs.worktree }}
+        run: |
+          python3 scripts/release_finalize.py --self-test --repo-root "${TAG_WORKTREE}"
+
+      - name: Verify platform artifacts and finalize release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
+          TAG_COMMIT: ${{ steps.resolve.outputs.tag_commit }}
+          TAG_WORKTREE: ${{ steps.resolve.outputs.worktree }}
+          EXPECTED_CSV: ${{ steps.resolve.outputs.expected_csv }}
+          RELEASE_ID: ${{ steps.resolve.outputs.release_id }}
+          PUBLISH_FLAG: ${{ steps.resolve.outputs.publish_flag }}
+        run: |
+          set -euo pipefail
+          ARGS=(
+            --finalize
+            --repo "${GITHUB_REPOSITORY}"
+            --tag "${RELEASE_TAG}"
+            --tag-commit "${TAG_COMMIT}"
+            --repo-root "${TAG_WORKTREE}"
+            --expected-platforms "${EXPECTED_CSV}"
+            --github-output "${GITHUB_OUTPUT}"
+          )
+          if [ -n "${RELEASE_ID}" ]; then
+            ARGS+=(--release-id "${RELEASE_ID}")
+          fi
+          if [ -n "${PUBLISH_FLAG}" ]; then
+            ARGS+=("${PUBLISH_FLAG}")
+          fi
+          python3 scripts/release_finalize.py "${ARGS[@]}"
+
+      - name: Cleanup tag worktree
+        if: always() && steps.resolve.outputs.worktree != ''
+        env:
+          TAG_WORKTREE: ${{ steps.resolve.outputs.worktree }}
+        run: |
+          if [ -n "${TAG_WORKTREE}" ] && [ -e "${TAG_WORKTREE}" ]; then
+            git worktree remove --force "${TAG_WORKTREE}" || rm -rf "${TAG_WORKTREE}"
+          fi
