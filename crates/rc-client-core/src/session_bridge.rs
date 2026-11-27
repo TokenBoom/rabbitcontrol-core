@@ -2688,6 +2688,20 @@ fn collect_lan_candidate_addrs(cfg: &UiSessionConfig, grant: &ConnectGrant) -> V
         out.push(addr);
         probe_targets.push(addr);
     }
+    // 当未配置同局域网显式直连地址且双方同族公网 IP 已确认不同时，直接跳过 RFC 1918 `/24` 猜测，
+    // 消除跨网 `192.168.1.0/24` 地址重名造成的黑洞等待；跨地址族返回 `None` 时不误杀。
+    let self_pubs: Vec<&str> = grant.self_public_addr.as_deref().into_iter().collect();
+    let peer_pubs: Vec<&str> = grant
+        .peer_public_addr
+        .as_deref()
+        .into_iter()
+        .chain(grant.peer_public_addrs.iter().map(String::as_str))
+        .collect();
+    if cfg.lan_direct_addr.is_none()
+        && crate::nat::same_public_ip_any(&self_pubs, &peer_pubs) == Some(false)
+    {
+        return out;
+    }
     if let Ok(relay_addr) = grant.relay_addr.parse::<SocketAddr>() {
         if !probe_targets.contains(&relay_addr) {
             probe_targets.push(relay_addr);
@@ -2718,6 +2732,260 @@ fn collect_lan_candidate_addrs(cfg: &UiSessionConfig, grant: &ConnectGrant) -> V
         }
     }
     out
+}
+
+enum DirectTierWinner {
+    Lan {
+        transport: Box<dyn Transport>,
+        peer_cert_fingerprint: Option<String>,
+        lan_addr: SocketAddr,
+        p2p_already_failed: bool,
+    },
+    P2p {
+        transport: Box<dyn Transport>,
+        peer_cert_fingerprint: Option<String>,
+    },
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum FirstOk {
+    Lan,
+    P2p,
+}
+
+enum DirectTierRaceError {
+    FatalMtls(String),
+    NonFatal(Vec<String>),
+    Cancelled,
+}
+
+type LanDialResult =
+    Result<(Box<dyn Transport>, Option<String>, SocketAddr), (Vec<String>, Option<String>)>;
+type P2pDialResult = Result<(Box<dyn Transport>, Option<String>), (String, Option<String>)>;
+
+enum RaceBranchOutcome {
+    LanOk {
+        transport: Box<dyn Transport>,
+        peer_cert_fingerprint: Option<String>,
+        lan_addr: SocketAddr,
+    },
+    LanErr {
+        reasons: Vec<String>,
+        fatal_mtls: Option<String>,
+    },
+    P2pOk {
+        transport: Box<dyn Transport>,
+        peer_cert_fingerprint: Option<String>,
+    },
+    P2pErr {
+        reason: String,
+        fatal_mtls: Option<String>,
+    },
+}
+
+fn race_lan_and_p2p_with<FLan, FP2p>(
+    encrypt_connection: bool,
+    disconnect_flag: &AtomicBool,
+    dial_lan: FLan,
+    dial_p2p: FP2p,
+) -> Result<DirectTierWinner, DirectTierRaceError>
+where
+    FLan: FnOnce(&AtomicBool) -> LanDialResult + Send,
+    FP2p: FnOnce(&AtomicBool) -> P2pDialResult + Send,
+{
+    let lan_cancel = AtomicBool::new(false);
+    let p2p_cancel = AtomicBool::new(false);
+    let (tx, rx) = mpsc::sync_channel::<RaceBranchOutcome>(2);
+
+    std::thread::scope(|scope| {
+        let tx_lan = tx.clone();
+        let lan_cancel_ref = &lan_cancel;
+        scope.spawn(move || {
+            let msg = match dial_lan(lan_cancel_ref) {
+                Ok((transport, peer_cert_fingerprint, lan_addr)) => RaceBranchOutcome::LanOk {
+                    transport,
+                    peer_cert_fingerprint,
+                    lan_addr,
+                },
+                Err((reasons, fatal_mtls)) => RaceBranchOutcome::LanErr {
+                    reasons,
+                    fatal_mtls,
+                },
+            };
+            let _ = tx_lan.send(msg);
+        });
+
+        let tx_p2p = tx;
+        let p2p_cancel_ref = &p2p_cancel;
+        scope.spawn(move || {
+            let msg = match dial_p2p(p2p_cancel_ref) {
+                Ok((transport, peer_cert_fingerprint)) => RaceBranchOutcome::P2pOk {
+                    transport,
+                    peer_cert_fingerprint,
+                },
+                Err((reason, fatal_mtls)) => RaceBranchOutcome::P2pErr { reason, fatal_mtls },
+            };
+            let _ = tx_p2p.send(msg);
+        });
+
+        let mut lan_res: Option<LanDialResult> = None;
+        let mut p2p_res: Option<P2pDialResult> = None;
+        let mut first_ok: Option<FirstOk> = None;
+        let mut p2p_failed_before_lan_win = false;
+
+        while lan_res.is_none() || p2p_res.is_none() {
+            if disconnect_flag.load(Ordering::Acquire) {
+                lan_cancel.store(true, Ordering::Release);
+                p2p_cancel.store(true, Ordering::Release);
+            }
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(RaceBranchOutcome::LanOk {
+                    transport,
+                    peer_cert_fingerprint,
+                    lan_addr,
+                }) => {
+                    if first_ok.is_none() {
+                        first_ok = Some(FirstOk::Lan);
+                    }
+                    p2p_cancel.store(true, Ordering::Release);
+                    lan_res = Some(Ok((transport, peer_cert_fingerprint, lan_addr)));
+                }
+                Ok(RaceBranchOutcome::LanErr {
+                    reasons,
+                    fatal_mtls,
+                }) => {
+                    if fatal_mtls.is_some() {
+                        p2p_cancel.store(true, Ordering::Release);
+                    }
+                    lan_res = Some(Err((reasons, fatal_mtls)));
+                }
+                Ok(RaceBranchOutcome::P2pOk {
+                    transport,
+                    peer_cert_fingerprint,
+                }) => {
+                    if first_ok.is_none() {
+                        first_ok = Some(FirstOk::P2p);
+                    }
+                    lan_cancel.store(true, Ordering::Release);
+                    p2p_res = Some(Ok((transport, peer_cert_fingerprint)));
+                }
+                Ok(RaceBranchOutcome::P2pErr { reason, fatal_mtls }) => {
+                    if lan_res.is_none() {
+                        p2p_failed_before_lan_win = true;
+                    }
+                    if fatal_mtls.is_some() {
+                        lan_cancel.store(true, Ordering::Release);
+                    }
+                    p2p_res = Some(Err((reason, fatal_mtls)));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        if disconnect_flag.load(Ordering::Acquire) {
+            return Err(DirectTierRaceError::Cancelled);
+        }
+
+        if encrypt_connection {
+            if let Some(Err((_, Some(mtls_err)))) = &lan_res {
+                return Err(DirectTierRaceError::FatalMtls(mtls_err.clone()));
+            }
+            if let Some(Err((_, Some(mtls_err)))) = &p2p_res {
+                return Err(DirectTierRaceError::FatalMtls(mtls_err.clone()));
+            }
+        }
+
+        // 保持先到达的胜者，避免丢弃已与 Host 建好 QUIC 的 P2P 连接造成 Host 孤儿会话。
+        if first_ok == Some(FirstOk::P2p) {
+            if let Some(Ok((transport, peer_cert_fingerprint))) = p2p_res {
+                drop(lan_res);
+                return Ok(DirectTierWinner::P2p {
+                    transport,
+                    peer_cert_fingerprint,
+                });
+            }
+        }
+
+        if let Some(Ok((transport, peer_cert_fingerprint, lan_addr))) = lan_res {
+            drop(p2p_res);
+            return Ok(DirectTierWinner::Lan {
+                transport,
+                peer_cert_fingerprint,
+                lan_addr,
+                p2p_already_failed: p2p_failed_before_lan_win,
+            });
+        }
+
+        if let Some(Ok((transport, peer_cert_fingerprint))) = p2p_res {
+            return Ok(DirectTierWinner::P2p {
+                transport,
+                peer_cert_fingerprint,
+            });
+        }
+
+        let mut all_reasons = Vec::new();
+        if let Some(Err((reasons, _))) = lan_res {
+            all_reasons.extend(reasons);
+        }
+        if let Some(Err((reason, _))) = p2p_res {
+            all_reasons.push(reason);
+        }
+        Err(DirectTierRaceError::NonFatal(all_reasons))
+    })
+}
+
+fn build_client_p2p_candidates(grant: &ConnectGrant) -> P2pCandidates {
+    let self_pubs: Vec<&str> = grant.self_public_addr.as_deref().into_iter().collect();
+    let peer_pubs: Vec<&str> = grant
+        .peer_public_addr
+        .as_deref()
+        .into_iter()
+        .chain(grant.peer_public_addrs.iter().map(String::as_str))
+        .collect();
+    let filtered_peer_lan_addrs =
+        p2p::filter_cross_site_lan_addrs(&grant.peer_lan_addrs, &self_pubs, &peer_pubs);
+    P2pCandidates {
+        session_id: grant.session_id.clone(),
+        peer_public_addr: grant.peer_public_addr.clone(),
+        peer_public_addrs: grant.peer_public_addrs.clone(),
+        peer_lan_addrs: filtered_peer_lan_addrs,
+        local_udp_port: grant.local_udp_port,
+        self_nat_type: grant.self_nat_type,
+        self_nat_port_delta: grant.self_nat_port_delta,
+        peer_nat_type: grant.peer_nat_type,
+        peer_nat_port_delta: grant.peer_nat_port_delta,
+    }
+}
+
+fn dial_p2p_held_transport(
+    candidates: &P2pCandidates,
+    quic_mtls: Option<&rc_net::mtls::MtlsConfig>,
+    encrypt_connection: bool,
+    cancel: &AtomicBool,
+) -> P2pDialResult {
+    let port_hold = crate::signal_client::acquire_local_udp_port_for_p2p(candidates.local_udp_port);
+    match p2p::attempt_p2p_quic_client_mtls(
+        candidates,
+        p2p::DEFAULT_PUNCH_TIMEOUT,
+        p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
+        cancel,
+        quic_mtls,
+    ) {
+        Ok(p2p_conn) => {
+            let held = crate::signal_client::P2pHeldTransport::new(p2p_conn, port_hold);
+            let fp = held
+                .peer_mtls_identity()
+                .map(|id| id.cert_fingerprint_sha256);
+            Ok((Box::new(held) as Box<dyn Transport>, fp))
+        }
+        Err(err) => {
+            drop(port_hold);
+            let fatal_mtls = (encrypt_connection && is_mtls_cert_or_config_error(&err))
+                .then(|| format!("P2P mTLS 证书校验失败（严禁静默降级）: {err}"));
+            Err((err, fatal_mtls))
+        }
+    }
 }
 
 fn dial_lan_direct_quic(
@@ -3275,108 +3543,216 @@ fn run_session_thread(
         let allow_lan_and_p2p =
             effective_mode != ConnectionMode::TcpRelay && !proxy_active_for_relay;
         if allow_lan_and_p2p && !disconnect_flag.load(Ordering::Acquire) {
-            for lan_addr in collect_lan_candidate_addrs(&cfg, grant) {
-                if disconnect_flag.load(Ordering::Acquire) {
-                    return Ok(SessionEnd::fatal("用户主动断开"));
+            let lan_addrs = collect_lan_candidate_addrs(&cfg, grant);
+            let p2p_candidates = build_client_p2p_candidates(grant);
+            let has_lan = !lan_addrs.is_empty();
+            let has_p2p = !p2p::parse_candidate_addrs(&p2p_candidates).is_empty();
+
+            let direct_winner: Option<DirectTierWinner> = if has_lan && has_p2p {
+                let quic_mtls_ref = quic_mtls.as_ref();
+                let encrypt_conn = cfg.encrypt_connection;
+                let disc_ref = &disconnect_flag;
+                match race_lan_and_p2p_with(
+                    encrypt_conn,
+                    disc_ref,
+                    |lan_cancel| {
+                        let mut reasons = Vec::new();
+                        for &lan_addr in &lan_addrs {
+                            if lan_cancel.load(Ordering::Acquire)
+                                || disc_ref.load(Ordering::Acquire)
+                            {
+                                break;
+                            }
+                            match dial_lan_direct_quic(lan_addr, quic_mtls_ref, lan_cancel) {
+                                Ok((t, fp)) => return Ok((t, fp, lan_addr)),
+                                Err(err) => {
+                                    if encrypt_conn && is_mtls_cert_or_config_error(&err) {
+                                        return Err((
+                                            reasons,
+                                            Some(format!(
+                                                "LAN mTLS 证书校验失败（严禁静默降级）: {err}"
+                                            )),
+                                        ));
+                                    }
+                                    reasons.push(err);
+                                }
+                            }
+                        }
+                        Err((reasons, None))
+                    },
+                    |p2p_cancel| {
+                        dial_p2p_held_transport(
+                            &p2p_candidates,
+                            quic_mtls_ref,
+                            encrypt_conn,
+                            p2p_cancel,
+                        )
+                    },
+                ) {
+                    Ok(winner) => Some(winner),
+                    Err(DirectTierRaceError::FatalMtls(msg)) => {
+                        return Err(SessionEnd::fatal(msg));
+                    }
+                    Err(DirectTierRaceError::Cancelled) => {
+                        return Ok(SessionEnd::fatal("用户主动断开"));
+                    }
+                    Err(DirectTierRaceError::NonFatal(reasons)) => {
+                        direct_fail_reasons.extend(reasons);
+                        None
+                    }
                 }
-                match dial_lan_direct_quic(lan_addr, quic_mtls.as_ref(), &disconnect_flag) {
-                    Ok((t, fp)) => {
-                        match attempt_tier_handshake(
-                            SelectedRelayPath {
+            } else if has_lan {
+                let mut found = None;
+                for lan_addr in lan_addrs {
+                    if disconnect_flag.load(Ordering::Acquire) {
+                        return Ok(SessionEnd::fatal("用户主动断开"));
+                    }
+                    match dial_lan_direct_quic(lan_addr, quic_mtls.as_ref(), &disconnect_flag) {
+                        Ok((t, fp)) => {
+                            found = Some(DirectTierWinner::Lan {
                                 transport: t,
+                                peer_cert_fingerprint: fp,
+                                lan_addr,
+                                p2p_already_failed: false,
+                            });
+                            break;
+                        }
+                        Err(err) => {
+                            if cfg.encrypt_connection && is_mtls_cert_or_config_error(&err) {
+                                return Err(SessionEnd::fatal(format!(
+                                    "LAN mTLS 证书校验失败（严禁静默降级）: {err}"
+                                )));
+                            }
+                            direct_fail_reasons.push(err);
+                        }
+                    }
+                }
+                found
+            } else if has_p2p {
+                match dial_p2p_held_transport(
+                    &p2p_candidates,
+                    quic_mtls.as_ref(),
+                    cfg.encrypt_connection,
+                    &disconnect_flag,
+                ) {
+                    Ok((transport, peer_cert_fingerprint)) => Some(DirectTierWinner::P2p {
+                        transport,
+                        peer_cert_fingerprint,
+                    }),
+                    Err((err, Some(fatal_mtls))) => {
+                        let _ = err;
+                        return Err(SessionEnd::fatal(fatal_mtls));
+                    }
+                    Err((err, None)) => {
+                        direct_fail_reasons.push(err);
+                        None
+                    }
+                }
+            } else {
+                if effective_mode == ConnectionMode::P2pOnly {
+                    direct_fail_reasons.push("无可用直连或 P2P 候选地址".to_string());
+                }
+                None
+            };
+
+            if let Some(winner) = direct_winner {
+                let mut retry_p2p_on_lan_fallback = false;
+                let (path, peer_addr, handshake_timeout) = match winner {
+                    DirectTierWinner::Lan {
+                        transport,
+                        peer_cert_fingerprint,
+                        lan_addr,
+                        p2p_already_failed,
+                    } => {
+                        retry_p2p_on_lan_fallback = !p2p_already_failed;
+                        (
+                            SelectedRelayPath {
+                                transport,
                                 relay_shutdown: None,
                                 transport_label: "UDP LAN",
                                 backend_suffix: None,
                                 mtls_active: cfg.encrypt_connection,
-                                peer_cert_fingerprint: fp,
+                                peer_cert_fingerprint,
                             },
                             lan_addr,
                             LAN_DIRECT_HANDSHAKE_TIMEOUT,
-                            true,
-                        ) {
-                            TierHandshakeResult::Ready(session) => {
-                                ready = Some(*session);
-                                break;
+                        )
+                    }
+                    DirectTierWinner::P2p {
+                        transport,
+                        peer_cert_fingerprint,
+                    } => (
+                        SelectedRelayPath {
+                            transport,
+                            relay_shutdown: None,
+                            transport_label: "UDP P2P",
+                            backend_suffix: Some("(P2P 直连)"),
+                            mtls_active: cfg.encrypt_connection,
+                            peer_cert_fingerprint,
+                        },
+                        cfg.connect_addr,
+                        P2P_DIRECT_HANDSHAKE_TIMEOUT,
+                    ),
+                };
+                match attempt_tier_handshake(path, peer_addr, handshake_timeout, true) {
+                    TierHandshakeResult::Ready(session) => {
+                        ready = Some(*session);
+                    }
+                    TierHandshakeResult::Fallback(reason) => {
+                        direct_fail_reasons.push(reason);
+                        update_tx.push(SessionUpdate::Connecting {
+                            phase: ConnectPhase::Connecting,
+                            watch_only: live_watch_only.load(Ordering::Acquire),
+                        });
+                        if retry_p2p_on_lan_fallback
+                            && has_p2p
+                            && !disconnect_flag.load(Ordering::Acquire)
+                        {
+                            match dial_p2p_held_transport(
+                                &p2p_candidates,
+                                quic_mtls.as_ref(),
+                                cfg.encrypt_connection,
+                                &disconnect_flag,
+                            ) {
+                                Ok((transport, peer_cert_fingerprint)) => {
+                                    let p2p_path = SelectedRelayPath {
+                                        transport,
+                                        relay_shutdown: None,
+                                        transport_label: "UDP P2P",
+                                        backend_suffix: Some("(P2P 直连)"),
+                                        mtls_active: cfg.encrypt_connection,
+                                        peer_cert_fingerprint,
+                                    };
+                                    match attempt_tier_handshake(
+                                        p2p_path,
+                                        cfg.connect_addr,
+                                        P2P_DIRECT_HANDSHAKE_TIMEOUT,
+                                        true,
+                                    ) {
+                                        TierHandshakeResult::Ready(session) => {
+                                            ready = Some(*session);
+                                        }
+                                        TierHandshakeResult::Fallback(p2p_reason) => {
+                                            direct_fail_reasons.push(p2p_reason);
+                                            update_tx.push(SessionUpdate::Connecting {
+                                                phase: ConnectPhase::Connecting,
+                                                watch_only: live_watch_only.load(Ordering::Acquire),
+                                            });
+                                        }
+                                        TierHandshakeResult::Abort(res) => return res,
+                                    }
+                                }
+                                Err((_, Some(fatal_mtls))) => {
+                                    return Err(SessionEnd::fatal(fatal_mtls));
+                                }
+                                Err((err, None)) => {
+                                    direct_fail_reasons.push(err);
+                                }
                             }
-                            TierHandshakeResult::Fallback(reason) => {
-                                direct_fail_reasons.push(reason);
-                                update_tx.push(SessionUpdate::Connecting {
-                                    phase: ConnectPhase::Connecting,
-                                    watch_only: live_watch_only.load(Ordering::Acquire),
-                                });
-                            }
-                            TierHandshakeResult::Abort(res) => return res,
                         }
                     }
-                    Err(err) => {
-                        if cfg.encrypt_connection && is_mtls_cert_or_config_error(&err) {
-                            return Err(SessionEnd::fatal(format!(
-                                "LAN mTLS 证书校验失败（严禁静默降级）: {err}"
-                            )));
-                        }
-                        direct_fail_reasons.push(err);
-                    }
+                    TierHandshakeResult::Abort(res) => return res,
                 }
-            }
-        }
-
-        // Tier 2：LAN 未命中或安全回退且非强制中继时，尝试 UDP P2P 打洞 + QUIC 直连及握手。
-        if ready.is_none() && allow_lan_and_p2p && !disconnect_flag.load(Ordering::Acquire) {
-            let candidates = P2pCandidates {
-                session_id: grant.session_id.clone(),
-                peer_public_addr: grant.peer_public_addr.clone(),
-                peer_lan_addrs: grant.peer_lan_addrs.clone(),
-                local_udp_port: grant.local_udp_port,
-            };
-            if !p2p::parse_candidate_addrs(&candidates).is_empty() {
-                match p2p::attempt_p2p_quic_client_mtls(
-                    &candidates,
-                    p2p::DEFAULT_PUNCH_TIMEOUT,
-                    p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
-                    &disconnect_flag,
-                    quic_mtls.as_ref(),
-                ) {
-                    Ok(p2p_conn) => {
-                        let fp = p2p_conn
-                            .peer_mtls_identity()
-                            .map(|id| id.cert_fingerprint_sha256);
-                        match attempt_tier_handshake(
-                            SelectedRelayPath {
-                                transport: Box::new(p2p_conn),
-                                relay_shutdown: None,
-                                transport_label: "UDP P2P",
-                                backend_suffix: Some("(P2P 直连)"),
-                                mtls_active: cfg.encrypt_connection,
-                                peer_cert_fingerprint: fp,
-                            },
-                            cfg.connect_addr,
-                            P2P_DIRECT_HANDSHAKE_TIMEOUT,
-                            true,
-                        ) {
-                            TierHandshakeResult::Ready(session) => {
-                                ready = Some(*session);
-                            }
-                            TierHandshakeResult::Fallback(reason) => {
-                                direct_fail_reasons.push(reason);
-                                update_tx.push(SessionUpdate::Connecting {
-                                    phase: ConnectPhase::Connecting,
-                                    watch_only: live_watch_only.load(Ordering::Acquire),
-                                });
-                            }
-                            TierHandshakeResult::Abort(res) => return res,
-                        }
-                    }
-                    Err(err) => {
-                        if cfg.encrypt_connection && is_mtls_cert_or_config_error(&err) {
-                            return Err(SessionEnd::fatal(format!(
-                                "P2P mTLS 证书校验失败（严禁静默降级）: {err}"
-                            )));
-                        }
-                        direct_fail_reasons.push(err);
-                    }
-                }
-            } else if effective_mode == ConnectionMode::P2pOnly {
-                direct_fail_reasons.push("无可用直连或 P2P 候选地址".to_string());
             }
         }
 
@@ -9141,5 +9517,369 @@ mod tests {
         );
         let ui_err = ended_ui_error.expect("SessionUpdate::Ended must include UiError");
         assert_eq!(ui_err.code, crate::ui_error::codes::PROXY_CONFIG_CONFLICT);
+    }
+
+    #[test]
+    fn collect_lan_candidate_addrs_prunes_rfc1918_when_public_ips_differ() {
+        let probe_targets = vec!["192.0.2.10:21116".parse().unwrap()];
+        let local_v4s = lan_discovery::discover_local_lan_ipv4s(&probe_targets);
+        let peer_same_subnet = local_v4s
+            .first()
+            .map(|local_ip| {
+                let o = local_ip.octets();
+                let last = if o[3] == 200 { 201 } else { 200 };
+                format!("{}.{}.{}.{}:50000", o[0], o[1], o[2], last)
+            })
+            .unwrap_or_else(|| "192.168.1.88:50000".to_string());
+
+        // 1) 公网 IP 明确不同且无 lan_direct_addr -> 彻底剪枝 RFC 1918 `/24` LAN 候选，消除黑洞等待
+        let cfg_no_direct = UiSessionConfig::default();
+        let grant_diff_pub = ConnectGrant {
+            session_id: "sess-diff-pub".to_string(),
+            target_id: "111222333".to_string(),
+            relay_addr: "192.0.2.10:21117".to_string(),
+            relay_token: "tok".to_string(),
+            self_public_addr: Some("198.51.100.10:50000".to_string()),
+            peer_public_addr: Some("203.0.113.20:60000".to_string()),
+            peer_lan_addrs: vec![peer_same_subnet.clone(), "192.168.1.99:50000".to_string()],
+            ..ConnectGrant::default()
+        };
+        assert!(
+            collect_lan_candidate_addrs(&cfg_no_direct, &grant_diff_pub).is_empty(),
+            "different public IPs without lan_direct_addr must prune RFC1918 LAN candidates"
+        );
+
+        // 2) 若显式配置了同网段 mDNS 发现的 lan_direct_addr，仍保留该显式地址
+        let explicit_lan: SocketAddr = "192.168.77.88:9901".parse().unwrap();
+        let cfg_with_direct = UiSessionConfig {
+            lan_direct_addr: Some(explicit_lan),
+            ..UiSessionConfig::default()
+        };
+        assert_eq!(
+            collect_lan_candidate_addrs(&cfg_with_direct, &grant_diff_pub)[0],
+            explicit_lan
+        );
+
+        // 3) 若公网 IP 相同（同 NAT 发夹或同局域网出口），保留同子网 LAN 候选
+        if let Some(local_ip) = local_v4s.first() {
+            let o = local_ip.octets();
+            let sibling_ip =
+                std::net::Ipv4Addr::new(o[0], o[1], o[2], if o[3] == 200 { 201 } else { 200 });
+            let grant_same_pub = ConnectGrant {
+                self_public_addr: Some("198.51.100.10:50000".to_string()),
+                peer_public_addr: Some("198.51.100.10:50001".to_string()),
+                ..grant_diff_pub.clone()
+            };
+            let cands = collect_lan_candidate_addrs(&cfg_no_direct, &grant_same_pub);
+            assert!(cands.contains(&SocketAddr::new(
+                std::net::IpAddr::V4(sibling_ip),
+                crate::host_bridge::DEFAULT_HOST_PORT,
+            )));
+
+            // 4) 跨地址族（本端 IPv6 公网 vs 对端 IPv4 公网）时同族不可比，绝不误杀同局域网直连
+            let grant_cross_family = ConnectGrant {
+                self_public_addr: Some("[2001:db8::10]:50000".to_string()),
+                peer_public_addr: Some("203.0.113.20:60000".to_string()),
+                peer_public_addrs: vec!["203.0.113.20:60000".to_string()],
+                ..grant_diff_pub.clone()
+            };
+            let cands_cross = collect_lan_candidate_addrs(&cfg_no_direct, &grant_cross_family);
+            assert!(
+                cands_cross.contains(&SocketAddr::new(
+                    std::net::IpAddr::V4(sibling_ip),
+                    crate::host_bridge::DEFAULT_HOST_PORT,
+                )),
+                "cross-family (IPv6 vs IPv4) public addrs must not prune same-subnet LAN candidates"
+            );
+        }
+
+        // 5) peer_public_addr 为空但 peer_public_addrs 含不同 IPv4 时仍准确剪枝
+        let grant_via_list = ConnectGrant {
+            self_public_addr: Some("198.51.100.10:50000".to_string()),
+            peer_public_addr: None,
+            peer_public_addrs: vec![
+                "[2001:db8::20]:60000".to_string(),
+                "203.0.113.20:60000".to_string(),
+            ],
+            ..grant_diff_pub
+        };
+        assert!(collect_lan_candidate_addrs(&cfg_no_direct, &grant_via_list).is_empty());
+    }
+
+    #[test]
+    fn build_client_p2p_candidates_filters_cross_site_rfc1918_only() {
+        let grant = ConnectGrant {
+            session_id: "sess-filter".to_string(),
+            target_id: "111222333".to_string(),
+            relay_addr: "192.0.2.10:21117".to_string(),
+            relay_token: "tok".to_string(),
+            self_public_addr: Some("198.51.100.10:50000".to_string()),
+            peer_public_addr: Some("203.0.113.20:60000".to_string()),
+            peer_public_addrs: vec!["203.0.113.20:60000".to_string()],
+            peer_lan_addrs: vec![
+                "192.168.1.20:9901".to_string(),
+                "10.0.0.8:9901".to_string(),
+                "203.0.113.21:45000".to_string(),
+                "[2001:db8::20]:9901".to_string(),
+            ],
+            ..ConnectGrant::default()
+        };
+        let p2p_cands = build_client_p2p_candidates(&grant);
+        assert_eq!(
+            p2p_cands.peer_lan_addrs,
+            vec![
+                "203.0.113.21:45000".to_string(),
+                "[2001:db8::20]:9901".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn race_lan_and_p2p_cancels_loser_prefers_first_ok_and_fails_closed_on_mtls() {
+        struct DropTrackTransport {
+            dropped: Arc<AtomicBool>,
+        }
+        impl Transport for DropTrackTransport {
+            fn send_datagram(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+                Ok(())
+            }
+            fn send_reliable(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+                Ok(())
+            }
+            fn send_reliable_urgent(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+                Ok(())
+            }
+            fn poll(&mut self, _timeout: Duration) -> rc_types::Result<Vec<NetEvent>> {
+                Ok(Vec::new())
+            }
+            fn stats(&self) -> NetStats {
+                NetStats::default()
+            }
+            fn set_pacing_rate(&mut self, _bps: u64) {}
+            fn tx_queued_bytes(&self) -> usize {
+                0
+            }
+            fn tx_dropped_datagrams(&self) -> u64 {
+                0
+            }
+        }
+        impl Drop for DropTrackTransport {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+
+        let no_disc = AtomicBool::new(false);
+        let lan_addr: SocketAddr = "192.168.1.20:9901".parse().unwrap();
+
+        // 1) LAN 先成功 -> 立即置位 p2p_cancel，P2P 快速中止，采用 LAN 且 p2p_already_failed=false
+        let p2p_saw_cancel = Arc::new(AtomicBool::new(false));
+        let p2p_saw_cancel_bg = Arc::clone(&p2p_saw_cancel);
+        let t0 = Instant::now();
+        let res1 = race_lan_and_p2p_with(
+            false,
+            &no_disc,
+            |_lan_cancel| {
+                Ok((
+                    Box::new(DropTrackTransport {
+                        dropped: Arc::new(AtomicBool::new(false)),
+                    }),
+                    None,
+                    lan_addr,
+                ))
+            },
+            move |p2p_cancel| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    if p2p_cancel.load(Ordering::Acquire) {
+                        p2p_saw_cancel_bg.store(true, Ordering::Release);
+                        return Err(("cancelled".to_string(), None));
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(("timed out".to_string(), None))
+            },
+        );
+        assert!(t0.elapsed() < Duration::from_millis(300));
+        assert!(p2p_saw_cancel.load(Ordering::Acquire));
+        assert!(matches!(
+            res1,
+            Ok(DirectTierWinner::Lan {
+                p2p_already_failed: false,
+                ..
+            })
+        ));
+
+        // 2) P2P 先成功而 LAN 黑洞等待 -> 立即置位 lan_cancel，LAN 快速中止，采用 P2P
+        let lan_saw_cancel = Arc::new(AtomicBool::new(false));
+        let lan_saw_cancel_bg = Arc::clone(&lan_saw_cancel);
+        let t1 = Instant::now();
+        let res2 = race_lan_and_p2p_with(
+            false,
+            &no_disc,
+            move |lan_cancel| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    if lan_cancel.load(Ordering::Acquire) {
+                        lan_saw_cancel_bg.store(true, Ordering::Release);
+                        return Err((vec!["cancelled".to_string()], None));
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err((vec!["timed out".to_string()], None))
+            },
+            |_p2p_cancel| {
+                Ok((
+                    Box::new(DropTrackTransport {
+                        dropped: Arc::new(AtomicBool::new(false)),
+                    }),
+                    None,
+                ))
+            },
+        );
+        assert!(t1.elapsed() < Duration::from_millis(300));
+        assert!(lan_saw_cancel.load(Ordering::Acquire));
+        assert!(matches!(res2, Ok(DirectTierWinner::P2p { .. })));
+
+        // 3) LanOk 先到、P2pOk 稍晚到 -> 保持 LAN 且立即释放迟到 P2P 传输
+        let p2p_dropped = Arc::new(AtomicBool::new(false));
+        let p2p_dropped_bg = Arc::clone(&p2p_dropped);
+        let (lan_done_tx, lan_done_rx) = mpsc::channel();
+        let res3 = race_lan_and_p2p_with(
+            false,
+            &no_disc,
+            move |_lan_cancel| {
+                let _ = lan_done_tx.send(());
+                Ok((
+                    Box::new(DropTrackTransport {
+                        dropped: Arc::new(AtomicBool::new(false)),
+                    }),
+                    None,
+                    lan_addr,
+                ))
+            },
+            move |p2p_cancel| {
+                let _ = lan_done_rx.recv();
+                while !p2p_cancel.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok((
+                    Box::new(DropTrackTransport {
+                        dropped: p2p_dropped_bg,
+                    }),
+                    None,
+                ))
+            },
+        );
+        assert!(matches!(
+            res3,
+            Ok(DirectTierWinner::Lan {
+                p2p_already_failed: false,
+                ..
+            })
+        ));
+        assert!(
+            p2p_dropped.load(Ordering::Acquire),
+            "late P2P transport must be dropped when LanOk arrived first"
+        );
+
+        // 4) P2pOk 先到、LanOk 稍晚到 -> 保持先胜者 P2P 并丢弃迟到 LAN（绝不制造 Host 孤儿 P2P 会话）
+        let lan_dropped = Arc::new(AtomicBool::new(false));
+        let lan_dropped_bg = Arc::clone(&lan_dropped);
+        let p2p_kept_dropped = Arc::new(AtomicBool::new(false));
+        let p2p_kept_dropped_bg = Arc::clone(&p2p_kept_dropped);
+        let (p2p_done_tx, p2p_done_rx) = mpsc::channel();
+        let res4 = race_lan_and_p2p_with(
+            false,
+            &no_disc,
+            move |lan_cancel| {
+                let _ = p2p_done_rx.recv();
+                while !lan_cancel.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok((
+                    Box::new(DropTrackTransport {
+                        dropped: lan_dropped_bg,
+                    }),
+                    None,
+                    lan_addr,
+                ))
+            },
+            move |_p2p_cancel| {
+                let _ = p2p_done_tx.send(());
+                Ok((
+                    Box::new(DropTrackTransport {
+                        dropped: p2p_kept_dropped_bg,
+                    }),
+                    None,
+                ))
+            },
+        );
+        assert!(matches!(res4, Ok(DirectTierWinner::P2p { .. })));
+        assert!(
+            lan_dropped.load(Ordering::Acquire),
+            "late LAN transport must be dropped when P2pOk arrived first"
+        );
+        assert!(
+            !p2p_kept_dropped.load(Ordering::Acquire),
+            "winning P2P transport must stay alive"
+        );
+        drop(res4);
+
+        // 5) P2P 先明确失败、随后 LAN 成功 -> p2p_already_failed=true（握手回退时不重复补试）
+        let (p2p_fail_tx, p2p_fail_rx) = mpsc::channel();
+        let res5 = race_lan_and_p2p_with(
+            false,
+            &no_disc,
+            move |_lan_cancel| {
+                let _ = p2p_fail_rx.recv();
+                thread::sleep(Duration::from_millis(25));
+                Ok((
+                    Box::new(DropTrackTransport {
+                        dropped: Arc::new(AtomicBool::new(false)),
+                    }),
+                    None,
+                    lan_addr,
+                ))
+            },
+            move |_p2p_cancel| {
+                let _ = p2p_fail_tx.send(());
+                Err(("punch failed".to_string(), None))
+            },
+        );
+        assert!(matches!(
+            res5,
+            Ok(DirectTierWinner::Lan {
+                p2p_already_failed: true,
+                ..
+            })
+        ));
+
+        // 6) 开启 mTLS 时任一侧出现证书校验失败 -> 严格 fail-closed 并取消另一侧
+        let lan_cancelled_on_mtls = Arc::new(AtomicBool::new(false));
+        let lan_cancelled_on_mtls_bg = Arc::clone(&lan_cancelled_on_mtls);
+        let res6 = race_lan_and_p2p_with(
+            true,
+            &no_disc,
+            move |lan_cancel| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    if lan_cancel.load(Ordering::Acquire) {
+                        lan_cancelled_on_mtls_bg.store(true, Ordering::Release);
+                        return Err((vec!["cancelled".to_string()], None));
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err((vec!["timed out".to_string()], None))
+            },
+            |_p2p_cancel| {
+                Err((
+                    "InvalidPeerCertificate".to_string(),
+                    Some("P2P mTLS 证书校验失败（严禁静默降级）".to_string()),
+                ))
+            },
+        );
+        assert!(lan_cancelled_on_mtls.load(Ordering::Acquire));
+        assert!(matches!(res6, Err(DirectTierRaceError::FatalMtls(_))));
     }
 }

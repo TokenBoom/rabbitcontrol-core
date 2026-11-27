@@ -33,6 +33,11 @@ use rc_net::quic::{Identity, QuicEndpoint, QuicTransport};
 use rc_net::{NetConfig, NetEvent, NetStats, Role, Transport};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+use crate::nat::{
+    canonicalize_socket_addr, is_global_unicast_ipv6, is_routable_public_ip,
+    is_routable_public_ipv4, predict_symmetric_ports, NatType,
+};
+
 /// UDP 打洞包魔数（`RCP2`）。
 pub const PUNCH_MAGIC: &[u8; 4] = b"RCP2";
 
@@ -43,13 +48,25 @@ pub const PUNCH_VERSION: u8 = 1;
 pub const PUNCH_PACKET_LEN: usize = 29;
 
 /// 默认 UDP 打洞超时（超时后上层回退 TCP 中继）。
-pub const DEFAULT_PUNCH_TIMEOUT: Duration = Duration::from_millis(1_500);
+pub const DEFAULT_PUNCH_TIMEOUT: Duration = Duration::from_millis(2_400);
 
 /// 打洞成功后默认的 QUIC 握手超时。
 pub const DEFAULT_QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 探测包周期发送间隔。
-const PROBE_INTERVAL: Duration = Duration::from_millis(40);
+const PROBE_INTERVAL: Duration = Duration::from_millis(30);
+
+/// Phase 1 主候选地址高速探测窗口时长（超时未收敛则切入 Phase 2 对称端口预测）。
+const PHASE1_DURATION: Duration = Duration::from_millis(350);
+
+/// Phase 2 单次 tick 最多发送的预测端口数（抑制路由/运营商 UDP 洪泛限速）。
+const MAX_PREDICTED_PORTS_PER_TICK: usize = 6;
+
+/// 对称 NAT 生日碰撞阶段最多开启的辅助非阻塞 UDP 套接字数量。
+const MAX_AUX_SOCKETS: usize = 16;
+
+/// Phase 2 单次 tick 最多发送探测包的辅助套接字数量（抑制突发 UDP 洪泛）。
+const MAX_AUX_PROBES_PER_TICK: usize = 4;
 
 /// 接收轮询与取消检查步长。
 const POLL_STEP: Duration = Duration::from_millis(5);
@@ -87,16 +104,26 @@ impl P2pRole {
 }
 
 /// P2P 建连所需的对端候选地址与本地端口提示。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct P2pCandidates {
     /// 信令协调下发的会话标识（用于派生 16 字节 `session_hash`）。
     pub session_id: String,
     /// 信令服务器观测到的对端公网 UDP 地址（如 `"198.51.100.22:60123"`）。
     pub peer_public_addr: Option<String>,
+    /// 信令服务器观测到的对端双栈公网 UDP 地址列表（IPv6 + IPv4）。
+    pub peer_public_addrs: Vec<String>,
     /// 对端上报的局域网候选地址列表（优先级高于公网地址）。
     pub peer_lan_addrs: Vec<String>,
     /// 本端持久化 UDP `RCSP` 探测套接字绑定的本地端口（优先复用以对齐 NAT 映射）。
     pub local_udp_port: Option<u16>,
+    /// 本端探测到的 NAT 类型。
+    pub self_nat_type: NatType,
+    /// 本端顺序对称 NAT 分配端口步长（如有）。
+    pub self_nat_port_delta: Option<i16>,
+    /// 对端上报的 NAT 类型。
+    pub peer_nat_type: NatType,
+    /// 对端顺序对称 NAT 分配端口步长（如有）。
+    pub peer_nat_port_delta: Option<i16>,
 }
 
 /// 解码后的 `RCP2` UDP 打洞包。
@@ -251,35 +278,73 @@ pub fn decode_punch_packet(buf: &[u8]) -> Option<PunchPacket> {
     })
 }
 
-/// 解析并排序对端候选 UDP 地址：优先保留 `peer_lan_addrs`（同局域网直连优先），
-/// 其次追加 `peer_public_addr`，自动去重并过滤非法、端口为 0 或未指定地址（`0.0.0.0` / `::`）。
+fn parse_valid_candidate_addr(raw: &str) -> Option<SocketAddr> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = trimmed.parse::<SocketAddr>().ok()?;
+    let normalized = canonicalize_socket_addr(parsed);
+    if normalized.port() == 0 || normalized.ip().is_unspecified() {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// 解析并排序对端候选 UDP 地址，自动去重并过滤非法、端口为 0 或未指定地址（`0.0.0.0` / `::`）。
+///
+/// - 当 `peer_public_addrs` 非空时，合并 `peer_public_addrs`、`peer_public_addr` 与 `peer_lan_addrs` 并按
+///   **全球单播 IPv6 → 私有 LAN 地址 → 公网 IPv4** 排序；
+/// - 当 `peer_public_addrs` 为空时，保留历史顺序（`peer_lan_addrs` 优先于 `peer_public_addr`）。
 pub fn parse_candidate_addrs(candidates: &P2pCandidates) -> Vec<SocketAddr> {
-    let mut out = Vec::new();
     let mut seen = HashSet::new();
-
-    let mut push_raw = |raw: &str| {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return;
+    if candidates.peer_public_addrs.is_empty() {
+        let mut out = Vec::new();
+        for lan in &candidates.peer_lan_addrs {
+            if let Some(addr) = parse_valid_candidate_addr(lan) {
+                if seen.insert(addr) {
+                    out.push(addr);
+                }
+            }
         }
-        let Ok(parsed) = trimmed.parse::<SocketAddr>() else {
-            return;
+        if let Some(ref public) = candidates.peer_public_addr {
+            if let Some(addr) = parse_valid_candidate_addr(public) {
+                if seen.insert(addr) {
+                    out.push(addr);
+                }
+            }
+        }
+        return out;
+    }
+
+    let mut global_v6 = Vec::new();
+    let mut lan_addrs = Vec::new();
+    let mut public_v4 = Vec::new();
+
+    for raw in candidates
+        .peer_public_addrs
+        .iter()
+        .map(String::as_str)
+        .chain(candidates.peer_public_addr.as_deref())
+        .chain(candidates.peer_lan_addrs.iter().map(String::as_str))
+    {
+        let Some(addr) = parse_valid_candidate_addr(raw) else {
+            continue;
         };
-        let normalized = canonicalize_socket_addr(parsed);
-        if normalized.port() == 0 || normalized.ip().is_unspecified() {
-            return;
+        if !seen.insert(addr) {
+            continue;
         }
-        if seen.insert(normalized) {
-            out.push(normalized);
+        match addr {
+            SocketAddr::V6(v6) if is_global_unicast_ipv6(*v6.ip()) => global_v6.push(addr),
+            _ if !is_routable_public_ip(addr.ip()) => lan_addrs.push(addr),
+            _ => public_v4.push(addr),
         }
-    };
+    }
 
-    for lan in &candidates.peer_lan_addrs {
-        push_raw(lan);
-    }
-    if let Some(ref public) = candidates.peer_public_addr {
-        push_raw(public);
-    }
+    let mut out = Vec::with_capacity(global_v6.len() + lan_addrs.len() + public_v4.len());
+    out.extend(global_v6);
+    out.extend(lan_addrs);
+    out.extend(public_v4);
     out
 }
 
@@ -308,16 +373,6 @@ fn fnv1a_64_mixed(domain: &[u8], data: &[u8]) -> u64 {
     hash ^= hash >> 27;
     hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
     hash ^ (hash >> 31)
-}
-
-fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
-    match addr {
-        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
-            Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
-            None => SocketAddr::V6(v6),
-        },
-        SocketAddr::V4(v4) => SocketAddr::V4(v4),
-    }
 }
 
 /// 将地址适配为当前套接字的地址族：
@@ -445,13 +500,141 @@ struct PunchedSocket {
     port_lease: Option<LocalUdpPortLease>,
 }
 
+struct AuxPunchSocket {
+    socket: UdpSocket,
+    confirmed_peer: Option<SocketAddr>,
+}
+
+fn has_global_v6_or_lan_target(all_targets: &[SocketAddr]) -> bool {
+    all_targets.iter().any(|addr| match addr {
+        SocketAddr::V6(v6) => is_global_unicast_ipv6(*v6.ip()),
+        SocketAddr::V4(v4) => !is_routable_public_ipv4(*v4.ip()),
+    })
+}
+
+/// 当双端处于不同可路由公网 IP（跨站点）时，过滤掉不可达的私网/本地 LAN 候选，
+/// 同时保留全球单播 IPv6 与可路由公网 IPv4（例如 UPnP 映射公网地址）。
+///
+/// 若双端同处同一公网 IP 或无法同族比较（如跨族 `v6` vs `v4`、`same_public_ip_any` 返回 `None`），
+/// 则原样返回 `lan_addrs.to_vec()`。
+pub fn filter_cross_site_lan_addrs(
+    lan_addrs: &[String],
+    self_public_addrs: &[&str],
+    peer_public_addrs: &[&str],
+) -> Vec<String> {
+    if crate::nat::same_public_ip_any(self_public_addrs, peer_public_addrs) != Some(false) {
+        return lan_addrs.to_vec();
+    }
+
+    lan_addrs
+        .iter()
+        .filter(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            let Ok(ip) = trimmed
+                .parse::<SocketAddr>()
+                .map(|s| s.ip())
+                .or_else(|_| trimmed.parse::<IpAddr>())
+            else {
+                return false;
+            };
+            is_routable_public_ip(ip)
+        })
+        .cloned()
+        .collect()
+}
+
+fn should_use_aux_sockets(self_nat: NatType, peer_nat: NatType) -> bool {
+    matches!(self_nat, NatType::SymmetricSeq | NatType::SymmetricRandom)
+        && matches!(peer_nat, NatType::Cone | NatType::Unknown)
+}
+
+fn build_predicted_targets(
+    candidates: &P2pCandidates,
+    existing_targets: &[SocketAddr],
+    socket_is_ipv6: bool,
+) -> Vec<SocketAddr> {
+    let max_ports = match candidates.peer_nat_type {
+        NatType::Cone => return Vec::new(),
+        NatType::SymmetricSeq => 64,
+        NatType::SymmetricRandom => 512,
+        NatType::Unknown => 24,
+    };
+
+    let mut existing: HashSet<SocketAddr> = existing_targets
+        .iter()
+        .copied()
+        .map(canonicalize_socket_addr)
+        .collect();
+    let mut base_v4s = Vec::new();
+    let mut seen_bases = HashSet::new();
+
+    for raw in candidates
+        .peer_public_addr
+        .as_deref()
+        .into_iter()
+        .chain(candidates.peer_public_addrs.iter().map(String::as_str))
+    {
+        let Some(SocketAddr::V4(v4)) = parse_valid_candidate_addr(raw) else {
+            continue;
+        };
+        if v4.ip().is_private() || v4.ip().is_link_local() {
+            continue;
+        }
+        let canon = SocketAddr::V4(v4);
+        if seen_bases.insert(canon) {
+            base_v4s.push(v4);
+        }
+    }
+
+    let mut out = Vec::new();
+    for base in base_v4s {
+        let ports = predict_symmetric_ports(
+            base.port(),
+            candidates.peer_nat_type,
+            candidates.peer_nat_port_delta,
+            max_ports,
+        );
+        for port in ports {
+            let cand_v4 = SocketAddr::new(IpAddr::V4(*base.ip()), port);
+            if existing.insert(cand_v4) {
+                out.push(normalize_addr_for_socket(cand_v4, socket_is_ipv6));
+            }
+        }
+    }
+    out
+}
+
+fn spawn_aux_punch_sockets(
+    count: usize,
+    socket_is_ipv6: bool,
+    has_ipv4: bool,
+) -> Vec<AuxPunchSocket> {
+    let mut aux = Vec::with_capacity(count);
+    for _ in 0..count {
+        match bind_punch_socket(None, socket_is_ipv6, has_ipv4) {
+            Ok((socket, _)) => aux.push(AuxPunchSocket {
+                socket,
+                confirmed_peer: None,
+            }),
+            Err(_) => break,
+        }
+    }
+    aux
+}
+
 /// 执行双向 UDP 打洞，成功后返回已打通的非阻塞 `UdpSocket`、实测对端地址及打洞耗时。
 ///
+/// - 若双端均为 [`NatType::SymmetricRandom`] 且候选地址仅含公网 IPv4，立即快速失败以零延迟回退中继；
 /// - 优先在进程级端口租约保护下复用 `candidates.local_udp_port`（`SO_REUSEADDR` + `SO_REUSEPORT`），
 ///   若已被同进程其他在途/活跃 P2P 连接占用或绑定失败则自动降级为无 `SO_REUSEPORT` 的临时端口 `0`；
 /// - 存在 IPv6 候选（含 IPv4+IPv6 混合）时自动使用双栈 `AF_INET6` 套接字，保留全部候选地址；
-/// - 每 40ms 向候选地址发送 29 字节 `RCP2` 探测/确认包，使用 `peek_from` 预检入站包以完好保留
-///   对端先发出的 QUIC `Initial` 报文；
+/// - Phase 1（`0..350ms`）每 `30ms` 向主 `targets` 发送 29 字节 `RCP2` 探测包；Phase 2（`350ms..timeout`）
+///   按 [`predict_symmetric_ports`] 对对端公网 IPv4 邻域限流探测（每 tick 最多 6 个端口），并在本端为对称
+///   NAT 且对端为 Cone/Unknown 时于 Phase 2 按需开启最多 16 个辅助临时套接字（每 tick 限流 4 个）进行有界生日碰撞；
+/// - 使用 `peek_from` 预检入站包以完好保留对端先发出的 QUIC `Initial` 报文；
 /// - 严格要求双向连通确认（收到异侧 `ack = 1` 或已确认对端/目标发来的非 `RCP2` 报文），
 ///   杜绝单向 Probe 误判；
 /// - `cancel` 置位时在 ~5ms 内快速中止，便于上层立刻回退 TCP 中继。
@@ -480,12 +663,28 @@ fn punch_udp_pair_with_lease(
         return Err("没有可用的对端 UDP 候选地址".to_string());
     }
 
+    if candidates.self_nat_type == NatType::SymmetricRandom
+        && candidates.peer_nat_type == NatType::SymmetricRandom
+        && !has_global_v6_or_lan_target(&all_targets)
+    {
+        return Err("双端均为随机对称 NAT，跳过 UDP 打洞直接回退中继".to_string());
+    }
+
     let PunchSetup {
         socket,
         port_lease,
         targets,
         socket_is_ipv6,
     } = prepare_punch_socket_and_targets(candidates, &all_targets)?;
+
+    let has_ipv4 = all_targets.iter().any(SocketAddr::is_ipv4);
+    let want_aux_sockets =
+        should_use_aux_sockets(candidates.self_nat_type, candidates.peer_nat_type);
+    let mut aux_spawned = false;
+    let mut aux_sockets: Vec<AuxPunchSocket> = Vec::new();
+    let mut aux_cursor = 0usize;
+    let predicted_targets = build_predicted_targets(candidates, &targets, socket_is_ipv6);
+    let mut pred_cursor = 0usize;
 
     let target_canons: HashSet<SocketAddr> = targets
         .iter()
@@ -525,6 +724,7 @@ fn punch_udp_pair_with_lease(
         }
 
         if last_send.map_or(true, |t| t.elapsed() >= PROBE_INTERVAL) {
+            let in_phase2 = start.elapsed() >= PHASE1_DURATION;
             if let Some(peer_addr) = confirmed_peer {
                 let _ = socket.send_to(&ack_pkt, peer_addr);
                 let peer_canon = canonicalize_socket_addr(peer_addr);
@@ -536,6 +736,43 @@ fn punch_udp_pair_with_lease(
             } else {
                 for &target in &targets {
                     let _ = socket.send_to(&probe_pkt, target);
+                }
+                if in_phase2 && !predicted_targets.is_empty() {
+                    let batch = MAX_PREDICTED_PORTS_PER_TICK.min(predicted_targets.len());
+                    for _ in 0..batch {
+                        let pred_addr = predicted_targets[pred_cursor];
+                        pred_cursor = (pred_cursor + 1) % predicted_targets.len();
+                        let _ = socket.send_to(&probe_pkt, pred_addr);
+                    }
+                }
+                if want_aux_sockets && !aux_spawned && in_phase2 {
+                    aux_spawned = true;
+                    aux_sockets =
+                        spawn_aux_punch_sockets(MAX_AUX_SOCKETS, socket_is_ipv6, has_ipv4);
+                }
+            }
+
+            for aux in &aux_sockets {
+                if let Some(peer_addr) = aux.confirmed_peer {
+                    let _ = aux.socket.send_to(&ack_pkt, peer_addr);
+                }
+            }
+            if confirmed_peer.is_none() && !aux_sockets.is_empty() {
+                let len = aux_sockets.len();
+                aux_cursor %= len;
+                let mut probed = 0usize;
+                for _ in 0..len {
+                    if probed >= MAX_AUX_PROBES_PER_TICK {
+                        break;
+                    }
+                    let aux = &aux_sockets[aux_cursor];
+                    aux_cursor = (aux_cursor + 1) % len;
+                    if aux.confirmed_peer.is_none() {
+                        for &target in &targets {
+                            let _ = aux.socket.send_to(&probe_pkt, target);
+                        }
+                        probed += 1;
+                    }
                 }
             }
             last_send = Some(Instant::now());
@@ -554,11 +791,56 @@ fn punch_udp_pair_with_lease(
             &mut socket_ref,
         )?;
         if let DrainOutcome::Ready(peer_addr) = drain_outcome {
+            drop(aux_sockets);
             return Ok(PunchedSocket {
                 socket,
                 peer_addr,
                 elapsed: start.elapsed(),
                 port_lease,
+            });
+        }
+
+        let mut won_aux: Option<(usize, SocketAddr)> = None;
+        let mut idx = 0usize;
+        while idx < aux_sockets.len() {
+            let outcome = {
+                let aux = &mut aux_sockets[idx];
+                let mut aux_ref = &aux.socket;
+                drain_punch_rx(
+                    &mut recv_buf,
+                    socket_is_ipv6,
+                    session_hash,
+                    expected_role,
+                    role,
+                    &target_canons,
+                    &ack_pkt,
+                    &mut aux.confirmed_peer,
+                    &mut aux_ref,
+                )
+            };
+            match outcome {
+                Ok(DrainOutcome::Ready(peer_addr)) => {
+                    won_aux = Some((idx, peer_addr));
+                    break;
+                }
+                Ok(DrainOutcome::Continue) => {
+                    idx += 1;
+                }
+                Err(_) => {
+                    aux_sockets.swap_remove(idx);
+                }
+            }
+        }
+        if let Some((win_idx, peer_addr)) = won_aux {
+            let winner = aux_sockets.swap_remove(win_idx);
+            drop(aux_sockets);
+            drop(socket);
+            drop(port_lease);
+            return Ok(PunchedSocket {
+                socket: winner.socket,
+                peer_addr,
+                elapsed: start.elapsed(),
+                port_lease: None,
             });
         }
 
@@ -998,6 +1280,7 @@ mod tests {
                 "10.0.0.8:50001".to_string(),
             ],
             local_udp_port: None,
+            ..Default::default()
         };
         let parsed = parse_candidate_addrs(&candidates);
         assert_eq!(
@@ -1015,6 +1298,7 @@ mod tests {
             peer_public_addr: Some("192.168.1.20:50000".to_string()),
             peer_lan_addrs: vec!["192.168.1.20:50000".to_string()],
             local_udp_port: None,
+            ..Default::default()
         };
         assert_eq!(
             parse_candidate_addrs(&dup_pub),
@@ -1063,12 +1347,14 @@ mod tests {
             peer_public_addr: Some(format!("127.0.0.1:{client_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(host_port),
+            ..Default::default()
         };
         let client_cand = P2pCandidates {
             session_id: "punch-localhost-ok".to_string(),
             peer_public_addr: Some(format!("127.0.0.1:{host_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(client_port),
+            ..Default::default()
         };
 
         let cancel_h = Arc::new(AtomicBool::new(false));
@@ -1116,12 +1402,14 @@ mod tests {
             peer_public_addr: Some(format!("127.0.0.1:{client_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(host_port),
+            ..Default::default()
         };
         let client_cand = P2pCandidates {
             session_id: "p2p-quic-e2e-001".to_string(),
             peer_public_addr: Some(format!("127.0.0.1:{host_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(client_port),
+            ..Default::default()
         };
 
         let cancel_h = Arc::new(AtomicBool::new(false));
@@ -1224,12 +1512,14 @@ mod tests {
             peer_public_addr: Some(format!("127.0.0.1:{client_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(host_port),
+            ..Default::default()
         };
         let client_cand = P2pCandidates {
             session_id: "p2p-coexist-probe-001".to_string(),
             peer_public_addr: Some(format!("127.0.0.1:{host_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(client_port),
+            ..Default::default()
         };
 
         let cancel_h = Arc::new(AtomicBool::new(false));
@@ -1289,6 +1579,7 @@ mod tests {
             peer_public_addr: Some(format!("127.0.0.1:{dead_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: None,
+            ..Default::default()
         };
         let t0 = Instant::now();
         let res = punch_udp_pair(
@@ -1312,6 +1603,7 @@ mod tests {
             peer_public_addr: Some(format!("127.0.0.1:{dead_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: None,
+            ..Default::default()
         };
         let t1 = Instant::now();
         let err = punch_udp_pair(
@@ -1337,6 +1629,7 @@ mod tests {
             peer_public_addr: None,
             peer_lan_addrs: Vec::new(),
             local_udp_port: None,
+            ..Default::default()
         };
         let t2 = Instant::now();
         assert!(attempt_p2p_quic_client(
@@ -1389,6 +1682,7 @@ mod tests {
             peer_public_addr: Some(format!("[::1]:{host_v6_port}")),
             peer_lan_addrs: vec![format!("127.0.0.1:{dead_v4_port}")],
             local_udp_port: None,
+            ..Default::default()
         };
         let all = parse_candidate_addrs(&mixed_client_cand);
         let setup = prepare_punch_socket_and_targets(&mixed_client_cand, &all)
@@ -1431,12 +1725,14 @@ mod tests {
             peer_public_addr: Some(format!("[::1]:{client_v6_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(host_v6_port),
+            ..Default::default()
         };
         let client_mixed_cand = P2pCandidates {
             session_id: "mixed-v4-v6-e2e".to_string(),
             peer_public_addr: Some(format!("[::1]:{host_v6_port}")),
             peer_lan_addrs: vec![format!("127.0.0.1:{dead_v4_port}")],
             local_udp_port: Some(client_v6_port),
+            ..Default::default()
         };
 
         let cancel_h = Arc::new(AtomicBool::new(false));
@@ -1475,12 +1771,14 @@ mod tests {
             peer_public_addr: Some(format!("127.0.0.1:{client_dual_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(host_v4_port),
+            ..Default::default()
         };
         let client_dual_cand = P2pCandidates {
             session_id: "dual-to-v4-e2e".to_string(),
             peer_public_addr: Some(format!("[::1]:{dead_v6_port}")),
             peer_lan_addrs: vec![format!("127.0.0.1:{host_v4_port}")],
             local_udp_port: Some(client_dual_port),
+            ..Default::default()
         };
         let cancel_h2 = Arc::new(AtomicBool::new(false));
         let cancel_c2 = Arc::clone(&cancel_h2);
@@ -1557,6 +1855,7 @@ mod tests {
             peer_public_addr: Some(peer_addr.to_string()),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(host_port),
+            ..Default::default()
         };
         let cancel = AtomicBool::new(false);
         let (host_sock, punched_peer, _) =
@@ -1612,6 +1911,7 @@ mod tests {
             peer_public_addr: Some(peer_addr.to_string()),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(host_port),
+            ..Default::default()
         };
         let cancel = AtomicBool::new(false);
         let res = punch_udp_pair(
@@ -1667,12 +1967,14 @@ mod tests {
             peer_public_addr: Some(format!("127.0.0.1:{client_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(host_port),
+            ..Default::default()
         };
         let client_cand = P2pCandidates {
             session_id: "p2p-mtls-ok".to_string(),
             peer_public_addr: Some(format!("127.0.0.1:{host_port}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(client_port),
+            ..Default::default()
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_h = Arc::clone(&cancel);
@@ -1727,12 +2029,14 @@ mod tests {
             peer_public_addr: Some(format!("127.0.0.1:{client_port2}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(host_port2),
+            ..Default::default()
         };
         let client_cand2 = P2pCandidates {
             session_id: "p2p-mtls-mismatch".to_string(),
             peer_public_addr: Some(format!("127.0.0.1:{host_port2}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: Some(client_port2),
+            ..Default::default()
         };
         let mut wrong_client_mtls = client_mtls;
         wrong_client_mtls.expected_peer_device_id = Some("999999999".to_string());
@@ -1949,5 +2253,441 @@ mod tests {
         )
         .unwrap_err();
         assert!(err5.contains("P2P UDP 打洞读取失败"));
+    }
+
+    #[test]
+    fn parse_candidate_addrs_merges_peer_public_addrs_with_priority_v6_lan_v4() {
+        assert_eq!(DEFAULT_PUNCH_TIMEOUT, Duration::from_millis(2_400));
+
+        let candidates = P2pCandidates {
+            session_id: "merge-priority".to_string(),
+            peer_public_addr: Some("203.0.113.5:60000".to_string()),
+            peer_public_addrs: vec![
+                "198.51.100.22:60123".to_string(),
+                "[2001:db8::1]:60123".to_string(),
+                "[::ffff:198.51.100.22]:60123".to_string(), // 与 IPv4 去重
+                "[fe80::1]:60123".to_string(),              // 非全球单播 IPv6 归入 LAN 档
+            ],
+            peer_lan_addrs: vec![
+                "192.168.1.20:50000".to_string(),
+                "10.0.0.8:50001".to_string(),
+                "203.0.113.5:60000".to_string(), // 去重
+            ],
+            local_udp_port: None,
+            ..Default::default()
+        };
+
+        let parsed = parse_candidate_addrs(&candidates);
+        assert_eq!(
+            parsed,
+            vec![
+                "[2001:db8::1]:60123".parse::<SocketAddr>().unwrap(),
+                "[fe80::1]:60123".parse::<SocketAddr>().unwrap(),
+                "192.168.1.20:50000".parse::<SocketAddr>().unwrap(),
+                "10.0.0.8:50001".parse::<SocketAddr>().unwrap(),
+                "198.51.100.22:60123".parse::<SocketAddr>().unwrap(),
+                "203.0.113.5:60000".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn symmetric_random_both_sides_public_ipv4_only_fails_immediately() {
+        let cancel = AtomicBool::new(false);
+        let cand_fast_fail = P2pCandidates {
+            session_id: "sym-rand-fast-fail".to_string(),
+            peer_public_addr: Some("203.0.113.10:50000".to_string()),
+            peer_public_addrs: vec!["198.51.100.20:50001".to_string()],
+            peer_lan_addrs: Vec::new(),
+            local_udp_port: None,
+            self_nat_type: NatType::SymmetricRandom,
+            self_nat_port_delta: None,
+            peer_nat_type: NatType::SymmetricRandom,
+            peer_nat_port_delta: None,
+        };
+
+        let t0 = Instant::now();
+        let err = punch_udp_pair(
+            P2pRole::Client,
+            &cand_fast_fail,
+            DEFAULT_PUNCH_TIMEOUT,
+            &cancel,
+        )
+        .unwrap_err();
+        let elapsed = t0.elapsed();
+        assert!(
+            err.contains("双端均为随机对称 NAT"),
+            "unexpected fast-fail err: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "fast-fail must return in < 50ms, took {elapsed:?}"
+        );
+
+        // 若存在全球 IPv6 或 LAN 候选，不得触发双随机快速失败
+        let host_port = reserve_ephemeral_udp_port();
+        let client_port = reserve_ephemeral_udp_port();
+        let host_cand = P2pCandidates {
+            session_id: "sym-rand-lan-bypass".to_string(),
+            peer_public_addr: Some("203.0.113.10:50000".to_string()),
+            peer_lan_addrs: vec![format!("127.0.0.1:{client_port}")],
+            local_udp_port: Some(host_port),
+            self_nat_type: NatType::SymmetricRandom,
+            peer_nat_type: NatType::SymmetricRandom,
+            ..Default::default()
+        };
+        let client_cand = P2pCandidates {
+            session_id: "sym-rand-lan-bypass".to_string(),
+            peer_public_addr: Some("198.51.100.20:50001".to_string()),
+            peer_lan_addrs: vec![format!("127.0.0.1:{host_port}")],
+            local_udp_port: Some(client_port),
+            self_nat_type: NatType::SymmetricRandom,
+            peer_nat_type: NatType::SymmetricRandom,
+            ..Default::default()
+        };
+        let cancel_h = Arc::new(AtomicBool::new(false));
+        let cancel_c = Arc::clone(&cancel_h);
+        let jh = thread::spawn(move || {
+            punch_udp_pair(P2pRole::Host, &host_cand, DEFAULT_PUNCH_TIMEOUT, &cancel_h)
+        });
+        let (_, _, c_elapsed) = punch_udp_pair(
+            P2pRole::Client,
+            &client_cand,
+            DEFAULT_PUNCH_TIMEOUT,
+            &cancel_c,
+        )
+        .expect("LAN candidate must bypass symmetric_random fast-fail");
+        jh.join().unwrap().expect("host punch must succeed via LAN");
+        assert!(c_elapsed < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn punch_udp_pair_cone_to_sequential_symmetric_delta_plus_3_succeeds() {
+        let sym_real_sock = UdpSocket::bind("127.0.0.1:0").expect("bind sym real sock");
+        let sym_real_port = sym_real_sock.local_addr().unwrap().port();
+        assert!(sym_real_port > 100);
+        let sym_stun_port = sym_real_port - 3;
+        let host_port = reserve_ephemeral_udp_port();
+
+        let session_id = "cone-vs-seq-sym-plus-3";
+        let session_hash = derive_session_hash(session_id);
+
+        let peer_thread = thread::spawn(move || {
+            sym_real_sock
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0u8; 256];
+            // 仅在 Host Phase 2 预测到 sym_stun_port + 3 时才能收到探测包
+            let (n, from_addr) = sym_real_sock
+                .recv_from(&mut buf)
+                .expect("must receive Phase 2 predicted probe on base+3");
+            let pkt = decode_punch_packet(&buf[..n]).expect("valid host probe");
+            assert_eq!(pkt.role, P2pRole::Host);
+            assert!(!pkt.ack);
+
+            let client_ack = encode_punch_packet(&PunchPacket {
+                version: PUNCH_VERSION,
+                role: P2pRole::Client,
+                ack: true,
+                session_hash,
+                nonce: [5u8; 6],
+            });
+            sym_real_sock.send_to(&client_ack, from_addr).unwrap();
+        });
+
+        let host_cand = P2pCandidates {
+            session_id: session_id.to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{sym_stun_port}")),
+            local_udp_port: Some(host_port),
+            self_nat_type: NatType::Cone,
+            peer_nat_type: NatType::SymmetricSeq,
+            peer_nat_port_delta: Some(3),
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let (_host_sock, punched_peer, elapsed) =
+            punch_udp_pair(P2pRole::Host, &host_cand, DEFAULT_PUNCH_TIMEOUT, &cancel)
+                .expect("Cone -> Sequential Symmetric (+3) must succeed in Phase 2");
+        peer_thread.join().unwrap();
+
+        assert_eq!(punched_peer.port(), sym_real_port);
+        assert!(
+            elapsed >= Duration::from_millis(300) && elapsed < Duration::from_millis(1_500),
+            "expected Phase 2 hit shortly after 350ms, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn open_fd_count() -> Option<usize> {
+        let dir = if std::path::Path::new("/proc/self/fd").exists() {
+            "/proc/self/fd"
+        } else if std::path::Path::new("/dev/fd").exists() {
+            "/dev/fd"
+        } else {
+            return None;
+        };
+        std::fs::read_dir(dir).ok().map(|entries| entries.count())
+    }
+
+    #[test]
+    fn punch_udp_pair_cone_to_random_symmetric_birthday_succeeds_without_fd_leak() {
+        #[cfg(unix)]
+        let fd_before = open_fd_count();
+
+        let host_sock = UdpSocket::bind("127.0.0.1:0").expect("bind host sock");
+        let host_port = host_sock.local_addr().unwrap().port();
+        let client_primary_port = reserve_ephemeral_udp_port();
+        assert_ne!(host_port, client_primary_port);
+
+        let session_id = "cone-vs-rand-sym-birthday";
+        let session_hash = derive_session_hash(session_id);
+        let fake_quic_initial = b"\xc0\x00\x00\x00\x01birthday-aux-quic-initial".to_vec();
+        let expected_quic = fake_quic_initial.clone();
+
+        let host_thread = thread::spawn(move || {
+            host_sock
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0u8; 256];
+            let mut chosen_aux_addr: Option<SocketAddr> = None;
+
+            // 模拟对端主端口被对称 NAT 映射改变而无法直通，强制选出一个辅助生日 socket 完成握手
+            for _ in 0..128 {
+                let (n, from) = host_sock.recv_from(&mut buf).expect("recv client probe");
+                let Some(pkt) = decode_punch_packet(&buf[..n]) else {
+                    continue;
+                };
+                if pkt.session_hash != session_hash || pkt.role != P2pRole::Client {
+                    continue;
+                }
+                if from.port() == client_primary_port {
+                    continue;
+                }
+                chosen_aux_addr = Some(from);
+                break;
+            }
+            let aux_addr = chosen_aux_addr.expect("must receive probe from an aux birthday socket");
+
+            let host_probe = encode_punch_packet(&PunchPacket {
+                version: PUNCH_VERSION,
+                role: P2pRole::Host,
+                ack: false,
+                session_hash,
+                nonce: [4u8; 6],
+            });
+            host_sock.send_to(&host_probe, aux_addr).unwrap();
+
+            // 等待辅助 socket 回复 RCP2 Ack，再发合成 QUIC Initial（Ack 已覆盖或由 peek_from 保留）
+            let mut got_ack = false;
+            for _ in 0..64 {
+                let (n, from) = host_sock.recv_from(&mut buf).expect("recv aux ack");
+                if from == aux_addr {
+                    if let Some(pkt) = decode_punch_packet(&buf[..n]) {
+                        if pkt.ack
+                            && pkt.role == P2pRole::Client
+                            && pkt.session_hash == session_hash
+                        {
+                            got_ack = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            assert!(got_ack, "winning aux socket must reply with RCP2 Ack");
+            host_sock.send_to(&fake_quic_initial, aux_addr).unwrap();
+            aux_addr.port()
+        });
+
+        let client_cand = P2pCandidates {
+            session_id: session_id.to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{host_port}")),
+            local_udp_port: Some(client_primary_port),
+            self_nat_type: NatType::SymmetricRandom,
+            peer_nat_type: NatType::Cone,
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let (client_sock, punched_peer, elapsed) = punch_udp_pair(
+            P2pRole::Client,
+            &client_cand,
+            DEFAULT_PUNCH_TIMEOUT,
+            &cancel,
+        )
+        .expect("Random Symmetric -> Cone birthday aux socket must succeed");
+
+        let winning_aux_port = host_thread.join().unwrap();
+        assert_eq!(punched_peer.port(), host_port);
+        assert_eq!(client_sock.local_addr().unwrap().port(), winning_aux_port);
+        assert_ne!(winning_aux_port, client_primary_port);
+        assert!(
+            elapsed >= Duration::from_millis(300) && elapsed < Duration::from_millis(1_500),
+            "birthday aux punch must delay to Phase 2 (>=350ms) and finish promptly, took {elapsed:?}"
+        );
+
+        // 主 socket 及其端口租约必须在 aux 胜出后立即释放
+        assert!(
+            LocalUdpPortLease::try_acquire(client_primary_port).is_some(),
+            "primary local_udp_port lease must be released when aux socket wins"
+        );
+        assert!(
+            UdpSocket::bind(("127.0.0.1", client_primary_port)).is_ok(),
+            "primary socket must be dropped without FD leak"
+        );
+
+        // 校验胜出辅助 socket 同样通过 peek_from 完好保留了 QUIC Initial
+        client_sock.set_nonblocking(false).unwrap();
+        client_sock
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut verify_buf = [0u8; 256];
+        let (n, from) = client_sock
+            .recv_from(&mut verify_buf)
+            .expect("winning aux socket must preserve QUIC Initial via peek_from");
+        assert_eq!(from.port(), host_port);
+        assert_eq!(&verify_buf[..n], expected_quic.as_slice());
+
+        drop(client_sock);
+        #[cfg(unix)]
+        if let (Some(before), Some(after)) = (fd_before, open_fd_count()) {
+            assert_eq!(
+                after, before,
+                "all aux and primary sockets must be closed without FD leak (before={before}, after={after})"
+            );
+        }
+    }
+
+    #[test]
+    fn phase2_predicted_port_ignores_stray_non_rcp2_datagram_without_hijack() {
+        let stray_sock = UdpSocket::bind("127.0.0.1:0").expect("bind stray sock");
+        let stray_port = stray_sock.local_addr().unwrap().port();
+        assert!(stray_port > 100);
+        let stun_port = stray_port - 3;
+        let host_port = reserve_ephemeral_udp_port();
+
+        let stray_thread = thread::spawn(move || {
+            stray_sock
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0u8; 256];
+            if let Ok((_n, from_addr)) = stray_sock.recv_from(&mut buf) {
+                // 回一个非 RCP2 杂散 UDP 包，绝不能让 Host 在未确认 RCP2 前误判打洞成功
+                let _ = stray_sock.send_to(b"NOT_RCP2_STRAY_DNS_REPLY", from_addr);
+            }
+        });
+
+        let host_cand = P2pCandidates {
+            session_id: "phase2-stray-non-rcp2".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{stun_port}")),
+            local_udp_port: Some(host_port),
+            self_nat_type: NatType::Cone,
+            peer_nat_type: NatType::SymmetricSeq,
+            peer_nat_port_delta: Some(3),
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let err = punch_udp_pair(
+            P2pRole::Host,
+            &host_cand,
+            Duration::from_millis(550),
+            &cancel,
+        )
+        .unwrap_err();
+        stray_thread.join().unwrap();
+        assert!(
+            err.contains("超时"),
+            "Host must ignore non-RCP2 packet from Phase 2 predicted port and time out, got: {err}"
+        );
+    }
+
+    #[test]
+    fn should_use_aux_sockets_only_on_symmetric_to_cone_or_unknown() {
+        assert!(!should_use_aux_sockets(
+            NatType::Cone,
+            NatType::SymmetricRandom
+        ));
+        assert!(!should_use_aux_sockets(
+            NatType::Cone,
+            NatType::SymmetricSeq
+        ));
+        assert!(!should_use_aux_sockets(NatType::Cone, NatType::Cone));
+        assert!(!should_use_aux_sockets(NatType::Cone, NatType::Unknown));
+        assert!(!should_use_aux_sockets(NatType::Unknown, NatType::Cone));
+        assert!(!should_use_aux_sockets(
+            NatType::SymmetricRandom,
+            NatType::SymmetricRandom
+        ));
+        assert!(!should_use_aux_sockets(
+            NatType::SymmetricSeq,
+            NatType::SymmetricSeq
+        ));
+
+        assert!(should_use_aux_sockets(
+            NatType::SymmetricRandom,
+            NatType::Cone
+        ));
+        assert!(should_use_aux_sockets(
+            NatType::SymmetricRandom,
+            NatType::Unknown
+        ));
+        assert!(should_use_aux_sockets(NatType::SymmetricSeq, NatType::Cone));
+        assert!(should_use_aux_sockets(
+            NatType::SymmetricSeq,
+            NatType::Unknown
+        ));
+    }
+
+    #[test]
+    fn has_global_v6_or_lan_target_rejects_link_local_and_ula_v6() {
+        assert!(!has_global_v6_or_lan_target(&[
+            "[fe80::1]:50000".parse().unwrap(),
+            "[fc00::1]:50000".parse().unwrap(),
+            "[fd12:3456::1]:50000".parse().unwrap(),
+            "198.51.100.10:50000".parse().unwrap(),
+        ]));
+        assert!(has_global_v6_or_lan_target(&["[2001:db8::1]:50000"
+            .parse()
+            .unwrap(),]));
+        assert!(has_global_v6_or_lan_target(&["192.168.1.20:50000"
+            .parse()
+            .unwrap(),]));
+    }
+
+    #[test]
+    fn filter_cross_site_lan_addrs_filters_private_on_diff_public_ip_and_preserves_otherwise() {
+        let lan = vec![
+            "192.168.1.20:50000".to_string(),
+            "10.0.0.8:50001".to_string(),
+            "172.16.1.9:50002".to_string(),
+            "100.64.1.2:50003".to_string(),
+            "169.254.1.2:50004".to_string(),
+            "127.0.0.1:50005".to_string(),
+            "[fe80::1]:50006".to_string(),
+            "[fd00::1]:50007".to_string(),
+            "203.0.113.45:51234".to_string(),     // UPnP 公网 IPv4
+            "[240e:3b0:1::10]:51235".to_string(), // 全球单播 IPv6
+        ];
+
+        // 公网 IPv4 不同 -> 剔除 RFC 1918 / CGNAT / 链路本地 / 回环 / 非全球 IPv6，保留 UPnP 公网 IPv4 与全球 IPv6
+        let filtered =
+            filter_cross_site_lan_addrs(&lan, &["198.51.100.22:60000"], &["203.0.113.9:60001"]);
+        assert_eq!(
+            filtered,
+            vec![
+                "203.0.113.45:51234".to_string(),
+                "[240e:3b0:1::10]:51235".to_string(),
+            ]
+        );
+
+        // 同公网 IP -> 原样保留 RFC 1918
+        assert_eq!(
+            filter_cross_site_lan_addrs(&lan, &["198.51.100.22:60000"], &["198.51.100.22:60001"],),
+            lan
+        );
+
+        // 跨族 (v6, v4) -> 原样保留 RFC 1918
+        assert_eq!(
+            filter_cross_site_lan_addrs(&lan, &["[240e:3b0:1::20]:60000"], &["203.0.113.9:60001"],),
+            lan
+        );
     }
 }

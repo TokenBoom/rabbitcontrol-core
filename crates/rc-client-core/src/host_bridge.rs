@@ -6217,6 +6217,29 @@ fn dial_relay_for_incoming(
 /// 2) 打洞或 QUIC 失败，或 P2P 建连后握手阶段因超时/断链在进入 `Streaming` 前失败（H4 分裂脑恢复），
 ///    均自动无缝回退至 TCP `RCR1` 中继并重新握手（配置了 mTLS 时强制走外层 mTLS，内层 `HostAuto` 自动兼容客户端开关）；
 /// 3) 完成鉴权与机主审批 → 串流驱动（含剪贴板/音频/W2/W3/W4 工具引擎）→ 干净收尾。
+fn build_host_p2p_candidates(incoming: &RelayIncoming) -> P2pCandidates {
+    let self_pubs: Vec<&str> = incoming.self_public_addr.as_deref().into_iter().collect();
+    let peer_pubs: Vec<&str> = incoming
+        .peer_public_addr
+        .as_deref()
+        .into_iter()
+        .chain(incoming.peer_public_addrs.iter().map(String::as_str))
+        .collect();
+    let filtered_peer_lan_addrs =
+        p2p::filter_cross_site_lan_addrs(&incoming.peer_lan_addrs, &self_pubs, &peer_pubs);
+    P2pCandidates {
+        session_id: incoming.session_id.clone(),
+        peer_public_addr: incoming.peer_public_addr.clone(),
+        peer_public_addrs: incoming.peer_public_addrs.clone(),
+        peer_lan_addrs: filtered_peer_lan_addrs,
+        local_udp_port: incoming.local_udp_port,
+        self_nat_type: incoming.self_nat_type,
+        self_nat_port_delta: incoming.self_nat_port_delta,
+        peer_nat_type: incoming.peer_nat_type,
+        peer_nat_port_delta: incoming.peer_nat_port_delta,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_relay_incoming(
     incoming: RelayIncoming,
@@ -6309,12 +6332,7 @@ fn serve_relay_incoming(
             Ok(Some(_))
         ),
     };
-    let candidates = P2pCandidates {
-        session_id: incoming.session_id.clone(),
-        peer_public_addr: incoming.peer_public_addr.clone(),
-        peer_lan_addrs: incoming.peer_lan_addrs.clone(),
-        local_udp_port: incoming.local_udp_port,
-    };
+    let candidates = build_host_p2p_candidates(&incoming);
     let mut established: Option<EstablishedIncomingHost> = None;
 
     if !skip_p2p_for_proxy
@@ -6322,6 +6340,8 @@ fn serve_relay_incoming(
         && !stop_flag.load(Ordering::Acquire)
         && !disconnect_flag.load(Ordering::Acquire)
     {
+        let port_hold =
+            crate::signal_client::acquire_local_udp_port_for_p2p(candidates.local_udp_port);
         if let Ok(p2p_conn) = p2p::attempt_p2p_quic_host_mtls(
             &candidates,
             p2p::DEFAULT_PUNCH_TIMEOUT,
@@ -6333,12 +6353,15 @@ fn serve_relay_incoming(
                 || disconnect_flag.load(Ordering::Acquire)
                 || session_cancel.load(Ordering::Acquire)
             {
+                drop(p2p_conn);
+                drop(port_hold);
                 disconnect_flag.store(false, Ordering::Release);
                 return;
             }
+            let held_p2p = crate::signal_client::P2pHeldTransport::new(p2p_conn, port_hold);
             let peer_label = format!("设备 {} (P2P 直连)", incoming.peer_id);
             match build_and_handshake_transport(
-                Box::new(p2p_conn),
+                Box::new(held_p2p),
                 HostTransportKind::P2p,
                 &peer_label,
                 actual_addr,
@@ -7733,6 +7756,7 @@ mod tests {
             owner_grant: None,
             is_owner_connection: true,
             is_relay_alloc: false,
+            ..RelayIncoming::default()
         };
 
         queue.push(make_item("111222333", "old-token"));
@@ -8417,6 +8441,7 @@ mod tests {
             owner_grant: None,
             is_owner_connection: true,
             is_relay_alloc: false,
+            ..RelayIncoming::default()
         };
 
         q.push(mk("111222333", "stale-lan-token", vec!["192.168.1.5:9901"]));
@@ -8844,6 +8869,7 @@ mod tests {
                 owner_grant: None,
                 is_owner_connection: is_owner,
                 is_relay_alloc,
+                ..RelayIncoming::default()
             };
 
         let ttl = Duration::from_secs(20);
@@ -9157,6 +9183,7 @@ mod tests {
             owner_grant: None,
             is_owner_connection: true,
             is_relay_alloc,
+            ..RelayIncoming::default()
         };
 
         let ttl = Duration::from_secs(20);

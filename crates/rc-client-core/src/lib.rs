@@ -19,6 +19,7 @@ pub mod hud;
 pub mod input_bridge;
 pub mod lan_discovery;
 pub mod model;
+pub mod nat;
 pub mod p2p;
 pub mod platform;
 pub mod proxy;

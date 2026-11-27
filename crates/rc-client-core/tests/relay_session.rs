@@ -1559,6 +1559,7 @@ fn inproc_p2p_split_brain_handshake_drop_falls_back_to_tcp_relay() {
         peer_public_addr: Some(format!("127.0.0.1:{host_udp_port}")),
         peer_lan_addrs: Vec::new(),
         local_udp_port: Some(client_udp_port),
+        ..Default::default()
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let p2p_conn = rc_client_core::p2p::attempt_p2p_quic_client(
