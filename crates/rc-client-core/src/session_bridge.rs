@@ -732,28 +732,87 @@ struct BuiltPipeline {
     pipeline: ControllerPipeline,
     backend_label: String,
     renderer: RendererHandle,
+    pending_resize: Arc<AtomicU64>,
     layer_addr: usize,
     is_hardware: bool,
 }
 
-/// 共享渲染器包装：让会话线程在不改 `ControllerPipeline` API 的前提下响应 `StageRect` resize。
+fn pack_stage_rect(width: u32, height: u32) -> u64 {
+    (u64::from(width) << 32) | u64::from(height)
+}
+
+fn unpack_stage_rect(packed: u64) -> (u32, u32) {
+    ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32)
+}
+
+fn apply_stage_rect_nonblocking(
+    rend: &RendererHandle,
+    pending_resize: &AtomicU64,
+    width: u32,
+    height: u32,
+) -> bool {
+    match rend.try_lock() {
+        Ok(mut guard) => {
+            pending_resize.store(0, Ordering::Release);
+            let _ = guard.resize((width, height));
+            true
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            pending_resize.store(pack_stage_rect(width, height), Ordering::Release);
+            false
+        }
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            let mut guard = poisoned.into_inner();
+            pending_resize.store(0, Ordering::Release);
+            let _ = guard.resize((width, height));
+            true
+        }
+    }
+}
+
+fn apply_stage_rect_to_slot(
+    renderer_handle: &Mutex<Option<RendererHandle>>,
+    renderer_pending_resize: &Mutex<Arc<AtomicU64>>,
+    width: u32,
+    height: u32,
+) {
+    let rend_opt = renderer_handle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let pending = Arc::clone(
+        &renderer_pending_resize
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    );
+    if let Some(rend) = rend_opt {
+        apply_stage_rect_nonblocking(&rend, &pending, width, height);
+    }
+}
+
+/// 共享渲染器包装：让会话线程在不改 `ControllerPipeline` API 的前提下无阻塞响应 `StageRect` resize。
 struct SharedRenderer {
     inner: RendererHandle,
+    pending_resize: Arc<AtomicU64>,
 }
 
 impl Renderer for SharedRenderer {
     fn present(&mut self, frame: rc_decode::DecodedFrame) -> rc_types::Result<rc_types::Timestamp> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .present(frame)
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let packed = self.pending_resize.swap(0, Ordering::AcqRel);
+        if packed != 0 {
+            let (w, h) = unpack_stage_rect(packed);
+            if w > 0 && h > 0 {
+                let _ = guard.resize((w, h));
+            }
+        }
+        guard.present(frame)
     }
 
     fn resize(&mut self, size: (u32, u32)) -> rc_types::Result<()> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .resize(size)
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.pending_resize.store(0, Ordering::Release);
+        guard.resize(size)
     }
 
     fn set_vsync(&mut self, on: bool) {
@@ -2828,6 +2887,27 @@ impl RelayRttController {
     }
 }
 
+fn path_kind_from_transport_label(label: &str) -> TransportPathKind {
+    match label {
+        "TCP Relay" => TransportPathKind::Relay,
+        "UDP P2P" => TransportPathKind::P2p,
+        "UDP LAN (mTLS)" => TransportPathKind::MtlsLan,
+        _ => TransportPathKind::Lan,
+    }
+}
+
+fn should_run_initial_bw_probe(path_kind: TransportPathKind) -> bool {
+    matches!(path_kind, TransportPathKind::P2p)
+}
+
+fn sync_relay_rtt_ctrl_for_path(
+    path_kind: TransportPathKind,
+    target_bps: u32,
+    now: Instant,
+) -> Option<RelayRttController> {
+    (path_kind == TransportPathKind::Relay).then(|| RelayRttController::new(target_bps.max(1), now))
+}
+
 fn prepare_peer_mtls_bundle(
     cfg: &UiSessionConfig,
     grant: &ConnectGrant,
@@ -3553,6 +3633,8 @@ fn run_session_thread(
     let pending_control: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
     let backend_label: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let renderer_handle: Arc<Mutex<Option<RendererHandle>>> = Arc::new(Mutex::new(None));
+    let renderer_pending_resize: Arc<Mutex<Arc<AtomicU64>>> =
+        Arc::new(Mutex::new(Arc::new(AtomicU64::new(0))));
     let is_signaling_session = cfg.relay_grant.is_some();
     let streaming_started = Arc::new(AtomicBool::new(false));
     let clipboard_enabled_flag = Arc::new(AtomicBool::new(cfg.clipboard_enabled));
@@ -3563,6 +3645,7 @@ fn run_session_thread(
     let make_pipeline_factory = |backend_suffix: Option<&'static str>| {
         let label = Arc::clone(&backend_label);
         let rend_slot = Arc::clone(&renderer_handle);
+        let pending_slot = Arc::clone(&renderer_pending_resize);
         let layer_slot = Arc::clone(&layer_lease);
         let want_real = Arc::clone(&want_real_pipeline);
         let built_real = Arc::clone(&real_pipeline_built);
@@ -3579,13 +3662,16 @@ fn run_session_thread(
                     async_decode: false,
                     ..pcfg.clone()
                 };
-                let (pipeline, _renderer) = fake_controller_stack(&placeholder_cfg)?;
+                let (pipeline, _renderer, _pending_resize) =
+                    fake_controller_stack(&placeholder_cfg)?;
                 let final_label = match backend_suffix {
                     Some(suffix) => format!("tools-only {suffix}"),
                     None => "tools-only".to_string(),
                 };
                 *label.lock().unwrap_or_else(|e| e.into_inner()) = final_label;
                 *rend_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *pending_slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Arc::new(AtomicU64::new(0));
                 // tools_only 模式严禁创建硬件 VT/Metal，也不写入 layer_lease。
                 built_real.store(false, Ordering::Release);
                 hw_slot.store(false, Ordering::Release);
@@ -3601,6 +3687,8 @@ fn run_session_thread(
                 None => built.backend_label,
             };
             *label.lock().unwrap_or_else(|e| e.into_inner()) = final_label;
+            *pending_slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                Arc::clone(&built.pending_resize);
             *rend_slot.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(Arc::clone(&built.renderer));
             *layer_slot.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -3787,12 +3875,7 @@ fn run_session_thread(
                 watch_only: live_watch_only.load(Ordering::Acquire),
             });
 
-            let sw_kind = match chosen_transport_label {
-                "TCP Relay" => TransportPathKind::Relay,
-                "UDP P2P" => TransportPathKind::P2p,
-                "UDP LAN (mTLS)" => TransportPathKind::MtlsLan,
-                _ => TransportPathKind::Lan,
-            };
+            let sw_kind = path_kind_from_transport_label(chosen_transport_label);
             let (sw_transport, switch_handle) = SwitchableTransport::new(
                 raw_transport,
                 Role::Controller,
@@ -4935,12 +5018,13 @@ fn run_session_thread(
     let mut hud_width = negotiated.width;
     let mut hud_height = negotiated.height;
     let mut current_fps = negotiated.fps;
-    let initial_path_kind = switch_handle
-        .as_ref()
-        .map_or(TransportPathKind::Lan, |h| h.active_kind());
+    let mut active_path_kind = switch_handle.as_ref().map_or_else(
+        || path_kind_from_transport_label(transport_label),
+        |h| h.active_kind(),
+    );
     let mut path_monitor = RuntimePathMonitor::with_initial_path(
         HysteresisConfig::default(),
-        initial_path_kind,
+        active_path_kind,
         Instant::now(),
     );
     let mut last_path_sample_at = Instant::now();
@@ -4954,9 +5038,9 @@ fn run_session_thread(
     let mut reprobe_answer_tx: Option<std::sync::mpsc::Sender<SwitchControlMsg>> = None;
 
     // ── 驱动循环（无 duration 上限，直到 Disconnect 或对端 Bye/错误）──
-    let mut is_tcp_relay = transport_label == "TCP Relay";
-    let mut relay_rtt_ctrl = is_tcp_relay
-        .then(|| RelayRttController::new(negotiated.bitrate_bps.max(1), Instant::now()));
+    let mut last_manual_bitrate_bps: Option<u32> = None;
+    let mut relay_rtt_ctrl =
+        sync_relay_rtt_ctrl_for_path(active_path_kind, negotiated.bitrate_bps, Instant::now());
     let mut last_busy = true;
     let mut epoch_sid = client.session_id();
     let mut disconnect_requested = false;
@@ -4989,6 +5073,7 @@ fn run_session_thread(
                 }
                 SessionCommand::SetBitrate { bps } => {
                     if bps > 0 && client.state() == SessionState::Streaming {
+                        last_manual_bitrate_bps = Some(bps);
                         if let Some(ref mut ctrl) = relay_rtt_ctrl {
                             ctrl.on_manual_bitrate(bps, Instant::now());
                         }
@@ -5007,16 +5092,12 @@ fn run_session_thread(
                 SessionCommand::StageRect { width, height } => {
                     if width > 0 && height > 0 {
                         last_stage_rect = Some((width, height));
-                        if let Some(rend) = renderer_handle
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .as_ref()
-                        {
-                            let _ = rend
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .resize((width, height));
-                        }
+                        apply_stage_rect_to_slot(
+                            &renderer_handle,
+                            &renderer_pending_resize,
+                            width,
+                            height,
+                        );
                     }
                 }
                 SessionCommand::SetClipboardEnabled { enabled } => {
@@ -5140,6 +5221,7 @@ fn run_session_thread(
                                 backend: &mut backend,
                                 backend_label: &backend_label,
                                 renderer_handle: &renderer_handle,
+                                renderer_pending_resize: &renderer_pending_resize,
                                 layer_lease: &layer_lease,
                                 active_backend_suffix,
                                 is_hardware_decoder: &mut is_hardware_decoder,
@@ -5275,7 +5357,7 @@ fn run_session_thread(
                 if client.state() != SessionState::Streaming {
                     continue;
                 }
-                if !is_tcp_relay {
+                if should_run_initial_bw_probe(active_path_kind) {
                     client.start_bw_probe(now_us).map_err(|e| {
                         classify_runtime_err_end(
                             "带宽粗测失败",
@@ -5290,10 +5372,15 @@ fn run_session_thread(
                         active_backend_suffix = ev.backend_suffix;
                         mtls_active = ev.mtls_active;
                         peer_cert_fingerprint = ev.peer_cert_fingerprint.clone();
-                        is_tcp_relay = ev.kind == TransportPathKind::Relay;
+                        active_path_kind = ev.kind;
                         let mut cur_neg = client.negotiated().unwrap_or(negotiated);
                         cur_neg.width = hud_width;
                         cur_neg.height = hud_height;
+                        relay_rtt_ctrl = sync_relay_rtt_ctrl_for_path(
+                            active_path_kind,
+                            last_manual_bitrate_bps.unwrap_or(cur_neg.bitrate_bps),
+                            Instant::now(),
+                        );
                         update_tx.push(SessionUpdate::Negotiated {
                             width: cur_neg.width,
                             height: cur_neg.height,
@@ -6448,16 +6535,12 @@ fn run_session_thread(
                             pending_unrecovered_decode_failure = None;
                             legacy_hevc_requested = false;
                             if let Some((w, h)) = last_stage_rect {
-                                if let Some(rend) = renderer_handle
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .as_ref()
-                                {
-                                    let _ = rend
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .resize((w, h));
-                                }
+                                apply_stage_rect_to_slot(
+                                    &renderer_handle,
+                                    &renderer_pending_resize,
+                                    w,
+                                    h,
+                                );
                             }
                         }
                         if let Some(n) = client.negotiated() {
@@ -6499,6 +6582,7 @@ fn run_session_thread(
                                     backend: &mut backend,
                                     backend_label: &backend_label,
                                     renderer_handle: &renderer_handle,
+                                    renderer_pending_resize: &renderer_pending_resize,
                                     layer_lease: &layer_lease,
                                     active_backend_suffix,
                                     is_hardware_decoder: &mut is_hardware_decoder,
@@ -6684,6 +6768,7 @@ struct DesktopUpgradeCtx<'a> {
     backend: &'a mut String,
     backend_label: &'a Mutex<String>,
     renderer_handle: &'a Mutex<Option<RendererHandle>>,
+    renderer_pending_resize: &'a Mutex<Arc<AtomicU64>>,
     layer_lease: &'a Mutex<Option<LayerLease>>,
     active_backend_suffix: Option<&'static str>,
     is_hardware_decoder: &'a mut bool,
@@ -6762,12 +6847,11 @@ where
         };
         *ctx.backend = final_label.clone();
         *ctx.backend_label.lock().unwrap_or_else(|e| e.into_inner()) = final_label;
+        *ctx.renderer_pending_resize
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Arc::clone(&built.pending_resize);
         if let Some((w, h)) = ctx.last_stage_rect {
-            let _ = built
-                .renderer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .resize((w, h));
+            apply_stage_rect_nonblocking(&built.renderer, &built.pending_resize, w, h);
         }
         *ctx.renderer_handle
             .lock()
@@ -6853,21 +6937,23 @@ fn build_controller_pipeline(
                 );
             }
         }
-        let (pipeline, renderer) = fake_controller_stack(pcfg)?;
+        let (pipeline, renderer, pending_resize) = fake_controller_stack(pcfg)?;
         return Ok(BuiltPipeline {
             pipeline,
             backend_label: "fake(降级)".to_string(),
             renderer,
+            pending_resize,
             layer_addr: 0,
             is_hardware: false,
         });
     }
     let _ = session_start;
-    let (pipeline, renderer) = fake_controller_stack(pcfg)?;
+    let (pipeline, renderer, pending_resize) = fake_controller_stack(pcfg)?;
     Ok(BuiltPipeline {
         pipeline,
         backend_label: "fake".to_string(),
         renderer,
+        pending_resize,
         layer_addr: 0,
         is_hardware: false,
     })
@@ -6895,14 +6981,17 @@ fn try_hardware_controller_stack(
     )
     .map_err(rc_types::Error::InvalidConfig)?;
     let shared: RendererHandle = Arc::new(Mutex::new(hw_rend.renderer));
+    let pending_resize = Arc::new(AtomicU64::new(0));
     let wrapper = SharedRenderer {
         inner: Arc::clone(&shared),
+        pending_resize: Arc::clone(&pending_resize),
     };
     let pipeline = ControllerPipeline::with_backends(hw_cfg, decoder, Box::new(wrapper))?;
     Ok(BuiltPipeline {
         pipeline,
         backend_label: format!("{dl}+{}", hw_rend.label),
         renderer: shared,
+        pending_resize,
         layer_addr: hw_rend.layer_addr,
         is_hardware: true,
     })
@@ -6911,7 +7000,7 @@ fn try_hardware_controller_stack(
 /// 假后端控制端栈：`FakeDecoder` + `FakeRenderer`。
 fn fake_controller_stack(
     pcfg: &PipelineConfig,
-) -> rc_types::Result<(ControllerPipeline, RendererHandle)> {
+) -> rc_types::Result<(ControllerPipeline, RendererHandle, Arc<AtomicU64>)> {
     let decoder = rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
         resolution: pcfg.resolution,
         ..rc_decode::FakeDecoderConfig::default()
@@ -6921,15 +7010,17 @@ fn fake_controller_stack(
         ..rc_render::FakeRendererConfig::default()
     })?;
     let shared: RendererHandle = Arc::new(Mutex::new(Box::new(renderer)));
+    let pending_resize = Arc::new(AtomicU64::new(0));
     let wrapper = SharedRenderer {
         inner: Arc::clone(&shared),
+        pending_resize: Arc::clone(&pending_resize),
     };
     let mut fake_cfg = pcfg.clone();
     // 明确关闭假后端管线内部的 prefer_hardware，避免热切不同 codec 时误调硬件工厂报错锁死。
     fake_cfg.prefer_hardware = false;
     let pipeline =
         ControllerPipeline::with_backends(fake_cfg, Box::new(decoder), Box::new(wrapper))?;
-    Ok((pipeline, shared))
+    Ok((pipeline, shared, pending_resize))
 }
 
 /// 当晚到的 `Capabilities` 抵达时校准未恢复的解码失败记录：
@@ -8333,6 +8424,57 @@ mod tests {
     }
 
     #[test]
+    fn initial_bw_probe_runs_only_for_p2p_and_relay_rtt_ctrl_syncs_on_path_switch() {
+        assert!(!should_run_initial_bw_probe(TransportPathKind::Lan));
+        assert!(!should_run_initial_bw_probe(TransportPathKind::MtlsLan));
+        assert!(!should_run_initial_bw_probe(TransportPathKind::Relay));
+        assert!(should_run_initial_bw_probe(TransportPathKind::P2p));
+
+        assert_eq!(
+            path_kind_from_transport_label("UDP LAN"),
+            TransportPathKind::Lan
+        );
+        assert_eq!(
+            path_kind_from_transport_label("UDP LAN (mTLS)"),
+            TransportPathKind::MtlsLan
+        );
+        assert_eq!(
+            path_kind_from_transport_label("UDP P2P"),
+            TransportPathKind::P2p
+        );
+        assert_eq!(
+            path_kind_from_transport_label("TCP Relay"),
+            TransportPathKind::Relay
+        );
+
+        let t0 = Instant::now();
+        assert!(sync_relay_rtt_ctrl_for_path(TransportPathKind::Lan, 14_000_000, t0).is_none());
+        assert!(sync_relay_rtt_ctrl_for_path(TransportPathKind::MtlsLan, 14_000_000, t0).is_none());
+        assert!(sync_relay_rtt_ctrl_for_path(TransportPathKind::P2p, 14_000_000, t0).is_none());
+
+        let mut ctrl = sync_relay_rtt_ctrl_for_path(TransportPathKind::Relay, 12_000_000, t0)
+            .expect("Relay path must activate RelayRttController");
+        assert_eq!(ctrl.cap_bps, 12_000_000);
+        assert_eq!(ctrl.current_bps, 12_000_000);
+        assert_eq!(
+            ctrl.on_probe(t0 + Duration::from_secs(1), 1, Some(20_000)),
+            None
+        );
+        assert_eq!(
+            ctrl.on_probe(t0 + Duration::from_secs(3), 2, Some(90_000)),
+            Some(9_000_000)
+        );
+
+        // Switching Relay -> Lan disables RelayRttController; Lan -> Relay recreates a clean one.
+        let disabled = sync_relay_rtt_ctrl_for_path(TransportPathKind::Lan, 12_000_000, t0);
+        assert!(disabled.is_none());
+        let reset = sync_relay_rtt_ctrl_for_path(TransportPathKind::Relay, 8_000_000, t0)
+            .expect("Lan -> Relay must recreate RelayRttController");
+        assert_eq!(reset.cap_bps, 8_000_000);
+        assert_eq!(reset.current_bps, 8_000_000);
+    }
+
+    #[test]
     fn handle_display_ctrl_msg_emits_host_screen_state_update() {
         let mut hud_w = 1920u32;
         let mut hud_h = 1080u32;
@@ -9009,6 +9151,7 @@ mod tests {
         let mut backend = "tools-only".to_string();
         let backend_label = Mutex::new(backend.clone());
         let renderer_handle = Mutex::new(None);
+        let renderer_pending_resize = Mutex::new(Arc::new(AtomicU64::new(0)));
         let layer_lease = Mutex::new(None);
         let mut is_hardware_decoder = false;
         let mut client_supports_hevc = false;
@@ -9029,6 +9172,7 @@ mod tests {
                 backend: &mut backend,
                 backend_label: &backend_label,
                 renderer_handle: &renderer_handle,
+                renderer_pending_resize: &renderer_pending_resize,
                 layer_lease: &layer_lease,
                 active_backend_suffix: None,
                 is_hardware_decoder: &mut is_hardware_decoder,
@@ -9083,6 +9227,7 @@ mod tests {
                 backend: &mut backend,
                 backend_label: &backend_label,
                 renderer_handle: &renderer_handle,
+                renderer_pending_resize: &renderer_pending_resize,
                 layer_lease: &layer_lease,
                 active_backend_suffix: None,
                 is_hardware_decoder: &mut is_hardware_decoder,
@@ -9130,6 +9275,7 @@ mod tests {
         let mut backend = "tools-only".to_string();
         let backend_label = Mutex::new(backend.clone());
         let renderer_handle = Mutex::new(None);
+        let renderer_pending_resize = Mutex::new(Arc::new(AtomicU64::new(0)));
         let layer_lease = Mutex::new(None);
         let mut is_hardware_decoder = false;
         let mut client_supports_hevc = false;
@@ -9152,6 +9298,7 @@ mod tests {
                 backend: &mut backend,
                 backend_label: &backend_label,
                 renderer_handle: &renderer_handle,
+                renderer_pending_resize: &renderer_pending_resize,
                 layer_lease: &layer_lease,
                 active_backend_suffix: None,
                 is_hardware_decoder: &mut is_hardware_decoder,
@@ -9181,8 +9328,10 @@ mod tests {
                     Arc::new(Mutex::new(Box::new(RecordingStageRenderer {
                         resizes: resizes_for_build,
                     })));
+                let pending_resize = Arc::new(AtomicU64::new(0));
                 let wrapper = SharedRenderer {
                     inner: Arc::clone(&shared),
+                    pending_resize: Arc::clone(&pending_resize),
                 };
                 let pipeline = ControllerPipeline::with_backends(
                     pcfg.clone(),
@@ -9193,6 +9342,7 @@ mod tests {
                     pipeline,
                     backend_label: "fake".to_string(),
                     renderer: shared,
+                    pending_resize,
                     layer_addr: 0,
                     is_hardware: false,
                 })
@@ -10643,7 +10793,7 @@ mod tests {
             prefer_hardware: true,
             ..PipelineConfig::default()
         };
-        let (fake_pipe, _) = fake_controller_stack(&pcfg).expect("fake stack");
+        let (fake_pipe, _, _) = fake_controller_stack(&pcfg).expect("fake stack");
         assert!(!fake_pipe.config().prefer_hardware);
     }
 
@@ -10707,6 +10857,112 @@ mod tests {
             .expect("renderer remains healthy after clear");
     }
 
+    #[test]
+    fn apply_stage_rect_nonblocking_defers_under_contention_and_applies_before_present() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Op {
+            Resize(u32, u32),
+            Present(u32),
+        }
+
+        struct RecordingOpsRenderer {
+            ops: Arc<Mutex<Vec<Op>>>,
+        }
+
+        impl Renderer for RecordingOpsRenderer {
+            fn present(
+                &mut self,
+                frame: rc_decode::DecodedFrame,
+            ) -> rc_types::Result<rc_types::Timestamp> {
+                self.ops
+                    .lock()
+                    .unwrap()
+                    .push(Op::Present(frame.decode_done_ts.0));
+                Ok(frame.decode_done_ts)
+            }
+
+            fn resize(&mut self, size: (u32, u32)) -> rc_types::Result<()> {
+                self.ops.lock().unwrap().push(Op::Resize(size.0, size.1));
+                Ok(())
+            }
+
+            fn set_vsync(&mut self, _on: bool) {}
+            fn set_cursor(&mut self, _pos: (i32, i32), _visible: bool) {}
+        }
+
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let inner: RendererHandle = Arc::new(Mutex::new(Box::new(RecordingOpsRenderer {
+            ops: Arc::clone(&ops),
+        })));
+        let pending_resize = Arc::new(AtomicU64::new(0));
+        let mut shared_renderer = SharedRenderer {
+            inner: Arc::clone(&inner),
+            pending_resize: Arc::clone(&pending_resize),
+        };
+
+        // 1) While renderer mutex is held (simulating nextDrawable stall), apply_stage_rect_nonblocking
+        //    must return immediately without blocking and store packed dimensions.
+        let guard = inner.lock().unwrap();
+        let applied_now = apply_stage_rect_nonblocking(&inner, &pending_resize, 1600, 900);
+        assert!(!applied_now);
+        assert_eq!(
+            pending_resize.load(Ordering::Acquire),
+            pack_stage_rect(1600, 900)
+        );
+        // Latest contended resize overwrites earlier pending dimensions.
+        assert!(!apply_stage_rect_nonblocking(
+            &inner,
+            &pending_resize,
+            1920,
+            1080
+        ));
+        assert_eq!(
+            pending_resize.load(Ordering::Acquire),
+            pack_stage_rect(1920, 1080)
+        );
+        assert!(ops.lock().unwrap().is_empty());
+        drop(guard);
+
+        // 2) Next SharedRenderer::present() must apply pending resize(1920, 1080) BEFORE present(frame),
+        //    and clear pending_resize to 0.
+        let frame = rc_decode::DecodedFrame {
+            decode_done_ts: rc_types::Timestamp(150),
+            width: 64,
+            height: 64,
+            texture: rc_capture::FrameTexture::Cpu(rc_types::CpuFrame {
+                width: 64,
+                height: 64,
+                format: rc_types::PixelFormat::Bgra8,
+                stride: 64 * 4,
+                data: vec![0u8; 64 * 64 * 4],
+            }),
+        };
+        shared_renderer.present(frame).expect("present");
+        assert_eq!(pending_resize.load(Ordering::Acquire), 0);
+        assert_eq!(
+            *ops.lock().unwrap(),
+            vec![Op::Resize(1920, 1080), Op::Present(150)]
+        );
+
+        // 3) Uncontended apply_stage_rect_nonblocking applies immediately and clears any stale pending value.
+        pending_resize.store(pack_stage_rect(800, 600), Ordering::Release);
+        assert!(apply_stage_rect_nonblocking(
+            &inner,
+            &pending_resize,
+            2560,
+            1440
+        ));
+        assert_eq!(pending_resize.load(Ordering::Acquire), 0);
+        assert_eq!(
+            *ops.lock().unwrap(),
+            vec![
+                Op::Resize(1920, 1080),
+                Op::Present(150),
+                Op::Resize(2560, 1440)
+            ]
+        );
+    }
+
     /// 对抗评审 Medium #4 回归：纯工具态升级桌面且 `still_refinement_enabled == false` 时，
     /// 必须在发送 `ClientMediaCaps` 后同步补发 `DisplayControlMsg::StillRefineConfig { enabled: false }`。
     #[test]
@@ -10724,6 +10980,7 @@ mod tests {
         let mut backend = "tools-only".to_string();
         let backend_label = Mutex::new(backend.clone());
         let renderer_handle = Mutex::new(None);
+        let renderer_pending_resize = Mutex::new(Arc::new(AtomicU64::new(0)));
         let layer_lease = Mutex::new(None);
         let mut is_hardware_decoder = false;
         let mut client_supports_hevc = false;
@@ -10744,6 +11001,7 @@ mod tests {
                 backend: &mut backend,
                 backend_label: &backend_label,
                 renderer_handle: &renderer_handle,
+                renderer_pending_resize: &renderer_pending_resize,
                 layer_lease: &layer_lease,
                 active_backend_suffix: None,
                 is_hardware_decoder: &mut is_hardware_decoder,

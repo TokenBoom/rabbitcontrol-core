@@ -1460,7 +1460,10 @@ impl Drop for QuicTransport {
 fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name(name.to_string())
-        .spawn(f)
+        .spawn(move || {
+            crate::promote_current_thread_qos();
+            f();
+        })
         .expect("spawn transport thread")
 }
 
@@ -1629,6 +1632,9 @@ fn urgent_writer(mut stream: quinn::SendStream, rx: Receiver<Vec<u8>>, shared: A
     }
 }
 
+/// `pacer_worker` 前瞻合并窗口：允许将 250µs 内即将到期的包合批发送，消除 per-packet `wait_timeout(20us)` 抖动。
+const PACER_COALESCE_HORIZON: Duration = Duration::from_micros(250);
+
 /// 发送线程：按 pacing 速率把数据报写进 QUIC（N3）。
 fn pacer_worker(shared: Arc<Shared>) {
     loop {
@@ -1636,7 +1642,11 @@ fn pacer_worker(shared: Arc<Shared>) {
             return;
         }
         let now = Instant::now();
-        let due = shared.pacer.lock().expect("pacer").poll(now);
+        let due = shared
+            .pacer
+            .lock()
+            .expect("pacer")
+            .poll_coalesced(now, PACER_COALESCE_HORIZON);
         for d in due {
             let n = d.len() as u64;
             // 帧尾包离栈 = 整帧发出：打 Sent 点（rc-trace 语义）。
@@ -1666,12 +1676,12 @@ fn pacer_worker(shared: Arc<Shared>) {
         // 睡到下一个放行时刻；入队会经 condvar 提前唤醒。
         let p = shared.pacer.lock().expect("pacer");
         let wait = match p.next_release_at() {
-            Some(t) => t
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_micros(20)),
+            Some(t) => t.saturating_duration_since(Instant::now()),
             None => WORKER_IDLE_WAIT,
         };
-        drop(shared.pacer_cv.wait_timeout(p, wait).expect("pacer cv"));
+        if !wait.is_zero() {
+            drop(shared.pacer_cv.wait_timeout(p, wait).expect("pacer cv"));
+        }
     }
 }
 

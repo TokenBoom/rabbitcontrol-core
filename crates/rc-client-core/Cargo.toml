@@ -11,6 +11,7 @@ rc-session = { path = "../rc-session" }
 rc-net = { path = "../rc-net" }
 rc-input = { path = "../rc-input" }
 rc-types = { path = "../rc-types" }
+rc-proto = { path = "../rc-proto" }
 rc-pipeline = { path = "../rc-pipeline" }
 rc-capture = { path = "../rc-capture" }
 rc-encode = { path = "../rc-encode" }

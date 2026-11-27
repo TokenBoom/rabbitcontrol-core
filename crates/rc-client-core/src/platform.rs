@@ -371,7 +371,9 @@ pub trait ClientUpdateHooks: Send + Sync {
 
 /// 注册当前进程的客户端原生平台钩子实现（仅首次调用生效）。
 pub fn register_platform_hooks(hooks: Arc<dyn ClientPlatformHooks>) -> bool {
-    PLATFORM_HOOKS.set(hooks).is_ok()
+    let ok = PLATFORM_HOOKS.set(hooks).is_ok();
+    rc_net::register_thread_qos_hook(promote_current_thread_qos);
+    ok
 }
 
 /// 注册当前进程的客户端自动更新钩子实现（仅首次调用生效，优先于 [`ClientPlatformHooks`] 的默认更新方法）。

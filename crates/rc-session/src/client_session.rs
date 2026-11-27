@@ -1027,14 +1027,16 @@ impl ClientSession {
                 if self.watchdog.poll(now) {
                     self.idr.request(IdrReason::WatchdogStall, now);
                 }
-                // rtt 注入自 NetStats（握手初期可能为 0 → 超时退化为纯 margin，
-                // localhost/内网足够；不依赖 T15 的 ProbePing）。
-                let rtt_us = self
+                // 优先注入 T15 ProbePong 的实时中位数 RTT（捕获 TCP Relay 真实排队延迟）；
+                // 尚未采集到有效实时探针样本时，回落至传输层 NetStats::rtt_us。
+                let transport_rtt_us = self
                     .transport
                     .as_ref()
                     .expect("Streaming implies transport")
                     .stats()
                     .rtt_us;
+                let rtt_us =
+                    effective_idr_rtt_us(self.probe_snapshot().rtt_us_median, transport_rtt_us);
                 if let Some(req) = self.idr.poll(now, rtt_us) {
                     // T17：尽力而为——连接将死时的发送失败由 poll 的断线信号
                     // 接管（重连成功后去抖已清，恢复路径会重新请求）。
@@ -3013,6 +3015,14 @@ pub struct ClientRunSummary {
 // ─────────────────────────────────────────────────────────────────
 // 测试：全部离线确定性（mock transport + 假后端，无网络、无 sleep）
 // ─────────────────────────────────────────────────────────────────
+
+/// 优先使用实时 `ProbeSnapshot::rtt_us_median`（>0），无有效样本时回落至 `transport.stats().rtt_us`。
+fn effective_idr_rtt_us(probe_rtt_median_us: Option<u64>, transport_rtt_us: u32) -> u32 {
+    probe_rtt_median_us
+        .filter(|&rtt| rtt > 0)
+        .map(|rtt| u32::try_from(rtt).unwrap_or(u32::MAX))
+        .unwrap_or(transport_rtt_us)
+}
 
 #[cfg(test)]
 mod tests {
@@ -5515,5 +5525,133 @@ mod tests {
             "32 位会话钟饱和在 u32::MAX 时 2s 快检不得失明"
         );
         client2.close(ByeReason::Normal).expect("close");
+    }
+
+    #[test]
+    fn client_feeds_live_probe_rtt_to_idr_controller_and_falls_back_to_transport_stats() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        assert_eq!(effective_idr_rtt_us(None, 12_000), 12_000);
+        assert_eq!(effective_idr_rtt_us(Some(0), 12_000), 12_000);
+        assert_eq!(effective_idr_rtt_us(Some(180_000), 12_000), 180_000);
+        assert_eq!(effective_idr_rtt_us(Some(u64::MAX), 12_000), u32::MAX);
+
+        struct RttMockTransport {
+            inner: MockTransport,
+            rtt_us: Arc<AtomicU32>,
+        }
+
+        impl Transport for RttMockTransport {
+            fn send_datagram(&mut self, data: &[u8]) -> Result<()> {
+                self.inner.send_datagram(data)
+            }
+            fn send_reliable(&mut self, data: &[u8]) -> Result<()> {
+                self.inner.send_reliable(data)
+            }
+            fn send_reliable_urgent(&mut self, data: &[u8]) -> Result<()> {
+                self.inner.send_reliable_urgent(data)
+            }
+            fn poll(&mut self, timeout: Duration) -> Result<Vec<NetEvent>> {
+                self.inner.poll(timeout)
+            }
+            fn stats(&self) -> rc_net::NetStats {
+                rc_net::NetStats {
+                    rtt_us: self.rtt_us.load(Ordering::Acquire),
+                    ..rc_net::NetStats::default()
+                }
+            }
+        }
+
+        // Case A: no ProbePong yet -> uses transport.stats().rtt_us (10ms -> ack_timeout=60ms,
+        // so retry fires at min_retry_interval_us=100ms).
+        let (clock_a, now_a) = mutable_clock();
+        let mut mock_a = MockTransport::new();
+        mock_a.deliver_reliable(&welcome_msg(7, req(), proto::AuthStatus::Ok));
+        let handle_a = mock_a.clone();
+        let mut client_a = ClientSession::with_parts(
+            cfg(Vec::new()),
+            Box::new(RttMockTransport {
+                inner: mock_a,
+                rtt_us: Arc::new(AtomicU32::new(10_000)),
+            }),
+            fake_decoder(0),
+            fake_renderer(),
+            clock_a,
+        )
+        .expect("with_parts a");
+        client_a.handshake().expect("handshake a");
+        assert_eq!(client_a.probe_snapshot().rtt_us_median, None);
+
+        // Initial tick triggers DecoderNeedKeyframe at t=0.
+        client_a.tick(Duration::ZERO, Instant::now()).expect("a t0");
+        assert_eq!(client_a.idr_requests_sent(), 1);
+        *now_a.lock().unwrap() = 100_001;
+        client_a
+            .tick(Duration::ZERO, Instant::now())
+            .expect("a t100ms");
+        assert_eq!(
+            client_a.idr_requests_sent(),
+            2,
+            "without live probe RTT, fallback transport.stats().rtt_us=10ms triggers retry at 100ms"
+        );
+        client_a.close(ByeReason::Normal).expect("close a");
+        drop(handle_a);
+
+        // Case B: live ProbePong yields rtt_us_median=200ms while transport.stats().rtt_us stays
+        // stale at 10ms -> ack_timeout=250ms, suppressing premature retry at 150ms/250ms and retrying at 250_001us.
+        let (clock_b, now_b) = mutable_clock();
+        let mut mock_b = MockTransport::new();
+        mock_b.deliver_reliable(&welcome_msg(7, req(), proto::AuthStatus::Ok));
+        let mut handle_b = mock_b.clone();
+        let mut client_b = ClientSession::with_parts(
+            cfg(Vec::new()),
+            Box::new(RttMockTransport {
+                inner: mock_b,
+                rtt_us: Arc::new(AtomicU32::new(10_000)),
+            }),
+            fake_decoder(0),
+            fake_renderer(),
+            clock_b,
+        )
+        .expect("with_parts b");
+        client_b.handshake().expect("handshake b");
+
+        // Anchor probe clock at t=0, emit ProbePing(id=1) at t=1_000_000,
+        // and deliver ProbePong at t=1_200_000us -> median RTT = 200_000us.
+        client_b.pump_probes(0).expect("pump_probes anchor");
+        *now_b.lock().unwrap() = 1_000_000;
+        client_b.pump_probes(1_000_000).expect("pump_probes send");
+        *now_b.lock().unwrap() = 1_200_000;
+        handle_b.deliver_reliable(&ControlMessage::ProbePong {
+            probe_id: 1,
+            echoed_clock_us: 1_000_000,
+            responder_clock_us: 1_100_000,
+        });
+        client_b
+            .tick(Duration::ZERO, Instant::now())
+            .expect("b t1200ms");
+        assert_eq!(client_b.probe_snapshot().rtt_us_median, Some(200_000));
+        let sent_at_1200ms = client_b.idr_requests_sent();
+        assert_eq!(sent_at_1200ms, 1);
+
+        // At +150ms (t=1_350ms) and +250ms (t=1_450ms): elapsed <= 250ms, must NOT retry yet.
+        *now_b.lock().unwrap() = 1_350_000;
+        client_b
+            .tick(Duration::ZERO, Instant::now())
+            .expect("b t1350ms");
+        assert_eq!(client_b.idr_requests_sent(), sent_at_1200ms);
+        *now_b.lock().unwrap() = 1_450_000;
+        client_b
+            .tick(Duration::ZERO, Instant::now())
+            .expect("b t1450ms");
+        assert_eq!(client_b.idr_requests_sent(), sent_at_1200ms);
+
+        // At +250_001us (t=1_450_001us): elapsed > 200ms + 50ms -> retries once.
+        *now_b.lock().unwrap() = 1_450_001;
+        client_b
+            .tick(Duration::ZERO, Instant::now())
+            .expect("b t1450_001");
+        assert_eq!(client_b.idr_requests_sent(), sent_at_1200ms + 1);
+        client_b.close(ByeReason::Normal).expect("close b");
     }
 }

@@ -96,6 +96,30 @@ impl Pacer {
         out
     }
 
+    /// 取出当前时刻及前瞻合并窗口 `[now, now + coalesce_horizon]` 内允许发送的包。
+    ///
+    /// 队列从空闲转忙时首包仍按 `now` 锚定（避免引入额外启动偏移），随后在
+    /// `now + coalesce_horizon` 内的后续包同批放行，消除每包一次的线程唤醒与定时器合并抖动，
+    /// 同时保持速率与包序完全精确。
+    pub(crate) fn poll_coalesced(
+        &mut self,
+        now: Instant,
+        coalesce_horizon: Duration,
+    ) -> Vec<Vec<u8>> {
+        if self.next_release.is_none() && !self.queue.is_empty() {
+            let mut out = self.poll(now);
+            if !coalesce_horizon.is_zero() {
+                if let Some(horizon) = now.checked_add(coalesce_horizon) {
+                    out.extend(self.poll(horizon));
+                }
+            }
+            out
+        } else {
+            let horizon = now.checked_add(coalesce_horizon).unwrap_or(now);
+            self.poll(horizon)
+        }
+    }
+
     /// 更新速率（由拥塞控制驱动；M3 之前保持初始值）。
     pub fn set_rate(&mut self, bps: u64) {
         self.rate_bps = bps;
@@ -239,5 +263,43 @@ mod tests {
         assert_eq!(send_interval(8_000_000, 1), Duration::from_micros(1));
         // 速率 0 = 不限速
         assert_eq!(send_interval(0, 9999), Duration::ZERO);
+    }
+
+    #[test]
+    fn pacer_poll_coalesced_batches_within_horizon_and_preserves_rate() {
+        // 200 Mbps 下 1150B 包串行化间隔 = 46µs；250µs 合并窗口应一次放行 6 包（0,46,92,138,184,230µs），
+        // 且 next_release 精确停在 t0 + 276µs（无启动偏移）。
+        let mut p = Pacer::new(200_000_000);
+        for i in 0..20u8 {
+            p.enqueue(vec![i; 1150]);
+        }
+        let t0 = Instant::now();
+        let horizon = Duration::from_micros(250);
+        let first_batch = p.poll_coalesced(t0, horizon);
+        assert_eq!(first_batch.len(), 6);
+        for (idx, pkt) in first_batch.iter().enumerate() {
+            assert_eq!(pkt[0], idx as u8);
+        }
+        assert_eq!(p.next_release_at(), Some(t0 + Duration::from_micros(276)));
+
+        // 按 276µs 后继续轮询直至排空，验证 FIFO 保序且不重复/不丢包。
+        let mut drained: Vec<u8> = first_batch.iter().map(|b| b[0]).collect();
+        let mut now = t0;
+        while p.queued_bytes() > 0 {
+            now += Duration::from_micros(250);
+            for pkt in p.poll_coalesced(now, horizon) {
+                drained.push(pkt[0]);
+            }
+        }
+        assert_eq!(drained, (0..20u8).collect::<Vec<_>>());
+        assert_eq!(p.next_release_at(), None);
+
+        // 10 Mbps（1250B = 1ms/pkt > 250µs）时，poll_coalesced 仍每次只放行 1 包，保持 N3 平滑。
+        let mut slow = Pacer::new(RATE_10M);
+        slow.enqueue(vec![1; PKT]);
+        slow.enqueue(vec![2; PKT]);
+        let slow_batch = slow.poll_coalesced(t0, horizon);
+        assert_eq!(slow_batch.len(), 1);
+        assert_eq!(slow.next_release_at(), Some(t0 + ONE_MS));
     }
 }

@@ -3750,6 +3750,26 @@ impl RelayBitrateController {
     }
 }
 
+fn sync_host_bitrate_on_path_switch(
+    host: &mut HostSession,
+    was_relay: bool,
+    new_kind: HostTransportKind,
+    negotiated_initial_bitrate_bps: u32,
+    now: Instant,
+) -> Option<RelayBitrateController> {
+    let had_remote_probe = host.last_remote_probe_bitrate_bps().is_some();
+    host.clear_remote_probe_bitrate();
+    if (was_relay && new_kind != HostTransportKind::Relay) || had_remote_probe {
+        let restore_bps = host
+            .last_manual_bitrate_bps()
+            .unwrap_or(negotiated_initial_bitrate_bps)
+            .max(1);
+        let _ = host.on_set_bitrate(restore_bps, rc_session::proto::BitrateReason::Probe as u8);
+    }
+    (new_kind == HostTransportKind::Relay)
+        .then(|| RelayBitrateController::new(host.current_bitrate_bps().max(1), now))
+}
+
 struct HostSwitchRuntime {
     handle: SwitchHandle,
     incoming: RelayIncoming,
@@ -4076,6 +4096,11 @@ fn drive_ui_host_session_with_audio(
     let mut audio_silence_gate = AudioSilenceGate::default();
     let mut audio_seq: u32 = 0;
     let mut last_busy = true;
+    let negotiated_initial_bitrate_bps = host
+        .negotiated()
+        .map(|n| n.bitrate_bps)
+        .filter(|&b| b > 0)
+        .unwrap_or_else(|| host.current_bitrate_bps().max(1));
     let mut relay_bitrate_ctrl = (transport_kind == HostTransportKind::Relay)
         .then(|| RelayBitrateController::new(host.current_bitrate_bps().max(1), Instant::now()));
     let mut last_relay_bwe_at = Instant::now();
@@ -6311,6 +6336,7 @@ fn drive_ui_host_session_with_audio(
 
                         if let Some(ref sw_rt) = switch_rt {
                             for ev in sw_rt.handle.drain_path_events() {
+                                let was_relay = transport_kind == HostTransportKind::Relay;
                                 transport_kind = match ev.kind {
                                     TransportPathKind::Relay => HostTransportKind::Relay,
                                     TransportPathKind::P2p => HostTransportKind::P2p,
@@ -6318,13 +6344,13 @@ fn drive_ui_host_session_with_audio(
                                     TransportPathKind::MtlsLan => HostTransportKind::MtlsLan,
                                 };
                                 transport_kind_cell.set(transport_kind);
-                                relay_bitrate_ctrl = (transport_kind == HostTransportKind::Relay)
-                                    .then(|| {
-                                        RelayBitrateController::new(
-                                            host.current_bitrate_bps().max(1),
-                                            Instant::now(),
-                                        )
-                                    });
+                                relay_bitrate_ctrl = sync_host_bitrate_on_path_switch(
+                                    host,
+                                    was_relay,
+                                    transport_kind,
+                                    negotiated_initial_bitrate_bps,
+                                    Instant::now(),
+                                );
                                 let new_label = ev.kind.host_label(&sw_rt.incoming.peer_id);
                                 emit_peer_connected(host, &new_label, updates);
                             }
@@ -9286,6 +9312,159 @@ mod tests {
             None
         );
         assert_eq!(ctrl.effective_bps(), 8_000_000);
+    }
+
+    #[test]
+    fn sync_host_bitrate_on_path_switch_clears_probe_and_restores_bitrate_leaving_relay() {
+        use rc_session::proto::{
+            AuthMethod, BitrateReason, ControlMessage, Hello, PROTOCOL_VERSION,
+        };
+        use rc_session::testkit::MockTransport;
+
+        let initial_bps = 12_000_000;
+        let requested = SessionParams {
+            width: 320,
+            height: 240,
+            fps: 30,
+            bitrate_bps: initial_bps,
+        };
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&ControlMessage::Hello(Hello {
+            version: PROTOCOL_VERSION,
+            session_id: 99,
+            requested,
+            auth_method: AuthMethod::None,
+            auth_payload: Vec::new(),
+        }));
+        let mut handle = mock.clone();
+
+        let capture = rc_capture::FakeBackend::new(rc_capture::FakeBackendConfig {
+            display: rc_capture::DisplayInfo {
+                id: rc_types::DisplayId(0),
+                resolution: Resolution::new(320, 240),
+                scale: 1.0,
+                hdr: false,
+            },
+            fps: 30,
+            content: rc_capture::FakeContent::Static,
+            dirty_rect: None,
+        })
+        .expect("fake capture");
+        let encoder = rc_encode::FakeEncoder::new(rc_encode::EncoderConfig {
+            resolution: Resolution::new(320, 240),
+            fps: 30,
+            bitrate_bps: initial_bps,
+            ..rc_encode::EncoderConfig::default()
+        })
+        .expect("fake encoder");
+
+        let cfg = HostSessionConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            mtu: rc_session::DEFAULT_SESSION_MTU,
+            caps: requested,
+            pipeline: PipelineConfig {
+                resolution: Resolution::new(320, 240),
+                fps: 30,
+                bitrate_bps: initial_bps,
+                prefer_hardware: false,
+                target_latency_us: 22_000,
+                trace_capacity: 64,
+                diff: DiffMode::TrustPlatform,
+                clock_origin_us: None,
+                max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+                ..PipelineConfig::default()
+            },
+            handshake_timeout: Duration::from_secs(5),
+            injector: Box::new(RecordingInjector::new()),
+            pace_capture: false,
+            auth: HostAuthConfig::default(),
+            approver: Box::new(AutoApprover),
+            tool_permissions: rc_session::ToolPermissions::all_allowed(),
+        };
+        let clock: SessionClock = Arc::new(|| 1_000);
+        let mut host = HostSession::with_parts(
+            cfg,
+            Box::new(mock),
+            Box::new(capture),
+            Box::new(encoder),
+            clock,
+        )
+        .expect("with_parts");
+        host.handshake().expect("handshake");
+
+        // 1) Simulate Relay remote probe lowering bitrate to 4 Mbps.
+        handle.deliver_reliable(&ControlMessage::SetBitrate {
+            bps: 4_000_000,
+            reason: BitrateReason::Probe,
+        });
+        host.tick(Duration::ZERO).expect("tick");
+        assert_eq!(host.last_remote_probe_bitrate_bps(), Some(4_000_000));
+        assert_eq!(host.current_bitrate_bps(), 4_000_000);
+
+        // 2) Switch Relay -> P2p (without manual bitrate): clears probe & restores initial 12 Mbps.
+        let t0 = Instant::now();
+        let ctrl = sync_host_bitrate_on_path_switch(
+            &mut host,
+            true,
+            HostTransportKind::P2p,
+            initial_bps,
+            t0,
+        );
+        assert!(ctrl.is_none());
+        assert_eq!(host.last_remote_probe_bitrate_bps(), None);
+        assert_eq!(host.current_bitrate_bps(), initial_bps);
+
+        // 2b) P2p runs BwProbe -> SetBitrate(4M, Probe), then degrades P2p -> Relay:
+        //     must clear probe, restore initial 12 Mbps before constructing RelayBitrateController,
+        //     and initialize RelayBitrateController::effective_bps() == initial_bps.
+        handle.deliver_reliable(&ControlMessage::SetBitrate {
+            bps: 4_000_000,
+            reason: BitrateReason::Probe,
+        });
+        host.tick(Duration::ZERO).expect("tick");
+        assert_eq!(host.last_remote_probe_bitrate_bps(), Some(4_000_000));
+        assert_eq!(host.current_bitrate_bps(), 4_000_000);
+
+        let degraded_relay_ctrl = sync_host_bitrate_on_path_switch(
+            &mut host,
+            false,
+            HostTransportKind::Relay,
+            initial_bps,
+            t0,
+        )
+        .expect("P2p -> Relay must activate RelayBitrateController");
+        assert_eq!(host.last_remote_probe_bitrate_bps(), None);
+        assert_eq!(host.current_bitrate_bps(), initial_bps);
+        assert_eq!(degraded_relay_ctrl.effective_bps(), initial_bps);
+
+        // 3) On Relay, receive manual 8 Mbps + probe 3 Mbps, then Relay -> Lan:
+        //    must clear probe & restore to manual 8 Mbps (not initial 12 Mbps).
+        handle.deliver_reliable(&ControlMessage::SetBitrate {
+            bps: 8_000_000,
+            reason: BitrateReason::Manual,
+        });
+        handle.deliver_reliable(&ControlMessage::SetBitrate {
+            bps: 3_000_000,
+            reason: BitrateReason::Probe,
+        });
+        host.tick(Duration::ZERO).expect("tick");
+        assert_eq!(host.last_manual_bitrate_bps(), Some(8_000_000));
+        assert_eq!(host.last_remote_probe_bitrate_bps(), Some(3_000_000));
+        assert_eq!(host.current_bitrate_bps(), 3_000_000);
+
+        let lan_ctrl = sync_host_bitrate_on_path_switch(
+            &mut host,
+            true,
+            HostTransportKind::Lan,
+            initial_bps,
+            t0,
+        );
+        assert!(lan_ctrl.is_none());
+        assert_eq!(host.last_remote_probe_bitrate_bps(), None);
+        assert_eq!(host.current_bitrate_bps(), 8_000_000);
+
+        host.close(rc_session::proto::ByeReason::Normal)
+            .expect("close");
     }
 
     #[test]

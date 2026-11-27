@@ -37,9 +37,24 @@ pub mod stats;
 pub use mtls::{cert_sha256_hex, parse_rc_san_uri, MtlsConfig, PeerMtlsIdentity};
 
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use rc_types::Result;
+
+static THREAD_QOS_HOOK: OnceLock<fn()> = OnceLock::new();
+
+/// 注册当前进程的传输工作线程 QoS 提升钩子（仅首次调用生效）。
+pub fn register_thread_qos_hook(hook: fn()) {
+    let _ = THREAD_QOS_HOOK.set(hook);
+}
+
+/// 调用已注册的传输工作线程 QoS 提升钩子（未注册时无操作）。
+pub(crate) fn promote_current_thread_qos() {
+    if let Some(hook) = THREAD_QOS_HOOK.get() {
+        hook();
+    }
+}
 
 /// 本端在会话中的角色。
 ///
@@ -168,4 +183,24 @@ pub struct NetStats {
     pub bytes_sent: u64,
     /// 应用层已接收字节数
     pub bytes_recv: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static QOS_HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_qos_hook() {
+        QOS_HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn register_thread_qos_hook_invokes_registered_fn() {
+        let before = QOS_HOOK_CALLS.load(Ordering::Relaxed);
+        register_thread_qos_hook(test_qos_hook);
+        promote_current_thread_qos();
+        assert_eq!(QOS_HOOK_CALLS.load(Ordering::Relaxed), before + 1);
+    }
 }

@@ -69,8 +69,8 @@ const RELAY_TX_DATAGRAM_CAP: usize = 1024;
 const RELAY_TX_DATAGRAM_MAX_BYTES: usize = 768 * 1024;
 /// 写线程单次合批加密并写入 TCP 的最大明文字节数（32 KiB）。
 const RELAY_TX_BATCH_MAX_BYTES: usize = 32 * 1024;
-/// TLS 读线程单次 TCP 读缓冲（128 KiB）。
-const RELAY_READER_TLS_BUF_BYTES: usize = 128 * 1024;
+/// TLS 读线程单次 TCP 读缓冲（32 KiB，平滑单次突发，避免 128 KiB 一次冲刷百余数据报）。
+const RELAY_READER_TLS_BUF_BYTES: usize = 32 * 1024;
 /// 非 Linux 平台套接字发送缓冲上限（512 KiB），避免 macOS 自动扩到 4 MiB 放大排队延迟。
 #[cfg(not(target_os = "linux"))]
 const RELAY_SO_SNDBUF: usize = 512 * 1024;
@@ -276,6 +276,37 @@ fn extract_payload_media_frame_seq(payload: &[u8]) -> Option<u64> {
     }
 }
 
+/// 判定带 5 字节中继帧头的 `CH_DATAGRAM` 帧是否为 `rc-proto` IDR 关键帧分片。
+fn is_relay_media_idr(frame: &[u8]) -> bool {
+    frame.len() > 5
+        && frame[0] == CH_DATAGRAM
+        && rc_proto::MediaHeader::parse(&frame[5..]).is_ok_and(|h| h.flags.is_idr())
+}
+
+/// 原子移除 `guard.datagram[idx]` 及其同 `frame_seq` 全部分片并扣减 `datagram_bytes`。
+fn evict_relay_frame_at(guard: &mut TxQueueInner, idx: usize) -> (Option<u64>, u64) {
+    let Some(dropped) = guard.datagram.remove(idx) else {
+        return (None, 0);
+    };
+    guard.datagram_bytes = guard.datagram_bytes.saturating_sub(dropped.len());
+    let mut removed = 1u64;
+    let victim_seq = extract_relay_media_frame_seq(&dropped);
+    if let Some(seq) = victim_seq {
+        let mut extra_bytes = 0usize;
+        guard.datagram.retain(|d| {
+            if extract_relay_media_frame_seq(d) == Some(seq) {
+                extra_bytes = extra_bytes.saturating_add(d.len());
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        guard.datagram_bytes = guard.datagram_bytes.saturating_sub(extra_bytes);
+    }
+    (victim_seq, removed)
+}
+
 #[derive(Debug)]
 enum TxBatch {
     Frames { payload_bytes: u64 },
@@ -432,32 +463,36 @@ impl TxQueue {
         while guard.datagram.len() >= self.datagram_cap
             || guard.datagram_bytes.saturating_add(frame_len) > self.datagram_max_bytes
         {
-            if let Some(dropped) = guard.datagram.pop_front() {
-                guard.datagram_bytes = guard.datagram_bytes.saturating_sub(dropped.len());
-                evicted_count += 1;
-                if let Some(victim_seq) = extract_relay_media_frame_seq(&dropped) {
-                    while let Some(next_front) = guard.datagram.front() {
-                        if extract_relay_media_frame_seq(next_front) == Some(victim_seq) {
-                            let extra = guard.datagram.pop_front().expect("front checked");
-                            guard.datagram_bytes = guard.datagram_bytes.saturating_sub(extra.len());
-                            evicted_count += 1;
-                        } else {
-                            break;
-                        }
+            let evict_idx = match guard.datagram.iter().position(|d| !is_relay_media_idr(d)) {
+                Some(idx) => idx,
+                None if !is_relay_media_idr(&frame) => {
+                    // 队列中仅剩 IDR 分片时，直接丢弃入站 P 帧（并标记其 frame_seq 拒收后续尾片），
+                    // 避免挤掉在途 IDR 引发 >550ms `AwaitFrame` 停滞。
+                    if let Some(seq) = incoming_seq {
+                        guard.abandoned_frame_seq = Some(seq);
                     }
-                    if Some(victim_seq) == incoming_seq {
-                        // 超大单帧自身耗尽队列上限时整帧放弃并拒收后续尾包，避免发出必废残片。
-                        guard.abandoned_frame_seq = Some(victim_seq);
-                        evicted_count += 1;
-                        self.queued_datagram_bytes
-                            .store(guard.datagram_bytes, Ordering::Relaxed);
-                        self.dropped_datagrams
-                            .fetch_add(evicted_count, Ordering::Relaxed);
-                        return Ok(());
-                    }
+                    self.queued_datagram_bytes
+                        .store(guard.datagram_bytes, Ordering::Relaxed);
+                    self.dropped_datagrams
+                        .fetch_add(evicted_count + 1, Ordering::Relaxed);
+                    return Ok(());
                 }
-            } else {
+                None => 0,
+            };
+            let (victim_seq, removed) = evict_relay_frame_at(&mut guard, evict_idx);
+            if removed == 0 {
                 break;
+            }
+            evicted_count += removed;
+            if victim_seq.is_some() && victim_seq == incoming_seq {
+                // 超大单帧自身耗尽队列上限时整帧放弃并拒收后续尾包，避免发出必废残片。
+                guard.abandoned_frame_seq = victim_seq;
+                evicted_count += 1;
+                self.queued_datagram_bytes
+                    .store(guard.datagram_bytes, Ordering::Relaxed);
+                self.dropped_datagrams
+                    .fetch_add(evicted_count, Ordering::Relaxed);
+                return Ok(());
             }
         }
         guard.datagram_bytes = guard.datagram_bytes.saturating_add(frame_len);
@@ -675,24 +710,47 @@ impl RxQueue {
         }
     }
 
-    /// 推入 `Datagram`：永不阻塞；队列满（条数或总字节超限）时优先淘汰最旧的 `Datagram`。
-    fn push_datagram(&self, payload: Vec<u8>) {
+    fn push_datagram_locked(&self, guard: &mut RxQueueInner, payload: Vec<u8>) -> bool {
         let incoming_bytes = payload.len();
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if guard.shutdown || incoming_bytes > self.max_bytes {
-            return;
+            return false;
         }
         while guard.events.len() >= self.cap
             || guard.total_bytes.saturating_add(incoming_bytes) > self.max_bytes
         {
-            if !evict_oldest_datagram(&mut guard) {
+            if !evict_oldest_datagram(guard) {
                 // 队列已被 Reliable/ReliableUrgent 占满，直接丢弃本 datagram 防阻塞与超内存。
-                return;
+                return false;
             }
         }
         guard.total_bytes = guard.total_bytes.saturating_add(incoming_bytes);
         guard.events.push_back(NetEvent::Datagram(payload));
-        self.cv.notify_one();
+        true
+    }
+
+    /// 推入 `Datagram`：永不阻塞；队列满（条数或总字节超限）时优先淘汰最旧的 `Datagram`。
+    fn push_datagram(&self, payload: Vec<u8>) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if self.push_datagram_locked(&mut guard, payload) {
+            self.cv.notify_one();
+        }
+    }
+
+    /// 单锁批量推入连续 `Datagram`，并在至少推入 1 条后统一唤醒等待者。
+    fn push_datagram_batch(&self, payloads: &mut Vec<Vec<u8>>) {
+        if payloads.is_empty() {
+            return;
+        }
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pushed_any = false;
+        for payload in payloads.drain(..) {
+            if self.push_datagram_locked(&mut guard, payload) {
+                pushed_any = true;
+            }
+        }
+        if pushed_any {
+            self.cv.notify_one();
+        }
     }
 
     /// 推入 `Reliable` / `ReliableUrgent`：满（条数或总字节超限）时优先淘汰最旧 `Datagram`；
@@ -774,9 +832,36 @@ impl RxQueue {
         if guard.events.is_empty() {
             return Vec::new();
         }
-        let out: Vec<NetEvent> = guard.events.drain(..).collect();
-        guard.total_bytes = 0;
-        self.cv.notify_all();
+        const MAX_COMPLETE_FRAMES_PER_POLL: usize = 2;
+        let mut out = Vec::with_capacity(guard.events.len().min(64));
+        let mut kept = VecDeque::new();
+        let mut kept_bytes = 0usize;
+        let mut complete_frames_drained = 0usize;
+        while let Some(ev) = guard.events.pop_front() {
+            match &ev {
+                NetEvent::Datagram(p) => {
+                    if complete_frames_drained >= MAX_COMPLETE_FRAMES_PER_POLL {
+                        kept_bytes = kept_bytes.saturating_add(p.len());
+                        kept.push_back(ev);
+                        continue;
+                    }
+                    if rc_proto::MediaHeader::parse(p)
+                        .is_ok_and(|h| h.is_last() && !h.flags.is_parity())
+                    {
+                        complete_frames_drained += 1;
+                    }
+                    out.push(ev);
+                }
+                _ => {
+                    out.push(ev);
+                }
+            }
+        }
+        guard.events = kept;
+        guard.total_bytes = kept_bytes;
+        if !out.is_empty() {
+            self.cv.notify_all();
+        }
         out
     }
 }
@@ -2186,6 +2271,7 @@ fn connect_relay_internal(
     let reader_thread = thread::Builder::new()
         .name("rc-relay-rx".to_string())
         .spawn(move || {
+            crate::platform::promote_current_thread_qos();
             if let Some(tls) = tls_for_reader {
                 reader_loop_tls(
                     read_stream,
@@ -2215,6 +2301,7 @@ fn connect_relay_internal(
     let writer_thread = match thread::Builder::new()
         .name("rc-relay-writer".to_string())
         .spawn(move || {
+            crate::platform::promote_current_thread_qos();
             writer_loop(
                 write_stream,
                 tls_stack,
@@ -2471,7 +2558,9 @@ fn drain_plain_frames(
     read_pos: &mut usize,
     rx: &RxQueue,
     bytes_recv: &AtomicU64,
+    datagram_batch: &mut Vec<Vec<u8>>,
 ) -> std::result::Result<(), String> {
+    datagram_batch.clear();
     loop {
         let avail = &plain_buf[*read_pos..];
         if avail.len() < 5 {
@@ -2480,9 +2569,11 @@ fn drain_plain_frames(
         let ch = avail[0];
         let len = u32::from_be_bytes([avail[1], avail[2], avail[3], avail[4]]) as usize;
         if !matches!(ch, CH_DATAGRAM | CH_RELIABLE | CH_RELIABLE_URGENT) {
+            rx.push_datagram_batch(datagram_batch);
             return Err(format!("relay invalid channel id: {ch}"));
         }
         if len > MAX_RELAY_FRAME_LEN {
+            rx.push_datagram_batch(datagram_batch);
             return Err(format!(
                 "relay frame length {len} exceeds maximum {MAX_RELAY_FRAME_LEN}"
             ));
@@ -2493,8 +2584,15 @@ fn drain_plain_frames(
         }
         let payload = avail[5..total].to_vec();
         *read_pos += total;
-        dispatch_decoded_frame(ch, payload, rx, bytes_recv);
+        if ch == CH_DATAGRAM {
+            bytes_recv.fetch_add(payload.len() as u64, Ordering::Relaxed);
+            datagram_batch.push(payload);
+        } else {
+            rx.push_datagram_batch(datagram_batch);
+            dispatch_decoded_frame(ch, payload, rx, bytes_recv);
+        }
     }
+    rx.push_datagram_batch(datagram_batch);
     if *read_pos > 0 {
         if *read_pos >= plain_buf.len() {
             plain_buf.clear();
@@ -2520,6 +2618,7 @@ fn reader_loop_tls(
     let mut read_pos = 0usize;
     let mut net_buf = vec![0u8; RELAY_READER_TLS_BUF_BYTES];
     let mut mid_scratch = Vec::with_capacity(RELAY_READER_TLS_BUF_BYTES);
+    let mut datagram_batch = Vec::with_capacity(32);
 
     // 先排空握手结束时 TLS 缓冲中可能已携带的首批明文载荷（无需额外 TCP 读）。
     let init_res = tls
@@ -2531,8 +2630,13 @@ fn reader_loop_tls(
             if wants_write {
                 tx.request_flush();
             }
-            if let Err(reason) = drain_plain_frames(&mut plain_buf, &mut read_pos, &rx, &bytes_recv)
-            {
+            if let Err(reason) = drain_plain_frames(
+                &mut plain_buf,
+                &mut read_pos,
+                &rx,
+                &bytes_recv,
+                &mut datagram_batch,
+            ) {
                 rx.push_disconnected(reason);
                 return;
             }
@@ -2594,9 +2698,13 @@ fn reader_loop_tls(
                 if wants_write {
                     tx.request_flush();
                 }
-                if let Err(reason) =
-                    drain_plain_frames(&mut plain_buf, &mut read_pos, &rx, &bytes_recv)
-                {
+                if let Err(reason) = drain_plain_frames(
+                    &mut plain_buf,
+                    &mut read_pos,
+                    &rx,
+                    &bytes_recv,
+                    &mut datagram_batch,
+                ) {
                     rx.push_disconnected(reason);
                     return;
                 }
@@ -4080,5 +4188,216 @@ pub(crate) mod tests {
     fn relay_tcp_keepalive_parameters_are_tightened() {
         assert_eq!(KEEPALIVE_IDLE, Duration::from_secs(10));
         assert_eq!(KEEPALIVE_INTERVAL, Duration::from_secs(3));
+    }
+
+    fn make_valid_media_payload(
+        seq: u64,
+        packet_idx: u16,
+        packet_cnt: u16,
+        is_idr: bool,
+        is_parity: bool,
+        payload_len: usize,
+    ) -> Vec<u8> {
+        let mut flags = rc_proto::HeaderFlags::empty();
+        if is_idr {
+            flags.set(rc_proto::HeaderFlags::IDR);
+        }
+        if is_parity {
+            flags.set(rc_proto::HeaderFlags::PARITY);
+        }
+        if !is_parity && packet_idx + 1 == packet_cnt {
+            flags.set(rc_proto::HeaderFlags::LAST);
+        }
+        let hdr = rc_proto::MediaHeader {
+            frame_seq: rc_types::FrameSeq(seq),
+            capture_ts: rc_types::Timestamp(100),
+            encode_done_ts: rc_types::Timestamp(200),
+            packet_idx,
+            packet_cnt,
+            fec_group: 0,
+            flags,
+            layer_id: 0,
+            payload_len: u16::try_from(payload_len).unwrap(),
+        };
+        let mut out = vec![0u8; rc_proto::HEADER_LEN + payload_len];
+        let mut hdr_bytes = [0u8; rc_proto::HEADER_LEN];
+        hdr.write_checked(&mut hdr_bytes).unwrap();
+        out[..rc_proto::HEADER_LEN].copy_from_slice(&hdr_bytes);
+        out
+    }
+
+    fn make_valid_media_relay_frame(
+        seq: u64,
+        packet_idx: u16,
+        packet_cnt: u16,
+        is_idr: bool,
+        payload_len: usize,
+    ) -> Vec<u8> {
+        let payload =
+            make_valid_media_payload(seq, packet_idx, packet_cnt, is_idr, false, payload_len);
+        TcpRelayTransport::build_frame(CH_DATAGRAM, &payload).unwrap()
+    }
+
+    #[test]
+    fn relay_tx_queue_protects_queued_idr_and_drops_incoming_p_frame() {
+        // Each frame packet = 5B relay hdr + 32B media hdr + 63B payload = 100B.
+        // Queue cap = 350B: enqueue 2-packet IDR (seq=1, 200B) + 1-packet P (seq=2, 100B).
+        let q = TxQueue::new(64, 350, 8);
+        q.enqueue_datagram(make_valid_media_relay_frame(1, 0, 2, true, 63))
+            .unwrap();
+        q.enqueue_datagram(make_valid_media_relay_frame(1, 1, 2, true, 63))
+            .unwrap();
+        q.enqueue_datagram(make_valid_media_relay_frame(2, 0, 1, false, 63))
+            .unwrap();
+        assert_eq!(q.queued_bytes(), 300);
+
+        // Enqueue P-frame seq=3 (100B): total 400B > 350B -> must evict oldest P-frame (seq=2),
+        // keeping IDR (seq=1) untouched.
+        q.enqueue_datagram(make_valid_media_relay_frame(3, 0, 1, false, 63))
+            .unwrap();
+        assert_eq!(q.queued_bytes(), 300);
+        assert_eq!(q.dropped_datagrams(), 1);
+
+        // Now enqueue P-frame seq=4 (100B) -> evicts P-frame seq=3.
+        // Now queue holds ONLY IDR seq=1 (200B).
+        q.enqueue_datagram(make_valid_media_relay_frame(4, 0, 2, false, 63))
+            .unwrap();
+        assert_eq!(q.queued_bytes(), 300);
+        assert_eq!(q.dropped_datagrams(), 2);
+
+        // Simulate smaller cap=250B queue containing ONLY IDR seq=1 (200B):
+        // incoming multi-packet P-frame seq=5 (2x100B) must be rejected without evicting IDR seq=1,
+        // and its second fragment must also be rejected via abandoned_frame_seq.
+        let q_idr = TxQueue::new(64, 250, 8);
+        q_idr
+            .enqueue_datagram(make_valid_media_relay_frame(1, 0, 2, true, 63))
+            .unwrap();
+        q_idr
+            .enqueue_datagram(make_valid_media_relay_frame(1, 1, 2, true, 63))
+            .unwrap();
+        assert_eq!(q_idr.queued_bytes(), 200);
+
+        q_idr
+            .enqueue_datagram(make_valid_media_relay_frame(5, 0, 2, false, 63))
+            .unwrap();
+        q_idr
+            .enqueue_datagram(make_valid_media_relay_frame(5, 1, 2, false, 63))
+            .unwrap();
+        assert_eq!(q_idr.queued_bytes(), 200);
+        assert_eq!(q_idr.dropped_datagrams(), 2);
+
+        // Incoming newer IDR (seq=6) is allowed to evict front IDR (seq=1) atomically.
+        q_idr
+            .enqueue_datagram(make_valid_media_relay_frame(6, 0, 1, true, 63))
+            .unwrap();
+        assert_eq!(q_idr.queued_bytes(), 100);
+        assert_eq!(q_idr.dropped_datagrams(), 4);
+
+        q_idr.mark_closed();
+        let mut remaining = Vec::new();
+        while let Some(f) = q_idr.pop_next() {
+            remaining.push(extract_relay_media_frame_seq(&f));
+        }
+        assert_eq!(remaining, vec![Some(6)]);
+    }
+
+    #[test]
+    fn relay_rx_queue_caps_poll_at_two_complete_frames_and_never_stalls_control() {
+        let q = RxQueue::new(128, MAX_RX_QUEUE_BYTES);
+        let mut batch = vec![
+            make_valid_media_payload(1, 0, 2, true, false, 10),
+            make_valid_media_payload(1, 1, 2, true, false, 10),
+            make_valid_media_payload(2, 0, 2, false, false, 10),
+            make_valid_media_payload(2, 1, 2, false, false, 10),
+            make_valid_media_payload(3, 0, 2, false, false, 10),
+        ];
+        q.push_datagram_batch(&mut batch);
+        assert!(batch.is_empty());
+        q.push_reliable(NetEvent::Reliable(b"ctrl-msg".to_vec()));
+        q.push_datagram(make_valid_media_payload(3, 1, 2, false, false, 10));
+        q.push_reliable(NetEvent::ReliableUrgent(b"urg-input".to_vec()));
+        q.push_disconnected("eof".to_string());
+
+        // First poll must drain Frame 1 (2 pkts), Frame 2 (2 pkts), AND all control/input/disconnect,
+        // leaving Frame 3 (2 pkts) in the queue with exact remaining total_bytes.
+        let evs1 = q.poll(Duration::ZERO);
+        let mut dgram_seqs_1 = Vec::new();
+        let mut non_dgrams_1 = Vec::new();
+        for ev in evs1 {
+            match ev {
+                NetEvent::Datagram(p) => {
+                    dgram_seqs_1.push(rc_proto::MediaHeader::parse(&p).unwrap().frame_seq.0);
+                }
+                other => non_dgrams_1.push(other),
+            }
+        }
+        assert_eq!(dgram_seqs_1, vec![1, 1, 2, 2]);
+        assert_eq!(
+            non_dgrams_1,
+            vec![
+                NetEvent::Reliable(b"ctrl-msg".to_vec()),
+                NetEvent::ReliableUrgent(b"urg-input".to_vec()),
+                NetEvent::Disconnected {
+                    reason: "eof".to_string()
+                },
+            ]
+        );
+        {
+            let guard = q.inner.lock().unwrap();
+            assert_eq!(guard.events.len(), 2);
+            assert_eq!(guard.total_bytes, 2 * (rc_proto::HEADER_LEN + 10));
+        }
+
+        // Second poll drains remaining Frame 3 completely and zeroes total_bytes.
+        let evs2 = q.poll(Duration::ZERO);
+        assert_eq!(evs2.len(), 2);
+        {
+            let guard = q.inner.lock().unwrap();
+            assert!(guard.events.is_empty());
+            assert_eq!(guard.total_bytes, 0);
+        }
+
+        // Single 40-packet IDR must drain completely in 1 poll without splitting mid-frame.
+        let q_idr = RxQueue::new(128, MAX_RX_QUEUE_BYTES);
+        let mut idr_batch: Vec<Vec<u8>> = (0..40u16)
+            .map(|idx| make_valid_media_payload(9, idx, 40, true, false, 10))
+            .collect();
+        q_idr.push_datagram_batch(&mut idr_batch);
+        let idr_evs = q_idr.poll(Duration::ZERO);
+        assert_eq!(idr_evs.len(), 40);
+    }
+
+    #[test]
+    fn relay_drain_plain_frames_batches_datagrams_preserving_channel_order() {
+        let rx = RxQueue::new(64, MAX_RX_QUEUE_BYTES);
+        let bytes_recv = AtomicU64::new(0);
+        let mut plain_buf = Vec::new();
+        let d1 = make_valid_media_payload(1, 0, 2, true, false, 8);
+        let d2 = make_valid_media_payload(1, 1, 2, true, false, 8);
+        let r1 = b"ctrl".to_vec();
+        let d3 = make_valid_media_payload(2, 0, 1, false, false, 8);
+        plain_buf.extend_from_slice(&TcpRelayTransport::build_frame(CH_DATAGRAM, &d1).unwrap());
+        plain_buf.extend_from_slice(&TcpRelayTransport::build_frame(CH_DATAGRAM, &d2).unwrap());
+        plain_buf.extend_from_slice(&TcpRelayTransport::build_frame(CH_RELIABLE, &r1).unwrap());
+        plain_buf.extend_from_slice(&TcpRelayTransport::build_frame(CH_DATAGRAM, &d3).unwrap());
+
+        let mut read_pos = 0usize;
+        let mut batch = Vec::new();
+        drain_plain_frames(&mut plain_buf, &mut read_pos, &rx, &bytes_recv, &mut batch).unwrap();
+        assert!(batch.is_empty());
+        assert_eq!(
+            bytes_recv.load(Ordering::Relaxed),
+            (d1.len() + d2.len() + r1.len() + d3.len()) as u64
+        );
+        let evs = rx.poll(Duration::ZERO);
+        assert_eq!(
+            evs,
+            vec![
+                NetEvent::Datagram(d1),
+                NetEvent::Datagram(d2),
+                NetEvent::Reliable(r1),
+                NetEvent::Datagram(d3),
+            ]
+        );
     }
 }

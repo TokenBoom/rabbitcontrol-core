@@ -209,7 +209,6 @@ struct PendingCandidateRequest {
     max_loss_rate: Option<f32>,
 }
 
-#[derive(Default)]
 struct SwitchSharedState {
     active_kind: Mutex<TransportPathKind>,
     switch_capable: AtomicBool,
@@ -223,7 +222,7 @@ struct SwitchSharedState {
     switches_aborted: AtomicU64,
     candidate_rejected_security: AtomicU64,
     candidate_rejected_busy: AtomicU64,
-    anchor: Mutex<Option<Instant>>,
+    anchor: Instant,
 }
 
 impl SwitchSharedState {
@@ -241,27 +240,20 @@ impl SwitchSharedState {
             switches_aborted: AtomicU64::new(0),
             candidate_rejected_security: AtomicU64::new(0),
             candidate_rejected_busy: AtomicU64::new(0),
-            anchor: Mutex::new(Some(Instant::now())),
+            anchor: Instant::now(),
         }
     }
 
     fn touch_rx(&self) {
-        let now = Instant::now();
-        let ms = {
-            let anchor = self.anchor.lock().unwrap_or_else(|e| e.into_inner());
-            anchor
-                .as_ref()
-                .map_or(0, |a| now.saturating_duration_since(*a).as_millis() as u64)
-        };
+        let ms = Instant::now()
+            .saturating_duration_since(self.anchor)
+            .as_millis() as u64;
         self.last_rx_epoch_ms.store(ms, Ordering::Release);
     }
 
     fn silence_duration(&self) -> Duration {
         let last = self.last_rx_epoch_ms.load(Ordering::Acquire);
-        let anchor = self.anchor.lock().unwrap_or_else(|e| e.into_inner());
-        let now_ms = anchor
-            .as_ref()
-            .map_or(0, |a| a.elapsed().as_millis() as u64);
+        let now_ms = self.anchor.elapsed().as_millis() as u64;
         Duration::from_millis(now_ms.saturating_sub(last))
     }
 }
@@ -2957,5 +2949,23 @@ mod tests {
             "controller switch_capable must be true"
         );
         assert!(h_h.is_switch_capable(), "host switch_capable must be true");
+    }
+
+    #[test]
+    fn switch_shared_state_rx_silence_is_lock_free_and_accurate() {
+        let mut shared = SwitchSharedState::new(TransportPathKind::P2p);
+        shared.anchor = Instant::now() - Duration::from_millis(120);
+        let initial_silence = shared.silence_duration();
+        assert!(
+            initial_silence >= Duration::from_millis(100),
+            "expected silence >= 100ms, got {initial_silence:?}"
+        );
+
+        shared.touch_rx();
+        let after_touch = shared.silence_duration();
+        assert!(
+            after_touch < Duration::from_millis(50),
+            "touch_rx must reset silence near zero, got {after_touch:?}"
+        );
     }
 }

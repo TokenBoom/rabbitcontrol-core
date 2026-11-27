@@ -180,6 +180,15 @@ const FALLBACK_PEER_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::ne
     0,
 ));
 
+/// 单次 `HostSession::tick` 内部控制面事件轮询结果。
+#[derive(Default)]
+struct HostTransportPollOutcome {
+    bye: Option<ByeReason>,
+    disconnected: bool,
+    first_err: Option<Error>,
+    dirty: bool,
+}
+
 /// 被控端会话。
 ///
 /// 状态机严格四态单向 `Init→Connected→Streaming→Closed`（S1）：
@@ -205,6 +214,10 @@ pub struct HostSession {
     last_manual_bitrate_gen: u64,
     /// 最近一次收到对端探针请求码率（`ControlMessage::SetBitrate { reason: Probe }`）。
     last_remote_probe_bitrate: Option<u32>,
+    /// 最近一次实际发出媒体数据报的会话钟时刻（u32 微秒，用于抑制静态桌面 `WatchdogStall` 误触发 IDR）。
+    last_frame_sent_at: Option<u32>,
+    /// 最近一次实际发出媒体数据报时传输层累计淘汰的数据报计数。
+    last_frame_sent_tx_dropped: u64,
     /// 已发过 Bye（停机路径只发一次）。
     bye_sent: bool,
     /// 进入 Closed 的原因（summary 用）。
@@ -377,6 +390,8 @@ impl HostSession {
             last_manual_bitrate: None,
             last_manual_bitrate_gen: 0,
             last_remote_probe_bitrate: None,
+            last_frame_sent_at: None,
+            last_frame_sent_tx_dropped: 0,
             bye_sent: false,
             closed_reason: None,
             early_events_dropped: 0,
@@ -460,6 +475,8 @@ impl HostSession {
             last_manual_bitrate: None,
             last_manual_bitrate_gen: 0,
             last_remote_probe_bitrate: None,
+            last_frame_sent_at: None,
+            last_frame_sent_tx_dropped: 0,
             bye_sent: false,
             closed_reason: None,
             early_events_dropped: 0,
@@ -811,22 +828,158 @@ impl HostSession {
             });
         }
         let mut report = HostTickReport::default();
-        let effective_budget = if self.pipeline.as_ref().is_some_and(|p| p.has_pending_work()) {
-            Duration::ZERO
-        } else {
-            poll_budget
-        };
+        let mut poll_outcome = HostTransportPollOutcome::default();
+        // 先以 Duration::ZERO 非阻塞排空已到达的输入/控制消息，绝不在 pipeline.tick()
+        // 之前阻塞在空传输轮询上。
+        self.poll_and_dispatch_transport(Duration::ZERO, &mut report, &mut poll_outcome)?;
+
+        // 应用层客户端失活看门狗（时间注入）：本拍未收到对端可靠消息且距上次收包达到阈值 → 主动断链。
+        if !poll_outcome.dirty
+            && poll_outcome.bye.is_none()
+            && !poll_outcome.disconnected
+            && self.client_idle_timeout_us > 0
+        {
+            let idle_now_us = u64::from((self.clock)());
+            if let Some(last) = self.last_client_rx_us {
+                if idle_now_us < last {
+                    // 时钟回跳/重锚（或 32 位钟回绕）时重新锚定，防止 8s 看门狗因 saturating_sub 恒为 0 而失明。
+                    self.last_client_rx_us = Some(idle_now_us);
+                }
+            }
+            if self.idle_since_last_client_rx_us(idle_now_us) >= self.client_idle_timeout_us {
+                poll_outcome.disconnected = true;
+                report.busy = true;
+            }
+        }
+
+        // ② 管线一拍：产出的数据报当拍发完（S7）；纯工具模式暂停期间跳过采集/编码。
+        if !poll_outcome.dirty && poll_outcome.bye.is_none() && !poll_outcome.disconnected {
+            if !self.media_paused {
+                let produced = match self.pipeline.as_mut() {
+                    Some(p) => p.tick((self.clock)())?,
+                    None => None,
+                };
+                if let Some(mut datagrams) = produced {
+                    stamp_and_track_datagrams(
+                        &mut datagrams,
+                        self.frame_seq_offset,
+                        &mut self.last_sent_frame_seq,
+                    );
+                    if !datagrams.is_empty() {
+                        report.busy = true;
+                    }
+                    report.datagrams_sent = self.send_datagrams_best_effort(&datagrams);
+                    if report.datagrams_sent > 0 {
+                        self.last_frame_sent_at = Some((self.clock)());
+                        self.last_frame_sent_tx_dropped = self
+                            .transport
+                            .as_ref()
+                            .map_or(0, |t| t.tx_dropped_datagrams());
+                    }
+                    // T16（W5）：IDR 帧编码完成送出数据报的同一拍发 IdrAck
+                    //（reliable 流，一个跨多片的 IDR 只一条）——client 据此做
+                    // 去抖与超时复核。连接已死时后续 ack 无处可去，停止。
+                    for seq in crate::watchdog::idr_frame_seqs(&datagrams) {
+                        let mut buf = Vec::new();
+                        ControlMessage::IdrAck { frame_seq: seq.0 }.encode(&mut buf);
+                        match self.transport.as_mut() {
+                            Some(t) => {
+                                if t.send_reliable(&buf).is_err() {
+                                    break; // 连接已死：后续 ack 无处可去
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+            // ③ T20 剪贴板泵（仅 Streaming 态；未启用时空操作、零开销）。
+            if self.clipboard.is_some() {
+                self.pump_clipboard(u64::from((self.clock)()))?;
+            }
+        }
+
+        // 仅当本拍完全空闲且管线无待处理任务时，才在拍尾做 ≤500µs 的短轮询，
+        // 避免阻塞期间到帧被延迟发送。
+        const MAX_IDLE_TAIL_POLL: Duration = Duration::from_micros(500);
+        if !report.busy
+            && !poll_outcome.dirty
+            && poll_outcome.bye.is_none()
+            && !poll_outcome.disconnected
+            && !poll_budget.is_zero()
+            && !self.pipeline.as_ref().is_some_and(|p| p.has_pending_work())
+        {
+            self.poll_and_dispatch_transport(
+                poll_budget.min(MAX_IDLE_TAIL_POLL),
+                &mut report,
+                &mut poll_outcome,
+            )?;
+        }
+
+        // 发现 9：先累计当拍已注入的事件数再走停机/早退分支——脏消息
+        // 与注入失败路径的 `return Err` 在此之前发生的话，本拍已注入的
+        // 计数会被凭空吞掉（summary 的 events_injected 与实际不符）。
+        self.events_injected_total += u64::try_from(report.events_injected).unwrap_or(u64::MAX);
+
+        // 停机触发（tick 内完成，run 只看 closed）。
+        if let Some(reason) = poll_outcome.bye {
+            let stop = StopReason::ByeReceived(reason);
+            self.stop_with(stop.clone(), None);
+            report.closed = Some(stop);
+        }
+        // T17（R1）：Disconnected 不再等价于会话结束——保持窗口内进
+        // Detached、管线保留；停机/放弃决策交给窗口判定（tick_detached）。
+        if poll_outcome.disconnected {
+            self.on_disconnected(u64::from((self.clock)()));
+            // T18 修复：对端「先 Bye 后关连接」时，同一 poll 批里 Bye 与
+            // Disconnected 一起到达——Bye 先走 stop_with 进 Closed，
+            // on_disconnected 对非 Streaming 幂等返回，此时 Closed 是合法
+            // 终态（断言只认 Detached 会把正常优雅关闭打成 panic）。
+            debug_assert!(matches!(
+                self.state,
+                SessionState::Detached | SessionState::Closed
+            ));
+            report.busy = true;
+        }
+        if poll_outcome.dirty {
+            let err = poll_outcome.first_err.expect("dirty implies first_err");
+            self.stop_with(
+                StopReason::Disconnected(format!("dirty control message: {err}")),
+                None,
+            );
+            return Err(err);
+        }
+        if let Some(e) = poll_outcome.first_err {
+            // 输入解码/注入失败：与脏控制消息同一纪律——有序停机后上抛。
+            self.stop_with(
+                StopReason::Disconnected(format!("input inject failed: {e}")),
+                None,
+            );
+            return Err(e);
+        }
+
+        // T18：在途队列深度峰值采样（铁律 1 的观测点；停机排空期不再增长）。
+        let cur = self
+            .pipeline
+            .as_ref()
+            .map(|p| p.in_flight_len() as u32)
+            .unwrap_or(0);
+        self.in_flight_peak = self.in_flight_peak.max(cur);
+        Ok(report)
+    }
+
+    fn poll_and_dispatch_transport(
+        &mut self,
+        budget: Duration,
+        report: &mut HostTickReport,
+        outcome: &mut HostTransportPollOutcome,
+    ) -> Result<()> {
         let events = self
             .transport
             .as_mut()
             .expect("Streaming implies transport")
-            .poll(effective_budget)?;
+            .poll(budget)?;
         let rx_now_us = u64::from((self.clock)());
-
-        let mut bye: Option<ByeReason> = None;
-        let mut disconnected = false;
-        let mut first_err: Option<Error> = None;
-        let mut dirty = false;
 
         for ev in events {
             match ev {
@@ -873,7 +1026,7 @@ impl HostSession {
                             }
                         }
                         Err(e) => {
-                            first_err.get_or_insert(e);
+                            outcome.first_err.get_or_insert(e);
                         }
                     }
                 }
@@ -888,129 +1041,24 @@ impl HostSession {
                             report.busy = true;
                         }
                         Ok(ControlFlow::Bye(reason)) => {
-                            bye = Some(reason);
+                            outcome.bye = Some(reason);
                             report.busy = true;
                         }
                         Err(e) => {
                             // 脏控制消息：立即停止分发（S8），批内后续事件不猜。
-                            dirty = true;
-                            first_err.get_or_insert(e);
+                            outcome.dirty = true;
+                            outcome.first_err.get_or_insert(e);
                             break;
                         }
                     }
                 }
                 NetEvent::Disconnected { .. } => {
-                    disconnected = true;
+                    outcome.disconnected = true;
                     report.busy = true;
                 }
             }
         }
-
-        // 发现 9：先累计当拍已注入的事件数再走停机/早退分支——脏消息
-        // 与注入失败路径的 `return Err` 在此之前发生的话，本拍已注入的
-        // 计数会被凭空吞掉（summary 的 events_injected 与实际不符）。
-        self.events_injected_total += u64::try_from(report.events_injected).unwrap_or(u64::MAX);
-
-        // 应用层客户端失活看门狗（时间注入）：本拍未收到对端可靠消息且距上次收包达到阈值 → 主动断链。
-        if !dirty && bye.is_none() && !disconnected && self.client_idle_timeout_us > 0 {
-            let idle_now_us = u64::from((self.clock)());
-            if let Some(last) = self.last_client_rx_us {
-                if idle_now_us < last {
-                    // 时钟回跳/重锚（或 32 位钟回绕）时重新锚定，防止 8s 看门狗因 saturating_sub 恒为 0 而失明。
-                    self.last_client_rx_us = Some(idle_now_us);
-                }
-            }
-            if self.idle_since_last_client_rx_us(idle_now_us) >= self.client_idle_timeout_us {
-                disconnected = true;
-                report.busy = true;
-            }
-        }
-
-        // ② 管线一拍：产出的数据报当拍发完（S7）；纯工具模式暂停期间跳过采集/编码。
-        if !dirty && bye.is_none() && !disconnected {
-            if !self.media_paused {
-                let produced = match self.pipeline.as_mut() {
-                    Some(p) => p.tick((self.clock)())?,
-                    None => None,
-                };
-                if let Some(mut datagrams) = produced {
-                    stamp_and_track_datagrams(
-                        &mut datagrams,
-                        self.frame_seq_offset,
-                        &mut self.last_sent_frame_seq,
-                    );
-                    if !datagrams.is_empty() {
-                        report.busy = true;
-                    }
-                    report.datagrams_sent = self.send_datagrams_best_effort(&datagrams);
-                    // T16（W5）：IDR 帧编码完成送出数据报的同一拍发 IdrAck
-                    //（reliable 流，一个跨多片的 IDR 只一条）——client 据此做
-                    // 去抖与超时复核。连接已死时后续 ack 无处可去，停止。
-                    for seq in crate::watchdog::idr_frame_seqs(&datagrams) {
-                        let mut buf = Vec::new();
-                        ControlMessage::IdrAck { frame_seq: seq.0 }.encode(&mut buf);
-                        match self.transport.as_mut() {
-                            Some(t) => {
-                                if t.send_reliable(&buf).is_err() {
-                                    break; // 连接已死：后续 ack 无处可去
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                }
-            }
-            // ③ T20 剪贴板泵（仅 Streaming 态；未启用时空操作、零开销）。
-            if self.clipboard.is_some() {
-                self.pump_clipboard(u64::from((self.clock)()))?;
-            }
-        }
-
-        // 停机触发（tick 内完成，run 只看 closed）。
-        if let Some(reason) = bye {
-            let stop = StopReason::ByeReceived(reason);
-            self.stop_with(stop.clone(), None);
-            report.closed = Some(stop);
-        }
-        // T17（R1）：Disconnected 不再等价于会话结束——保持窗口内进
-        // Detached、管线保留；停机/放弃决策交给窗口判定（tick_detached）。
-        if disconnected {
-            self.on_disconnected(u64::from((self.clock)()));
-            // T18 修复：对端「先 Bye 后关连接」时，同一 poll 批里 Bye 与
-            // Disconnected 一起到达——Bye 先走 stop_with 进 Closed，
-            // on_disconnected 对非 Streaming 幂等返回，此时 Closed 是合法
-            // 终态（断言只认 Detached 会把正常优雅关闭打成 panic）。
-            debug_assert!(matches!(
-                self.state,
-                SessionState::Detached | SessionState::Closed
-            ));
-            report.busy = true;
-        }
-        if dirty {
-            let err = first_err.expect("dirty implies first_err");
-            self.stop_with(
-                StopReason::Disconnected(format!("dirty control message: {err}")),
-                None,
-            );
-            return Err(err);
-        }
-        if let Some(e) = first_err {
-            // 输入解码/注入失败：与脏控制消息同一纪律——有序停机后上抛。
-            self.stop_with(
-                StopReason::Disconnected(format!("input inject failed: {e}")),
-                None,
-            );
-            return Err(e);
-        }
-
-        // T18：在途队列深度峰值采样（铁律 1 的观测点；停机排空期不再增长）。
-        let cur = self
-            .pipeline
-            .as_ref()
-            .map(|p| p.in_flight_len() as u32)
-            .unwrap_or(0);
-        self.in_flight_peak = self.in_flight_peak.max(cur);
-        Ok(report)
+        Ok(())
     }
 
     /// T18：含关键事件的已注入批数（与发出的 InputAck `key_batch_seq`
@@ -1368,6 +1416,8 @@ impl HostSession {
         self.pipeline_alive = true;
         self.pipeline_generation += 1;
         self.media_paused = false;
+        self.last_frame_sent_at = None;
+        self.last_frame_sent_tx_dropped = 0;
         Ok(())
     }
 
@@ -1387,6 +1437,8 @@ impl HostSession {
             None
         };
         self.refresh_base_us = Some(now_us as u32);
+        self.last_frame_sent_at = None;
+        self.last_frame_sent_tx_dropped = 0;
     }
 
     /// 设置应用层客户端失活看门狗超时阈值（微秒；默认 `0` 禁用以兼容离线静默单测，
@@ -1560,6 +1612,8 @@ impl HostSession {
             self.live_display_id = pcfg.display_id;
             self.live_shows_cursor = pcfg.shows_cursor;
             self.negotiated = Some(new_params);
+            self.last_frame_sent_at = None;
+            self.last_frame_sent_tx_dropped = 0;
             return Ok(new_params);
         }
 
@@ -1704,6 +1758,8 @@ impl HostSession {
         self.pipeline_alive = true;
         self.pipeline_generation += 1;
         self.negotiated = Some(new_params);
+        self.last_frame_sent_at = None;
+        self.last_frame_sent_tx_dropped = 0;
         Ok(new_params)
     }
 
@@ -1876,6 +1932,8 @@ impl HostSession {
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
         self.last_client_rx_us = None;
+        self.last_frame_sent_at = None;
+        self.last_frame_sent_tx_dropped = 0;
         self.state = SessionState::Detached;
     }
 
@@ -2148,6 +2206,8 @@ impl HostSession {
             self.audio_ctrl_rx = None;
             self.audio_rx.clear();
             self.last_client_rx_us = Some(now_us);
+            self.last_frame_sent_at = None;
+            self.last_frame_sent_tx_dropped = 0;
         } else {
             // H1：未命中（含密码启用时的 resume 拒绝）绝不在全新 Hello 通过鉴权
             // 与审批前拆除保留管线——保持管线存活直到保持窗口 TTL 过期或认证通过。
@@ -2213,6 +2273,8 @@ impl HostSession {
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
         self.last_client_rx_us = None;
+        self.last_frame_sent_at = None;
+        self.last_frame_sent_tx_dropped = 0;
         self.state = SessionState::Detached;
         Ok(true)
     }
@@ -2680,6 +2742,8 @@ impl HostSession {
         self.last_manual_bitrate = None;
         self.last_manual_bitrate_gen = 0;
         self.last_remote_probe_bitrate = None;
+        self.last_frame_sent_at = None;
+        self.last_frame_sent_tx_dropped = 0;
         self.active_codec = self.cfg.pipeline.codec;
         self.target_display_id = self.cfg.pipeline.display_id;
         self.target_shows_cursor = self.cfg.pipeline.shows_cursor;
@@ -2739,10 +2803,22 @@ impl HostSession {
                     "auth/handshake message {other:?} is forbidden in Streaming state (A11)"
                 ),
             }),
-            ControlMessage::IdrRequest { .. } => {
+            ControlMessage::IdrRequest { reason } => {
+                const STATIC_WATCHDOG_SUPPRESS_US: u32 = 450_000;
                 self.idr_requests_received_total += 1;
-                if let Some(p) = self.pipeline.as_mut() {
-                    p.request_idr();
+                let current_tx_dropped = self
+                    .transport
+                    .as_ref()
+                    .map_or(0, |t| t.tx_dropped_datagrams());
+                let suppress_static_watchdog = reason == crate::proto::IdrReason::WatchdogStall
+                    && self.last_frame_sent_at.is_some_and(|last_sent| {
+                        (self.clock)().wrapping_sub(last_sent) >= STATIC_WATCHDOG_SUPPRESS_US
+                            && current_tx_dropped == self.last_frame_sent_tx_dropped
+                    });
+                if !suppress_static_watchdog {
+                    if let Some(p) = self.pipeline.as_mut() {
+                        p.request_idr();
+                    }
                 }
                 Ok(ControlFlow::Handled)
             }
@@ -2935,6 +3011,11 @@ impl HostSession {
         self.last_remote_probe_bitrate
     }
 
+    /// 清除记录的对端探针请求码率（路径切换时调用，防止旧路径的探针限速残留至新路径）。
+    pub fn clear_remote_probe_bitrate(&mut self) {
+        self.last_remote_probe_bitrate = None;
+    }
+
     /// 最近已发送至网络的最高动态视频帧线序号（供静止无损补帧标记 `base_frame_seq`）。
     pub fn last_sent_frame_seq(&self) -> Option<u64> {
         self.last_sent_frame_seq
@@ -3049,6 +3130,8 @@ impl HostSession {
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
         self.last_client_rx_us = None;
+        self.last_frame_sent_at = None;
+        self.last_frame_sent_tx_dropped = 0;
         self.closed_reason = Some(reason);
         self.state = SessionState::Closed;
         // 断开连接：QuicTransport 的 Drop 关闭连接（尽力 Bye 已在前面发出）。
@@ -5104,6 +5187,25 @@ mod tests {
         host.close(ByeReason::Normal).expect("close");
     }
 
+    #[test]
+    fn clear_remote_probe_bitrate_resets_recorded_probe_cap() {
+        let (inj, _) = RecordingInjector::new();
+        let (mut host, mut handle) = handshaken(Box::new(inj), caps());
+        assert_eq!(host.last_remote_probe_bitrate_bps(), None);
+
+        handle.deliver_reliable(&ControlMessage::SetBitrate {
+            bps: 400_000,
+            reason: proto::BitrateReason::Probe,
+        });
+        host.tick(Duration::from_millis(0)).expect("tick");
+        assert_eq!(host.last_remote_probe_bitrate_bps(), Some(400_000));
+        assert_eq!(host.current_bitrate_bps(), 400_000);
+
+        host.clear_remote_probe_bitrate();
+        assert_eq!(host.last_remote_probe_bitrate_bps(), None);
+        host.close(ByeReason::Normal).expect("close");
+    }
+
     /// 发现 8：key_batches_total 只在全新会话（非 resume）复位——resume
     /// 命中计数延续，两侧 InputAck `key_batch_seq` 口径对齐。
     #[test]
@@ -6773,6 +6875,329 @@ mod tests {
             SessionState::Detached,
             "reset_activity_clock 归零后 8s 看门狗必须正常触发"
         );
+        host.close(ByeReason::Normal).expect("close");
+    }
+
+    #[test]
+    fn static_watchdog_stall_suppression_respects_450ms_window_drops_and_non_watchdog_reasons() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        struct GatedCapture {
+            inner: Box<dyn CaptureBackend>,
+            emit: Arc<AtomicBool>,
+            clock: SessionClock,
+        }
+
+        impl CaptureBackend for GatedCapture {
+            fn next_frame(
+                &mut self,
+                timeout: Duration,
+            ) -> Result<Option<rc_capture::CapturedFrame>> {
+                if !self.emit.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                let mut frame = self.inner.next_frame(timeout)?;
+                if let Some(ref mut f) = frame {
+                    f.timestamp = rc_types::Timestamp((self.clock)());
+                }
+                Ok(frame)
+            }
+            fn poll_invalidation(&mut self) -> Option<rc_capture::InvalidationReason> {
+                self.inner.poll_invalidation()
+            }
+            fn rebuild(&mut self) -> Result<()> {
+                self.inner.rebuild()
+            }
+            fn display_info(&self) -> DisplayInfo {
+                self.inner.display_info()
+            }
+        }
+
+        struct DropCountingMockTransport {
+            inner: MockTransport,
+            dropped: Arc<AtomicU64>,
+        }
+
+        impl Transport for DropCountingMockTransport {
+            fn send_datagram(&mut self, data: &[u8]) -> Result<()> {
+                self.inner.send_datagram(data)
+            }
+            fn send_reliable(&mut self, data: &[u8]) -> Result<()> {
+                self.inner.send_reliable(data)
+            }
+            fn send_reliable_urgent(&mut self, data: &[u8]) -> Result<()> {
+                self.inner.send_reliable_urgent(data)
+            }
+            fn poll(&mut self, timeout: Duration) -> Result<Vec<NetEvent>> {
+                self.inner.poll(timeout)
+            }
+            fn stats(&self) -> rc_net::NetStats {
+                self.inner.stats()
+            }
+            fn tx_dropped_datagrams(&self) -> u64 {
+                self.dropped.load(Ordering::Acquire)
+            }
+        }
+
+        let (now, clock) = mutable_clock();
+        let emit = Arc::new(AtomicBool::new(true));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (inj, _) = RecordingInjector::new();
+
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&hello_msg(caps(), proto::AuthMethod::None));
+        let mut handle = mock.clone();
+
+        let capture = GatedCapture {
+            inner: fake_capture(FakeContent::Dynamic),
+            emit: Arc::clone(&emit),
+            clock: Arc::clone(&clock),
+        };
+        let mut host = HostSession::with_parts(
+            host_cfg(Box::new(inj)),
+            Box::new(DropCountingMockTransport {
+                inner: mock,
+                dropped: Arc::clone(&dropped),
+            }),
+            Box::new(capture),
+            fake_encoder(),
+            clock,
+        )
+        .expect("with_parts");
+        host.handshake().expect("handshake");
+
+        // Emit frame 1 (IDR) and frame 2 (P) so pipeline is past initial IDR.
+        drive_until_datagram(&mut host, &handle, 400);
+        drive_until_datagram(&mut host, &handle, 400);
+
+        let drive_next_frame_is_idr =
+            |host: &mut HostSession, handle: &MockTransport, emit: &AtomicBool| -> bool {
+                emit.store(true, Ordering::Release);
+                let prev = handle.datagrams_sent().len();
+                drive_until_datagram(host, handle, 400);
+                emit.store(false, Ordering::Release);
+                let dg = &handle.datagrams_sent()[prev];
+                rc_pipeline::host::datagram_header(dg)
+                    .expect("header")
+                    .is_idr()
+            };
+
+        // Pause capture to simulate static screen; clock at 0 -> advance >= 450ms (500ms).
+        emit.store(false, Ordering::Release);
+        *now.lock().unwrap() = 500_000;
+        handle.deliver_reliable(&ControlMessage::IdrRequest {
+            reason: proto::IdrReason::WatchdogStall,
+        });
+        host.tick(Duration::ZERO).expect("tick static watchdog");
+        assert!(
+            !drive_next_frame_is_idr(&mut host, &handle, &emit),
+            "static screen >= 450ms with 0 tx drop delta must suppress WatchdogStall IDR"
+        );
+
+        // Within < 450ms (e.g. +449_999us = 949_999us): WatchdogStall must still arm IDR (real blackout).
+        *now.lock().unwrap() = 949_999;
+        handle.deliver_reliable(&ControlMessage::IdrRequest {
+            reason: proto::IdrReason::WatchdogStall,
+        });
+        host.tick(Duration::ZERO).expect("tick active watchdog");
+        assert!(
+            drive_next_frame_is_idr(&mut host, &handle, &emit),
+            "WatchdogStall within < 450ms of last sent frame must arm IDR"
+        );
+
+        // >= 450ms static, BUT tx_dropped_datagrams increased -> must arm IDR.
+        *now.lock().unwrap() = 949_999 + 500_000;
+        dropped.fetch_add(1, Ordering::Release);
+        handle.deliver_reliable(&ControlMessage::IdrRequest {
+            reason: proto::IdrReason::WatchdogStall,
+        });
+        host.tick(Duration::ZERO).expect("tick dropped watchdog");
+        assert!(
+            drive_next_frame_is_idr(&mut host, &handle, &emit),
+            "WatchdogStall after tx drop delta > 0 must arm IDR"
+        );
+
+        // >= 450ms static with 0 drop delta, BUT DecoderNeedKeyframe -> must arm IDR.
+        *now.lock().unwrap() = 949_999 + 1_000_000;
+        handle.deliver_reliable(&ControlMessage::IdrRequest {
+            reason: proto::IdrReason::DecoderNeedKeyframe,
+        });
+        host.tick(Duration::ZERO)
+            .expect("tick decoder need keyframe");
+        assert!(
+            drive_next_frame_is_idr(&mut host, &handle, &emit),
+            "DecoderNeedKeyframe must always arm IDR regardless of static duration"
+        );
+
+        host.close(ByeReason::Normal).expect("close");
+
+        // u32 wrap boundary: start session near u32::MAX (below refresh_guard_us) and wrap past 0 by >= 450ms.
+        let (now2, clock2) = mutable_clock();
+        *now2.lock().unwrap() = u64::from(u32::MAX) - 100_000;
+        let emit2 = Arc::new(AtomicBool::new(true));
+        let (inj2, _) = RecordingInjector::new();
+        let mut mock2 = MockTransport::new();
+        mock2.deliver_reliable(&hello_msg(caps(), proto::AuthMethod::None));
+        let mut handle2 = mock2.clone();
+        let capture2 = GatedCapture {
+            inner: fake_capture(FakeContent::Dynamic),
+            emit: Arc::clone(&emit2),
+            clock: Arc::clone(&clock2),
+        };
+        let mut host2 = HostSession::with_parts(
+            host_cfg(Box::new(inj2)),
+            Box::new(mock2),
+            Box::new(capture2),
+            fake_encoder(),
+            clock2,
+        )
+        .expect("with_parts wrap");
+        host2.handshake().expect("handshake wrap");
+        drive_until_datagram(&mut host2, &handle2, 400);
+        drive_until_datagram(&mut host2, &handle2, 400);
+        emit2.store(false, Ordering::Release);
+        // Advance across u32::MAX wrap by 450_000us -> wrapped u32 = 349_999.
+        *now2.lock().unwrap() = 349_999;
+        handle2.deliver_reliable(&ControlMessage::IdrRequest {
+            reason: proto::IdrReason::WatchdogStall,
+        });
+        host2.tick(Duration::ZERO).expect("tick wrap watchdog");
+        assert!(
+            !drive_next_frame_is_idr(&mut host2, &handle2, &emit2),
+            "u32 wrapping_sub >= 450ms must also suppress static WatchdogStall"
+        );
+
+        host2.close(ByeReason::Normal).expect("close wrap");
+    }
+
+    #[test]
+    fn host_tick_runs_pipeline_before_blocking_on_idle_transport_poll_budget() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RecordingSleepTransport {
+            inner: MockTransport,
+            poll_budgets: Arc<Mutex<Vec<Duration>>>,
+        }
+
+        impl Transport for RecordingSleepTransport {
+            fn send_datagram(&mut self, data: &[u8]) -> Result<()> {
+                self.inner.send_datagram(data)
+            }
+            fn send_reliable(&mut self, data: &[u8]) -> Result<()> {
+                self.inner.send_reliable(data)
+            }
+            fn send_reliable_urgent(&mut self, data: &[u8]) -> Result<()> {
+                self.inner.send_reliable_urgent(data)
+            }
+            fn poll(&mut self, timeout: Duration) -> Result<Vec<NetEvent>> {
+                self.poll_budgets.lock().unwrap().push(timeout);
+                let out = self.inner.poll(Duration::ZERO)?;
+                if out.is_empty() && !timeout.is_zero() {
+                    std::thread::sleep(timeout);
+                }
+                Ok(out)
+            }
+            fn stats(&self) -> rc_net::NetStats {
+                self.inner.stats()
+            }
+        }
+
+        struct ToggleCapture {
+            inner: Box<dyn CaptureBackend>,
+            emit: Arc<AtomicBool>,
+        }
+
+        impl CaptureBackend for ToggleCapture {
+            fn next_frame(
+                &mut self,
+                timeout: Duration,
+            ) -> Result<Option<rc_capture::CapturedFrame>> {
+                if !self.emit.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                self.inner.next_frame(timeout)
+            }
+            fn poll_invalidation(&mut self) -> Option<rc_capture::InvalidationReason> {
+                self.inner.poll_invalidation()
+            }
+            fn rebuild(&mut self) -> Result<()> {
+                self.inner.rebuild()
+            }
+            fn display_info(&self) -> DisplayInfo {
+                self.inner.display_info()
+            }
+        }
+
+        let poll_budgets = Arc::new(Mutex::new(Vec::new()));
+        let emit = Arc::new(AtomicBool::new(false));
+        let (inj, _) = RecordingInjector::new();
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&hello_msg(caps(), proto::AuthMethod::None));
+        let handle = mock.clone();
+        let mut cfg = host_cfg(Box::new(inj));
+        cfg.pace_capture = false;
+        let mut host = HostSession::with_parts(
+            cfg,
+            Box::new(RecordingSleepTransport {
+                inner: mock,
+                poll_budgets: Arc::clone(&poll_budgets),
+            }),
+            Box::new(ToggleCapture {
+                inner: fake_capture(FakeContent::Dynamic),
+                emit: Arc::clone(&emit),
+            }),
+            fake_encoder(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+        host.handshake().expect("handshake");
+        poll_budgets.lock().unwrap().clear();
+
+        // 1) Even when pipeline is idle and caller passes 50ms budget, first poll is Duration::ZERO
+        //    and tail poll is capped at 500us (finishes well under 20ms).
+        let t0 = Instant::now();
+        let r_idle = host.tick(Duration::from_millis(50)).expect("idle tick");
+        let idle_elapsed = t0.elapsed();
+        assert!(!r_idle.busy);
+        assert!(
+            idle_elapsed < Duration::from_millis(20),
+            "idle tick took {idle_elapsed:?}, must cap tail poll at 500us"
+        );
+        assert_eq!(
+            *poll_budgets.lock().unwrap(),
+            vec![Duration::ZERO, Duration::from_micros(500)]
+        );
+
+        // 2) When capture produces a frame, drive ticks with 50ms budget until datagrams are sent:
+        //    no poll ever sees >500us, and the tick that emits datagrams polls Duration::ZERO only.
+        emit.store(true, Ordering::Release);
+        let t1 = Instant::now();
+        let mut sent_in_tick = false;
+        for _ in 0..400 {
+            poll_budgets.lock().unwrap().clear();
+            let r_busy = host.tick(Duration::from_millis(50)).expect("busy tick");
+            let budgets = poll_budgets.lock().unwrap().clone();
+            assert!(
+                budgets.iter().all(|&d| d <= Duration::from_micros(500)),
+                "host.tick must never block >500us on idle transport poll: {budgets:?}"
+            );
+            if r_busy.datagrams_sent > 0 {
+                assert!(r_busy.busy);
+                assert_eq!(budgets, vec![Duration::ZERO]);
+                sent_in_tick = true;
+                break;
+            }
+            host.pipeline().wait_event(Duration::from_millis(2));
+        }
+        emit.store(false, Ordering::Release);
+        let busy_elapsed = t1.elapsed();
+        assert!(sent_in_tick, "expected frame datagrams within 400 rounds");
+        assert!(
+            busy_elapsed < Duration::from_millis(100),
+            "busy loop took {busy_elapsed:?}"
+        );
+        assert!(!handle.datagrams_sent().is_empty());
+
         host.close(ByeReason::Normal).expect("close");
     }
 }
