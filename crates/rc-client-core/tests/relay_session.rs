@@ -1160,10 +1160,12 @@ fn inproc_p2p_unreachable_falls_back_seamlessly_to_tcp_relay() {
     let (relay_addr, relay_thread) = spawn_local_rcr1_relay(token.clone());
     let relay_addr_str = relay_addr.to_string();
 
-    // 使用两端口互不匹配的假候选地址（各自朝向空洞端口），模拟对称 NAT / UDP 阻断，
-    // 验证双方打洞超时后自动无缝回退至 TCP Relay。
-    let dead_port_a = reserve_ephemeral_udp_port();
-    let dead_port_b = reserve_ephemeral_udp_port();
+    // 保持两个占坑 UDP 套接字存活至测试结束，避免 Windows 立即复用刚关闭的临时端口导致 P2P 意外连通；
+    // 未读占位套接字只收不回，可跨三平台确定性模拟 UDP 阻断，使双方超时后回退至 TCP Relay。
+    let dead_sock_a = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind dead udp a");
+    let dead_sock_b = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind dead udp b");
+    let dead_port_a = dead_sock_a.local_addr().expect("dead udp a addr").port();
+    let dead_port_b = dead_sock_b.local_addr().expect("dead udp b addr").port();
 
     let mut host = HostHandle::spawn(UiHostConfig {
         listen_addr: "127.0.0.1:0".parse().expect("loopback"),
@@ -1243,6 +1245,7 @@ fn inproc_p2p_unreachable_falls_back_seamlessly_to_tcp_relay() {
     session.join();
     host.stop();
     relay_thread.join().expect("relay thread join");
+    drop((dead_sock_a, dead_sock_b));
 }
 
 #[test]
