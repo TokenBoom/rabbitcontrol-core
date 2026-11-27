@@ -28,6 +28,7 @@ pub mod server_config;
 pub mod session_bridge;
 pub mod signal_client;
 pub mod still_refine;
+pub mod switchable_transport;
 pub mod ui_error;
 pub mod updater;
 pub mod upnp;

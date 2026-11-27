@@ -21,8 +21,8 @@
 #![deny(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-#[cfg(target_os = "macos")]
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -344,6 +344,319 @@ pub fn detect_local_lan_ipv4_for_targets(preferred_targets: &[SocketAddr]) -> Op
 /// 探测本机出向局域网 IPv4 地址（纯标准库 UDP `connect` 路由表查询，发送 0 个报文）。
 pub fn detect_local_lan_ipv4() -> Option<Ipv4Addr> {
     detect_local_lan_ipv4_for_targets(&[])
+}
+
+/// 本机所有 UP 非回环网卡上的可用直连 IP 集合（多网卡/VPN IPv4 + 全球单播 IPv6）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LocalInterfaceIps {
+    /// 可用于局域网/VPN 直连或候选通告的 IPv4 地址列表（首选出向路由排在最前，已去重）。
+    pub ipv4s: Vec<Ipv4Addr>,
+    /// 全球单播 IPv6 地址列表（仅保留 `2000::/3`，过滤 `::1` / `fe80::/10` / `fc00::/7` / `::`）。
+    pub global_ipv6s: Vec<Ipv6Addr>,
+}
+
+const DEFAULT_V6_ROUTE_PROBE_TARGETS: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+    Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+];
+
+fn push_unique_v4(out: &mut Vec<Ipv4Addr>, ip: Ipv4Addr) {
+    if is_usable_lan_ipv4(ip) && !out.contains(&ip) {
+        out.push(ip);
+    }
+}
+
+fn push_unique_global_v6(out: &mut Vec<Ipv6Addr>, ip: Ipv6Addr) {
+    if crate::nat::is_global_unicast_ipv6(ip) && !out.contains(&ip) {
+        out.push(ip);
+    }
+}
+
+fn probe_route_local_ipv6(target: SocketAddrV6) -> Option<Ipv6Addr> {
+    let sock = UdpSocket::bind("[::]:0").ok()?;
+    sock.connect(target).ok()?;
+    match sock.local_addr().ok()?.ip().to_canonical() {
+        IpAddr::V6(v6) if crate::nat::is_global_unicast_ipv6(v6) => Some(v6),
+        _ => None,
+    }
+}
+
+fn parse_ipv4_token(raw: &str) -> Option<Ipv4Addr> {
+    let token = raw.trim().split('/').next()?.trim();
+    token.parse::<Ipv4Addr>().ok()
+}
+
+fn parse_ipv6_token(raw: &str) -> Option<Ipv6Addr> {
+    let no_cidr = raw.trim().split('/').next()?.trim();
+    let no_zone = no_cidr.split('%').next()?.trim();
+    let trimmed = no_zone.trim_start_matches('[').trim_end_matches(']');
+    match trimmed.parse::<Ipv6Addr>().ok()? {
+        v6 if v6.to_ipv4_mapped().is_some() => None,
+        v6 => Some(v6),
+    }
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn parse_macos_ifconfig_output(stdout: &str) -> LocalInterfaceIps {
+    let mut out = LocalInterfaceIps::default();
+    let mut iface_active = false;
+    let mut current_v4s: Vec<Ipv4Addr> = Vec::new();
+    let mut current_v6s: Vec<Ipv6Addr> = Vec::new();
+    let mut flush_iface = |active: bool, v4s: &mut Vec<Ipv4Addr>, v6s: &mut Vec<Ipv6Addr>| {
+        if active {
+            for ip in v4s.drain(..) {
+                push_unique_v4(&mut out.ipv4s, ip);
+            }
+            for ip in v6s.drain(..) {
+                push_unique_global_v6(&mut out.global_ipv6s, ip);
+            }
+        } else {
+            v4s.clear();
+            v6s.clear();
+        }
+    };
+
+    for line in stdout.lines() {
+        let is_header = !line.is_empty() && !line.starts_with([' ', '\t']);
+        if is_header {
+            flush_iface(iface_active, &mut current_v4s, &mut current_v6s);
+            let is_up_non_loopback = line
+                .split('<')
+                .nth(1)
+                .and_then(|s| s.split('>').next())
+                .map(|flags| {
+                    let parts: Vec<&str> = flags.split(',').map(str::trim).collect();
+                    parts.contains(&"UP") && !parts.contains(&"LOOPBACK")
+                })
+                .unwrap_or(false);
+            iface_active = is_up_non_loopback;
+            continue;
+        }
+        if !iface_active {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with("status:") && trimmed.contains("inactive") {
+            iface_active = false;
+            current_v4s.clear();
+            current_v6s.clear();
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("inet ") {
+            if let Some(tok) = rest.split_whitespace().next() {
+                if let Some(v4) = parse_ipv4_token(tok) {
+                    current_v4s.push(v4);
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("inet6 ") {
+            if trimmed.contains("deprecated") {
+                continue;
+            }
+            if let Some(tok) = rest.split_whitespace().next() {
+                if let Some(v6) = parse_ipv6_token(tok) {
+                    current_v6s.push(v6);
+                }
+            }
+        }
+    }
+    flush_iface(iface_active, &mut current_v4s, &mut current_v6s);
+    out
+}
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn parse_linux_ip_addr_show(stdout: &str) -> LocalInterfaceIps {
+    let mut out = LocalInterfaceIps::default();
+    for line in stdout.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        let ifname = cols[1].trim_end_matches(':');
+        if ifname == "lo" || line.contains(" deprecated ") {
+            continue;
+        }
+        match cols[2] {
+            "inet" => {
+                if let Some(v4) = parse_ipv4_token(cols[3]) {
+                    push_unique_v4(&mut out.ipv4s, v4);
+                }
+            }
+            "inet6" => {
+                if let Some(v6) = parse_ipv6_token(cols[3]) {
+                    push_unique_global_v6(&mut out.global_ipv6s, v6);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn parse_proc_if_inet6(content: &str) -> Vec<Ipv6Addr> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 6 {
+            continue;
+        }
+        let hex = cols[0].trim();
+        let ifname = cols[5].trim();
+        if hex.len() != 32 || ifname == "lo" {
+            continue;
+        }
+        // scope == "00" 表示 global scope，过滤链路本地/回环；flags bit 0x20 (IFA_F_DEPRECATED) 忽略已废弃地址
+        let flags = u8::from_str_radix(cols[4], 16).unwrap_or(0);
+        if (flags & 0x20) != 0 {
+            continue;
+        }
+        let mut raw = [0u8; 16];
+        let mut ok = true;
+        for (i, byte_slot) in raw.iter_mut().enumerate() {
+            let start = i * 2;
+            match u8::from_str_radix(&hex[start..start + 2], 16) {
+                Ok(b) => *byte_slot = b,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            push_unique_global_v6(&mut out, Ipv6Addr::from(raw));
+        }
+    }
+    out
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn parse_windows_ipconfig_output(stdout: &str) -> LocalInterfaceIps {
+    let mut out = LocalInterfaceIps::default();
+    let mut skip_adapter = false;
+    for raw_line in stdout.lines() {
+        let trimmed_end = raw_line.trim_end();
+        if trimmed_end.is_empty() {
+            continue;
+        }
+        let is_header = !raw_line.starts_with([' ', '\t']);
+        if is_header {
+            let lower = trimmed_end.to_ascii_lowercase();
+            skip_adapter = lower.contains("loopback") || lower.contains("回环");
+            continue;
+        }
+        if skip_adapter {
+            continue;
+        }
+        let Some((_label, value)) = trimmed_end.split_once(": ") else {
+            continue;
+        };
+        let mut cand = value.trim();
+        if let Some((prefix, _)) = cand.split_once('(') {
+            cand = prefix.trim();
+        }
+        if let Some(v4) = parse_ipv4_token(cand) {
+            push_unique_v4(&mut out.ipv4s, v4);
+        } else if let Some(v6) = parse_ipv6_token(cand) {
+            push_unique_global_v6(&mut out.global_ipv6s, v6);
+        }
+    }
+    out
+}
+
+fn discover_os_interface_ips() -> LocalInterfaceIps {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = Command::new("ifconfig").output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                return parse_macos_ifconfig_output(&text);
+            }
+        }
+        LocalInterfaceIps::default()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = LocalInterfaceIps::default();
+        if let Ok(output) = Command::new("ip")
+            .args(["-o", "addr", "show", "up"])
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                out = parse_linux_ip_addr_show(&text);
+            }
+        }
+        if let Ok(proc_v6) = std::fs::read_to_string("/proc/net/if_inet6") {
+            for v6 in parse_proc_if_inet6(&proc_v6) {
+                push_unique_global_v6(&mut out.global_ipv6s, v6);
+            }
+        }
+        out
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = Command::new("ipconfig").output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                return parse_windows_ipconfig_output(&text);
+            }
+        }
+        LocalInterfaceIps::default()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        LocalInterfaceIps::default()
+    }
+}
+
+/// 枚举本机全部 UP 非回环网卡上的可用 IPv4（含多网卡/VPN 网段）与全球单播 IPv6（`2000::/3`）。
+///
+/// 全实现基于纯安全 Rust（`#![deny(unsafe_code)]`、零第三方 crate），先通过 UDP `connect`
+/// 路由探测保证首选出向路由地址排在最前，再并入操作系统全网卡枚举出的其余私网/VPN/全球 IPv6 地址，
+/// 自动过滤回环（`127.0.0.0/8`、`::1`）、未指定（`0.0.0.0`、`::`）、链路本地（`169.254.0.0/16`、`fe80::/10`）、
+/// IPv6 ULA（`fc00::/7`）与多播/广播地址。
+pub fn detect_local_interface_ips_for_targets(
+    preferred_targets: &[SocketAddr],
+) -> LocalInterfaceIps {
+    let mut out = LocalInterfaceIps::default();
+
+    // 1. 首选出向路由 IPv4 排最前，保证与既有单网卡排序完全一致
+    for v4 in discover_local_lan_ipv4s(preferred_targets) {
+        push_unique_v4(&mut out.ipv4s, v4);
+    }
+
+    // 2. 首选出向全球单播 IPv6 排最前
+    for target in preferred_targets {
+        if let IpAddr::V6(v6) = target.ip().to_canonical() {
+            if !v6.is_unspecified() && !v6.is_loopback() && !v6.is_multicast() {
+                let port = if target.port() == 0 { 9 } else { target.port() };
+                if let Some(src) = probe_route_local_ipv6(SocketAddrV6::new(v6, port, 0, 0)) {
+                    push_unique_global_v6(&mut out.global_ipv6s, src);
+                }
+            }
+        }
+    }
+    for v6_probe in DEFAULT_V6_ROUTE_PROBE_TARGETS {
+        if let Some(src) = probe_route_local_ipv6(SocketAddrV6::new(v6_probe, 80, 0, 0)) {
+            push_unique_global_v6(&mut out.global_ipv6s, src);
+        }
+    }
+
+    // 3. 并入全部 UP 非回环网卡上的多网卡 / VPN IPv4 与全球单播 IPv6
+    let os_ips = discover_os_interface_ips();
+    for v4 in os_ips.ipv4s {
+        push_unique_v4(&mut out.ipv4s, v4);
+    }
+    for v6 in os_ips.global_ipv6s {
+        push_unique_global_v6(&mut out.global_ipv6s, v6);
+    }
+
+    out
+}
+
+/// 枚举本机全部 UP 非回环网卡上的可用 IPv4（含多网卡/VPN 网段）与全球单播 IPv6。
+pub fn detect_local_interface_ips() -> LocalInterfaceIps {
+    detect_local_interface_ips_for_targets(&[])
 }
 
 /// 获取本机可读设备名（优先 macOS `scutil`，次选 `HOSTNAME` 环境变量，兜底 `"本机 Mac"`）。
@@ -1023,5 +1336,111 @@ mod tests {
         assert_eq!(handle.shared.refresh_applied_gen.load(Ordering::Acquire), 2);
 
         handle.stop();
+    }
+
+    #[test]
+    fn os_interface_parsers_collect_multi_nic_vpn_v4_and_only_global_v6() {
+        let mac_sample = "\
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+\tinet6 ::1 prefixlen 128
+\tinet6 fe80::1%lo0 prefixlen 64 scopeid 0x1
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet6 fe80::a1b2:c3ff:fe01:203%en0 prefixlen 64 secured scopeid 0x6
+\tinet6 fd12:3456:789a::10 prefixlen 64
+\tinet6 2408:8207:1901:1111::1 prefixlen 64 deprecated
+\tinet6 2408:8207:1901:1111::42 prefixlen 64 autoconf temporary
+\tinet 192.168.50.10 netmask 0xffffff00 broadcast 192.168.50.255
+\tstatus: active
+en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 10.20.30.40 netmask 0xffffff00 broadcast 10.20.30.255
+\tstatus: inactive
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1420
+\tinet 100.64.12.34 --> 100.64.12.34 netmask 0xffffffff
+\tinet 172.24.8.9 --> 172.24.8.1 netmask 0xffff0000
+";
+        let mac_ips = parse_macos_ifconfig_output(mac_sample);
+        assert_eq!(
+            mac_ips.ipv4s,
+            vec![
+                Ipv4Addr::new(192, 168, 50, 10),
+                Ipv4Addr::new(100, 64, 12, 34),
+                Ipv4Addr::new(172, 24, 8, 9),
+            ]
+        );
+        assert_eq!(
+            mac_ips.global_ipv6s,
+            vec!["2408:8207:1901:1111::42".parse::<Ipv6Addr>().unwrap()]
+        );
+
+        let linux_ip_sample = "\
+1: lo    inet 127.0.0.1/8 scope host lo
+1: lo    inet6 ::1/128 scope host
+2: eth0    inet 192.168.10.25/24 brd 192.168.10.255 scope global eth0
+2: eth0    inet6 2409:8a00:1:2::99/64 scope global dynamic
+2: eth0    inet6 fe80::1234/64 scope link
+3: wg0    inet 10.88.0.2/24 scope global wg0
+3: wg0    inet6 fd00:10::2/64 scope global
+";
+        let linux_ips = parse_linux_ip_addr_show(linux_ip_sample);
+        assert_eq!(
+            linux_ips.ipv4s,
+            vec![Ipv4Addr::new(192, 168, 10, 25), Ipv4Addr::new(10, 88, 0, 2)]
+        );
+        assert_eq!(
+            linux_ips.global_ipv6s,
+            vec!["2409:8a00:1:2::99".parse::<Ipv6Addr>().unwrap()]
+        );
+
+        let proc_v6 = "\
+00000000000000000000000000000001 01 80 10 80       lo
+fe800000000000000000000000000001 02 40 20 80     eth0
+fd000000000000000000000000000002 02 40 00 80     eth0
+20010db8000000000000000000000001 02 40 00 20     eth0
+24088207000100020000000000000088 02 40 00 00     eth0
+";
+        assert_eq!(
+            parse_proc_if_inet6(proc_v6),
+            vec!["2408:8207:1:2::88".parse::<Ipv6Addr>().unwrap()]
+        );
+
+        let win_sample = "\
+Ethernet adapter Ethernet:
+   IPv6 Address. . . . . . . . . . . : 240e:3b0:1234::77(Preferred)
+   Link-local IPv6 Address . . . . . : fe80::1234:5678%12(Preferred)
+   IPv4 Address. . . . . . . . . . . : 192.168.1.55(Preferred)
+   Autoconfiguration IPv4 Address. . : 169.254.11.22(Preferred)
+
+Unknown adapter Tailscale:
+   IPv6 Address. . . . . . . . . . . : fd7a:115c:a1e0::1(Preferred)
+   IPv4 Address. . . . . . . . . . . : 100.64.5.9(Preferred)
+
+Loopback Pseudo-Interface 1:
+   IPv4 Address. . . . . . . . . . . : 127.0.0.1
+   IPv6 Address. . . . . . . . . . . : ::1
+";
+        let win_ips = parse_windows_ipconfig_output(win_sample);
+        assert_eq!(
+            win_ips.ipv4s,
+            vec![Ipv4Addr::new(192, 168, 1, 55), Ipv4Addr::new(100, 64, 5, 9)]
+        );
+        assert_eq!(
+            win_ips.global_ipv6s,
+            vec!["240e:3b0:1234::77".parse::<Ipv6Addr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn detect_local_interface_ips_filters_invalid_and_matches_primary() {
+        let ips = detect_local_interface_ips();
+        for ip in &ips.ipv4s {
+            assert!(is_usable_lan_ipv4(*ip));
+        }
+        for v6 in &ips.global_ipv6s {
+            assert!(crate::nat::is_global_unicast_ipv6(*v6));
+        }
+        if let Some(primary) = detect_local_lan_ipv4() {
+            assert_eq!(ips.ipv4s.first().copied(), Some(primary));
+        }
     }
 }

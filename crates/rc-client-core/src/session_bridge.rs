@@ -61,7 +61,11 @@ pub use crate::relay_transport::SessionMtlsBundle;
 use crate::relay_transport::{
     E2eeRelayTransport, RelayE2eeMode, RelayRole, RelayShutdownHandle, TcpRelayTransport,
 };
-use crate::signal_client::ConnectGrant;
+use crate::signal_client::{ConnectGrant, SignalClientHandle};
+use crate::switchable_transport::{
+    CandidateTransport, HysteresisConfig, HysteresisDecision, RuntimePathMonitor, SwitchControlMsg,
+    SwitchHandle, SwitchableTransport, TransportPathKind, DEFAULT_SWITCH_STAGE_TIMEOUT,
+};
 use crate::ui_error::{IntoUiError, UiError};
 
 /// 命令通道容量上限（T21 U6 / 铁律 1 UI 侧延伸）。
@@ -185,6 +189,12 @@ pub struct UiSessionConfig {
     /// 局域网多播发现命中的同局域网被控端直连地址（三阶路由 Tier 1 `UDP LAN` 优先探测）。
     #[serde(default)]
     pub lan_direct_addr: Option<SocketAddr>,
+    /// 可选信令客户端句柄（供运行期 `P2P -> Relay` 降级在初始 60s `relay_token` 过期后向服务端申请新 `RelayReady`）。
+    #[serde(skip)]
+    pub signal_client: Option<Arc<SignalClientHandle>>,
+    /// 可选目标 9 位设备码（配合 `signal_client` 发起运行期 `request_relay`）。
+    #[serde(skip)]
+    pub target_device_id: Option<String>,
 }
 
 impl Default for UiSessionConfig {
@@ -209,6 +219,8 @@ impl Default for UiSessionConfig {
             owner_grant: None,
             owner_signer: None,
             lan_direct_addr: None,
+            signal_client: None,
+            target_device_id: None,
         }
     }
 }
@@ -244,6 +256,8 @@ impl fmt::Debug for UiSessionConfig {
             .field("has_owner_grant", &self.owner_grant.is_some())
             .field("has_owner_signer", &self.owner_signer.is_some())
             .field("lan_direct_addr", &self.lan_direct_addr)
+            .field("has_signal_client", &self.signal_client.is_some())
+            .field("target_device_id", &self.target_device_id)
             .finish()
     }
 }
@@ -2854,7 +2868,8 @@ fn collect_lan_candidate_addrs(cfg: &UiSessionConfig, grant: &ConnectGrant) -> V
             probe_targets.push(relay_addr);
         }
     }
-    let local_v4s = lan_discovery::discover_local_lan_ipv4s(&probe_targets);
+    let local_ips = lan_discovery::detect_local_interface_ips_for_targets(&probe_targets);
+    let local_v4s = local_ips.ipv4s;
     for raw in &grant.peer_lan_addrs {
         let Ok(addr) = raw.parse::<SocketAddr>() else {
             continue;
@@ -2928,6 +2943,96 @@ enum RaceBranchOutcome {
         reason: String,
         fatal_mtls: Option<String>,
     },
+}
+
+/// Happy Eyeballs 并发 LAN 直连拨号（单目标零额外线程；多网卡候选以 ~50ms 错峰并发尝试，任一命中即中止其余拨号）。
+fn dial_lan_addrs_happy_eyeballs(
+    lan_addrs: &[SocketAddr],
+    mtls: Option<&rc_net::mtls::MtlsConfig>,
+    encrypt_conn: bool,
+    outer_cancel: &AtomicBool,
+) -> LanDialResult {
+    if lan_addrs.len() <= 1 {
+        let mut reasons = Vec::new();
+        for &lan_addr in lan_addrs {
+            if outer_cancel.load(Ordering::Acquire) {
+                break;
+            }
+            match dial_lan_direct_quic(lan_addr, mtls, outer_cancel) {
+                Ok((t, fp)) => return Ok((t, fp, lan_addr)),
+                Err(err) => {
+                    if encrypt_conn && is_mtls_cert_or_config_error(&err) {
+                        return Err((
+                            reasons,
+                            Some(format!("LAN mTLS 证书校验失败（严禁静默降级）: {err}")),
+                        ));
+                    }
+                    reasons.push(err);
+                }
+            }
+        }
+        return Err((reasons, None));
+    }
+
+    let capped: Vec<SocketAddr> = lan_addrs.iter().copied().take(4).collect();
+    let local_cancel = AtomicBool::new(false);
+    let (tx, rx) = std::sync::mpsc::channel::<(
+        SocketAddr,
+        Result<(Box<dyn Transport>, Option<String>), String>,
+    )>();
+
+    std::thread::scope(|scope| {
+        let total = capped.len();
+        for (idx, &addr) in capped.iter().enumerate() {
+            let tx_c = tx.clone();
+            let cancel_ref = &local_cancel;
+            scope.spawn(move || {
+                if idx > 0 {
+                    let delay_end = Instant::now() + Duration::from_millis((idx as u64) * 50);
+                    while Instant::now() < delay_end {
+                        if cancel_ref.load(Ordering::Acquire)
+                            || outer_cancel.load(Ordering::Acquire)
+                        {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                if cancel_ref.load(Ordering::Acquire) || outer_cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                let res = dial_lan_direct_quic(addr, mtls, cancel_ref);
+                let _ = tx_c.send((addr, res));
+            });
+        }
+        drop(tx);
+
+        let mut reasons = Vec::new();
+        let mut fatal_mtls: Option<String> = None;
+        let mut received = 0usize;
+        while received < total {
+            if outer_cancel.load(Ordering::Acquire) {
+                local_cancel.store(true, Ordering::Release);
+                break;
+            }
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok((addr, Ok((t, fp)))) => {
+                    local_cancel.store(true, Ordering::Release);
+                    return Ok((t, fp, addr));
+                }
+                Ok((_addr, Err(err))) => {
+                    received += 1;
+                    if fatal_mtls.is_none() && encrypt_conn && is_mtls_cert_or_config_error(&err) {
+                        fatal_mtls = Some(format!("LAN mTLS 证书校验失败（严禁静默降级）: {err}"));
+                    }
+                    reasons.push(err);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Err((reasons, fatal_mtls))
+    })
 }
 
 fn race_lan_and_p2p_with<FLan, FP2p>(
@@ -3100,8 +3205,13 @@ fn build_client_p2p_candidates(grant: &ConnectGrant) -> P2pCandidates {
         local_udp_port: grant.local_udp_port,
         self_nat_type: grant.self_nat_type,
         self_nat_port_delta: grant.self_nat_port_delta,
+        self_nat_port_range: grant.self_nat_port_range,
         peer_nat_type: grant.peer_nat_type,
         peer_nat_port_delta: grant.peer_nat_port_delta,
+        peer_nat_port_range: grant.peer_nat_port_range,
+        punch_secret: grant.punch_secret.clone(),
+        start_after_ms: grant.start_after_ms,
+        relay_fallback_after_ms: grant.relay_fallback_after_ms,
     }
 }
 
@@ -3142,11 +3252,16 @@ fn dial_lan_direct_quic(
 ) -> Result<(Box<dyn Transport>, Option<String>), String> {
     let identity = Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM)
         .map_err(|e| format!("LAN QUIC 端点证书加载失败: {e}"))?;
+    let local_addr: SocketAddr = if lan_addr.is_ipv6() {
+        "[::]:0".parse().expect("[::]:0 is a valid socket addr")
+    } else {
+        "0.0.0.0:0"
+            .parse()
+            .expect("0.0.0.0:0 is a valid socket addr")
+    };
     let net = NetConfig {
         role: Role::Controller,
-        local_addr: "0.0.0.0:0"
-            .parse()
-            .expect("0.0.0.0:0 is a valid socket addr"),
+        local_addr,
         peer_addr: Some(lan_addr),
         mtu: rc_session::DEFAULT_SESSION_MTU,
     };
@@ -3499,10 +3614,17 @@ fn run_session_thread(
     let (
         mut client,
         negotiated,
-        transport_label,
-        active_backend_suffix,
-        mtls_active,
-        peer_cert_fingerprint,
+        mut transport_label,
+        mut active_backend_suffix,
+        mut mtls_active,
+        mut peer_cert_fingerprint,
+        switch_handle,
+        mut bg_p2p_upgrade_rx,
+        bg_p2p_cancel_slot,
+        grant_obtained_at,
+        mut initial_relay_token_consumed,
+        proxy_active_runtime,
+        runtime_mode,
     ) = if let Some(grant) = cfg.relay_grant.as_ref() {
         update_tx.push(SessionUpdate::Connecting {
             phase: ConnectPhase::Connecting,
@@ -3543,12 +3665,108 @@ fn run_session_thread(
             backend_suffix: Option<&'static str>,
             mtls_active: bool,
             peer_cert_fingerprint: Option<String>,
+            switch_handle: SwitchHandle,
         }
         enum TierHandshakeResult {
             Ready(Box<ReadySignalingSession>),
             Fallback(String),
             Abort(Result<SessionEnd, SessionEnd>),
         }
+
+        let dial_relay_transport =
+            |relay_addr: &str,
+             relay_token: &str,
+             peer_b: Option<&SessionMtlsBundle>,
+             encrypt_conn: bool,
+             cancel: Arc<AtomicBool>,
+             disc_flag: &AtomicBool|
+             -> Result<SelectedRelayPath, Result<SessionEnd, SessionEnd>> {
+                const RELAY_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+                let (raw_transport, shutdown_handle, active, fp): (
+                    Box<dyn Transport>,
+                    RelayShutdownHandle,
+                    bool,
+                    Option<String>,
+                ) = if encrypt_conn {
+                    let Some(bundle) = peer_b else {
+                        return Err(Err(SessionEnd::fatal(
+                            "已开启「加密连接 (mTLS)」，但缺少设备证书配置",
+                        )));
+                    };
+                    let relay_mtls = bundle.to_relay_mtls_config(None);
+                    let t = E2eeRelayTransport::connect_cancellable(
+                        relay_addr,
+                        RelayRole::Client,
+                        relay_token,
+                        RELAY_CLIENT_CONNECT_TIMEOUT,
+                        cancel,
+                        Some(&relay_mtls),
+                        RelayE2eeMode::ClientRequired(bundle.clone()),
+                    )
+                    .map_err(|e| {
+                        if disc_flag.load(Ordering::Acquire) {
+                            Ok(SessionEnd::fatal("用户主动断开"))
+                        } else {
+                            Err(SessionEnd::fatal(classify_relay_connect_error(
+                                &e, true, true,
+                            )))
+                        }
+                    })?;
+                    let h = t.shutdown_handle();
+                    let fp = t
+                        .peer_mtls_identity()
+                        .map(|id| id.cert_fingerprint_sha256.clone());
+                    (Box::new(t), h, true, fp)
+                } else if let Some(bundle) = peer_b {
+                    let relay_mtls = bundle.to_relay_mtls_config(None);
+                    let t = TcpRelayTransport::connect_mtls_cancellable(
+                        relay_addr,
+                        RelayRole::Client,
+                        relay_token,
+                        RELAY_CLIENT_CONNECT_TIMEOUT,
+                        cancel,
+                        &relay_mtls,
+                    )
+                    .map_err(|e| {
+                        if disc_flag.load(Ordering::Acquire) {
+                            Ok(SessionEnd::fatal("用户主动断开"))
+                        } else {
+                            Err(SessionEnd::fatal(classify_relay_connect_error(
+                                &e, false, true,
+                            )))
+                        }
+                    })?;
+                    let h = t.shutdown_handle();
+                    (Box::new(t), h, false, None)
+                } else {
+                    let t = TcpRelayTransport::connect_cancellable(
+                        relay_addr,
+                        RelayRole::Client,
+                        relay_token,
+                        RELAY_CLIENT_CONNECT_TIMEOUT,
+                        cancel,
+                    )
+                    .map_err(|e| {
+                        if disc_flag.load(Ordering::Acquire) {
+                            Ok(SessionEnd::fatal("用户主动断开"))
+                        } else {
+                            Err(SessionEnd::fatal(classify_relay_connect_error(
+                                &e, false, false,
+                            )))
+                        }
+                    })?;
+                    let h = t.shutdown_handle();
+                    (Box::new(t), h, false, None)
+                };
+                Ok(SelectedRelayPath {
+                    transport: raw_transport,
+                    relay_shutdown: Some(shutdown_handle),
+                    transport_label: "TCP Relay",
+                    backend_suffix: Some("(中继)"),
+                    mtls_active: active,
+                    peer_cert_fingerprint: fp,
+                })
+            };
 
         let attempt_tier_handshake = |path: SelectedRelayPath,
                                       peer_addr: SocketAddr,
@@ -3569,8 +3787,20 @@ fn run_session_thread(
                 watch_only: live_watch_only.load(Ordering::Acquire),
             });
 
+            let sw_kind = match chosen_transport_label {
+                "TCP Relay" => TransportPathKind::Relay,
+                "UDP P2P" => TransportPathKind::P2p,
+                "UDP LAN (mTLS)" => TransportPathKind::MtlsLan,
+                _ => TransportPathKind::Lan,
+            };
+            let (sw_transport, switch_handle) = SwitchableTransport::new(
+                raw_transport,
+                Role::Controller,
+                sw_kind,
+                cfg.encrypt_connection,
+            );
             let bridge_transport = BridgeTransport {
-                inner: raw_transport,
+                inner: Box::new(sw_transport),
                 pending_control: Arc::clone(&pending_control),
                 disconnect_flag: Arc::clone(&disconnect_flag),
                 relay_shutdown,
@@ -3632,6 +3862,7 @@ fn run_session_thread(
                     backend_suffix,
                     mtls_active,
                     peer_cert_fingerprint: peer_fp,
+                    switch_handle,
                 })),
                 Err(e) => {
                     let user_disc = disconnect_flag.load(Ordering::Acquire);
@@ -3687,6 +3918,13 @@ fn run_session_thread(
                 "proxy_config_conflict: 当前已启用出站网络代理，与「仅 P2P 直连」模式冲突，请关闭代理或切换为自动/中继模式",
             ));
         }
+        let grant_obtained_at = Instant::now();
+        let mut initial_relay_token_consumed = false;
+        let bg_p2p_cancel = Arc::new(AtomicBool::new(false));
+        type BgP2pUpgradeRx =
+            std::sync::mpsc::Receiver<Result<(Box<dyn Transport>, Option<String>), String>>;
+        let mut bg_p2p_upgrade_rx: Option<BgP2pUpgradeRx> = None;
+
         let allow_lan_and_p2p =
             effective_mode != ConnectionMode::TcpRelay && !proxy_active_for_relay;
         if allow_lan_and_p2p && !disconnect_flag.load(Ordering::Acquire) {
@@ -3694,211 +3932,686 @@ fn run_session_thread(
             let p2p_candidates = build_client_p2p_candidates(grant);
             let has_lan = !lan_addrs.is_empty();
             let has_p2p = !p2p::parse_candidate_addrs(&p2p_candidates).is_empty();
+            let has_relay = !grant.relay_addr.is_empty() && !grant.relay_token.is_empty();
+            let use_relay_first =
+                effective_mode == ConnectionMode::Auto && has_relay && (has_lan || has_p2p);
 
-            let direct_winner: Option<DirectTierWinner> = if has_lan && has_p2p {
-                let quic_mtls_ref = quic_mtls.as_ref();
+            if use_relay_first {
+                let relay_first_delay = Duration::from_millis(
+                    u64::from(grant.relay_fallback_after_ms.unwrap_or(400)).clamp(50, 5_000),
+                );
+                let quic_mtls_c = if cfg.encrypt_connection {
+                    peer_bundle
+                        .as_ref()
+                        .and_then(|b| b.to_quic_mtls_config().ok())
+                } else {
+                    None
+                };
                 let encrypt_conn = cfg.encrypt_connection;
-                let disc_ref = &disconnect_flag;
-                match race_lan_and_p2p_with(
-                    encrypt_conn,
-                    disc_ref,
-                    |lan_cancel| {
-                        let mut reasons = Vec::new();
-                        for &lan_addr in &lan_addrs {
-                            if lan_cancel.load(Ordering::Acquire)
-                                || disc_ref.load(Ordering::Acquire)
-                            {
-                                break;
+                let lan_addrs_c = lan_addrs.clone();
+                let p2p_cands_c = p2p_candidates.clone();
+                let disc_c = Arc::clone(&disconnect_flag);
+                let bg_c = Arc::clone(&bg_p2p_cancel);
+                let direct_cancel = Arc::new(AtomicBool::new(false));
+                let dc_watch = Arc::clone(&direct_cancel);
+                type PendingDirectTransport = (
+                    Box<dyn Transport>,
+                    &'static str,
+                    Option<&'static str>,
+                    Option<String>,
+                    SocketAddr,
+                    Duration,
+                );
+                let (direct_tx, direct_rx) = std::sync::mpsc::channel::<
+                    Result<PendingDirectTransport, DirectTierRaceError>,
+                >();
+
+                let _ = thread::Builder::new()
+                    .name("rc-client-direct-race".to_string())
+                    .spawn(move || {
+                        let watch_stop = Arc::new(AtomicBool::new(false));
+                        let ws_c = Arc::clone(&watch_stop);
+                        let watcher = thread::spawn(move || {
+                            while !ws_c.load(Ordering::Acquire) {
+                                if disc_c.load(Ordering::Acquire) || bg_c.load(Ordering::Acquire) {
+                                    dc_watch.store(true, Ordering::Release);
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(5));
                             }
-                            match dial_lan_direct_quic(lan_addr, quic_mtls_ref, lan_cancel) {
-                                Ok((t, fp)) => return Ok((t, fp, lan_addr)),
-                                Err(err) => {
-                                    if encrypt_conn && is_mtls_cert_or_config_error(&err) {
-                                        return Err((
-                                            reasons,
-                                            Some(format!(
-                                                "LAN mTLS 证书校验失败（严禁静默降级）: {err}"
-                                            )),
-                                        ));
+                        });
+
+                        const BG_P2P_PUNCH_TIMEOUT: Duration = Duration::from_secs(14);
+                        let res = if has_lan && has_p2p {
+                            match race_lan_and_p2p_with(
+                                encrypt_conn,
+                                &direct_cancel,
+                                |lan_cancel| {
+                                    dial_lan_addrs_happy_eyeballs(
+                                        &lan_addrs_c,
+                                        quic_mtls_c.as_ref(),
+                                        encrypt_conn,
+                                        lan_cancel,
+                                    )
+                                },
+                                |p2p_cancel| {
+                                    let port_hold =
+                                        crate::signal_client::acquire_local_udp_port_for_p2p(
+                                            p2p_cands_c.local_udp_port,
+                                        );
+                                    match p2p::attempt_p2p_quic_client_mtls(
+                                        &p2p_cands_c,
+                                        BG_P2P_PUNCH_TIMEOUT,
+                                        p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
+                                        p2p_cancel,
+                                        quic_mtls_c.as_ref(),
+                                    ) {
+                                        Ok(p2p_conn) => {
+                                            let held = crate::signal_client::P2pHeldTransport::new(
+                                                p2p_conn, port_hold,
+                                            );
+                                            let fp = held
+                                                .peer_mtls_identity()
+                                                .map(|id| id.cert_fingerprint_sha256);
+                                            Ok((Box::new(held) as Box<dyn Transport>, fp))
+                                        }
+                                        Err(e) => {
+                                            drop(port_hold);
+                                            Err((e, None))
+                                        }
                                     }
-                                    reasons.push(err);
+                                },
+                            ) {
+                                Ok(DirectTierWinner::Lan {
+                                    transport,
+                                    peer_cert_fingerprint,
+                                    lan_addr,
+                                    ..
+                                }) => Ok((
+                                    transport,
+                                    "UDP LAN",
+                                    None,
+                                    peer_cert_fingerprint,
+                                    lan_addr,
+                                    LAN_DIRECT_HANDSHAKE_TIMEOUT,
+                                )),
+                                Ok(DirectTierWinner::P2p {
+                                    transport,
+                                    peer_cert_fingerprint,
+                                }) => Ok((
+                                    transport,
+                                    "UDP P2P",
+                                    Some("(P2P 直连)"),
+                                    peer_cert_fingerprint,
+                                    cfg.connect_addr,
+                                    P2P_DIRECT_HANDSHAKE_TIMEOUT,
+                                )),
+                                Err(e) => Err(e),
+                            }
+                        } else if has_lan {
+                            dial_lan_addrs_happy_eyeballs(
+                                &lan_addrs_c,
+                                quic_mtls_c.as_ref(),
+                                encrypt_conn,
+                                &direct_cancel,
+                            )
+                            .map(|(t, fp, lan_addr)| {
+                                (
+                                    t,
+                                    "UDP LAN",
+                                    None,
+                                    fp,
+                                    lan_addr,
+                                    LAN_DIRECT_HANDSHAKE_TIMEOUT,
+                                )
+                            })
+                            .map_err(|(reasons, fatal)| match fatal {
+                                Some(m) => DirectTierRaceError::FatalMtls(m),
+                                None => DirectTierRaceError::NonFatal(reasons),
+                            })
+                        } else {
+                            let port_hold = crate::signal_client::acquire_local_udp_port_for_p2p(
+                                p2p_cands_c.local_udp_port,
+                            );
+                            match p2p::attempt_p2p_quic_client_mtls(
+                                &p2p_cands_c,
+                                BG_P2P_PUNCH_TIMEOUT,
+                                p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
+                                &direct_cancel,
+                                quic_mtls_c.as_ref(),
+                            ) {
+                                Ok(p2p_conn) => {
+                                    let held = crate::signal_client::P2pHeldTransport::new(
+                                        p2p_conn, port_hold,
+                                    );
+                                    let fp = held
+                                        .peer_mtls_identity()
+                                        .map(|id| id.cert_fingerprint_sha256);
+                                    Ok((
+                                        Box::new(held) as Box<dyn Transport>,
+                                        "UDP P2P",
+                                        Some("(P2P 直连)"),
+                                        fp,
+                                        cfg.connect_addr,
+                                        P2P_DIRECT_HANDSHAKE_TIMEOUT,
+                                    ))
+                                }
+                                Err(e) => {
+                                    drop(port_hold);
+                                    if encrypt_conn && is_mtls_cert_or_config_error(&e) {
+                                        Err(DirectTierRaceError::FatalMtls(format!(
+                                            "P2P mTLS 证书校验失败（严禁静默降级）: {e}"
+                                        )))
+                                    } else {
+                                        Err(DirectTierRaceError::NonFatal(vec![e]))
+                                    }
                                 }
                             }
-                        }
-                        Err((reasons, None))
-                    },
-                    |p2p_cancel| {
-                        dial_p2p_held_transport(
-                            &p2p_candidates,
-                            quic_mtls_ref,
-                            encrypt_conn,
-                            p2p_cancel,
-                        )
-                    },
-                ) {
-                    Ok(winner) => Some(winner),
-                    Err(DirectTierRaceError::FatalMtls(msg)) => {
-                        return Err(SessionEnd::fatal(msg));
-                    }
-                    Err(DirectTierRaceError::Cancelled) => {
-                        return Ok(SessionEnd::fatal("用户主动断开"));
-                    }
-                    Err(DirectTierRaceError::NonFatal(reasons)) => {
-                        direct_fail_reasons.extend(reasons);
-                        None
-                    }
-                }
-            } else if has_lan {
-                let mut found = None;
-                for lan_addr in lan_addrs {
-                    if disconnect_flag.load(Ordering::Acquire) {
-                        return Ok(SessionEnd::fatal("用户主动断开"));
-                    }
-                    match dial_lan_direct_quic(lan_addr, quic_mtls.as_ref(), &disconnect_flag) {
-                        Ok((t, fp)) => {
-                            found = Some(DirectTierWinner::Lan {
-                                transport: t,
-                                peer_cert_fingerprint: fp,
-                                lan_addr,
-                                p2p_already_failed: false,
-                            });
-                            break;
-                        }
-                        Err(err) => {
-                            if cfg.encrypt_connection && is_mtls_cert_or_config_error(&err) {
-                                return Err(SessionEnd::fatal(format!(
-                                    "LAN mTLS 证书校验失败（严禁静默降级）: {err}"
-                                )));
+                        };
+                        watch_stop.store(true, Ordering::Release);
+                        let _ = watcher.join();
+                        let _ = direct_tx.send(res);
+                    });
+
+                // t = 0..400ms 优先等待直连；超时未成行则于 t = 400ms 启动 Relay 同步起流
+                let relay_start_at = Instant::now() + relay_first_delay;
+                let mut direct_rx_slot = Some(direct_rx);
+                let mut direct_finished_early = false;
+                while Instant::now() < relay_start_at && !disconnect_flag.load(Ordering::Acquire) {
+                    if let Some(ref rx) = direct_rx_slot {
+                        match rx.try_recv() {
+                            Ok(Ok((t, lbl, suffix, fp, p_addr, hs_to))) => {
+                                direct_rx_slot = None;
+                                match attempt_tier_handshake(
+                                    SelectedRelayPath {
+                                        transport: t,
+                                        relay_shutdown: None,
+                                        transport_label: lbl,
+                                        backend_suffix: suffix,
+                                        mtls_active: cfg.encrypt_connection,
+                                        peer_cert_fingerprint: fp,
+                                    },
+                                    p_addr,
+                                    hs_to,
+                                    true,
+                                ) {
+                                    TierHandshakeResult::Ready(sess) => {
+                                        ready = Some(*sess);
+                                        bg_p2p_cancel.store(true, Ordering::Release);
+                                        break;
+                                    }
+                                    TierHandshakeResult::Fallback(reason) => {
+                                        direct_fail_reasons.push(reason);
+                                        direct_finished_early = true;
+                                        break;
+                                    }
+                                    TierHandshakeResult::Abort(res) => return res,
+                                }
                             }
-                            direct_fail_reasons.push(err);
+                            Ok(Err(DirectTierRaceError::FatalMtls(msg))) => {
+                                bg_p2p_cancel.store(true, Ordering::Release);
+                                return Err(SessionEnd::fatal(msg));
+                            }
+                            Ok(Err(DirectTierRaceError::Cancelled)) => {
+                                direct_rx_slot = None;
+                                direct_finished_early = true;
+                                break;
+                            }
+                            Ok(Err(DirectTierRaceError::NonFatal(reasons))) => {
+                                direct_fail_reasons.extend(reasons);
+                                direct_rx_slot = None;
+                                direct_finished_early = true;
+                                break;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                direct_rx_slot = None;
+                                direct_finished_early = true;
+                                break;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                thread::sleep(Duration::from_millis(5));
+                            }
                         }
+                    } else {
+                        break;
                     }
                 }
-                found
-            } else if has_p2p {
-                match dial_p2p_held_transport(
-                    &p2p_candidates,
-                    quic_mtls.as_ref(),
-                    cfg.encrypt_connection,
-                    &disconnect_flag,
-                ) {
-                    Ok((transport, peer_cert_fingerprint)) => Some(DirectTierWinner::P2p {
-                        transport,
-                        peer_cert_fingerprint,
-                    }),
-                    Err((err, Some(fatal_mtls))) => {
-                        let _ = err;
-                        return Err(SessionEnd::fatal(fatal_mtls));
-                    }
-                    Err((err, None)) => {
-                        direct_fail_reasons.push(err);
-                        None
+
+                if ready.is_none() && !disconnect_flag.load(Ordering::Acquire) {
+                    let _ = direct_finished_early;
+                    let relay_addr_c = grant.relay_addr.clone();
+                    let relay_tok_c = grant.relay_token.clone();
+                    let peer_b_c = peer_bundle.clone();
+                    let encrypt_c = cfg.encrypt_connection;
+                    let relay_cancel = Arc::new(AtomicBool::new(false));
+                    let rc_c = Arc::clone(&relay_cancel);
+                    let dc_c = Arc::clone(&disconnect_flag);
+                    let (relay_tx, relay_rx) = std::sync::mpsc::channel();
+                    let _ = thread::Builder::new()
+                        .name("rc-client-relay-first".to_string())
+                        .spawn(move || {
+                            let peer_b_ref = peer_b_c.as_ref();
+                            let r = dial_relay_transport(
+                                &relay_addr_c,
+                                &relay_tok_c,
+                                peer_b_ref,
+                                encrypt_c,
+                                rc_c,
+                                &dc_c,
+                            );
+                            let _ = relay_tx.send(r);
+                        });
+
+                    let mut relay_done_err: Option<Result<SessionEnd, SessionEnd>> = None;
+                    let mut relay_rx_open = true;
+                    let mut pending_direct: Option<PendingDirectTransport> = None;
+                    let mut relay_hs_rx: Option<mpsc::Receiver<TierHandshakeResult>> = None;
+                    let mut relay_hs_shutdown: Option<crate::relay_transport::RelayShutdownHandle> =
+                        None;
+
+                    let loop_outcome: Option<Result<SessionEnd, SessionEnd>> = std::thread::scope(
+                        |scope| {
+                            while ready.is_none() && !disconnect_flag.load(Ordering::Acquire) {
+                                if let Some(ref drx) = direct_rx_slot {
+                                    match drx.try_recv() {
+                                        Ok(Ok((t, lbl, suffix, fp, p_addr, hs_to))) => {
+                                            direct_rx_slot = None;
+                                            if relay_hs_rx.is_some() {
+                                                // Relay 应用层握手已在途：保留已打通直连，若 Relay 失败立即回退直连，若 Relay 成功则立即交接无损升级
+                                                pending_direct =
+                                                    Some((t, lbl, suffix, fp, p_addr, hs_to));
+                                            } else {
+                                                relay_cancel.store(true, Ordering::Release);
+                                                match attempt_tier_handshake(
+                                                    SelectedRelayPath {
+                                                        transport: t,
+                                                        relay_shutdown: None,
+                                                        transport_label: lbl,
+                                                        backend_suffix: suffix,
+                                                        mtls_active: cfg.encrypt_connection,
+                                                        peer_cert_fingerprint: fp,
+                                                    },
+                                                    p_addr,
+                                                    hs_to,
+                                                    relay_rx_open,
+                                                ) {
+                                                    TierHandshakeResult::Ready(sess) => {
+                                                        ready = Some(*sess);
+                                                        break;
+                                                    }
+                                                    TierHandshakeResult::Fallback(r) => {
+                                                        direct_fail_reasons.push(r);
+                                                    }
+                                                    TierHandshakeResult::Abort(res) => {
+                                                        return Some(res);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok(Err(DirectTierRaceError::FatalMtls(msg))) => {
+                                            relay_cancel.store(true, Ordering::Release);
+                                            bg_p2p_cancel.store(true, Ordering::Release);
+                                            if let Some(h) = relay_hs_shutdown.take() {
+                                                h.shutdown();
+                                            }
+                                            return Some(Err(SessionEnd::fatal(msg)));
+                                        }
+                                        Ok(Err(DirectTierRaceError::Cancelled)) => {
+                                            direct_rx_slot = None;
+                                        }
+                                        Ok(Err(DirectTierRaceError::NonFatal(reasons))) => {
+                                            direct_fail_reasons.extend(reasons);
+                                            direct_rx_slot = None;
+                                        }
+                                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                            direct_rx_slot = None;
+                                        }
+                                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                                    }
+                                }
+
+                                if relay_rx_open && relay_hs_rx.is_none() {
+                                    match relay_rx.try_recv() {
+                                        Ok(Ok(relay_path)) => {
+                                            initial_relay_token_consumed = true;
+                                            relay_rx_open = false;
+                                            relay_hs_shutdown = relay_path.relay_shutdown.clone();
+                                            if let Some(ref handle) = relay_path.relay_shutdown {
+                                                *relay_interrupt
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner()) = Some(
+                                                    ActiveRelayInterrupt::Connected(handle.clone()),
+                                                );
+                                            }
+                                            let (hs_tx, hs_rx) = mpsc::sync_channel(1);
+                                            let peer_c = cfg.connect_addr;
+                                            let att = &attempt_tier_handshake;
+                                            scope.spawn(move || {
+                                                let r = att(
+                                                    relay_path,
+                                                    peer_c,
+                                                    Duration::from_secs(10),
+                                                    true,
+                                                );
+                                                let _ = hs_tx.send(r);
+                                            });
+                                            relay_hs_rx = Some(hs_rx);
+                                        }
+                                        Ok(Err(err_res)) => {
+                                            relay_done_err = Some(err_res);
+                                            relay_rx_open = false;
+                                        }
+                                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                            relay_rx_open = false;
+                                        }
+                                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                                    }
+                                }
+
+                                if let Some(ref hs_rx) = relay_hs_rx {
+                                    match hs_rx.try_recv() {
+                                        Ok(TierHandshakeResult::Ready(sess)) => {
+                                            relay_hs_rx = None;
+                                            relay_hs_shutdown = None;
+                                            ready = Some(*sess);
+                                            if let Some((t, _l, _s, fp, _, _)) =
+                                                pending_direct.take()
+                                            {
+                                                let (up_tx, up_rx) = std::sync::mpsc::channel();
+                                                let _ = up_tx.send(Ok((t, fp)));
+                                                bg_p2p_upgrade_rx = Some(up_rx);
+                                            } else if let Some(bg_drx) = direct_rx_slot.take() {
+                                                let (up_tx, up_rx) = std::sync::mpsc::channel();
+                                                let bg_c2 = Arc::clone(&bg_p2p_cancel);
+                                                let disc_c2 = Arc::clone(&disconnect_flag);
+                                                let _ = thread::Builder::new()
+                                                    .name("rc-client-bg-p2p-wait".to_string())
+                                                    .spawn(move || {
+                                                        while !bg_c2.load(Ordering::Acquire)
+                                                            && !disc_c2.load(Ordering::Acquire)
+                                                        {
+                                                            match bg_drx.recv_timeout(
+                                                                Duration::from_millis(50),
+                                                            ) {
+                                                                Ok(Ok((t, _l, _s, fp, _, _))) => {
+                                                                    let _ = up_tx.send(Ok((t, fp)));
+                                                                    break;
+                                                                }
+                                                                Ok(Err(DirectTierRaceError::FatalMtls(e))) => {
+                                                                    let _ = up_tx.send(Err(e));
+                                                                    break;
+                                                                }
+                                                                Ok(Err(DirectTierRaceError::Cancelled)) => break,
+                                                                Ok(Err(DirectTierRaceError::NonFatal(reasons))) => {
+                                                                    let _ = up_tx.send(Err(reasons.join("；")));
+                                                                    break;
+                                                                }
+                                                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                                                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                                            }
+                                                        }
+                                                    });
+                                                bg_p2p_upgrade_rx = Some(up_rx);
+                                            }
+                                            break;
+                                        }
+                                        Ok(TierHandshakeResult::Fallback(r)) => {
+                                            relay_hs_rx = None;
+                                            relay_hs_shutdown = None;
+                                            relay_done_err = Some(Err(SessionEnd::fatal(format!(
+                                                "连接/握手失败: {r}"
+                                            ))));
+                                            if let Some((t, lbl, suffix, fp, p_addr, hs_to)) =
+                                                pending_direct.take()
+                                            {
+                                                match attempt_tier_handshake(
+                                                    SelectedRelayPath {
+                                                        transport: t,
+                                                        relay_shutdown: None,
+                                                        transport_label: lbl,
+                                                        backend_suffix: suffix,
+                                                        mtls_active: cfg.encrypt_connection,
+                                                        peer_cert_fingerprint: fp,
+                                                    },
+                                                    p_addr,
+                                                    hs_to,
+                                                    direct_rx_slot.is_some(),
+                                                ) {
+                                                    TierHandshakeResult::Ready(sess) => {
+                                                        ready = Some(*sess);
+                                                        break;
+                                                    }
+                                                    TierHandshakeResult::Fallback(dr) => {
+                                                        direct_fail_reasons.push(dr);
+                                                    }
+                                                    TierHandshakeResult::Abort(res) => {
+                                                        return Some(res);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok(TierHandshakeResult::Abort(res)) => {
+                                            relay_hs_rx = None;
+                                            relay_hs_shutdown = None;
+                                            return Some(res);
+                                        }
+                                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                            relay_hs_rx = None;
+                                            relay_hs_shutdown = None;
+                                        }
+                                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                                    }
+                                }
+
+                                if direct_rx_slot.is_none()
+                                    && pending_direct.is_none()
+                                    && !relay_rx_open
+                                    && relay_hs_rx.is_none()
+                                {
+                                    if let Some(err_res) = relay_done_err {
+                                        return Some(err_res);
+                                    }
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            if let Some(h) = relay_hs_shutdown.take() {
+                                h.shutdown();
+                            }
+                            None
+                        },
+                    );
+                    if let Some(res) = loop_outcome {
+                        return res;
                     }
                 }
             } else {
-                if effective_mode == ConnectionMode::P2pOnly {
-                    direct_fail_reasons.push("无可用直连或 P2P 候选地址".to_string());
-                }
-                None
-            };
+                let direct_winner: Option<DirectTierWinner> = if has_lan && has_p2p {
+                    let quic_mtls_ref = quic_mtls.as_ref();
+                    let encrypt_conn = cfg.encrypt_connection;
+                    let disc_ref = &disconnect_flag;
+                    match race_lan_and_p2p_with(
+                        encrypt_conn,
+                        disc_ref,
+                        |lan_cancel| {
+                            dial_lan_addrs_happy_eyeballs(
+                                &lan_addrs,
+                                quic_mtls_ref,
+                                encrypt_conn,
+                                lan_cancel,
+                            )
+                        },
+                        |p2p_cancel| {
+                            dial_p2p_held_transport(
+                                &p2p_candidates,
+                                quic_mtls_ref,
+                                encrypt_conn,
+                                p2p_cancel,
+                            )
+                        },
+                    ) {
+                        Ok(winner) => Some(winner),
+                        Err(DirectTierRaceError::FatalMtls(msg)) => {
+                            return Err(SessionEnd::fatal(msg));
+                        }
+                        Err(DirectTierRaceError::Cancelled) => {
+                            return Ok(SessionEnd::fatal("用户主动断开"));
+                        }
+                        Err(DirectTierRaceError::NonFatal(reasons)) => {
+                            direct_fail_reasons.extend(reasons);
+                            None
+                        }
+                    }
+                } else if has_lan {
+                    match dial_lan_addrs_happy_eyeballs(
+                        &lan_addrs,
+                        quic_mtls.as_ref(),
+                        cfg.encrypt_connection,
+                        &disconnect_flag,
+                    ) {
+                        Ok((t, fp, lan_addr)) => Some(DirectTierWinner::Lan {
+                            transport: t,
+                            peer_cert_fingerprint: fp,
+                            lan_addr,
+                            p2p_already_failed: false,
+                        }),
+                        Err((_reasons, Some(fatal_msg))) => {
+                            return Err(SessionEnd::fatal(fatal_msg));
+                        }
+                        Err((reasons, None)) => {
+                            if disconnect_flag.load(Ordering::Acquire) {
+                                return Ok(SessionEnd::fatal("用户主动断开"));
+                            }
+                            direct_fail_reasons.extend(reasons);
+                            None
+                        }
+                    }
+                } else if has_p2p {
+                    match dial_p2p_held_transport(
+                        &p2p_candidates,
+                        quic_mtls.as_ref(),
+                        cfg.encrypt_connection,
+                        &disconnect_flag,
+                    ) {
+                        Ok((transport, peer_cert_fingerprint)) => Some(DirectTierWinner::P2p {
+                            transport,
+                            peer_cert_fingerprint,
+                        }),
+                        Err((err, Some(fatal_mtls))) => {
+                            let _ = err;
+                            return Err(SessionEnd::fatal(fatal_mtls));
+                        }
+                        Err((err, None)) => {
+                            direct_fail_reasons.push(err);
+                            None
+                        }
+                    }
+                } else {
+                    if effective_mode == ConnectionMode::P2pOnly {
+                        direct_fail_reasons.push("无可用直连或 P2P 候选地址".to_string());
+                    }
+                    None
+                };
 
-            if let Some(winner) = direct_winner {
-                let mut retry_p2p_on_lan_fallback = false;
-                let (path, peer_addr, handshake_timeout) = match winner {
-                    DirectTierWinner::Lan {
-                        transport,
-                        peer_cert_fingerprint,
-                        lan_addr,
-                        p2p_already_failed,
-                    } => {
-                        retry_p2p_on_lan_fallback = !p2p_already_failed;
-                        (
+                if let Some(winner) = direct_winner {
+                    let mut retry_p2p_on_lan_fallback = false;
+                    let (path, peer_addr, handshake_timeout) = match winner {
+                        DirectTierWinner::Lan {
+                            transport,
+                            peer_cert_fingerprint,
+                            lan_addr,
+                            p2p_already_failed,
+                        } => {
+                            retry_p2p_on_lan_fallback = !p2p_already_failed;
+                            (
+                                SelectedRelayPath {
+                                    transport,
+                                    relay_shutdown: None,
+                                    transport_label: "UDP LAN",
+                                    backend_suffix: None,
+                                    mtls_active: cfg.encrypt_connection,
+                                    peer_cert_fingerprint,
+                                },
+                                lan_addr,
+                                LAN_DIRECT_HANDSHAKE_TIMEOUT,
+                            )
+                        }
+                        DirectTierWinner::P2p {
+                            transport,
+                            peer_cert_fingerprint,
+                        } => (
                             SelectedRelayPath {
                                 transport,
                                 relay_shutdown: None,
-                                transport_label: "UDP LAN",
-                                backend_suffix: None,
+                                transport_label: "UDP P2P",
+                                backend_suffix: Some("(P2P 直连)"),
                                 mtls_active: cfg.encrypt_connection,
                                 peer_cert_fingerprint,
                             },
-                            lan_addr,
-                            LAN_DIRECT_HANDSHAKE_TIMEOUT,
-                        )
-                    }
-                    DirectTierWinner::P2p {
-                        transport,
-                        peer_cert_fingerprint,
-                    } => (
-                        SelectedRelayPath {
-                            transport,
-                            relay_shutdown: None,
-                            transport_label: "UDP P2P",
-                            backend_suffix: Some("(P2P 直连)"),
-                            mtls_active: cfg.encrypt_connection,
-                            peer_cert_fingerprint,
-                        },
-                        cfg.connect_addr,
-                        P2P_DIRECT_HANDSHAKE_TIMEOUT,
-                    ),
-                };
-                match attempt_tier_handshake(path, peer_addr, handshake_timeout, true) {
-                    TierHandshakeResult::Ready(session) => {
-                        ready = Some(*session);
-                    }
-                    TierHandshakeResult::Fallback(reason) => {
-                        direct_fail_reasons.push(reason);
-                        update_tx.push(SessionUpdate::Connecting {
-                            phase: ConnectPhase::Connecting,
-                            watch_only: live_watch_only.load(Ordering::Acquire),
-                        });
-                        if retry_p2p_on_lan_fallback
-                            && has_p2p
-                            && !disconnect_flag.load(Ordering::Acquire)
-                        {
-                            match dial_p2p_held_transport(
-                                &p2p_candidates,
-                                quic_mtls.as_ref(),
-                                cfg.encrypt_connection,
-                                &disconnect_flag,
-                            ) {
-                                Ok((transport, peer_cert_fingerprint)) => {
-                                    let p2p_path = SelectedRelayPath {
-                                        transport,
-                                        relay_shutdown: None,
-                                        transport_label: "UDP P2P",
-                                        backend_suffix: Some("(P2P 直连)"),
-                                        mtls_active: cfg.encrypt_connection,
-                                        peer_cert_fingerprint,
-                                    };
-                                    match attempt_tier_handshake(
-                                        p2p_path,
-                                        cfg.connect_addr,
-                                        P2P_DIRECT_HANDSHAKE_TIMEOUT,
-                                        true,
-                                    ) {
-                                        TierHandshakeResult::Ready(session) => {
-                                            ready = Some(*session);
+                            cfg.connect_addr,
+                            P2P_DIRECT_HANDSHAKE_TIMEOUT,
+                        ),
+                    };
+                    match attempt_tier_handshake(path, peer_addr, handshake_timeout, true) {
+                        TierHandshakeResult::Ready(session) => {
+                            ready = Some(*session);
+                        }
+                        TierHandshakeResult::Fallback(reason) => {
+                            direct_fail_reasons.push(reason);
+                            update_tx.push(SessionUpdate::Connecting {
+                                phase: ConnectPhase::Connecting,
+                                watch_only: live_watch_only.load(Ordering::Acquire),
+                            });
+                            if retry_p2p_on_lan_fallback
+                                && has_p2p
+                                && !disconnect_flag.load(Ordering::Acquire)
+                            {
+                                match dial_p2p_held_transport(
+                                    &p2p_candidates,
+                                    quic_mtls.as_ref(),
+                                    cfg.encrypt_connection,
+                                    &disconnect_flag,
+                                ) {
+                                    Ok((transport, peer_cert_fingerprint)) => {
+                                        let p2p_path = SelectedRelayPath {
+                                            transport,
+                                            relay_shutdown: None,
+                                            transport_label: "UDP P2P",
+                                            backend_suffix: Some("(P2P 直连)"),
+                                            mtls_active: cfg.encrypt_connection,
+                                            peer_cert_fingerprint,
+                                        };
+                                        match attempt_tier_handshake(
+                                            p2p_path,
+                                            cfg.connect_addr,
+                                            P2P_DIRECT_HANDSHAKE_TIMEOUT,
+                                            true,
+                                        ) {
+                                            TierHandshakeResult::Ready(session) => {
+                                                ready = Some(*session);
+                                            }
+                                            TierHandshakeResult::Fallback(p2p_reason) => {
+                                                direct_fail_reasons.push(p2p_reason);
+                                                update_tx.push(SessionUpdate::Connecting {
+                                                    phase: ConnectPhase::Connecting,
+                                                    watch_only: live_watch_only
+                                                        .load(Ordering::Acquire),
+                                                });
+                                            }
+                                            TierHandshakeResult::Abort(res) => return res,
                                         }
-                                        TierHandshakeResult::Fallback(p2p_reason) => {
-                                            direct_fail_reasons.push(p2p_reason);
-                                            update_tx.push(SessionUpdate::Connecting {
-                                                phase: ConnectPhase::Connecting,
-                                                watch_only: live_watch_only.load(Ordering::Acquire),
-                                            });
-                                        }
-                                        TierHandshakeResult::Abort(res) => return res,
                                     }
-                                }
-                                Err((_, Some(fatal_mtls))) => {
-                                    return Err(SessionEnd::fatal(fatal_mtls));
-                                }
-                                Err((err, None)) => {
-                                    direct_fail_reasons.push(err);
+                                    Err((_, Some(fatal_mtls))) => {
+                                        return Err(SessionEnd::fatal(fatal_mtls));
+                                    }
+                                    Err((err, None)) => {
+                                        direct_fail_reasons.push(err);
+                                    }
                                 }
                             }
                         }
+                        TierHandshakeResult::Abort(res) => return res,
                     }
-                    TierHandshakeResult::Abort(res) => return res,
                 }
             }
         }
@@ -3927,105 +4640,38 @@ fn run_session_thread(
             backend_suffix,
             mtls_active,
             peer_cert_fingerprint: peer_fp,
+            switch_handle,
         } = match ready {
             Some(session) => session,
             None => {
-                // 与服务端默认中继配对超时（15s）对齐，兼容远端仍处旧版清理窗口的边缘场景。
-                const RELAY_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-                let (raw_transport, shutdown_handle, active, fp): (
-                    Box<dyn Transport>,
-                    RelayShutdownHandle,
-                    bool,
-                    Option<String>,
-                ) = if cfg.encrypt_connection {
-                    let bundle = peer_bundle.ok_or_else(|| {
-                        SessionEnd::fatal("已开启「加密连接 (mTLS)」，但缺少设备证书配置")
-                    })?;
-                    let relay_mtls = bundle.to_relay_mtls_config(None);
-                    let t = match E2eeRelayTransport::connect_cancellable(
-                        &grant.relay_addr,
-                        RelayRole::Client,
-                        &grant.relay_token,
-                        RELAY_CLIENT_CONNECT_TIMEOUT,
-                        Arc::clone(&dial_cancel),
-                        Some(&relay_mtls),
-                        RelayE2eeMode::ClientRequired(bundle),
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            if disconnect_flag.load(Ordering::Acquire) {
-                                return Ok(SessionEnd::fatal("用户主动断开"));
-                            }
-                            return Err(SessionEnd::fatal(classify_relay_connect_error(
-                                &e, true, true,
-                            )));
-                        }
-                    };
-                    let h = t.shutdown_handle();
-                    let fp = t
-                        .peer_mtls_identity()
-                        .map(|id| id.cert_fingerprint_sha256.clone());
-                    (Box::new(t), h, true, fp)
-                } else if let Some(bundle) = peer_bundle {
-                    let relay_mtls = bundle.to_relay_mtls_config(None);
-                    let t = match TcpRelayTransport::connect_mtls_cancellable(
-                        &grant.relay_addr,
-                        RelayRole::Client,
-                        &grant.relay_token,
-                        RELAY_CLIENT_CONNECT_TIMEOUT,
-                        Arc::clone(&dial_cancel),
-                        &relay_mtls,
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            if disconnect_flag.load(Ordering::Acquire) {
-                                return Ok(SessionEnd::fatal("用户主动断开"));
-                            }
-                            return Err(SessionEnd::fatal(classify_relay_connect_error(
-                                &e, false, true,
-                            )));
-                        }
-                    };
-                    let h = t.shutdown_handle();
-                    (Box::new(t), h, false, None)
-                } else {
-                    let t = match TcpRelayTransport::connect_cancellable(
-                        &grant.relay_addr,
-                        RelayRole::Client,
-                        &grant.relay_token,
-                        RELAY_CLIENT_CONNECT_TIMEOUT,
-                        Arc::clone(&dial_cancel),
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            if disconnect_flag.load(Ordering::Acquire) {
-                                return Ok(SessionEnd::fatal("用户主动断开"));
-                            }
-                            return Err(SessionEnd::fatal(classify_relay_connect_error(
-                                &e, false, false,
-                            )));
-                        }
-                    };
-                    let h = t.shutdown_handle();
-                    (Box::new(t), h, false, None)
+                initial_relay_token_consumed = true;
+                let relay_path = dial_relay_transport(
+                    &grant.relay_addr,
+                    &grant.relay_token,
+                    peer_bundle.as_ref(),
+                    cfg.encrypt_connection,
+                    Arc::clone(&dial_cancel),
+                    &disconnect_flag,
+                )
+                .map_err(|end_res| match end_res {
+                    Ok(e) => Err(e),
+                    Err(e) => Err(e),
+                });
+                let relay_path = match relay_path {
+                    Ok(p) => p,
+                    Err(Ok(end)) | Err(Err(end)) => {
+                        return if end.recoverable { Ok(end) } else { Err(end) };
+                    }
                 };
-
-                *relay_interrupt.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(ActiveRelayInterrupt::Connected(shutdown_handle.clone()));
+                if let Some(ref shutdown_handle) = relay_path.relay_shutdown {
+                    *relay_interrupt.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(ActiveRelayInterrupt::Connected(shutdown_handle.clone()));
+                }
                 if disconnect_flag.load(Ordering::Acquire) {
-                    shutdown_handle.shutdown();
                     return Ok(SessionEnd::fatal("用户主动断开"));
                 }
-
                 match attempt_tier_handshake(
-                    SelectedRelayPath {
-                        transport: raw_transport,
-                        relay_shutdown: Some(shutdown_handle),
-                        transport_label: "TCP Relay",
-                        backend_suffix: Some("(中继)"),
-                        mtls_active: active,
-                        peer_cert_fingerprint: fp,
-                    },
+                    relay_path,
                     cfg.connect_addr,
                     Duration::from_secs(10),
                     false,
@@ -4045,6 +4691,13 @@ fn run_session_thread(
             backend_suffix,
             mtls_active,
             peer_fp,
+            Some(switch_handle),
+            bg_p2p_upgrade_rx,
+            Some(bg_p2p_cancel),
+            grant_obtained_at,
+            initial_relay_token_consumed,
+            proxy_active_for_relay,
+            effective_mode,
         )
     } else {
         let direct_mtls = if cfg.encrypt_connection {
@@ -4175,6 +4828,13 @@ fn run_session_thread(
             None,
             cfg.encrypt_connection,
             fp,
+            None,
+            None,
+            None,
+            Instant::now(),
+            false,
+            false,
+            ConnectionMode::P2pOnly,
         )
     };
     client.set_peer_idle_timeout_us(ClientSession::PEER_IDLE_TIMEOUT_US);
@@ -4275,9 +4935,26 @@ fn run_session_thread(
     let mut hud_width = negotiated.width;
     let mut hud_height = negotiated.height;
     let mut current_fps = negotiated.fps;
+    let initial_path_kind = switch_handle
+        .as_ref()
+        .map_or(TransportPathKind::Lan, |h| h.active_kind());
+    let mut path_monitor = RuntimePathMonitor::with_initial_path(
+        HysteresisConfig::default(),
+        initial_path_kind,
+        Instant::now(),
+    );
+    let mut last_path_sample_at = Instant::now();
+    let mut runtime_switch_inflight: Option<u8> = None; // Some(1) = P2P->Relay degrade, Some(2) = Relay->P2P reprobe
+    let mut last_seen_committed = switch_handle.as_ref().map_or(0, |h| h.switches_committed());
+    let mut last_seen_aborted = switch_handle.as_ref().map_or(0, |h| h.switches_aborted());
+    let mut degrade_rx: Option<std::sync::mpsc::Receiver<Result<CandidateTransport, String>>> =
+        None;
+    let mut reprobe_rx: Option<std::sync::mpsc::Receiver<Result<CandidateTransport, String>>> =
+        None;
+    let mut reprobe_answer_tx: Option<std::sync::mpsc::Sender<SwitchControlMsg>> = None;
 
     // ── 驱动循环（无 duration 上限，直到 Disconnect 或对端 Bye/错误）──
-    let is_tcp_relay = transport_label == "TCP Relay";
+    let mut is_tcp_relay = transport_label == "TCP Relay";
     let mut relay_rtt_ctrl = is_tcp_relay
         .then(|| RelayRttController::new(negotiated.bitrate_bps.max(1), Instant::now()));
     let mut last_busy = true;
@@ -4606,6 +5283,444 @@ fn run_session_thread(
                             disconnect_flag.load(Ordering::Acquire),
                         )
                     })?;
+                }
+                if let Some(ref sw_h) = switch_handle {
+                    for ev in sw_h.drain_path_events() {
+                        transport_label = ev.label;
+                        active_backend_suffix = ev.backend_suffix;
+                        mtls_active = ev.mtls_active;
+                        peer_cert_fingerprint = ev.peer_cert_fingerprint.clone();
+                        is_tcp_relay = ev.kind == TransportPathKind::Relay;
+                        let mut cur_neg = client.negotiated().unwrap_or(negotiated);
+                        cur_neg.width = hud_width;
+                        cur_neg.height = hud_height;
+                        update_tx.push(SessionUpdate::Negotiated {
+                            width: cur_neg.width,
+                            height: cur_neg.height,
+                            fps: cur_neg.fps,
+                            bitrate_bps: cur_neg.bitrate_bps,
+                            backend: backend.clone(),
+                            watch_only: live_watch_only.load(Ordering::Acquire),
+                            transport: transport_label.to_string(),
+                            mtls_active,
+                            peer_cert_fingerprint: peer_cert_fingerprint.clone(),
+                        });
+                        let cur = sample_hud(&client, &clock_reader, cur_neg);
+                        let snap = HudSnapshot::derive_with_transport(
+                            Some(&prev_hud),
+                            &cur,
+                            transport_label,
+                        );
+                        update_tx.push(SessionUpdate::Hud(snap));
+                        prev_hud = cur;
+                    }
+
+                    for ctrl_msg in sw_h.drain_control_msgs() {
+                        if matches!(ctrl_msg, SwitchControlMsg::P2pReprobeAnswer { .. }) {
+                            if let Some(ref ans_tx) = reprobe_answer_tx {
+                                let _ = ans_tx.send(ctrl_msg);
+                            }
+                        }
+                    }
+
+                    let cur_committed = sw_h.switches_committed();
+                    let cur_aborted = sw_h.switches_aborted();
+                    if cur_committed > last_seen_committed || cur_aborted > last_seen_aborted {
+                        let committed = cur_committed > last_seen_committed;
+                        last_seen_committed = cur_committed;
+                        last_seen_aborted = cur_aborted;
+                        match runtime_switch_inflight.take() {
+                            Some(1) => path_monitor.on_degrade_finished(committed, Instant::now()),
+                            Some(2) => path_monitor.on_reprobe_finished(Instant::now()),
+                            _ => {}
+                        }
+                    }
+
+                    if let Some(ref up_rx) = bg_p2p_upgrade_rx {
+                        match up_rx.try_recv() {
+                            Ok(Ok((t, fp))) => {
+                                bg_p2p_upgrade_rx = None;
+                                path_monitor.on_reprobe_finished(Instant::now());
+                                let _ = sw_h.initiate_switch(CandidateTransport {
+                                    transport: t,
+                                    kind: TransportPathKind::P2p,
+                                    mtls_verified: !cfg.encrypt_connection || fp.is_some(),
+                                    peer_cert_fingerprint: fp,
+                                });
+                            }
+                            Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                bg_p2p_upgrade_rx = None;
+                                path_monitor.on_reprobe_finished(Instant::now());
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                    }
+
+                    if let Some(ref drx) = degrade_rx {
+                        match drx.try_recv() {
+                            Ok(Ok(cand)) => {
+                                degrade_rx = None;
+                                if sw_h.initiate_switch(cand).is_err() {
+                                    runtime_switch_inflight = None;
+                                    path_monitor.on_degrade_finished(false, Instant::now());
+                                }
+                            }
+                            Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                degrade_rx = None;
+                                runtime_switch_inflight = None;
+                                path_monitor.on_degrade_finished(false, Instant::now());
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                    }
+
+                    if let Some(ref rrx) = reprobe_rx {
+                        match rrx.try_recv() {
+                            Ok(Ok(cand)) => {
+                                reprobe_rx = None;
+                                reprobe_answer_tx = None;
+                                let max_rtt_us = path_monitor
+                                    .relay_rtt_ms()
+                                    .map(|r| r.saturating_add(40).saturating_mul(1_000));
+                                if sw_h
+                                    .submit_candidate_with_hold(
+                                        cand,
+                                        true,
+                                        DEFAULT_SWITCH_STAGE_TIMEOUT,
+                                        HysteresisConfig::default().recovery_hold_window,
+                                        max_rtt_us,
+                                        Some(HysteresisConfig::default().recovery_max_loss),
+                                    )
+                                    .is_err()
+                                {
+                                    runtime_switch_inflight = None;
+                                    path_monitor.on_reprobe_finished(Instant::now());
+                                }
+                            }
+                            Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                reprobe_rx = None;
+                                reprobe_answer_tx = None;
+                                runtime_switch_inflight = None;
+                                path_monitor.on_reprobe_finished(Instant::now());
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                    }
+
+                    if is_signaling_session
+                        && runtime_mode == ConnectionMode::Auto
+                        && !proxy_active_runtime
+                        && bg_p2p_upgrade_rx.is_none()
+                        && sw_h.is_switch_capable()
+                        && !sw_h.is_switch_inflight()
+                        && runtime_switch_inflight.is_none()
+                        && last_path_sample_at.elapsed() >= Duration::from_millis(200)
+                    {
+                        last_path_sample_at = Instant::now();
+                        let stats = client.net_stats();
+                        match path_monitor.evaluate(
+                            last_path_sample_at,
+                            sw_h.active_kind(),
+                            stats,
+                            sw_h.rx_silence(),
+                        ) {
+                            HysteresisDecision::Hold => {}
+                            HysteresisDecision::TriggerDegradeToRelay { .. } => {
+                                if let Some(grant) = cfg.relay_grant.as_ref() {
+                                    runtime_switch_inflight = Some(1);
+                                    let (dtx, drx) = std::sync::mpsc::channel();
+                                    degrade_rx = Some(drx);
+                                    let use_initial = !initial_relay_token_consumed
+                                        && grant_obtained_at.elapsed() < Duration::from_secs(50)
+                                        && !grant.relay_addr.is_empty()
+                                        && !grant.relay_token.is_empty();
+                                    let init_addr = grant.relay_addr.clone();
+                                    let init_tok = grant.relay_token.clone();
+                                    let peer_b = prepare_peer_mtls_bundle(&cfg, grant);
+                                    let sig_opt = cfg.signal_client.clone();
+                                    let target_id_opt = cfg
+                                        .target_device_id
+                                        .clone()
+                                        .filter(|s| !s.is_empty())
+                                        .or_else(|| {
+                                            (!grant.target_id.is_empty())
+                                                .then(|| grant.target_id.clone())
+                                        });
+                                    let encrypt_c = cfg.encrypt_connection;
+                                    let sw_clone = sw_h.clone();
+                                    let disc_c = Arc::clone(&disconnect_flag);
+                                    if use_initial {
+                                        initial_relay_token_consumed = true;
+                                    }
+                                    let _ = thread::Builder::new()
+                                        .name("rc-runtime-degrade".to_string())
+                                        .spawn(move || {
+                                            let (relay_addr, relay_token) = if use_initial {
+                                                let _ = sw_clone.send_control_msg(
+                                                    &SwitchControlMsg::UseInitialRelay,
+                                                );
+                                                (init_addr, init_tok)
+                                            } else if let (Some(sig), Some(tid)) =
+                                                (sig_opt, target_id_opt)
+                                            {
+                                                match sig
+                                                    .request_relay(&tid, Duration::from_secs(8))
+                                                {
+                                                    Ok(fresh) => {
+                                                        let _ = sw_clone.send_control_msg(
+                                                            &SwitchControlMsg::RelayAllocReady {
+                                                                session_id: fresh.session_id,
+                                                            },
+                                                        );
+                                                        (fresh.relay_addr, fresh.relay_token)
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = dtx.send(Err(e));
+                                                        return;
+                                                    }
+                                                }
+                                            } else {
+                                                let _ = dtx
+                                                    .send(Err("缺少信令句柄，无法续签中继令牌"
+                                                        .to_string()));
+                                                return;
+                                            };
+
+                                            let res = if encrypt_c {
+                                                let Some(bundle) = peer_b else {
+                                                    let _ = dtx.send(Err("缺少 mTLS 证书".into()));
+                                                    return;
+                                                };
+                                                let relay_mtls = bundle.to_relay_mtls_config(None);
+                                                E2eeRelayTransport::connect_cancellable(
+                                                    &relay_addr,
+                                                    RelayRole::Client,
+                                                    &relay_token,
+                                                    Duration::from_secs(10),
+                                                    disc_c,
+                                                    Some(&relay_mtls),
+                                                    RelayE2eeMode::ClientRequired(bundle),
+                                                )
+                                                .map(|t| {
+                                                    let fp = t
+                                                        .peer_mtls_identity()
+                                                        .map(|i| i.cert_fingerprint_sha256.clone());
+                                                    CandidateTransport {
+                                                        transport: Box::new(t),
+                                                        kind: TransportPathKind::Relay,
+                                                        mtls_verified: true,
+                                                        peer_cert_fingerprint: fp,
+                                                    }
+                                                })
+                                                .map_err(|e| format!("{e}"))
+                                            } else if let Some(bundle) = peer_b {
+                                                let relay_mtls = bundle.to_relay_mtls_config(None);
+                                                TcpRelayTransport::connect_mtls_cancellable(
+                                                    &relay_addr,
+                                                    RelayRole::Client,
+                                                    &relay_token,
+                                                    Duration::from_secs(10),
+                                                    disc_c,
+                                                    &relay_mtls,
+                                                )
+                                                .map(|t| CandidateTransport {
+                                                    transport: Box::new(t),
+                                                    kind: TransportPathKind::Relay,
+                                                    mtls_verified: false,
+                                                    peer_cert_fingerprint: None,
+                                                })
+                                                .map_err(|e| format!("{e}"))
+                                            } else {
+                                                TcpRelayTransport::connect_cancellable(
+                                                    &relay_addr,
+                                                    RelayRole::Client,
+                                                    &relay_token,
+                                                    Duration::from_secs(10),
+                                                    disc_c,
+                                                )
+                                                .map(|t| CandidateTransport {
+                                                    transport: Box::new(t),
+                                                    kind: TransportPathKind::Relay,
+                                                    mtls_verified: false,
+                                                    peer_cert_fingerprint: None,
+                                                })
+                                                .map_err(|e| format!("{e}"))
+                                            };
+                                            let _ = dtx.send(res);
+                                        });
+                                }
+                            }
+                            HysteresisDecision::TriggerP2pReprobe => {
+                                if let Some(grant) = cfg.relay_grant.as_ref() {
+                                    runtime_switch_inflight = Some(2);
+                                    let (rtx, rrx) = std::sync::mpsc::channel();
+                                    let (atx, arx) = std::sync::mpsc::channel();
+                                    reprobe_rx = Some(rrx);
+                                    reprobe_answer_tx = Some(atx);
+                                    let sw_clone = sw_h.clone();
+                                    let initial_nat_type = grant.self_nat_type;
+                                    let initial_nat_delta = grant.self_nat_port_delta;
+                                    let initial_nat_range = grant.self_nat_port_range;
+                                    let initial_local_port = grant.local_udp_port;
+                                    let initial_self_pub = grant.self_public_addr.clone();
+                                    let initial_peer_pubs = grant.peer_public_addrs.clone();
+                                    let sc_opt = cfg.signal_client.clone();
+                                    let encrypt_c = cfg.encrypt_connection;
+                                    let q_mtls = if encrypt_c {
+                                        prepare_peer_mtls_bundle(&cfg, grant)
+                                            .and_then(|b| b.to_quic_mtls_config().ok())
+                                    } else {
+                                        None
+                                    };
+                                    let disc_c = Arc::clone(&disconnect_flag);
+                                    let _ = thread::Builder::new()
+                                        .name("rc-runtime-p2p-reprobe".to_string())
+                                        .spawn(move || {
+                                            let sc_snap = sc_opt
+                                                .as_ref()
+                                                .map(|sc| sc.snapshot_p2p_reprobe_info());
+                                            let (sc_port, sc_addrs, sc_nat, sc_delta, sc_range) =
+                                                match sc_snap {
+                                                    Some((p, addrs, nat, d, r)) => {
+                                                        (p, addrs, Some(nat), d, r)
+                                                    }
+                                                    None => (None, Vec::new(), None, None, None),
+                                                };
+                                            let local_port = sc_port
+                                                .or(initial_local_port)
+                                                .filter(|&p| p != 0)
+                                                .or_else(|| {
+                                                    std::net::UdpSocket::bind("0.0.0.0:0")
+                                                        .ok()
+                                                        .and_then(|s| s.local_addr().ok())
+                                                        .map(|a| a.port())
+                                                        .filter(|&p| p != 0)
+                                                })
+                                                .unwrap_or(0);
+                                            if local_port == 0 {
+                                                let _ = rtx.send(Err("port 0".into()));
+                                                return;
+                                            }
+                                            let mut sec = [0u8; 16];
+                                            use rand::RngCore;
+                                            rand::rngs::OsRng.fill_bytes(&mut sec);
+                                            let mut secret_hex = String::with_capacity(32);
+                                            for b in sec {
+                                                use std::fmt::Write;
+                                                let _ = write!(&mut secret_hex, "{b:02x}");
+                                            }
+                                            let probe_id = format!(
+                                                "rp-{:08x}",
+                                                rand::rngs::OsRng.next_u32()
+                                            );
+                                            let mut self_addrs = sc_addrs;
+                                            if let Some(ref pub_raw) = initial_self_pub {
+                                                if let Ok(sock) =
+                                                    pub_raw.trim().parse::<SocketAddr>()
+                                                {
+                                                    if sock.port() != 0 {
+                                                        let s = sock.to_string();
+                                                        if !self_addrs.contains(&s) {
+                                                            self_addrs.push(s);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            for lan in
+                                                crate::host_bridge::collect_host_lan_addrs(
+                                                    local_port,
+                                                )
+                                            {
+                                                if !self_addrs.contains(&lan) {
+                                                    self_addrs.push(lan);
+                                                }
+                                            }
+                                            let self_nat_type = sc_nat
+                                                .filter(|n| *n != crate::nat::NatType::Unknown)
+                                                .unwrap_or(initial_nat_type);
+                                            let self_nat_delta = sc_delta.or(initial_nat_delta);
+                                            let self_nat_range = sc_range.or(initial_nat_range);
+                                            if sw_clone
+                                                .send_control_msg(&SwitchControlMsg::P2pReprobeOffer {
+                                                    probe_id: probe_id.clone(),
+                                                    local_udp_port: local_port,
+                                                    addrs: self_addrs,
+                                                    nat_type: self_nat_type,
+                                                    nat_port_delta: self_nat_delta,
+                                                    nat_port_range: self_nat_range,
+                                                    punch_secret: secret_hex.clone(),
+                                                })
+                                                .is_err()
+                                            {
+                                                let _ = rtx.send(Err("send offer fail".into()));
+                                                return;
+                                            }
+                                            let Ok(SwitchControlMsg::P2pReprobeAnswer {
+                                                local_udp_port: _,
+                                                addrs: peer_addrs,
+                                                nat_type: peer_nat,
+                                                nat_port_delta: peer_delta,
+                                                nat_port_range: peer_range,
+                                                ..
+                                            }) = arx.recv_timeout(Duration::from_secs(5))
+                                            else {
+                                                let _ = rtx.send(Err("answer timeout".into()));
+                                                return;
+                                            };
+                                            let (peer_public_addrs, peer_lan_addrs) =
+                                                crate::signal_client::split_public_and_lan_addrs(
+                                                    &peer_addrs,
+                                                    &initial_peer_pubs,
+                                                );
+                                            let cands = P2pCandidates {
+                                                session_id: format!("reprobe-{probe_id}"),
+                                                peer_public_addr: peer_public_addrs.first().cloned(),
+                                                peer_public_addrs,
+                                                peer_lan_addrs,
+                                                local_udp_port: Some(local_port),
+                                                self_nat_type,
+                                                self_nat_port_delta: self_nat_delta,
+                                                self_nat_port_range: self_nat_range,
+                                                peer_nat_type: peer_nat,
+                                                peer_nat_port_delta: peer_delta,
+                                                peer_nat_port_range: peer_range,
+                                                punch_secret: Some(secret_hex),
+                                                start_after_ms: None,
+                                                relay_fallback_after_ms: None,
+                                            };
+                                            let port_hold = crate::signal_client::acquire_local_udp_port_for_p2p(Some(local_port));
+                                            match p2p::attempt_p2p_quic_client_mtls(
+                                                &cands,
+                                                p2p::DEFAULT_PUNCH_TIMEOUT,
+                                                p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
+                                                &disc_c,
+                                                q_mtls.as_ref(),
+                                            ) {
+                                                Ok(p2p_conn) => {
+                                                    let fp = p2p_conn
+                                                        .peer_mtls_identity()
+                                                        .map(|i| i.cert_fingerprint_sha256);
+                                                    let held = crate::signal_client::P2pHeldTransport::new(
+                                                        p2p_conn,
+                                                        port_hold,
+                                                    );
+                                                    let _ = rtx.send(Ok(CandidateTransport {
+                                                        transport: Box::new(held),
+                                                        kind: TransportPathKind::P2p,
+                                                        mtls_verified: !encrypt_c || fp.is_some(),
+                                                        peer_cert_fingerprint: fp,
+                                                    }));
+                                                }
+                                                Err(e) => {
+                                                    drop(port_hold);
+                                                    let _ = rtx.send(Err(e));
+                                                }
+                                            }
+                                        });
+                                }
+                            }
+                        }
+                    }
                 }
                 if clipboard_enabled_flag.load(Ordering::Acquire) {
                     let _ = client.pump_clipboard(now_us);
@@ -5498,6 +6613,9 @@ fn run_session_thread(
         player.stop();
     }
     drop(audio_player);
+    if let Some(bg_cancel) = bg_p2p_cancel_slot {
+        bg_cancel.store(true, Ordering::Release);
+    }
 
     if lock_on_disconnect.load(Ordering::Acquire) && client.state() == SessionState::Streaming {
         if let Some(payload) = display_ctrl::encode_display_ctrl(&DisplayControlMsg::LockScreen) {
@@ -7044,7 +8162,8 @@ mod tests {
             "[fd00::10]:40000".to_string(),
         ];
         let probe_targets = vec![direct, "192.0.2.10:21116".parse().unwrap()];
-        let local_v4s = lan_discovery::discover_local_lan_ipv4s(&probe_targets);
+        let local_ips = lan_discovery::detect_local_interface_ips_for_targets(&probe_targets);
+        let local_v4s = local_ips.ipv4s;
         let expected_same_subnet = local_v4s.first().map(|local_ip| {
             let octets = local_ip.octets();
             let sibling = std::net::Ipv4Addr::new(
@@ -9731,7 +10850,8 @@ mod tests {
     #[test]
     fn collect_lan_candidate_addrs_prunes_rfc1918_when_public_ips_differ() {
         let probe_targets = vec!["192.0.2.10:21116".parse().unwrap()];
-        let local_v4s = lan_discovery::discover_local_lan_ipv4s(&probe_targets);
+        let local_ips = lan_discovery::detect_local_interface_ips_for_targets(&probe_targets);
+        let local_v4s = local_ips.ipv4s;
         let peer_same_subnet = local_v4s
             .first()
             .map(|local_ip| {
@@ -10152,5 +11272,38 @@ mod tests {
             .is_err());
         assert!(hub_arc.lock().unwrap().portmap.list_rules().is_empty());
         drop(fw);
+    }
+
+    #[test]
+    fn dial_lan_addrs_happy_eyeballs_does_not_block_on_unreachable_candidate() {
+        // 启动一个真实测试 QUIC 服务端监听在 127.0.0.1:0
+        let identity = Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM).unwrap();
+        let net = NetConfig {
+            role: Role::Host,
+            local_addr: "127.0.0.1:0".parse().unwrap(),
+            peer_addr: None,
+            mtu: rc_session::DEFAULT_SESSION_MTU,
+        };
+        let host_ep = QuicEndpoint::new(&net, &identity).unwrap();
+        let ok_addr = host_ep.local_addr().unwrap();
+        let accept_jh = std::thread::spawn(move || {
+            let _ = host_ep.accept(Duration::from_secs(2));
+        });
+
+        // 第一个候选为不可达 TEST-NET-1（黑洞，普通顺序拨号会阻塞满 LAN_DIRECT_PROBE_TIMEOUT=1500ms），
+        // 第二个候选为可达的本地回环端口；Happy Eyeballs 并发必须在 <500ms 内命中 ok_addr
+        let dead_addr: SocketAddr = "192.0.2.250:9901".parse().unwrap();
+        let cancel = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let (_t, _fp, won_addr) =
+            dial_lan_addrs_happy_eyeballs(&[dead_addr, ok_addr], None, false, &cancel)
+                .expect("Happy Eyeballs must succeed via reachable second LAN addr");
+        let elapsed = t0.elapsed();
+        accept_jh.join().unwrap();
+        assert_eq!(won_addr, ok_addr);
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "dead first LAN candidate must not block second candidate for 1500ms, took {elapsed:?}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! 跨平台 UPnP IGD（v2/v1）与 NAT-PMP（RFC 6886）自动 UDP 端口映射模块。
+//! 跨平台 UPnP IGD（v2/v1）、PCP v2（RFC 6887）与 NAT-PMP（RFC 6886）自动 UDP 端口映射模块。
 //!
 //! 零外部协议 crate 依赖，纯安全 Rust（`#![deny(unsafe_code)]`、`#![deny(missing_docs)]`），
 //! 100% 跨平台（Linux / macOS / Windows）。核心特性：
@@ -6,7 +6,8 @@
 //! - 严格 **SSRF 防护**：仅允许 `http://` 协议且目标为局域网私有 IPv4（RFC 1918 或非云元数据链路本地）的 `LOCATION` 与 `controlURL`，拒绝公网、回环及域名；
 //! - 严格 **CGNAT / 内网假外网拦截**：[`is_public_ipv4`] 拒绝 RFC 1918、CGNAT（`100.64.0.0/10`）、回环、链路本地、保留与文档网段；
 //! - 端口冲突自动回退：首试与 `internal_port` 同号，失败后再试动态分配 `0` 或随机高位端口（`30000..60000`）；
-//! - UPnP IGD 失败时自动回退 NAT-PMP（RFC 6886，UDP 5351）；
+//! - UPnP IGD 失败时按 `:5351/udp` 先尝试 **PCP v2 (RFC 6887)**（严格遵守 RFC 6887 §7.2 源地址一致性、96-bit mapping nonce 与结果码校验），不支持或失败时平滑回退 **NAT-PMP（RFC 6886）**；
+//! - IPv6 PCP v2 `MAP` 仅在发现 IPv6 默认网关且能绑定全球单播 IPv6 源地址时触发，绝不跨族发送；
 //! - 支持基于租约元数据的续租（[`renew_udp_mapping`]）与尽力退租（[`unmap_udp_port`]）。
 
 #![deny(unsafe_code)]
@@ -14,7 +15,11 @@
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, UdpSocket,
+};
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -73,22 +78,25 @@ pub enum UpnpProtocol {
     UpnpIgdV1,
     /// UPnP Internet Gateway Device v2（`WANIPConnection:2`）。
     UpnpIgdV2,
+    /// Port Control Protocol v2（RFC 6887）。
+    PcpV2,
     /// NAT Port Mapping Protocol（RFC 6886）。
     NatPmp,
 }
 
 impl UpnpProtocol {
-    /// 返回协议的标准可读标识字符串（`"upnp_igd_v1"` / `"upnp_igd_v2"` / `"nat_pmp"`）。
+    /// 返回协议的标准可读标识字符串（`"upnp_igd_v1"` / `"upnp_igd_v2"` / `"pcp_v2"` / `"nat_pmp"`）。
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::UpnpIgdV1 => "upnp_igd_v1",
             Self::UpnpIgdV2 => "upnp_igd_v2",
+            Self::PcpV2 => "pcp_v2",
             Self::NatPmp => "nat_pmp",
         }
     }
 }
 
-/// 客户端当前 UPnP / NAT-PMP 端口映射状态快照（面向 IPC 与设置页展示）。
+/// 客户端当前 UPnP / PCP v2 / NAT-PMP 端口映射状态快照（面向 IPC 与设置页展示）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum UpnpStatus {
@@ -100,7 +108,7 @@ pub enum UpnpStatus {
     Mapped {
         /// 网关分配的公网地址（`ip:port`）。
         external_addr: String,
-        /// 生效协议名称（如 `"upnp_igd_v2"` / `"upnp_igd_v1"` / `"nat_pmp"`）。
+        /// 生效协议名称（如 `"upnp_igd_v2"` / `"upnp_igd_v1"` / `"pcp_v2"` / `"nat_pmp"`）。
         protocol: String,
     },
     /// 网关不支持、处于 CGNAT 后方或映射失败。
@@ -119,6 +127,11 @@ enum LeaseGateway {
         control_path: String,
         service_type: String,
         internal_client: Ipv4Addr,
+    },
+    PcpV2 {
+        gateway_addr: SocketAddr,
+        client_ip: Ipv6Addr,
+        mapping_nonce: [u8; 12],
     },
     NatPmp {
         gateway_addr: SocketAddrV4,
@@ -354,20 +367,24 @@ fn resolve_control_url(
 /// 尝试为本机 `internal_port` 申请公网 UDP 端口映射（租期 `lease_secs` 秒）。
 ///
 /// 优先尝试 UPnP IGD（`WANIPConnection:2` / `WANIPConnection:1` / `WANPPPConnection:1`），
-/// 失败时自动回退 NAT-PMP（RFC 6886）。若网关处于 CGNAT 后方或返回非公网 IP，
-/// 将明确返回错误而不产生无效映射。
+/// 失败时在 `:5351/udp` 上先尝试 PCP v2（RFC 6887），不支持或失败时平滑回退 NAT-PMP（RFC 6886）；
+/// 若发现 IPv6 默认网关且可绑定全球单播 IPv6 源地址，也会尝试 IPv6 PCP v2。
+/// 若网关处于 CGNAT 后方或返回非公网 IP，将明确返回错误而不产生无效映射。
 pub fn map_udp_port(
     internal_port: u16,
     lease_secs: u32,
     timeout: Duration,
 ) -> Result<UpnpMappingLease, String> {
     let nat_pmp_gateways = discover_nat_pmp_gateways();
-    map_udp_port_internal(
+    let v6_gateways = discover_ipv6_default_gateways();
+    map_udp_port_internal_with_v6(
         internal_port,
         lease_secs,
         timeout,
         SocketAddr::V4(SSDP_MULTICAST_ADDR),
         &nat_pmp_gateways,
+        &v6_gateways,
+        None,
         false,
     )
 }
@@ -422,6 +439,26 @@ pub fn renew_udp_mapping(
                 gateway: lease.gateway.clone(),
             })
         }
+        LeaseGateway::PcpV2 {
+            gateway_addr,
+            client_ip,
+            mapping_nonce,
+        } => {
+            let suggested_ip = match lease.external_addr {
+                SocketAddr::V4(v4) => v4.ip().to_ipv6_mapped(),
+                SocketAddr::V6(v6) => *v6.ip(),
+            };
+            pcp_v2_map_with_client_ip(
+                *gateway_addr,
+                *client_ip,
+                *mapping_nonce,
+                lease.internal_port,
+                lease.external_port,
+                suggested_ip,
+                lease_secs,
+                deadline,
+            )
+        }
         LeaseGateway::NatPmp { gateway_addr } => nat_pmp_map_udp(
             *gateway_addr,
             lease.internal_port,
@@ -432,7 +469,7 @@ pub fn renew_udp_mapping(
     }
 }
 
-/// 尽力释放已申请的 UDP 端口映射（UPnP `DeletePortMapping` 或 NAT-PMP `lifetime = 0`）。
+/// 尽力释放已申请的 UDP 端口映射（UPnP `DeletePortMapping`、PCP v2 `lifetime = 0` 或 NAT-PMP `lifetime = 0`）。
 ///
 /// 失败时静默忽略，绝不阻塞超过 `timeout`。
 pub fn unmap_udp_port(lease: &UpnpMappingLease, timeout: Duration) {
@@ -461,6 +498,19 @@ pub fn unmap_udp_port(lease: &UpnpMappingLease, timeout: Duration) {
                 deadline,
             );
         }
+        LeaseGateway::PcpV2 {
+            gateway_addr,
+            client_ip,
+            mapping_nonce,
+        } => {
+            let _ = pcp_v2_unmap_udp(
+                *gateway_addr,
+                *client_ip,
+                *mapping_nonce,
+                lease.internal_port,
+                deadline,
+            );
+        }
         LeaseGateway::NatPmp { gateway_addr } => {
             let _ = nat_pmp_unmap_udp(*gateway_addr, lease.internal_port, deadline);
         }
@@ -470,11 +520,12 @@ pub fn unmap_udp_port(lease: &UpnpMappingLease, timeout: Duration) {
 fn remaining_timeout(deadline: Instant) -> Result<Duration, String> {
     let now = Instant::now();
     if now >= deadline {
-        return Err("UPnP / NAT-PMP 操作超时".to_string());
+        return Err("UPnP / PCP / NAT-PMP 操作超时".to_string());
     }
     Ok(deadline.saturating_duration_since(now))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn map_udp_port_internal(
     internal_port: u16,
     lease_secs: u32,
@@ -483,17 +534,41 @@ fn map_udp_port_internal(
     nat_pmp_gateways: &[SocketAddrV4],
     allow_loopback: bool,
 ) -> Result<UpnpMappingLease, String> {
+    map_udp_port_internal_with_v6(
+        internal_port,
+        lease_secs,
+        timeout,
+        ssdp_target,
+        nat_pmp_gateways,
+        &[],
+        None,
+        allow_loopback,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_udp_port_internal_with_v6(
+    internal_port: u16,
+    lease_secs: u32,
+    timeout: Duration,
+    ssdp_target: SocketAddr,
+    nat_pmp_gateways: &[SocketAddrV4],
+    v6_gateways: &[SocketAddrV6],
+    v6_source_override: Option<Ipv6Addr>,
+    allow_loopback: bool,
+) -> Result<UpnpMappingLease, String> {
     if internal_port == 0 {
         return Err("内部端口不能为 0".to_string());
     }
     let eff_timeout = timeout.max(Duration::from_millis(50));
     let total_deadline = Instant::now() + eff_timeout;
 
-    // 1) 优先 UPnP IGD（分配约 65% 时间预算给 SSDP + 描述拉取 + SOAP，若失败立即转入 NAT-PMP）
-    let upnp_budget = if nat_pmp_gateways.is_empty() {
+    // 1) 优先 UPnP IGD（若有 `:5351` 候选网关则保留约 45% 预算给 PCP v2 -> NAT-PMP）
+    let has_5351_gateways = !nat_pmp_gateways.is_empty() || !v6_gateways.is_empty();
+    let upnp_budget = if !has_5351_gateways {
         eff_timeout
     } else {
-        eff_timeout.mul_f32(0.65).max(Duration::from_millis(40))
+        eff_timeout.mul_f32(0.55).max(Duration::from_millis(40))
     };
     let upnp_deadline = (Instant::now() + upnp_budget).min(total_deadline);
     let upnp_err = match try_upnp_igd_map(
@@ -507,31 +582,68 @@ fn map_udp_port_internal(
         Err(err) => err,
     };
 
-    // 2) 回退 NAT-PMP（RFC 6886）
-    if nat_pmp_gateways.is_empty() {
+    if !has_5351_gateways {
         return Err(format!(
-            "UPnP IGD 失败（{upnp_err}），且未探测到可用的 NAT-PMP 局域网网关"
+            "UPnP IGD 失败（{upnp_err}），且未探测到可用的 PCP/NAT-PMP 局域网网关"
         ));
     }
 
-    let mut last_pmp_err = String::new();
+    // 2) IPv4 `:5351/udp`：先尝试 PCP v2 (RFC 6887)，不支持或失败时平滑回退 NAT-PMP (RFC 6886)
+    let mut last_gw_err = String::new();
     for &gw in nat_pmp_gateways {
         if !is_lan_gateway_ipv4(*gw.ip(), allow_loopback) {
             continue;
         }
-        if Instant::now() >= total_deadline {
-            last_pmp_err = "NAT-PMP 探测超时".to_string();
+        let now = Instant::now();
+        if now >= total_deadline {
+            last_gw_err = "PCP / NAT-PMP 探测超时".to_string();
             break;
         }
-        match nat_pmp_map_udp(gw, internal_port, internal_port, lease_secs, total_deadline) {
+        let rem = total_deadline.saturating_duration_since(now);
+        let pcp_budget = rem.min(Duration::from_millis(120)).min(rem / 2);
+        let pcp_deadline = now + pcp_budget.max(Duration::from_millis(25)).min(rem);
+        match pcp_v2_map_v4(gw, internal_port, internal_port, lease_secs, pcp_deadline) {
             Ok(lease) => return Ok(lease),
-            Err(err) => last_pmp_err = err,
+            Err(pcp_err) => {
+                if Instant::now() >= total_deadline {
+                    last_gw_err = format!("PCP v2 失败（{pcp_err}），且 NAT-PMP 预算耗尽");
+                    break;
+                }
+                match nat_pmp_map_udp(gw, internal_port, internal_port, lease_secs, total_deadline)
+                {
+                    Ok(lease) => return Ok(lease),
+                    Err(pmp_err) => {
+                        last_gw_err =
+                            format!("PCP v2 失败（{pcp_err}）；NAT-PMP 失败（{pmp_err}）");
+                    }
+                }
+            }
         }
     }
 
-    Err(format!(
-        "UPnP IGD 失败（{upnp_err}）；NAT-PMP 失败（{last_pmp_err}）"
-    ))
+    // 3) IPv6 PCP v2 (RFC 6887 §7.2)：仅当存在 IPv6 默认网关且可绑定全球单播 IPv6 源地址时触发
+    for &gw6 in v6_gateways {
+        if Instant::now() >= total_deadline {
+            break;
+        }
+        match pcp_v2_map_v6(
+            gw6,
+            internal_port,
+            internal_port,
+            lease_secs,
+            total_deadline,
+            v6_source_override,
+            allow_loopback,
+        ) {
+            Ok(lease) => return Ok(lease),
+            Err(err) => last_gw_err = err,
+        }
+    }
+
+    if last_gw_err.is_empty() {
+        last_gw_err = "未发现可用同族源地址或有效局域网网关".to_string();
+    }
+    Err(format!("UPnP IGD 失败（{upnp_err}）；{last_gw_err}"))
 }
 
 fn try_upnp_igd_map(
@@ -1479,6 +1591,627 @@ fn nat_pmp_unmap_udp(
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────
+// PCP v2 (RFC 6887) UDP 端口映射实现
+// ─────────────────────────────────────────────────────────────────
+
+const PCP_VERSION: u8 = 2;
+const PCP_OPCODE_MAP: u8 = 1;
+const PCP_OPCODE_RESPONSE_BIT: u8 = 0x80;
+const PCP_PROTO_UDP: u8 = 17;
+const PCP_MAP_PACKET_LEN: usize = 60;
+
+fn pcp_result_name(code: u8) -> &'static str {
+    match code {
+        0 => "SUCCESS",
+        1 => "UNSUPP_VERSION",
+        2 => "NOT_AUTHORIZED",
+        3 => "MALFORMED_REQUEST",
+        4 => "UNSUPP_OPCODE",
+        5 => "UNSUPP_OPTION",
+        6 => "MALFORMED_OPTION",
+        7 => "NETWORK_FAILURE",
+        8 => "NO_RESOURCES",
+        9 => "UNSUPP_PROTOCOL",
+        10 => "USER_EX_QUOTA",
+        11 => "CANNOT_PROVIDE_EXTERNAL",
+        12 => "ADDRESS_MISMATCH",
+        13 => "EXCESSIVE_REMOTE_PEERS",
+        _ => "UNKNOWN_ERROR",
+    }
+}
+
+fn build_pcp_map_request(
+    client_ip: Ipv6Addr,
+    mapping_nonce: [u8; 12],
+    internal_port: u16,
+    suggested_external_port: u16,
+    suggested_external_ip: Ipv6Addr,
+    lease_secs: u32,
+) -> [u8; PCP_MAP_PACKET_LEN] {
+    let mut pkt = [0u8; PCP_MAP_PACKET_LEN];
+    pkt[0] = PCP_VERSION;
+    pkt[1] = PCP_OPCODE_MAP;
+    // bytes [2..4] Reserved = 0
+    pkt[4..8].copy_from_slice(&lease_secs.to_be_bytes());
+    pkt[8..24].copy_from_slice(&client_ip.octets());
+    pkt[24..36].copy_from_slice(&mapping_nonce);
+    pkt[36] = PCP_PROTO_UDP;
+    // bytes [37..40] Reserved = 0
+    pkt[40..42].copy_from_slice(&internal_port.to_be_bytes());
+    pkt[42..44].copy_from_slice(&suggested_external_port.to_be_bytes());
+    pkt[44..60].copy_from_slice(&suggested_external_ip.octets());
+    pkt
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PcpMapResponse {
+    granted_lifetime: u32,
+    assigned_external_port: u16,
+    assigned_external_addr: SocketAddr,
+}
+
+fn parse_pcp_map_response(
+    buf: &[u8],
+    expected_nonce: &[u8; 12],
+    expected_internal_port: u16,
+    expect_unmap: bool,
+) -> Result<PcpMapResponse, String> {
+    if buf.len() < PCP_MAP_PACKET_LEN {
+        return Err(format!(
+            "PCP v2 响应长度不足：{} < {}",
+            buf.len(),
+            PCP_MAP_PACKET_LEN
+        ));
+    }
+    if buf[0] != PCP_VERSION {
+        return Err(format!("PCP 响应版本号不匹配：{}", buf[0]));
+    }
+    if buf[1] != (PCP_OPCODE_RESPONSE_BIT | PCP_OPCODE_MAP) {
+        return Err(format!("PCP 响应 opcode 非 MAP_RESP：0x{:02x}", buf[1]));
+    }
+    let result_code = buf[3];
+    if result_code != 0 {
+        return Err(format!(
+            "PCP v2 返回错误码 {} ({})",
+            result_code,
+            pcp_result_name(result_code)
+        ));
+    }
+    if &buf[24..36] != expected_nonce {
+        return Err("PCP v2 响应 mapping nonce 不匹配".to_string());
+    }
+    if buf[36] != PCP_PROTO_UDP {
+        return Err(format!("PCP v2 响应协议号非 UDP(17)：{}", buf[36]));
+    }
+    let resp_internal = u16::from_be_bytes([buf[40], buf[41]]);
+    if resp_internal != expected_internal_port {
+        return Err(format!(
+            "PCP v2 响应 internal_port 不一致：{resp_internal} != {expected_internal_port}"
+        ));
+    }
+
+    let granted_lifetime = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let assigned_external_port = u16::from_be_bytes([buf[42], buf[43]]);
+    let mut ext_octets = [0u8; 16];
+    ext_octets.copy_from_slice(&buf[44..60]);
+    let ext_v6 = Ipv6Addr::from(ext_octets);
+
+    if expect_unmap {
+        return Ok(PcpMapResponse {
+            granted_lifetime,
+            assigned_external_port,
+            assigned_external_addr: SocketAddr::V6(SocketAddrV6::new(
+                ext_v6,
+                assigned_external_port,
+                0,
+                0,
+            )),
+        });
+    }
+
+    if assigned_external_port == 0 || granted_lifetime == 0 {
+        return Err(format!(
+            "PCP v2 返回无效映射参数：ext_port={assigned_external_port}, lifetime={granted_lifetime}"
+        ));
+    }
+
+    let assigned_external_addr = if let Some(ext_v4) = ext_v6.to_ipv4_mapped() {
+        if !is_public_ipv4(ext_v4) {
+            return Err(format!(
+                "PCP v2 网关返回非公网 IP（疑似 CGNAT 或双层 NAT）：{ext_v4}"
+            ));
+        }
+        SocketAddr::V4(SocketAddrV4::new(ext_v4, assigned_external_port))
+    } else if crate::nat::is_global_unicast_ipv6(ext_v6) {
+        SocketAddr::V6(SocketAddrV6::new(ext_v6, assigned_external_port, 0, 0))
+    } else {
+        return Err(format!(
+            "PCP v2 网关返回非公网/非全球单播 IPv6 地址：{ext_v6}"
+        ));
+    };
+
+    Ok(PcpMapResponse {
+        granted_lifetime,
+        assigned_external_port,
+        assigned_external_addr,
+    })
+}
+
+fn pcp_v2_exchange(
+    sock: &UdpSocket,
+    gateway: SocketAddr,
+    request: &[u8; PCP_MAP_PACKET_LEN],
+    expected_nonce: &[u8; 12],
+    internal_port: u16,
+    expect_unmap: bool,
+    deadline: Instant,
+) -> Result<PcpMapResponse, String> {
+    let mut buf = [0u8; 256];
+    let canon_gw = crate::nat::canonicalize_socket_addr(gateway);
+    for attempt in 0..2 {
+        let rem = remaining_timeout(deadline)?;
+        let step = if attempt == 0 {
+            rem.min(Duration::from_millis(80))
+        } else {
+            rem
+        };
+        sock.send_to(request, gateway)
+            .map_err(|e| format!("向 {gateway} 发送 PCP v2 请求失败：{e}"))?;
+        let _ = sock.set_read_timeout(Some(step.max(Duration::from_millis(1))));
+
+        match sock.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                if crate::nat::canonicalize_socket_addr(src) != canon_gw {
+                    continue;
+                }
+                if n >= 4 && buf[0] == 0 && (buf[1] == 128 || buf[1] == 129) {
+                    return Err("网关返回 NAT-PMP v0 响应，不支持 PCP v2".to_string());
+                }
+                if n >= PCP_MAP_PACKET_LEN
+                    && buf[0] == PCP_VERSION
+                    && buf[1] == (PCP_OPCODE_RESPONSE_BIT | PCP_OPCODE_MAP)
+                {
+                    let result_code = buf[3];
+                    if result_code != 0 {
+                        return Err(format!(
+                            "PCP v2 返回错误码 {} ({})",
+                            result_code,
+                            pcp_result_name(result_code)
+                        ));
+                    }
+                    if &buf[24..36] != expected_nonce {
+                        continue;
+                    }
+                    return parse_pcp_map_response(
+                        &buf[..n],
+                        expected_nonce,
+                        internal_port,
+                        expect_unmap,
+                    );
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(format!("接收 PCP v2 响应失败：{err}")),
+        }
+    }
+    Err(format!("等待 PCP v2 网关 {gateway} 响应超时"))
+}
+
+fn pcp_v2_map_v4(
+    gateway: SocketAddrV4,
+    internal_port: u16,
+    suggested_external_port: u16,
+    lease_secs: u32,
+    deadline: Instant,
+) -> Result<UpnpMappingLease, String> {
+    // 严格遵守 RFC 6887 §7.2：IPv4 PCP 客户端必须从本机 IPv4 源地址发包，且将同一 IPv4 编码为 ::ffff:a.b.c.d
+    let local_v4 = if gateway.ip().is_loopback() {
+        Ipv4Addr::LOCALHOST
+    } else {
+        resolve_local_ipv4_for_peer(*gateway.ip(), gateway.port()).ok_or_else(|| {
+            format!("无法解析通往 PCP v2 IPv4 网关 {gateway} 的本机出向 IPv4 源地址")
+        })?
+    };
+    let client_ip = local_v4.to_ipv6_mapped();
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill(&mut nonce);
+    pcp_v2_map_with_client_ip(
+        SocketAddr::V4(gateway),
+        client_ip,
+        nonce,
+        internal_port,
+        suggested_external_port,
+        Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(),
+        lease_secs,
+        deadline,
+    )
+}
+
+fn resolve_global_ipv6_source_for_gateway(
+    gateway: SocketAddrV6,
+    override_src: Option<Ipv6Addr>,
+) -> Option<Ipv6Addr> {
+    if let Some(src) = override_src {
+        if crate::nat::is_global_unicast_ipv6(src) {
+            return Some(src);
+        }
+        return None;
+    }
+    if let Ok(probe_sock) = UdpSocket::bind("[::]:0") {
+        if probe_sock.connect(gateway).is_ok() {
+            if let Ok(local) = probe_sock.local_addr() {
+                if let IpAddr::V6(v6) = local.ip() {
+                    if crate::nat::is_global_unicast_ipv6(v6) {
+                        return Some(v6);
+                    }
+                }
+            }
+        }
+    }
+    crate::lan_discovery::detect_local_interface_ips()
+        .global_ipv6s
+        .into_iter()
+        .find(|&v6| {
+            crate::nat::is_global_unicast_ipv6(v6)
+                && UdpSocket::bind(SocketAddrV6::new(v6, 0, 0, 0)).is_ok()
+        })
+}
+
+fn pcp_v2_map_v6(
+    gateway: SocketAddrV6,
+    internal_port: u16,
+    suggested_external_port: u16,
+    lease_secs: u32,
+    deadline: Instant,
+    v6_source_override: Option<Ipv6Addr>,
+    allow_loopback: bool,
+) -> Result<UpnpMappingLease, String> {
+    let gw_ip = *gateway.ip();
+    if gw_ip.is_unspecified() || gw_ip.is_multicast() || gw_ip.to_ipv4_mapped().is_some() {
+        return Err(format!("非法 IPv6 PCP 网关地址：{gateway}"));
+    }
+    if gw_ip.is_loopback() && !allow_loopback {
+        return Err("生产模式下拒绝回环 IPv6 PCP 网关".to_string());
+    }
+    // 严格遵守 RFC 6887 §7.2：仅在能绑定全球单播 IPv6 源地址时触发 IPv6 PCP MAP，绝不跨族发送
+    let src_v6 = resolve_global_ipv6_source_for_gateway(gateway, v6_source_override)
+        .ok_or_else(|| "未发现可绑定的全球单播 IPv6 源地址，跳过 IPv6 PCP v2".to_string())?;
+    if !crate::nat::is_global_unicast_ipv6(src_v6) {
+        return Err(format!("IPv6 PCP 源地址非全球单播地址：{src_v6}"));
+    }
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill(&mut nonce);
+    pcp_v2_map_with_client_ip(
+        SocketAddr::V6(gateway),
+        src_v6,
+        nonce,
+        internal_port,
+        suggested_external_port,
+        Ipv6Addr::UNSPECIFIED,
+        lease_secs,
+        deadline,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pcp_v2_map_with_client_ip(
+    gateway: SocketAddr,
+    client_ip: Ipv6Addr,
+    mapping_nonce: [u8; 12],
+    internal_port: u16,
+    suggested_external_port: u16,
+    suggested_external_ip: Ipv6Addr,
+    lease_secs: u32,
+    deadline: Instant,
+) -> Result<UpnpMappingLease, String> {
+    let sock = bind_pcp_socket_for_family(gateway, client_ip)?;
+    let req = build_pcp_map_request(
+        client_ip,
+        mapping_nonce,
+        internal_port,
+        suggested_external_port,
+        suggested_external_ip,
+        lease_secs,
+    );
+    let resp = pcp_v2_exchange(
+        &sock,
+        gateway,
+        &req,
+        &mapping_nonce,
+        internal_port,
+        false,
+        deadline,
+    )?;
+    Ok(UpnpMappingLease {
+        external_addr: resp.assigned_external_addr,
+        internal_port,
+        external_port: resp.assigned_external_port,
+        protocol: UpnpProtocol::PcpV2,
+        gateway: LeaseGateway::PcpV2 {
+            gateway_addr: gateway,
+            client_ip,
+            mapping_nonce,
+        },
+    })
+}
+
+fn pcp_v2_unmap_udp(
+    gateway: SocketAddr,
+    client_ip: Ipv6Addr,
+    mapping_nonce: [u8; 12],
+    internal_port: u16,
+    deadline: Instant,
+) -> Result<(), String> {
+    let sock = bind_pcp_socket_for_family(gateway, client_ip)?;
+    let suggested_ext_ip = if gateway.is_ipv4() {
+        Ipv4Addr::UNSPECIFIED.to_ipv6_mapped()
+    } else {
+        Ipv6Addr::UNSPECIFIED
+    };
+    let req = build_pcp_map_request(
+        client_ip,
+        mapping_nonce,
+        internal_port,
+        0,
+        suggested_ext_ip,
+        0,
+    );
+    let _ = pcp_v2_exchange(
+        &sock,
+        gateway,
+        &req,
+        &mapping_nonce,
+        internal_port,
+        true,
+        deadline,
+    );
+    Ok(())
+}
+
+fn bind_pcp_socket_for_family(
+    gateway: SocketAddr,
+    client_ip: Ipv6Addr,
+) -> Result<UdpSocket, String> {
+    match (gateway, client_ip.to_ipv4_mapped()) {
+        (SocketAddr::V4(_), Some(local_v4)) => UdpSocket::bind(SocketAddrV4::new(local_v4, 0))
+            .map_err(|e| format!("绑定 IPv4 PCP v2 源套接字 ({local_v4}) 失败：{e}")),
+        (SocketAddr::V6(gw6), None) => {
+            if gw6.ip().is_loopback() {
+                UdpSocket::bind(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
+                    .map_err(|e| format!("绑定回环 IPv6 PCP v2 套接字失败：{e}"))
+            } else {
+                UdpSocket::bind(SocketAddrV6::new(client_ip, 0, 0, 0)).map_err(|e| {
+                    format!("绑定全球单播 IPv6 PCP v2 源套接字 ({client_ip}) 失败：{e}")
+                })
+            }
+        }
+        _ => Err("PCP v2 网关地址族与客户端源地址族不匹配（禁止跨族发送）".to_string()),
+    }
+}
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn parse_linux_proc_ipv6_route(content: &str) -> Vec<SocketAddrV6> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 10 {
+            continue;
+        }
+        // 默认路由：dest == 00..00 且 dest_plen == 00
+        if cols[0] != "00000000000000000000000000000000" || cols[1] != "00" {
+            continue;
+        }
+        let gw_hex = cols[4].trim();
+        if gw_hex.len() != 32 {
+            continue;
+        }
+        let mut raw = [0u8; 16];
+        let mut ok = true;
+        for (i, slot) in raw.iter_mut().enumerate() {
+            match u8::from_str_radix(&gw_hex[i * 2..i * 2 + 2], 16) {
+                Ok(b) => *slot = b,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let ip = Ipv6Addr::from(raw);
+        if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+            continue;
+        }
+        let addr = SocketAddrV6::new(ip, NAT_PMP_PORT, 0, 0);
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn parse_macos_route_get_inet6(
+    stdout: &str,
+    ifconfig_stdout: Option<&str>,
+) -> Option<SocketAddrV6> {
+    let mut gateway_raw: Option<&str> = None;
+    let mut iface_name: Option<&str> = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("gateway:") {
+            gateway_raw = Some(rest.trim());
+        } else if let Some(rest) = trimmed.strip_prefix("interface:") {
+            iface_name = Some(rest.trim());
+        }
+    }
+    let gw = gateway_raw?;
+    let (ip_str, scope_hint) = match gw.split_once('%') {
+        Some((a, b)) => (a.trim(), Some(b.trim())),
+        None => (gw, iface_name),
+    };
+    let ip: Ipv6Addr = ip_str.parse().ok()?;
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.to_ipv4_mapped().is_some()
+    {
+        return None;
+    }
+    let mut scope_id = 0u32;
+    if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+        if let Some(scope_tok) = scope_hint {
+            if let Ok(num) = scope_tok.parse::<u32>() {
+                scope_id = num;
+            } else if let Some(ifc) = ifconfig_stdout {
+                scope_id = lookup_macos_ifconfig_scope_id(ifc, scope_tok).unwrap_or(0);
+            }
+        }
+    }
+    Some(SocketAddrV6::new(ip, NAT_PMP_PORT, 0, scope_id))
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn lookup_macos_ifconfig_scope_id(ifconfig_stdout: &str, target_iface: &str) -> Option<u32> {
+    let mut in_target = false;
+    for line in ifconfig_stdout.lines() {
+        if !line.is_empty() && !line.starts_with([' ', '\t']) {
+            let name = line.split(':').next()?.trim();
+            in_target = name == target_iface;
+            continue;
+        }
+        if !in_target {
+            continue;
+        }
+        if let Some((_, rest)) = line.split_once("scopeid 0x") {
+            let hex = rest.split_whitespace().next()?;
+            return u32::from_str_radix(hex, 16).ok();
+        }
+    }
+    None
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn parse_windows_netsh_ipv6_route(stdout: &str) -> Vec<SocketAddrV6> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let Some(prefix_idx) = cols.iter().position(|c| *c == "::/0") else {
+            continue;
+        };
+        if prefix_idx + 2 >= cols.len() {
+            continue;
+        }
+        // `netsh interface ipv6 show route` 列：Publish  Type  Met  Prefix  Idx  Gateway/Interface Name
+        let gw_tok = cols[prefix_idx + 2].split('%').next().unwrap_or("").trim();
+        if let Ok(ip) = gw_tok.parse::<Ipv6Addr>() {
+            if !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() {
+                let scope_id = cols[prefix_idx + 1].parse::<u32>().unwrap_or(0);
+                let addr = SocketAddrV6::new(
+                    ip,
+                    NAT_PMP_PORT,
+                    0,
+                    if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+                        scope_id
+                    } else {
+                        0
+                    },
+                );
+                if !out.contains(&addr) {
+                    out.push(addr);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 探测本机 IPv6 默认网关列表（用于确定是否触发 IPv6 PCP v2 `:5351/udp`）。
+fn discover_ipv6_default_gateways() -> Vec<SocketAddrV6> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        if let Ok(content) = std::fs::read_to_string("/proc/net/ipv6_route") {
+            out.extend(parse_linux_proc_ipv6_route(&content));
+        }
+        if out.is_empty() {
+            if let Ok(output) = Command::new("ip")
+                .args(["-6", "route", "show", "default"])
+                .output()
+            {
+                if output.status.success() {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    for line in text.lines() {
+                        let cols: Vec<&str> = line.split_whitespace().collect();
+                        if let Some(via_idx) = cols.iter().position(|c| *c == "via") {
+                            if let Some(ip_tok) = cols.get(via_idx + 1) {
+                                if let Ok(ip) =
+                                    ip_tok.split('%').next().unwrap_or("").parse::<Ipv6Addr>()
+                                {
+                                    if !ip.is_unspecified()
+                                        && !ip.is_loopback()
+                                        && !ip.is_multicast()
+                                    {
+                                        let addr = SocketAddrV6::new(ip, NAT_PMP_PORT, 0, 0);
+                                        if !out.contains(&addr) {
+                                            out.push(addr);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(route_out) = Command::new("route")
+            .args(["-n", "get", "-inet6", "default"])
+            .output()
+        {
+            if route_out.status.success() {
+                let ifc_text = Command::new("ifconfig")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+                if let Some(gw) = parse_macos_route_get_inet6(
+                    &String::from_utf8_lossy(&route_out.stdout),
+                    ifc_text.as_deref(),
+                ) {
+                    return vec![gw];
+                }
+            }
+        }
+        Vec::new()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = Command::new("netsh")
+            .args(["interface", "ipv6", "show", "route"])
+            .output()
+        {
+            if output.status.success() {
+                return parse_windows_netsh_ipv6_route(&String::from_utf8_lossy(&output.stdout));
+            }
+        }
+        Vec::new()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1544,6 +2277,7 @@ mod tests {
     fn upnp_protocol_and_status_serde_format() {
         assert_eq!(UpnpProtocol::UpnpIgdV1.as_str(), "upnp_igd_v1");
         assert_eq!(UpnpProtocol::UpnpIgdV2.as_str(), "upnp_igd_v2");
+        assert_eq!(UpnpProtocol::PcpV2.as_str(), "pcp_v2");
         assert_eq!(UpnpProtocol::NatPmp.as_str(), "nat_pmp");
 
         let mapped = UpnpStatus::Mapped {
@@ -2331,6 +3065,248 @@ mod tests {
             !locs.is_empty() && locs.len() <= MAX_SSDP_LOCATIONS,
             "expected 1..={MAX_SSDP_LOCATIONS} locations, got {}",
             locs.len()
+        );
+    }
+
+    struct MockPcpV2Handle {
+        addr: SocketAddr,
+        requests: Arc<Mutex<Vec<Vec<u8>>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for MockPcpV2Handle {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(h) = self.thread.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn spawn_mock_pcp_v2(
+        bind_addr: &str,
+        external_ip: Ipv6Addr,
+        granted_ext_port: Option<u16>,
+        force_result_code: Option<u8>,
+        fallback_nat_pmp_v4: Option<(Ipv4Addr, u16)>,
+    ) -> MockPcpV2Handle {
+        let sock = UdpSocket::bind(bind_addr).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(20)));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let reqs_bg = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            while !stop_bg.load(Ordering::Acquire) {
+                if let Ok((n, src)) = sock.recv_from(&mut buf) {
+                    let pkt = buf[..n].to_vec();
+                    reqs_bg.lock().unwrap().push(pkt.clone());
+                    if n >= PCP_MAP_PACKET_LEN && pkt[0] == PCP_VERSION && pkt[1] == PCP_OPCODE_MAP
+                    {
+                        let mut resp = [0u8; PCP_MAP_PACKET_LEN];
+                        resp[0] = PCP_VERSION;
+                        resp[1] = PCP_OPCODE_RESPONSE_BIT | PCP_OPCODE_MAP;
+                        resp[3] = force_result_code.unwrap_or(0);
+                        resp[4..8].copy_from_slice(&pkt[4..8]);
+                        resp[8..12].copy_from_slice(&777u32.to_be_bytes());
+                        resp[24..36].copy_from_slice(&pkt[24..36]);
+                        resp[36] = pkt[36];
+                        resp[40..42].copy_from_slice(&pkt[40..42]);
+                        let lifetime = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+                        let internal_port = u16::from_be_bytes([pkt[40], pkt[41]]);
+                        let suggested_ext = u16::from_be_bytes([pkt[42], pkt[43]]);
+                        let assigned_port = if lifetime == 0 {
+                            0
+                        } else {
+                            granted_ext_port.unwrap_or(if suggested_ext == 0 {
+                                internal_port
+                            } else {
+                                suggested_ext
+                            })
+                        };
+                        resp[42..44].copy_from_slice(&assigned_port.to_be_bytes());
+                        resp[44..60].copy_from_slice(&external_ip.octets());
+                        let _ = sock.send_to(&resp, src);
+                    } else if let Some((pmp_ext_ip, pmp_port)) = fallback_nat_pmp_v4 {
+                        if n >= 2 && pkt[0] == 0 && pkt[1] == 0 {
+                            let mut resp = [0u8; 12];
+                            resp[1] = 128;
+                            resp[8..12].copy_from_slice(&pmp_ext_ip.octets());
+                            let _ = sock.send_to(&resp, src);
+                        } else if n >= 12 && pkt[0] == 0 && pkt[1] == 1 {
+                            let mut resp = [0u8; 16];
+                            resp[1] = 129;
+                            resp[8..10].copy_from_slice(&pkt[4..6]);
+                            resp[10..12].copy_from_slice(&pmp_port.to_be_bytes());
+                            resp[12..16].copy_from_slice(&pkt[8..12]);
+                            let _ = sock.send_to(&resp, src);
+                        }
+                    }
+                }
+            }
+        });
+
+        MockPcpV2Handle {
+            addr,
+            requests,
+            stop,
+            thread: Some(handle),
+        }
+    }
+
+    #[test]
+    fn pcp_v2_ipv4_map_renew_unmap_nonce_and_nat_pmp_fallback() {
+        let silent_ssdp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let silent_ssdp_addr = silent_ssdp.local_addr().unwrap();
+
+        // 1) IPv4 PCP v2 成功（client_ip == ::ffff:127.0.0.1，96-bit mapping_nonce 保持一致）
+        let ext_v4 = Ipv4Addr::new(9, 9, 9, 8);
+        let mock_pcp = spawn_mock_pcp_v2(
+            "127.0.0.1:0",
+            ext_v4.to_ipv6_mapped(),
+            Some(52345),
+            None,
+            None,
+        );
+        let SocketAddr::V4(gw_v4) = mock_pcp.addr else {
+            unreachable!();
+        };
+        let lease = map_udp_port_internal(
+            48123,
+            3600,
+            Duration::from_millis(600),
+            silent_ssdp_addr,
+            &[gw_v4],
+            true,
+        )
+        .expect("PCP v2 IPv4 mapping should succeed");
+        assert_eq!(lease.protocol, UpnpProtocol::PcpV2);
+        assert_eq!(lease.external_addr, SocketAddr::from(([9, 9, 9, 8], 52345)));
+
+        let renewed = renew_udp_mapping(&lease, 7200, Duration::from_millis(500))
+            .expect("PCP v2 renew should preserve nonce and succeed");
+        assert_eq!(renewed.protocol, UpnpProtocol::PcpV2);
+        assert_eq!(renewed.external_addr, lease.external_addr);
+
+        unmap_udp_port(&renewed, Duration::from_millis(500));
+
+        let reqs = mock_pcp.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        let map_nonce = &reqs[0][24..36];
+        let renew_nonce = &reqs[1][24..36];
+        let unmap_nonce = &reqs[2][24..36];
+        assert_eq!(reqs[0].len(), 60);
+        assert_eq!(
+            &reqs[0][8..24],
+            &Ipv4Addr::LOCALHOST.to_ipv6_mapped().octets()
+        );
+        assert_eq!(reqs[0][36], PCP_PROTO_UDP);
+        assert_eq!(map_nonce, renew_nonce);
+        assert_eq!(map_nonce, unmap_nonce);
+        assert_eq!(
+            u32::from_be_bytes([reqs[2][4], reqs[2][5], reqs[2][6], reqs[2][7]]),
+            0
+        );
+        assert_eq!(u16::from_be_bytes([reqs[2][42], reqs[2][43]]), 0);
+        drop(reqs);
+
+        // 2) PCP v2 响应 UNSUPP_VERSION (1) 时平滑回退 NAT-PMP
+        let mock_fallback = spawn_mock_pcp_v2(
+            "127.0.0.1:0",
+            ext_v4.to_ipv6_mapped(),
+            None,
+            Some(1),
+            Some((Ipv4Addr::new(8, 8, 4, 4), 53333)),
+        );
+        let SocketAddr::V4(gw_fb) = mock_fallback.addr else {
+            unreachable!();
+        };
+        let fb_lease = map_udp_port_internal(
+            48124,
+            3600,
+            Duration::from_millis(600),
+            silent_ssdp_addr,
+            &[gw_fb],
+            true,
+        )
+        .expect("PCP v2 UNSUPP_VERSION must fall back to NAT-PMP");
+        assert_eq!(fb_lease.protocol, UpnpProtocol::NatPmp);
+        assert_eq!(
+            fb_lease.external_addr,
+            SocketAddr::from(([8, 8, 4, 4], 53333))
+        );
+
+        // 3) PCP v2 返回 CGNAT IP 时必须拦截，且映射响应校验拒绝错 nonce
+        let bad_nonce = [0xAAu8; 12];
+        let mut fake_resp = [0u8; PCP_MAP_PACKET_LEN];
+        fake_resp[0] = PCP_VERSION;
+        fake_resp[1] = PCP_OPCODE_RESPONSE_BIT | PCP_OPCODE_MAP;
+        fake_resp[4..8].copy_from_slice(&3600u32.to_be_bytes());
+        fake_resp[24..36].copy_from_slice(&[0xBBu8; 12]);
+        fake_resp[36] = PCP_PROTO_UDP;
+        fake_resp[40..42].copy_from_slice(&48125u16.to_be_bytes());
+        fake_resp[42..44].copy_from_slice(&50000u16.to_be_bytes());
+        fake_resp[44..60].copy_from_slice(&Ipv4Addr::new(9, 9, 9, 9).to_ipv6_mapped().octets());
+        assert!(parse_pcp_map_response(&fake_resp, &bad_nonce, 48125, false).is_err());
+
+        fake_resp[24..36].copy_from_slice(&bad_nonce);
+        fake_resp[44..60].copy_from_slice(&Ipv4Addr::new(100, 64, 1, 2).to_ipv6_mapped().octets());
+        let cgnat_err = parse_pcp_map_response(&fake_resp, &bad_nonce, 48125, false).unwrap_err();
+        assert!(cgnat_err.contains("非公网") || cgnat_err.contains("CGNAT"));
+    }
+
+    #[test]
+    fn pcp_v2_ipv6_source_consistency_and_gateway_parsers() {
+        // 1) 无 IPv6 默认网关或无全球单播 IPv6 源地址时绝不跨族发送或强行触发
+        assert!(resolve_global_ipv6_source_for_gateway(
+            "[::1]:5351".parse().unwrap(),
+            Some("fe80::1".parse().unwrap()),
+        )
+        .is_none());
+        assert!(resolve_global_ipv6_source_for_gateway(
+            "[::1]:5351".parse().unwrap(),
+            Some("fc00::1".parse().unwrap()),
+        )
+        .is_none());
+
+        // 2) 若强行将 IPv4 映射源地址配给 IPv6 PCP 网关，bind_pcp_socket_for_family 拒绝跨族发送
+        assert!(bind_pcp_socket_for_family(
+            "[::1]:5351".parse().unwrap(),
+            Ipv4Addr::LOCALHOST.to_ipv6_mapped(),
+        )
+        .is_err());
+
+        // 3) 跨平台 IPv6 默认网关解析单测（Linux /proc/net/ipv6_route、macOS route+ifconfig、Windows netsh）
+        let linux_proc = "\
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00050003 enp3s0
+";
+        let gws_linux = parse_linux_proc_ipv6_route(linux_proc);
+        assert_eq!(
+            gws_linux,
+            vec!["[fe80::1]:5351".parse::<SocketAddrV6>().unwrap()]
+        );
+
+        let mac_route = "   route to: default\n destination: default\n     gateway: fe80::1%en0\n   interface: en0\n";
+        let mac_ifc = "en0: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\n\tinet6 fe80::2%en0 prefixlen 64 scopeid 0x6\n";
+        let gw_mac = parse_macos_route_get_inet6(mac_route, Some(mac_ifc)).unwrap();
+        assert_eq!(*gw_mac.ip(), "fe80::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(gw_mac.port(), 5351);
+        assert_eq!(gw_mac.scope_id(), 6);
+
+        let win_netsh = "\
+Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name
+-------  --------  ---  ------------------------  ---  ------------------------
+No       Manual    256  ::/0                       12  fe80::1
+No       System    256  ::1/128                     1  Loopback Pseudo-Interface 1
+";
+        let gws_win = parse_windows_netsh_ipv6_route(win_netsh);
+        assert_eq!(
+            gws_win,
+            vec![SocketAddrV6::new("fe80::1".parse().unwrap(), 5351, 0, 12)]
         );
     }
 }

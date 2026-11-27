@@ -3576,7 +3576,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn build_mock_mtls_relay_server_config(
+    pub(crate) fn build_mock_mtls_relay_server_config(
         ca_pem: &str,
         srv_cert_pem: &str,
         srv_key_pem: &str,
@@ -3606,7 +3606,7 @@ pub(crate) mod tests {
         Arc::new(cfg)
     }
 
-    fn spawn_mock_mtls_relay_server(
+    pub(crate) fn spawn_mock_mtls_relay_server(
         server_cfg: Arc<rustls::ServerConfig>,
     ) -> (SocketAddr, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

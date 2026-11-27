@@ -15,10 +15,24 @@
 //! [23..29] nonce:        [u8; 6]（本次打洞随机防重放标记）
 //! ```
 
+//! # `RCP2 v2` 48 字节认证打洞包布局（提供 `punch_secret` 时默认启用；缺失/非法时平滑回退 `v1` 29 字节）
+//!
+//! ```text
+//! [0..4]   magic:        b"RCP2"
+//! [4]      version:      u8 = 2
+//! [5]      role:         u8 (1 = Host, 2 = Client)
+//! [6]      flags:        u8 (bit0 = Ack)
+//! [7]      reserved:     u8 = 0
+//! [8..16]  session_hash: [u8; 8]  = SHA256(session_id)[..8]
+//! [16..24] sender_nonce: [u8; 8]
+//! [24..32] echo_nonce:   [u8; 8]  （Probe 固定 [0; 8]；Ack 回显对端 sender_nonce）
+//! [32..48] mac_tag:      [u8; 16] = HMAC-SHA256(punch_secret, bytes[0..32])[..16]
+//! ```
+
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,21 +45,38 @@ use rand::RngCore;
 use rc_net::mtls::{MtlsConfig, PeerMtlsIdentity};
 use rc_net::quic::{Identity, QuicEndpoint, QuicTransport};
 use rc_net::{NetConfig, NetEvent, NetStats, Role, Transport};
+use ring::hmac;
+use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::nat::{
-    canonicalize_socket_addr, is_global_unicast_ipv6, is_routable_public_ip,
-    is_routable_public_ipv4, predict_symmetric_ports, NatType,
+    canonicalize_ip, canonicalize_socket_addr, is_global_unicast_ipv6, is_routable_public_ip,
+    predict_symmetric_ports_in_range, NatType, PortRangeHint,
 };
 
 /// UDP 打洞包魔数（`RCP2`）。
 pub const PUNCH_MAGIC: &[u8; 4] = b"RCP2";
 
-/// 当前 UDP 打洞协议版本。
+/// `RCP2 v1` 兼容打洞协议版本（29 字节无 MAC）。
 pub const PUNCH_VERSION: u8 = 1;
 
-/// UDP 打洞包定长字节数（4 + 1 + 1 + 1 + 16 + 6 = 29）。
+/// `RCP2 v2` HMAC 认证打洞协议版本（48 字节）。
+pub const PUNCH_VERSION_V2: u8 = 2;
+
+/// `RCP2 v1` 打洞包定长字节数（4 + 1 + 1 + 1 + 16 + 6 = 29）。
 pub const PUNCH_PACKET_LEN: usize = 29;
+
+/// `RCP2 v2` 认证打洞包定长字节数（4 + 1 + 1 + 1 + 1 + 8 + 8 + 8 + 16 = 48）。
+pub const PUNCH_V2_PACKET_LEN: usize = 48;
+
+/// `RCP2 v2` `flags` 字段确认位掩码（`bit 0 = Ack`）。
+pub const PUNCH_V2_FLAG_ACK: u8 = 0x01;
+
+/// `RCP2 v2` 单源 IP 回复 Ack 的最小限频间隔（严格 1.0x 等长 48B 回复，防反射放大）。
+const ACK_RATE_MIN_INTERVAL: Duration = Duration::from_millis(20);
+
+/// `RCP2 v2` 单源 IP 限频表最大跟踪 IP 数。
+const MAX_ACK_RATE_TRACKED_IPS: usize = 128;
 
 /// 默认 UDP 打洞超时（超时后上层回退 TCP 中继）。
 pub const DEFAULT_PUNCH_TIMEOUT: Duration = Duration::from_millis(2_400);
@@ -56,23 +87,48 @@ pub const DEFAULT_QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 探测包周期发送间隔。
 const PROBE_INTERVAL: Duration = Duration::from_millis(30);
 
-/// Phase 1 主候选地址高速探测窗口时长（超时未收敛则切入 Phase 2 对称端口预测）。
+/// Phase 1 主候选地址高速探测窗口时长（超时未收敛则切入后续阶段）。
 const PHASE1_DURATION: Duration = Duration::from_millis(350);
 
-/// Phase 2 单次 tick 最多发送的预测端口数（抑制路由/运营商 UDP 洪泛限速）。
+/// `ConeUnverified ↔ ConeUnverified` Phase 2a（窄邻域探测）结束时间点。
+const PHASE2A_END: Duration = Duration::from_millis(1_200);
+
+/// `ConeUnverified ↔ ConeUnverified` 激活 Phase 2b（角色交替喷洒）所需的最小总超时门槛。
+const PHASE2B_MIN_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// RTT 同步起跑最大允许延迟上限（毫秒）。
+const MAX_START_AFTER_MS: u16 = 500;
+
+/// 辅助临时 UDP 套接字硬上限（防止耗尽进程 FD）。
+const MAX_AUX_SOCKETS_HARD_CAP: usize = 96;
+
+/// `Cone* ↔ ApdmSeq/AdmSeq` 对称侧辅助套接字数量。
+const AUX_SEQ_TO_CONE_COUNT: usize = 8;
+
+/// `ApdmSeq ↔ ApdmSeq`（`|delta| == 1`）定向会师辅助套接字数量。
+const AUX_APDM_SEQ_DELTA1_COUNT: usize = 48;
+
+/// `ApdmSeq ↔ ApdmSeq`（`2 <= |delta| <= 4`）定向会师辅助套接字数量。
+const AUX_APDM_SEQ_DELTA2_4_COUNT: usize = 24;
+
+/// 单个 tick 内 Cone 侧最多发送的预测端口数（`6 / 30ms = 200 pps` 上限）。
 const MAX_PREDICTED_PORTS_PER_TICK: usize = 6;
 
-/// 对称 NAT 生日碰撞阶段最多开启的辅助非阻塞 UDP 套接字数量。
-const MAX_AUX_SOCKETS: usize = 16;
+/// 单波次 Cone 侧随机端口扫描预算。
+const CONE_SCAN_BUDGET_PER_WAVE: usize = 512;
 
-/// Phase 2 单次 tick 最多发送探测包的辅助套接字数量（抑制突发 UDP 洪泛）。
-const MAX_AUX_PROBES_PER_TICK: usize = 4;
+/// 单次 tick 最多轮转发送探测包的辅助套接字数量（抑制突发 UDP 洪泛）。
+const MAX_AUX_PROBES_PER_TICK: usize = 24;
 
 /// 接收轮询与取消检查步长。
 const POLL_STEP: Duration = Duration::from_millis(5);
 
 /// 收到有效包时立即连发 Ack 的次数（对抗弱网单包丢失）。
 const IMMEDIATE_ACK_BURST: usize = 3;
+
+/// Happy Eyeballs v2（RFC 8305）双栈探测时全球单播 IPv6 的领先起跑窗口（50ms），
+/// 期满后立即与 LAN/IPv4 并发探测，IPv6 不可达或超时对 IPv4 打洞 0 阻塞。
+const HAPPY_EYEBALLS_V6_HEAD_START: Duration = Duration::from_millis(50);
 
 /// P2P 打洞角色（与信令协调中的 `host` / `client` 一一对应）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +162,7 @@ impl P2pRole {
 /// P2P 建连所需的对端候选地址与本地端口提示。
 #[derive(Debug, Clone, Default)]
 pub struct P2pCandidates {
-    /// 信令协调下发的会话标识（用于派生 16 字节 `session_hash`）。
+    /// 信令协调下发的会话标识（用于派生会话哈希）。
     pub session_id: String,
     /// 信令服务器观测到的对端公网 UDP 地址（如 `"198.51.100.22:60123"`）。
     pub peer_public_addr: Option<String>,
@@ -120,16 +176,26 @@ pub struct P2pCandidates {
     pub self_nat_type: NatType,
     /// 本端顺序对称 NAT 分配端口步长（如有）。
     pub self_nat_port_delta: Option<i16>,
+    /// 本端 NAT 外网端口区间提示（如有）。
+    pub self_nat_port_range: Option<PortRangeHint>,
     /// 对端上报的 NAT 类型。
     pub peer_nat_type: NatType,
     /// 对端顺序对称 NAT 分配端口步长（如有）。
     pub peer_nat_port_delta: Option<i16>,
+    /// 对端 NAT 外网端口区间提示（如有）。
+    pub peer_nat_port_range: Option<PortRangeHint>,
+    /// 服务端下发的会话共享 `RCP2 v2` HMAC 密钥（32 位十六进制字符串，缺失或非法时回退 `v1`）。
+    pub punch_secret: Option<String>,
+    /// 服务端协调的快侧打洞起跑延迟（毫秒）。
+    pub start_after_ms: Option<u16>,
+    /// 服务端协调的并发中继回退延迟（毫秒）。
+    pub relay_fallback_after_ms: Option<u16>,
 }
 
-/// 解码后的 `RCP2` UDP 打洞包。
+/// 解码后的 `RCP2 v1` 29 字节 UDP 打洞包。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PunchPacket {
-    /// 协议版本号（当前固定为 [`PUNCH_VERSION`] = `1`）。
+    /// 协议版本号（固定为 [`PUNCH_VERSION`] = `1`）。
     pub version: u8,
     /// 发送方角色。
     pub role: P2pRole,
@@ -139,6 +205,27 @@ pub struct PunchPacket {
     pub session_hash: [u8; 16],
     /// 6 字节随机 nonce。
     pub nonce: [u8; 6],
+}
+
+/// 解码且通过 HMAC-SHA256 校验后的 `RCP2 v2` 48 字节认证打洞包。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PunchPacketV2 {
+    /// 协议版本号（固定为 [`PUNCH_VERSION_V2`] = `2`）。
+    pub version: u8,
+    /// 发送方角色。
+    pub role: P2pRole,
+    /// 标志位（`bit 0` = Ack）。
+    pub flags: u8,
+    /// 保留字节（固定为 `0`）。
+    pub reserved: u8,
+    /// `SHA256(session_id)[..8]`。
+    pub session_hash: [u8; 8],
+    /// 发送方 8 字节随机 nonce。
+    pub sender_nonce: [u8; 8],
+    /// 回显对端 `sender_nonce`（`Probe` 固定 `[0; 8]`，`Ack` 填对端 `sender_nonce`）。
+    pub echo_nonce: [u8; 8],
+    /// 16 字节截断 HMAC-SHA256 标签。
+    pub mac_tag: [u8; 16],
 }
 
 static LOCAL_UDP_PORT_LEASES: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
@@ -235,7 +322,7 @@ impl Transport for P2pQuicConnection {
     }
 }
 
-/// 将 [`PunchPacket`] 编码为 29 字节固定二进制包。
+/// 将 [`PunchPacket`] 编码为 29 字节固定二进制包（`RCP2 v1` 兼容格式）。
 pub fn encode_punch_packet(pkt: &PunchPacket) -> [u8; PUNCH_PACKET_LEN] {
     let mut out = [0u8; PUNCH_PACKET_LEN];
     out[0..4].copy_from_slice(PUNCH_MAGIC);
@@ -247,7 +334,7 @@ pub fn encode_punch_packet(pkt: &PunchPacket) -> [u8; PUNCH_PACKET_LEN] {
     out
 }
 
-/// 从 UDP 载荷解码 29 字节 `RCP2` 打洞包；长度、魔数、版本、角色或确认位非法均返回 `None`。
+/// 从 UDP 载荷解码 29 字节 `RCP2 v1` 打洞包；长度、魔数、版本、角色或确认位非法均返回 `None`。
 pub fn decode_punch_packet(buf: &[u8]) -> Option<PunchPacket> {
     if buf.len() != PUNCH_PACKET_LEN {
         return None;
@@ -278,6 +365,113 @@ pub fn decode_punch_packet(buf: &[u8]) -> Option<PunchPacket> {
     })
 }
 
+/// 解析 32 位十六进制 `punch_secret` 为 16 字节原始 HMAC 密钥；缺失或非法时返回 `None`（回退 `RCP2 v1`）。
+pub fn parse_punch_secret(raw: Option<&str>) -> Option<[u8; 16]> {
+    let hex = raw?.trim();
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let s = std::str::from_utf8(chunk).ok()?;
+        out[idx] = u8::from_str_radix(s, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// 由 `session_id` 派生 `RCP2 v2` 8 字节会话哈希：`SHA256(session_id)[..8]`。
+pub fn derive_session_hash_v2(session_id: &str) -> [u8; 8] {
+    let digest = Sha256::digest(session_id.as_bytes());
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    out
+}
+
+/// 构造并签名 48 字节 `RCP2 v2` HMAC-SHA256 认证打洞报文。
+///
+/// - `Probe` (`ack = false`) 中 `echo_nonce` 应为 `[0; 8]`；
+/// - `Ack` (`ack = true`) 中 `echo_nonce` 回显对端 `sender_nonce`。
+pub fn encode_punch_packet_v2(
+    role: P2pRole,
+    ack: bool,
+    session_hash: [u8; 8],
+    sender_nonce: [u8; 8],
+    echo_nonce: [u8; 8],
+    punch_secret: &[u8; 16],
+) -> [u8; PUNCH_V2_PACKET_LEN] {
+    let mut out = [0u8; PUNCH_V2_PACKET_LEN];
+    out[0..4].copy_from_slice(PUNCH_MAGIC);
+    out[4] = PUNCH_VERSION_V2;
+    out[5] = role as u8;
+    out[6] = if ack { PUNCH_V2_FLAG_ACK } else { 0 };
+    out[7] = 0;
+    out[8..16].copy_from_slice(&session_hash);
+    out[16..24].copy_from_slice(&sender_nonce);
+    out[24..32].copy_from_slice(&echo_nonce);
+
+    let key = hmac::Key::new(hmac::HMAC_SHA256, punch_secret);
+    let tag = hmac::sign(&key, &out[0..32]);
+    out[32..48].copy_from_slice(&tag.as_ref()[..16]);
+    out
+}
+
+/// 解码并常量时间验签 48 字节 `RCP2 v2` 认证打洞报文；任何字段或 MAC 失败均返回 `None`。
+pub fn decode_and_verify_punch_packet_v2(
+    buf: &[u8],
+    punch_secret: &[u8; 16],
+) -> Option<PunchPacketV2> {
+    if buf.len() != PUNCH_V2_PACKET_LEN {
+        return None;
+    }
+    if &buf[0..4] != PUNCH_MAGIC {
+        return None;
+    }
+    if buf[4] != PUNCH_VERSION_V2 {
+        return None;
+    }
+    let role = P2pRole::from_u8(buf[5])?;
+    let flags = buf[6];
+    if (flags & !PUNCH_V2_FLAG_ACK) != 0 {
+        return None;
+    }
+    let reserved = buf[7];
+    if reserved != 0 {
+        return None;
+    }
+
+    let key = hmac::Key::new(hmac::HMAC_SHA256, punch_secret);
+    let expected = hmac::sign(&key, &buf[0..32]);
+    let expected_tag = &expected.as_ref()[..16];
+    let recv_tag = &buf[32..48];
+    let mut diff = 0u8;
+    for i in 0..16 {
+        diff |= expected_tag[i] ^ recv_tag[i];
+    }
+    if diff != 0 {
+        return None;
+    }
+
+    let mut session_hash = [0u8; 8];
+    session_hash.copy_from_slice(&buf[8..16]);
+    let mut sender_nonce = [0u8; 8];
+    sender_nonce.copy_from_slice(&buf[16..24]);
+    let mut echo_nonce = [0u8; 8];
+    echo_nonce.copy_from_slice(&buf[24..32]);
+    let mut mac_tag = [0u8; 16];
+    mac_tag.copy_from_slice(&buf[32..48]);
+
+    Some(PunchPacketV2 {
+        version: PUNCH_VERSION_V2,
+        role,
+        flags,
+        reserved,
+        session_hash,
+        sender_nonce,
+        echo_nonce,
+        mac_tag,
+    })
+}
+
 fn parse_valid_candidate_addr(raw: &str) -> Option<SocketAddr> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -299,22 +493,32 @@ fn parse_valid_candidate_addr(raw: &str) -> Option<SocketAddr> {
 pub fn parse_candidate_addrs(candidates: &P2pCandidates) -> Vec<SocketAddr> {
     let mut seen = HashSet::new();
     if candidates.peer_public_addrs.is_empty() {
-        let mut out = Vec::new();
+        let mut global_v6 = Vec::new();
+        let mut others = Vec::new();
         for lan in &candidates.peer_lan_addrs {
             if let Some(addr) = parse_valid_candidate_addr(lan) {
                 if seen.insert(addr) {
-                    out.push(addr);
+                    if matches!(addr, SocketAddr::V6(v6) if is_global_unicast_ipv6(*v6.ip())) {
+                        global_v6.push(addr);
+                    } else {
+                        others.push(addr);
+                    }
                 }
             }
         }
         if let Some(ref public) = candidates.peer_public_addr {
             if let Some(addr) = parse_valid_candidate_addr(public) {
                 if seen.insert(addr) {
-                    out.push(addr);
+                    if matches!(addr, SocketAddr::V6(v6) if is_global_unicast_ipv6(*v6.ip())) {
+                        global_v6.push(addr);
+                    } else {
+                        others.push(addr);
+                    }
                 }
             }
         }
-        return out;
+        global_v6.extend(others);
+        return global_v6;
     }
 
     let mut global_v6 = Vec::new();
@@ -503,13 +707,141 @@ struct PunchedSocket {
 struct AuxPunchSocket {
     socket: UdpSocket,
     confirmed_peer: Option<SocketAddr>,
+    peer_sender_nonce: Option<[u8; 8]>,
+    auth: PunchAuthMode,
 }
 
-fn has_global_v6_or_lan_target(all_targets: &[SocketAddr]) -> bool {
-    all_targets.iter().any(|addr| match addr {
-        SocketAddr::V6(v6) => is_global_unicast_ipv6(*v6.ip()),
-        SocketAddr::V4(v4) => !is_routable_public_ipv4(*v4.ip()),
-    })
+#[derive(Default)]
+struct AckRateLimiter {
+    last_reply_by_ip: HashMap<IpAddr, Instant>,
+}
+
+impl AckRateLimiter {
+    fn allow_reply(&mut self, ip: IpAddr, now: Instant) -> bool {
+        let canon_ip = canonicalize_ip(ip);
+        if let Some(&last) = self.last_reply_by_ip.get(&canon_ip) {
+            if now.saturating_duration_since(last) < ACK_RATE_MIN_INTERVAL {
+                return false;
+            }
+        } else if self.last_reply_by_ip.len() >= MAX_ACK_RATE_TRACKED_IPS {
+            if let Some(oldest_ip) = self
+                .last_reply_by_ip
+                .iter()
+                .min_by_key(|(_, ts)| *ts)
+                .map(|(k, _)| *k)
+            {
+                self.last_reply_by_ip.remove(&oldest_ip);
+            }
+        }
+        self.last_reply_by_ip.insert(canon_ip, now);
+        true
+    }
+}
+
+enum PunchAuthMode {
+    V1 {
+        session_hash: [u8; 16],
+        probe_pkt: [u8; PUNCH_PACKET_LEN],
+        ack_pkt: [u8; PUNCH_PACKET_LEN],
+    },
+    V2 {
+        role: P2pRole,
+        secret: [u8; 16],
+        session_hash: [u8; 8],
+        local_sender_nonce: [u8; 8],
+        probe_pkt: [u8; PUNCH_V2_PACKET_LEN],
+        rate_limiter: AckRateLimiter,
+    },
+}
+
+impl PunchAuthMode {
+    fn new(role: P2pRole, session_id: &str, punch_secret: Option<&str>) -> Self {
+        if let Some(secret) = parse_punch_secret(punch_secret) {
+            let session_hash = derive_session_hash_v2(session_id);
+            let mut local_sender_nonce = [0u8; 8];
+            OsRng.fill_bytes(&mut local_sender_nonce);
+            let probe_pkt = encode_punch_packet_v2(
+                role,
+                false,
+                session_hash,
+                local_sender_nonce,
+                [0u8; 8],
+                &secret,
+            );
+            Self::V2 {
+                role,
+                secret,
+                session_hash,
+                local_sender_nonce,
+                probe_pkt,
+                rate_limiter: AckRateLimiter::default(),
+            }
+        } else {
+            let session_hash = derive_session_hash(session_id);
+            let mut nonce = [0u8; 6];
+            OsRng.fill_bytes(&mut nonce);
+            let probe_pkt = encode_punch_packet(&PunchPacket {
+                version: PUNCH_VERSION,
+                role,
+                ack: false,
+                session_hash,
+                nonce,
+            });
+            let ack_pkt = encode_punch_packet(&PunchPacket {
+                version: PUNCH_VERSION,
+                role,
+                ack: true,
+                session_hash,
+                nonce,
+            });
+            Self::V1 {
+                session_hash,
+                probe_pkt,
+                ack_pkt,
+            }
+        }
+    }
+
+    fn probe_bytes(&self) -> &[u8] {
+        match self {
+            Self::V1 { probe_pkt, .. } => probe_pkt,
+            Self::V2 { probe_pkt, .. } => probe_pkt,
+        }
+    }
+
+    fn periodic_ack_bytes(&self, peer_sender_nonce: Option<[u8; 8]>) -> Option<Vec<u8>> {
+        match self {
+            Self::V1 { ack_pkt, .. } => Some(ack_pkt.to_vec()),
+            Self::V2 {
+                role,
+                secret,
+                session_hash,
+                local_sender_nonce,
+                ..
+            } => peer_sender_nonce.map(|echo| {
+                encode_punch_packet_v2(
+                    *role,
+                    true,
+                    *session_hash,
+                    *local_sender_nonce,
+                    echo,
+                    secret,
+                )
+                .to_vec()
+            }),
+        }
+    }
+}
+
+fn has_global_v6_or_explicit_lan(candidates: &P2pCandidates, all_targets: &[SocketAddr]) -> bool {
+    let has_global_v6 = all_targets
+        .iter()
+        .any(|addr| matches!(addr, SocketAddr::V6(v6) if is_global_unicast_ipv6(*v6.ip())));
+    let has_explicit_lan = candidates
+        .peer_lan_addrs
+        .iter()
+        .any(|raw| parse_valid_candidate_addr(raw).is_some());
+    has_global_v6 || has_explicit_lan
 }
 
 /// 当双端处于不同可路由公网 IP（跨站点）时，过滤掉不可达的私网/本地 LAN 候选，
@@ -547,27 +879,10 @@ pub fn filter_cross_site_lan_addrs(
 }
 
 fn should_use_aux_sockets(self_nat: NatType, peer_nat: NatType) -> bool {
-    matches!(self_nat, NatType::SymmetricSeq | NatType::SymmetricRandom)
-        && matches!(peer_nat, NatType::Cone | NatType::Unknown)
+    self_nat.is_symmetric() && (peer_nat.is_cone() || peer_nat == NatType::Unknown)
 }
 
-fn build_predicted_targets(
-    candidates: &P2pCandidates,
-    existing_targets: &[SocketAddr],
-    socket_is_ipv6: bool,
-) -> Vec<SocketAddr> {
-    let max_ports = match candidates.peer_nat_type {
-        NatType::Cone => return Vec::new(),
-        NatType::SymmetricSeq => 64,
-        NatType::SymmetricRandom => 512,
-        NatType::Unknown => 24,
-    };
-
-    let mut existing: HashSet<SocketAddr> = existing_targets
-        .iter()
-        .copied()
-        .map(canonicalize_socket_addr)
-        .collect();
+fn collect_peer_base_v4s(candidates: &P2pCandidates) -> Vec<std::net::SocketAddrV4> {
     let mut base_v4s = Vec::new();
     let mut seen_bases = HashSet::new();
 
@@ -588,13 +903,175 @@ fn build_predicted_targets(
             base_v4s.push(v4);
         }
     }
+    base_v4s
+}
 
+fn wrap_or_clamp_port(raw: i32, base_port: u16, range_hint: Option<PortRangeHint>) -> Option<u16> {
+    if let Some(hint) = range_hint.and_then(PortRangeHint::validated) {
+        let (min_p, max_p) = hint.bounds();
+        if base_port >= min_p && base_port <= max_p {
+            let span = i32::from(max_p) - i32::from(min_p) + 1;
+            let min_i32 = i32::from(min_p);
+            let wrapped = min_i32 + (raw - min_i32).rem_euclid(span);
+            return u16::try_from(wrapped).ok().filter(|&p| p != 0);
+        }
+    }
+    if (1..=65_535).contains(&raw) {
+        Some(raw as u16)
+    } else {
+        None
+    }
+}
+
+fn build_seq_scan_targets(
+    candidates: &P2pCandidates,
+    existing_targets: &[SocketAddr],
+    socket_is_ipv6: bool,
+    steps: i32,
+    tolerance: i32,
+) -> Vec<SocketAddr> {
+    let mut existing: HashSet<SocketAddr> = existing_targets
+        .iter()
+        .copied()
+        .map(canonicalize_socket_addr)
+        .collect();
     let mut out = Vec::new();
+    let base_v4s = collect_peer_base_v4s(candidates);
+
     for base in base_v4s {
-        let ports = predict_symmetric_ports(
+        let base_i32 = i32::from(base.port());
+        let mut push_port = |port: u16| {
+            if port == 0 || port == base.port() {
+                return;
+            }
+            let cand_v4 = SocketAddr::new(IpAddr::V4(*base.ip()), port);
+            if existing.insert(cand_v4) {
+                out.push(normalize_addr_for_socket(cand_v4, socket_is_ipv6));
+            }
+        };
+
+        if let Some(step) = candidates.peer_nat_port_delta.filter(|&d| d != 0) {
+            let step_i32 = i32::from(step);
+            for k in 1..=steps {
+                if let Some(p) = wrap_or_clamp_port(
+                    base_i32 + k * step_i32,
+                    base.port(),
+                    candidates.peer_nat_port_range,
+                ) {
+                    push_port(p);
+                }
+                if (1..=65_535).contains(&(base_i32 + k * step_i32)) {
+                    push_port((base_i32 + k * step_i32) as u16);
+                }
+            }
+            for off in 1..=tolerance {
+                for anchor in [base_i32, base_i32 + step_i32] {
+                    if let Some(p) = wrap_or_clamp_port(
+                        anchor + off,
+                        base.port(),
+                        candidates.peer_nat_port_range,
+                    ) {
+                        push_port(p);
+                    }
+                    if let Some(p) = wrap_or_clamp_port(
+                        anchor - off,
+                        base.port(),
+                        candidates.peer_nat_port_range,
+                    ) {
+                        push_port(p);
+                    }
+                }
+            }
+        } else {
+            for off in 1..=32 {
+                for raw in [base_i32 + off, base_i32 - off] {
+                    if (1..=65_535).contains(&raw) {
+                        push_port(raw as u16);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn build_narrow_cone_targets(
+    candidates: &P2pCandidates,
+    existing_targets: &[SocketAddr],
+    socket_is_ipv6: bool,
+    radius: i32,
+) -> Vec<SocketAddr> {
+    let mut existing: HashSet<SocketAddr> = existing_targets
+        .iter()
+        .copied()
+        .map(canonicalize_socket_addr)
+        .collect();
+    let mut out = Vec::new();
+    for base in collect_peer_base_v4s(candidates) {
+        let base_i32 = i32::from(base.port());
+        for off in 1..=radius {
+            for raw in [base_i32 + off, base_i32 - off] {
+                if (1..=65_535).contains(&raw) {
+                    let cand_v4 = SocketAddr::new(IpAddr::V4(*base.ip()), raw as u16);
+                    if existing.insert(cand_v4) {
+                        out.push(normalize_addr_for_socket(cand_v4, socket_is_ipv6));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn build_directed_rendezvous_targets(
+    candidates: &P2pCandidates,
+    multiplier: i32,
+    congruence_span: i32,
+    socket_is_ipv6: bool,
+) -> Vec<SocketAddr> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let step = i32::from(candidates.peer_nat_port_delta.unwrap_or(1));
+    for base in collect_peer_base_v4s(candidates) {
+        let anchor_raw = i32::from(base.port()) + multiplier * step;
+        let Some(anchor_port) =
+            wrap_or_clamp_port(anchor_raw, base.port(), candidates.peer_nat_port_range)
+        else {
+            continue;
+        };
+        for offset in 0..congruence_span.max(1) {
+            let candidate_raw = i32::from(anchor_port) + offset;
+            if let Some(p) =
+                wrap_or_clamp_port(candidate_raw, base.port(), candidates.peer_nat_port_range)
+            {
+                let cand_v4 = SocketAddr::new(IpAddr::V4(*base.ip()), p);
+                if seen.insert(cand_v4) {
+                    out.push(normalize_addr_for_socket(cand_v4, socket_is_ipv6));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn build_random_scan_targets(
+    candidates: &P2pCandidates,
+    existing_targets: &[SocketAddr],
+    socket_is_ipv6: bool,
+    max_ports: usize,
+) -> Vec<SocketAddr> {
+    let mut existing: HashSet<SocketAddr> = existing_targets
+        .iter()
+        .copied()
+        .map(canonicalize_socket_addr)
+        .collect();
+    let mut out = Vec::new();
+    for base in collect_peer_base_v4s(candidates) {
+        let ports = predict_symmetric_ports_in_range(
             base.port(),
-            candidates.peer_nat_type,
-            candidates.peer_nat_port_delta,
+            NatType::ApdmRandom,
+            None,
+            candidates.peer_nat_port_range,
             max_ports,
         );
         for port in ports {
@@ -607,22 +1084,310 @@ fn build_predicted_targets(
     out
 }
 
+fn build_predicted_targets(
+    candidates: &P2pCandidates,
+    existing_targets: &[SocketAddr],
+    socket_is_ipv6: bool,
+) -> Vec<SocketAddr> {
+    let max_ports = match candidates.peer_nat_type {
+        NatType::Public | NatType::ConeVerified | NatType::ConeUnverified | NatType::UdpBlocked => {
+            return Vec::new();
+        }
+        NatType::AdmSeq | NatType::ApdmSeq => 64,
+        NatType::AdmRandom | NatType::ApdmRandom => CONE_SCAN_BUDGET_PER_WAVE,
+        NatType::Unknown => 24,
+    };
+
+    let mut existing: HashSet<SocketAddr> = existing_targets
+        .iter()
+        .copied()
+        .map(canonicalize_socket_addr)
+        .collect();
+    let mut out = Vec::new();
+    for base in collect_peer_base_v4s(candidates) {
+        let ports = predict_symmetric_ports_in_range(
+            base.port(),
+            candidates.peer_nat_type,
+            candidates.peer_nat_port_delta,
+            candidates.peer_nat_port_range,
+            max_ports,
+        );
+        for port in ports {
+            let cand_v4 = SocketAddr::new(IpAddr::V4(*base.ip()), port);
+            if existing.insert(cand_v4) {
+                out.push(normalize_addr_for_socket(cand_v4, socket_is_ipv6));
+            }
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+enum PunchStrategy {
+    DirectOnly,
+    MainScanImmediate {
+        scan_targets: Vec<SocketAddr>,
+    },
+    AuxPersistent {
+        aux_count: usize,
+        aux_targets: Vec<SocketAddr>,
+        scan_targets: Vec<SocketAddr>,
+    },
+    DirectedRendezvous {
+        aux_count: usize,
+        aux_targets: Vec<SocketAddr>,
+    },
+    TwoWaveBirthdayAux {
+        aux_count: usize,
+    },
+    TwoWaveConeScan {
+        wave1_targets: Vec<SocketAddr>,
+        wave2_targets: Vec<SocketAddr>,
+    },
+    ConeUnverifiedProgressive {
+        role: P2pRole,
+        self_verified: bool,
+        peer_verified: bool,
+        narrow_targets: Vec<SocketAddr>,
+        wide_targets: Vec<SocketAddr>,
+    },
+    LegacyPhase2 {
+        want_aux: bool,
+        aux_count: usize,
+        scan_targets: Vec<SocketAddr>,
+    },
+}
+
+fn select_punch_strategy(
+    role: P2pRole,
+    candidates: &P2pCandidates,
+    targets: &[SocketAddr],
+    all_targets: &[SocketAddr],
+    socket_is_ipv6: bool,
+) -> PunchStrategy {
+    let self_nat = candidates.self_nat_type;
+    let peer_nat = candidates.peer_nat_type;
+
+    if self_nat == NatType::Public
+        || peer_nat == NatType::Public
+        || has_global_v6_or_explicit_lan(candidates, all_targets)
+        || (self_nat == NatType::ConeVerified && peer_nat == NatType::ConeVerified)
+    {
+        return PunchStrategy::DirectOnly;
+    }
+
+    if self_nat == NatType::AdmSeq && peer_nat == NatType::AdmSeq {
+        return PunchStrategy::MainScanImmediate {
+            scan_targets: build_seq_scan_targets(candidates, targets, socket_is_ipv6, 64, 3),
+        };
+    }
+
+    if self_nat.is_cone() && peer_nat.is_symmetric_seq() {
+        return PunchStrategy::MainScanImmediate {
+            scan_targets: build_seq_scan_targets(candidates, targets, socket_is_ipv6, 64, 3),
+        };
+    }
+
+    if self_nat.is_symmetric_seq() && peer_nat.is_cone() {
+        return PunchStrategy::AuxPersistent {
+            aux_count: AUX_SEQ_TO_CONE_COUNT,
+            aux_targets: targets.to_vec(),
+            scan_targets: Vec::new(),
+        };
+    }
+
+    if self_nat == NatType::ApdmSeq && peer_nat == NatType::ApdmSeq {
+        let abs_delta = candidates
+            .peer_nat_port_delta
+            .map(i32::from)
+            .map(i32::abs)
+            .unwrap_or(0);
+        if abs_delta == 1 {
+            let aux_targets = build_directed_rendezvous_targets(candidates, 24, 1, socket_is_ipv6);
+            if !aux_targets.is_empty() {
+                return PunchStrategy::DirectedRendezvous {
+                    aux_count: AUX_APDM_SEQ_DELTA1_COUNT,
+                    aux_targets,
+                };
+            }
+        } else if (2..=4).contains(&abs_delta) {
+            let aux_targets =
+                build_directed_rendezvous_targets(candidates, 24, abs_delta, socket_is_ipv6);
+            if !aux_targets.is_empty() {
+                return PunchStrategy::DirectedRendezvous {
+                    aux_count: AUX_APDM_SEQ_DELTA2_4_COUNT,
+                    aux_targets,
+                };
+            }
+        }
+        return PunchStrategy::AuxPersistent {
+            aux_count: AUX_SEQ_TO_CONE_COUNT,
+            aux_targets: targets.to_vec(),
+            scan_targets: build_seq_scan_targets(candidates, targets, socket_is_ipv6, 64, 3),
+        };
+    }
+
+    if self_nat.is_symmetric_random() && peer_nat.is_cone() {
+        return PunchStrategy::TwoWaveBirthdayAux {
+            aux_count: MAX_AUX_SOCKETS_HARD_CAP,
+        };
+    }
+
+    if self_nat.is_cone() && peer_nat.is_symmetric_random() {
+        let all_random = build_random_scan_targets(
+            candidates,
+            targets,
+            socket_is_ipv6,
+            CONE_SCAN_BUDGET_PER_WAVE * 2,
+        );
+        let split = all_random.len().min(CONE_SCAN_BUDGET_PER_WAVE);
+        let wave1_targets = all_random[..split].to_vec();
+        let wave2_targets = if all_random.len() > split {
+            all_random[split..].to_vec()
+        } else {
+            wave1_targets.clone()
+        };
+        return PunchStrategy::TwoWaveConeScan {
+            wave1_targets,
+            wave2_targets,
+        };
+    }
+
+    if self_nat.is_cone() && peer_nat.is_cone() {
+        let narrow_targets = build_narrow_cone_targets(candidates, targets, socket_is_ipv6, 32);
+        let wide_targets = build_random_scan_targets(
+            candidates,
+            targets,
+            socket_is_ipv6,
+            CONE_SCAN_BUDGET_PER_WAVE,
+        );
+        return PunchStrategy::ConeUnverifiedProgressive {
+            role,
+            self_verified: self_nat == NatType::ConeVerified,
+            peer_verified: peer_nat == NatType::ConeVerified,
+            narrow_targets,
+            wide_targets,
+        };
+    }
+
+    if self_nat.is_symmetric_seq() && peer_nat.is_symmetric_seq() {
+        return PunchStrategy::AuxPersistent {
+            aux_count: AUX_SEQ_TO_CONE_COUNT,
+            aux_targets: targets.to_vec(),
+            scan_targets: build_seq_scan_targets(candidates, targets, socket_is_ipv6, 64, 3),
+        };
+    }
+
+    if self_nat.is_symmetric_random() && peer_nat.is_symmetric_seq() {
+        return PunchStrategy::TwoWaveBirthdayAux {
+            aux_count: MAX_AUX_SOCKETS_HARD_CAP,
+        };
+    }
+
+    if self_nat.is_symmetric_seq() && peer_nat.is_symmetric_random() {
+        let all_random = build_random_scan_targets(
+            candidates,
+            targets,
+            socket_is_ipv6,
+            CONE_SCAN_BUDGET_PER_WAVE * 2,
+        );
+        let split = all_random.len().min(CONE_SCAN_BUDGET_PER_WAVE);
+        let wave1_targets = all_random[..split].to_vec();
+        let wave2_targets = if all_random.len() > split {
+            all_random[split..].to_vec()
+        } else {
+            wave1_targets.clone()
+        };
+        return PunchStrategy::TwoWaveConeScan {
+            wave1_targets,
+            wave2_targets,
+        };
+    }
+
+    let want_aux = should_use_aux_sockets(self_nat, peer_nat);
+    let aux_count = if self_nat.is_symmetric_random() {
+        MAX_AUX_SOCKETS_HARD_CAP
+    } else if want_aux {
+        AUX_SEQ_TO_CONE_COUNT
+    } else {
+        0
+    };
+    PunchStrategy::LegacyPhase2 {
+        want_aux,
+        aux_count,
+        scan_targets: build_predicted_targets(candidates, targets, socket_is_ipv6),
+    }
+}
+
 fn spawn_aux_punch_sockets(
     count: usize,
     socket_is_ipv6: bool,
     has_ipv4: bool,
+    role: P2pRole,
+    session_id: &str,
+    punch_secret: Option<&str>,
+    cancel: &AtomicBool,
 ) -> Vec<AuxPunchSocket> {
-    let mut aux = Vec::with_capacity(count);
-    for _ in 0..count {
+    let capped = count.min(MAX_AUX_SOCKETS_HARD_CAP);
+    let mut aux = Vec::with_capacity(capped);
+    for _ in 0..capped {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
         match bind_punch_socket(None, socket_is_ipv6, has_ipv4) {
             Ok((socket, _)) => aux.push(AuxPunchSocket {
                 socket,
                 confirmed_peer: None,
+                peer_sender_nonce: None,
+                auth: PunchAuthMode::new(role, session_id, punch_secret),
             }),
+            // 遇到 EMFILE / ENFILE / 系统端口或绑定上限立即停止扩张并保留已绑定 socket 安全探测，绝不 panic。
             Err(_) => break,
         }
     }
     aux
+}
+
+fn wait_start_after_delay(
+    start_after_ms: Option<u16>,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let delay_ms = start_after_ms.unwrap_or(0).min(MAX_START_AFTER_MS);
+    if delay_ms == 0 {
+        return Ok(());
+    }
+    let target = Instant::now() + Duration::from_millis(u64::from(delay_ms));
+    let wait_until = target.min(deadline);
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("P2P 打洞已取消".to_string());
+        }
+        let now = Instant::now();
+        if now >= wait_until {
+            return Ok(());
+        }
+        thread::sleep(POLL_STEP.min(wait_until - now));
+    }
+}
+
+fn send_paced_scan_batch(
+    socket: &UdpSocket,
+    scan_targets: &[SocketAddr],
+    cursor: &mut usize,
+    probe_bytes: &[u8],
+    max_batch: usize,
+) {
+    if scan_targets.is_empty() || max_batch == 0 {
+        return;
+    }
+    let batch = max_batch.min(scan_targets.len());
+    for _ in 0..batch {
+        *cursor %= scan_targets.len();
+        let addr = scan_targets[*cursor];
+        *cursor = (*cursor + 1) % scan_targets.len();
+        let _ = socket.send_to(probe_bytes, addr);
+    }
 }
 
 /// 执行双向 UDP 打洞，成功后返回已打通的非阻塞 `UdpSocket`、实测对端地址及打洞耗时。
@@ -663,12 +1428,23 @@ fn punch_udp_pair_with_lease(
         return Err("没有可用的对端 UDP 候选地址".to_string());
     }
 
-    if candidates.self_nat_type == NatType::SymmetricRandom
-        && candidates.peer_nat_type == NatType::SymmetricRandom
-        && !has_global_v6_or_lan_target(&all_targets)
+    let has_v6_or_lan = has_global_v6_or_explicit_lan(candidates, &all_targets);
+    if (candidates.self_nat_type == NatType::UdpBlocked
+        || candidates.peer_nat_type == NatType::UdpBlocked)
+        && !has_v6_or_lan
+    {
+        return Err("UDP 探测受阻且无可用 IPv6/LAN 候选，跳过 UDP 打洞直接回退中继".to_string());
+    }
+    if candidates.self_nat_type.is_symmetric_random()
+        && candidates.peer_nat_type.is_symmetric_random()
+        && !has_v6_or_lan
     {
         return Err("双端均为随机对称 NAT，跳过 UDP 打洞直接回退中继".to_string());
     }
+
+    let start = Instant::now();
+    let deadline = start + timeout;
+    wait_start_after_delay(candidates.start_after_ms, deadline, cancel)?;
 
     let PunchSetup {
         socket,
@@ -678,44 +1454,128 @@ fn punch_udp_pair_with_lease(
     } = prepare_punch_socket_and_targets(candidates, &all_targets)?;
 
     let has_ipv4 = all_targets.iter().any(SocketAddr::is_ipv4);
-    let want_aux_sockets =
-        should_use_aux_sockets(candidates.self_nat_type, candidates.peer_nat_type);
-    let mut aux_spawned = false;
-    let mut aux_sockets: Vec<AuxPunchSocket> = Vec::new();
-    let mut aux_cursor = 0usize;
-    let predicted_targets = build_predicted_targets(candidates, &targets, socket_is_ipv6);
-    let mut pred_cursor = 0usize;
-
-    let target_canons: HashSet<SocketAddr> = targets
+    let strategy = select_punch_strategy(role, candidates, &targets, &all_targets, socket_is_ipv6);
+    let mut target_canons: HashSet<SocketAddr> = targets
         .iter()
         .copied()
         .map(canonicalize_socket_addr)
         .collect();
-    let session_hash = derive_session_hash(&candidates.session_id);
     let expected_role = role.opposite();
-
-    let mut nonce = [0u8; 6];
-    OsRng.fill_bytes(&mut nonce);
-
-    let probe_pkt = encode_punch_packet(&PunchPacket {
-        version: PUNCH_VERSION,
+    let mut auth = PunchAuthMode::new(
         role,
-        ack: false,
-        session_hash,
-        nonce,
-    });
-    let ack_pkt = encode_punch_packet(&PunchPacket {
-        version: PUNCH_VERSION,
-        role,
-        ack: true,
-        session_hash,
-        nonce,
-    });
+        &candidates.session_id,
+        candidates.punch_secret.as_deref(),
+    );
 
-    let start = Instant::now();
-    let deadline = start + timeout;
+    let mut aux_sockets: Vec<AuxPunchSocket> = Vec::new();
+    let mut aux_targets_override: Option<Vec<SocketAddr>> = None;
+    let mut aux_cursor = 0usize;
+    let mut scan_targets: Vec<SocketAddr> = Vec::new();
+    let mut pred_cursor = 0usize;
+
+    let punch_start = Instant::now();
+    let remaining_after_start = deadline.saturating_duration_since(punch_start);
+
+    // 根据策略初始化 t=0 资源与多波次切换时间点
+    let mut wave2_at: Option<Instant> = None;
+    let mut wave2_done = false;
+    let mut legacy_p2_done = false;
+    let mut p2a_done = false;
+    let mut p2b_r1_done = false;
+    let mut p2b_r2_done = false;
+
+    match &strategy {
+        PunchStrategy::DirectOnly => {}
+        PunchStrategy::MainScanImmediate { scan_targets: s } => {
+            scan_targets = s.clone();
+        }
+        PunchStrategy::AuxPersistent {
+            aux_count,
+            aux_targets,
+            scan_targets: s,
+        } => {
+            aux_sockets = spawn_aux_punch_sockets(
+                *aux_count,
+                socket_is_ipv6,
+                has_ipv4,
+                role,
+                &candidates.session_id,
+                candidates.punch_secret.as_deref(),
+                cancel,
+            );
+            for &t in aux_targets {
+                target_canons.insert(canonicalize_socket_addr(t));
+            }
+            aux_targets_override = Some(aux_targets.clone());
+            scan_targets = s.clone();
+        }
+        PunchStrategy::DirectedRendezvous {
+            aux_count,
+            aux_targets,
+        } => {
+            aux_sockets = spawn_aux_punch_sockets(
+                *aux_count,
+                socket_is_ipv6,
+                has_ipv4,
+                role,
+                &candidates.session_id,
+                candidates.punch_secret.as_deref(),
+                cancel,
+            );
+            for &t in aux_targets {
+                target_canons.insert(canonicalize_socket_addr(t));
+            }
+            aux_targets_override = Some(aux_targets.clone());
+        }
+        PunchStrategy::TwoWaveBirthdayAux { aux_count } => {
+            aux_sockets = spawn_aux_punch_sockets(
+                *aux_count,
+                socket_is_ipv6,
+                has_ipv4,
+                role,
+                &candidates.session_id,
+                candidates.punch_secret.as_deref(),
+                cancel,
+            );
+            if remaining_after_start >= Duration::from_millis(1_000) {
+                wave2_at = Some(punch_start + remaining_after_start / 2);
+            }
+        }
+        PunchStrategy::TwoWaveConeScan { wave1_targets, .. } => {
+            scan_targets = wave1_targets.clone();
+            if remaining_after_start >= Duration::from_millis(1_000) {
+                wave2_at = Some(punch_start + remaining_after_start / 2);
+            }
+        }
+        PunchStrategy::ConeUnverifiedProgressive { .. } | PunchStrategy::LegacyPhase2 { .. } => {}
+    }
+
+    let p2b_start_at = punch_start + PHASE2A_END;
+    let p2b_swap_at = if timeout >= PHASE2B_MIN_TOTAL_TIMEOUT && deadline > p2b_start_at {
+        Some(p2b_start_at + deadline.saturating_duration_since(p2b_start_at) / 2)
+    } else {
+        None
+    };
+
+    let has_global_v6_targets = socket_is_ipv6
+        && targets
+            .iter()
+            .any(|t| matches!(t, SocketAddr::V6(v6) if is_global_unicast_ipv6(*v6.ip())));
+    let has_v4_or_lan_targets = targets
+        .iter()
+        .any(|t| !matches!(t, SocketAddr::V6(v6) if is_global_unicast_ipv6(*v6.ip())));
+    let mut he_v4_release_at: Option<Instant> = if has_global_v6_targets
+        && has_v4_or_lan_targets
+        && remaining_after_start >= Duration::from_millis(150)
+    {
+        Some(punch_start + HAPPY_EYEBALLS_V6_HEAD_START)
+    } else {
+        None
+    };
+
     let mut last_send: Option<Instant> = None;
     let mut confirmed_peer: Option<SocketAddr> = None;
+    let mut peer_sender_nonce: Option<[u8; 8]> = None;
     let mut recv_buf = [0u8; 2048];
 
     loop {
@@ -723,41 +1583,185 @@ fn punch_udp_pair_with_lease(
             return Err("P2P 打洞已取消".to_string());
         }
 
+        let now = Instant::now();
+        if let Some(release_at) = he_v4_release_at {
+            if now >= release_at {
+                he_v4_release_at = None;
+                last_send = None;
+            }
+        }
+        let any_aux_confirmed = aux_sockets.iter().any(|a| a.confirmed_peer.is_some());
+
+        // 处理分阶段/多波次状态迁移（仅在未确认对端前切换/滚动释放）
+        if confirmed_peer.is_none() && !any_aux_confirmed {
+            match &strategy {
+                PunchStrategy::TwoWaveBirthdayAux { aux_count } => {
+                    if !wave2_done && wave2_at.is_some_and(|t| now >= t) {
+                        wave2_done = true;
+                        // 先彻底 drop Wave 1 全部辅助 socket 释放 FD 与 conntrack，再开 Wave 2
+                        aux_sockets.clear();
+                        aux_cursor = 0;
+                        aux_sockets = spawn_aux_punch_sockets(
+                            *aux_count,
+                            socket_is_ipv6,
+                            has_ipv4,
+                            role,
+                            &candidates.session_id,
+                            candidates.punch_secret.as_deref(),
+                            cancel,
+                        );
+                    }
+                }
+                PunchStrategy::TwoWaveConeScan { wave2_targets, .. } => {
+                    if !wave2_done && wave2_at.is_some_and(|t| now >= t) {
+                        wave2_done = true;
+                        scan_targets = wave2_targets.clone();
+                        pred_cursor = 0;
+                    }
+                }
+                PunchStrategy::ConeUnverifiedProgressive {
+                    role: self_role,
+                    self_verified,
+                    peer_verified,
+                    narrow_targets,
+                    wide_targets,
+                } => {
+                    let elapsed = now.saturating_duration_since(punch_start);
+                    if !p2a_done && elapsed >= PHASE1_DURATION {
+                        p2a_done = true;
+                        scan_targets = narrow_targets.clone();
+                        pred_cursor = 0;
+                    }
+                    if timeout >= PHASE2B_MIN_TOTAL_TIMEOUT {
+                        if !p2b_r1_done && now >= p2b_start_at {
+                            p2b_r1_done = true;
+                            let spawn_aux_r1 = if *self_verified && !*peer_verified {
+                                false
+                            } else if !*self_verified && *peer_verified {
+                                true
+                            } else {
+                                *self_role == P2pRole::Host
+                            };
+                            if spawn_aux_r1 {
+                                scan_targets.clear();
+                                aux_sockets = spawn_aux_punch_sockets(
+                                    MAX_AUX_SOCKETS_HARD_CAP,
+                                    socket_is_ipv6,
+                                    has_ipv4,
+                                    role,
+                                    &candidates.session_id,
+                                    candidates.punch_secret.as_deref(),
+                                    cancel,
+                                );
+                            } else {
+                                scan_targets = wide_targets.clone();
+                                pred_cursor = 0;
+                            }
+                        }
+                        if !p2b_r2_done && p2b_swap_at.is_some_and(|t| now >= t) {
+                            p2b_r2_done = true;
+                            aux_sockets.clear();
+                            aux_cursor = 0;
+                            if !*self_verified && !*peer_verified {
+                                // 角色互换：Round 1 为 Host 喷洒/Client 扫描，Round 2 改为 Client 喷洒/Host 扫描
+                                if *self_role == P2pRole::Client {
+                                    scan_targets.clear();
+                                    aux_sockets = spawn_aux_punch_sockets(
+                                        MAX_AUX_SOCKETS_HARD_CAP,
+                                        socket_is_ipv6,
+                                        has_ipv4,
+                                        role,
+                                        &candidates.session_id,
+                                        candidates.punch_secret.as_deref(),
+                                        cancel,
+                                    );
+                                } else {
+                                    scan_targets = wide_targets.clone();
+                                    pred_cursor = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+                PunchStrategy::LegacyPhase2 {
+                    want_aux,
+                    aux_count,
+                    scan_targets: s,
+                } if !legacy_p2_done
+                    && now.saturating_duration_since(punch_start) >= PHASE1_DURATION =>
+                {
+                    legacy_p2_done = true;
+                    scan_targets = s.clone();
+                    pred_cursor = 0;
+                    if *want_aux && *aux_count > 0 {
+                        aux_sockets = spawn_aux_punch_sockets(
+                            *aux_count,
+                            socket_is_ipv6,
+                            has_ipv4,
+                            role,
+                            &candidates.session_id,
+                            candidates.punch_secret.as_deref(),
+                            cancel,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
         if last_send.map_or(true, |t| t.elapsed() >= PROBE_INTERVAL) {
-            let in_phase2 = start.elapsed() >= PHASE1_DURATION;
+            let probe_bytes = auth.probe_bytes();
             if let Some(peer_addr) = confirmed_peer {
-                let _ = socket.send_to(&ack_pkt, peer_addr);
+                if let Some(ack_bytes) = auth.periodic_ack_bytes(peer_sender_nonce) {
+                    let _ = socket.send_to(&ack_bytes, peer_addr);
+                }
                 let peer_canon = canonicalize_socket_addr(peer_addr);
                 for &target in &targets {
                     if canonicalize_socket_addr(target) != peer_canon {
-                        let _ = socket.send_to(&probe_pkt, target);
+                        let _ = socket.send_to(probe_bytes, target);
                     }
                 }
             } else {
-                for &target in &targets {
-                    let _ = socket.send_to(&probe_pkt, target);
-                }
-                if in_phase2 && !predicted_targets.is_empty() {
-                    let batch = MAX_PREDICTED_PORTS_PER_TICK.min(predicted_targets.len());
-                    for _ in 0..batch {
-                        let pred_addr = predicted_targets[pred_cursor];
-                        pred_cursor = (pred_cursor + 1) % predicted_targets.len();
-                        let _ = socket.send_to(&probe_pkt, pred_addr);
+                if he_v4_release_at.is_some() {
+                    let mut any_v6_sent_ok = false;
+                    for &target in &targets {
+                        if matches!(target, SocketAddr::V6(v6) if is_global_unicast_ipv6(*v6.ip()))
+                            && socket.send_to(probe_bytes, target).is_ok()
+                        {
+                            any_v6_sent_ok = true;
+                        }
+                    }
+                    if !any_v6_sent_ok {
+                        // 若所有全球单播 IPv6 发送立即报本地不可达，0 阻塞立即放开 IPv4/LAN 并发探测
+                        he_v4_release_at = None;
                     }
                 }
-                if want_aux_sockets && !aux_spawned && in_phase2 {
-                    aux_spawned = true;
-                    aux_sockets =
-                        spawn_aux_punch_sockets(MAX_AUX_SOCKETS, socket_is_ipv6, has_ipv4);
+                if he_v4_release_at.is_none() {
+                    for &target in &targets {
+                        let _ = socket.send_to(probe_bytes, target);
+                    }
+                    let scan_budget = MAX_PREDICTED_PORTS_PER_TICK
+                        .saturating_sub(targets.len())
+                        .max(1);
+                    send_paced_scan_batch(
+                        &socket,
+                        &scan_targets,
+                        &mut pred_cursor,
+                        probe_bytes,
+                        scan_budget,
+                    );
                 }
             }
 
             for aux in &aux_sockets {
                 if let Some(peer_addr) = aux.confirmed_peer {
-                    let _ = aux.socket.send_to(&ack_pkt, peer_addr);
+                    if let Some(ack_bytes) = aux.auth.periodic_ack_bytes(aux.peer_sender_nonce) {
+                        let _ = aux.socket.send_to(&ack_bytes, peer_addr);
+                    }
                 }
             }
             if confirmed_peer.is_none() && !aux_sockets.is_empty() {
+                let aux_dests = aux_targets_override.as_deref().unwrap_or(&targets);
                 let len = aux_sockets.len();
                 aux_cursor %= len;
                 let mut probed = 0usize;
@@ -768,8 +1772,9 @@ fn punch_udp_pair_with_lease(
                     let aux = &aux_sockets[aux_cursor];
                     aux_cursor = (aux_cursor + 1) % len;
                     if aux.confirmed_peer.is_none() {
-                        for &target in &targets {
-                            let _ = aux.socket.send_to(&probe_pkt, target);
+                        let aux_probe = aux.auth.probe_bytes();
+                        for &target in aux_dests {
+                            let _ = aux.socket.send_to(aux_probe, target);
                         }
                         probed += 1;
                     }
@@ -782,12 +1787,12 @@ fn punch_udp_pair_with_lease(
         let drain_outcome = drain_punch_rx(
             &mut recv_buf,
             socket_is_ipv6,
-            session_hash,
+            &mut auth,
             expected_role,
             role,
             &target_canons,
-            &ack_pkt,
             &mut confirmed_peer,
+            &mut peer_sender_nonce,
             &mut socket_ref,
         )?;
         if let DrainOutcome::Ready(peer_addr) = drain_outcome {
@@ -809,12 +1814,12 @@ fn punch_udp_pair_with_lease(
                 drain_punch_rx(
                     &mut recv_buf,
                     socket_is_ipv6,
-                    session_hash,
+                    &mut aux.auth,
                     expected_role,
                     role,
                     &target_canons,
-                    &ack_pkt,
                     &mut aux.confirmed_peer,
+                    &mut aux.peer_sender_nonce,
                     &mut aux_ref,
                 )
             };
@@ -844,12 +1849,12 @@ fn punch_udp_pair_with_lease(
             });
         }
 
-        let now = Instant::now();
-        if now >= deadline {
+        let now_after = Instant::now();
+        if now_after >= deadline {
             return Err(format!("P2P UDP 打洞超时（{timeout:?}）"));
         }
 
-        let sleep_budget = POLL_STEP.min(deadline - now);
+        let sleep_budget = POLL_STEP.min(deadline - now_after);
         thread::sleep(sleep_budget);
     }
 }
@@ -913,28 +1918,92 @@ fn classify_punch_datagram(
     n: usize,
     from_addr: SocketAddr,
     already_consumed: bool,
-    session_hash: [u8; 16],
+    auth: &mut PunchAuthMode,
     expected_role: P2pRole,
     role: P2pRole,
     target_canons: &HashSet<SocketAddr>,
-    ack_pkt: &[u8],
     confirmed_peer: &mut Option<SocketAddr>,
+    peer_sender_nonce: &mut Option<[u8; 8]>,
     ops: &mut dyn PunchSocketOps,
 ) -> Option<SocketAddr> {
-    if let Some(pkt) = decode_punch_packet(&recv_buf[..n]) {
+    if n >= PUNCH_MAGIC.len() && &recv_buf[..PUNCH_MAGIC.len()] == PUNCH_MAGIC {
         if !already_consumed {
-            // 合法 RCP2 打洞包：先从内核接收队列消费掉再处理。
+            // 任意 RCP2 前缀报文先从内核接收队列消费掉：合法包按规则处理，非法/伪造包静默丢弃且零回包。
             let _ = ops.recv_from(recv_buf);
         }
-        return handle_decoded_punch_packet(
-            pkt,
-            from_addr,
-            session_hash,
-            expected_role,
-            ack_pkt,
-            confirmed_peer,
-            ops,
-        );
+        return match auth {
+            PunchAuthMode::V1 {
+                session_hash,
+                ack_pkt,
+                ..
+            } => {
+                let pkt = decode_punch_packet(&recv_buf[..n])?;
+                handle_decoded_punch_packet(
+                    pkt,
+                    from_addr,
+                    *session_hash,
+                    expected_role,
+                    ack_pkt,
+                    confirmed_peer,
+                    ops,
+                )
+            }
+            PunchAuthMode::V2 {
+                role: self_role,
+                secret,
+                session_hash,
+                local_sender_nonce,
+                rate_limiter,
+                ..
+            } => {
+                let pkt = decode_and_verify_punch_packet_v2(&recv_buf[..n], secret)?;
+                if pkt.session_hash != *session_hash || pkt.role != expected_role {
+                    return None;
+                }
+                let is_ack = (pkt.flags & PUNCH_V2_FLAG_ACK) != 0;
+                if is_ack {
+                    if pkt.echo_nonce != *local_sender_nonce {
+                        return None;
+                    }
+                    *peer_sender_nonce = Some(pkt.sender_nonce);
+                    if confirmed_peer.is_none() {
+                        *confirmed_peer = Some(from_addr);
+                    }
+                    if rate_limiter.allow_reply(from_addr.ip(), Instant::now()) {
+                        let reply = encode_punch_packet_v2(
+                            *self_role,
+                            true,
+                            *session_hash,
+                            *local_sender_nonce,
+                            pkt.sender_nonce,
+                            secret,
+                        );
+                        ops.send_to(&reply, from_addr);
+                    }
+                    Some(from_addr)
+                } else {
+                    if pkt.echo_nonce != [0u8; 8] {
+                        return None;
+                    }
+                    *peer_sender_nonce = Some(pkt.sender_nonce);
+                    if confirmed_peer.is_none() {
+                        *confirmed_peer = Some(from_addr);
+                    }
+                    if rate_limiter.allow_reply(from_addr.ip(), Instant::now()) {
+                        let reply = encode_punch_packet_v2(
+                            *self_role,
+                            true,
+                            *session_hash,
+                            *local_sender_nonce,
+                            pkt.sender_nonce,
+                            secret,
+                        );
+                        ops.send_to(&reply, from_addr);
+                    }
+                    None
+                }
+            }
+        };
     }
 
     let from_canon = canonicalize_socket_addr(from_addr);
@@ -956,12 +2025,12 @@ fn classify_punch_datagram(
 fn drain_punch_rx(
     recv_buf: &mut [u8],
     socket_is_ipv6: bool,
-    session_hash: [u8; 16],
+    auth: &mut PunchAuthMode,
     expected_role: P2pRole,
     role: P2pRole,
     target_canons: &HashSet<SocketAddr>,
-    ack_pkt: &[u8],
     confirmed_peer: &mut Option<SocketAddr>,
+    peer_sender_nonce: &mut Option<[u8; 8]>,
     ops: &mut dyn PunchSocketOps,
 ) -> Result<DrainOutcome, String> {
     let mut consecutive_transient_errors = 0usize;
@@ -975,12 +2044,12 @@ fn drain_punch_rx(
                     n,
                     from_addr,
                     false,
-                    session_hash,
+                    auth,
                     expected_role,
                     role,
                     target_canons,
-                    ack_pkt,
                     confirmed_peer,
+                    peer_sender_nonce,
                     ops,
                 ) {
                     return Ok(DrainOutcome::Ready(peer));
@@ -1017,12 +2086,12 @@ fn drain_punch_rx(
                                 n,
                                 from_addr,
                                 true,
-                                session_hash,
+                                auth,
                                 expected_role,
                                 role,
                                 target_canons,
-                                ack_pkt,
                                 confirmed_peer,
+                                peer_sender_nonce,
                                 ops,
                             ) {
                                 return Ok(DrainOutcome::Ready(peer));
@@ -2137,15 +3206,21 @@ mod tests {
             sent: 0,
             peeks: 0,
         };
+        let mut auth1 = PunchAuthMode::V1 {
+            session_hash,
+            probe_pkt: local_ack,
+            ack_pkt: local_ack,
+        };
+        let mut peer_nonce1 = None;
         let res = drain_punch_rx(
             &mut recv_buf,
             false,
-            session_hash,
+            &mut auth1,
             P2pRole::Client,
             P2pRole::Host,
             &target_canons,
-            &local_ack,
             &mut confirmed_peer,
+            &mut peer_nonce1,
             &mut fake1,
         )
         .expect("transient errors followed by ACK must succeed");
@@ -2154,6 +3229,7 @@ mod tests {
 
         // 2) 连续超过 MAX_CONSECUTIVE_TRANSIENT_ERRORS (64) 次瞬态错误时必须主动 break，避免饿死超时/取消
         let mut confirmed_peer2 = None;
+        let mut peer_nonce2 = None;
         let mut fake2 = FakePunchSocket {
             peek_results: (0..100)
                 .map(|_| Err(io::Error::from(ErrorKind::Interrupted)))
@@ -2165,12 +3241,12 @@ mod tests {
         let res2 = drain_punch_rx(
             &mut recv_buf,
             false,
-            session_hash,
+            &mut auth1,
             P2pRole::Client,
             P2pRole::Host,
             &target_canons,
-            &local_ack,
             &mut confirmed_peer2,
+            &mut peer_nonce2,
             &mut fake2,
         )
         .expect("capped transient errors must break cleanly");
@@ -2179,6 +3255,7 @@ mod tests {
 
         // 3) 非瞬态硬错误立即向上返回 Err
         let mut confirmed_peer3 = None;
+        let mut peer_nonce3 = None;
         let mut fake3 = FakePunchSocket {
             peek_results: std::collections::VecDeque::from([Err(io::Error::from(
                 ErrorKind::InvalidInput,
@@ -2190,12 +3267,12 @@ mod tests {
         let err = drain_punch_rx(
             &mut recv_buf,
             false,
-            session_hash,
+            &mut auth1,
             P2pRole::Client,
             P2pRole::Host,
             &target_canons,
-            &local_ack,
             &mut confirmed_peer3,
+            &mut peer_nonce3,
             &mut fake3,
         )
         .unwrap_err();
@@ -2203,6 +3280,7 @@ mod tests {
 
         // 4) ConnectionReset 后由 recv_from 返回来自已知对端的非 RCP2（如 QUIC Initial）报文也必须返回 Ready
         let mut confirmed_peer4 = None;
+        let mut peer_nonce4 = None;
         let quic_initial_like = b"\xc0\x00\x00\x00\x01QUIC-INITIAL".to_vec();
         let mut fake4 = FakePunchSocket {
             peek_results: std::collections::VecDeque::from([Err(io::Error::from(
@@ -2215,12 +3293,12 @@ mod tests {
         let res4 = drain_punch_rx(
             &mut recv_buf,
             false,
-            session_hash,
+            &mut auth1,
             P2pRole::Client,
             P2pRole::Host,
             &target_canons,
-            &local_ack,
             &mut confirmed_peer4,
+            &mut peer_nonce4,
             &mut fake4,
         )
         .expect(
@@ -2230,6 +3308,7 @@ mod tests {
 
         // 5) ConnectionReset 清错路径中若 recv_from 返回非瞬态硬错误，不得吞错而应立即向上返回 Err
         let mut confirmed_peer5 = None;
+        let mut peer_nonce5 = None;
         let mut fake5 = FakePunchSocket {
             peek_results: std::collections::VecDeque::from([Err(io::Error::from(
                 ErrorKind::ConnectionReset,
@@ -2243,12 +3322,12 @@ mod tests {
         let err5 = drain_punch_rx(
             &mut recv_buf,
             false,
-            session_hash,
+            &mut auth1,
             P2pRole::Client,
             P2pRole::Host,
             &target_canons,
-            &local_ack,
             &mut confirmed_peer5,
+            &mut peer_nonce5,
             &mut fake5,
         )
         .unwrap_err();
@@ -2300,10 +3379,11 @@ mod tests {
             peer_public_addrs: vec!["198.51.100.20:50001".to_string()],
             peer_lan_addrs: Vec::new(),
             local_udp_port: None,
-            self_nat_type: NatType::SymmetricRandom,
+            self_nat_type: NatType::ApdmRandom,
             self_nat_port_delta: None,
-            peer_nat_type: NatType::SymmetricRandom,
+            peer_nat_type: NatType::ApdmRandom,
             peer_nat_port_delta: None,
+            ..Default::default()
         };
 
         let t0 = Instant::now();
@@ -2332,8 +3412,8 @@ mod tests {
             peer_public_addr: Some("203.0.113.10:50000".to_string()),
             peer_lan_addrs: vec![format!("127.0.0.1:{client_port}")],
             local_udp_port: Some(host_port),
-            self_nat_type: NatType::SymmetricRandom,
-            peer_nat_type: NatType::SymmetricRandom,
+            self_nat_type: NatType::ApdmRandom,
+            peer_nat_type: NatType::ApdmRandom,
             ..Default::default()
         };
         let client_cand = P2pCandidates {
@@ -2341,8 +3421,8 @@ mod tests {
             peer_public_addr: Some("198.51.100.20:50001".to_string()),
             peer_lan_addrs: vec![format!("127.0.0.1:{host_port}")],
             local_udp_port: Some(client_port),
-            self_nat_type: NatType::SymmetricRandom,
-            peer_nat_type: NatType::SymmetricRandom,
+            self_nat_type: NatType::ApdmRandom,
+            peer_nat_type: NatType::ApdmRandom,
             ..Default::default()
         };
         let cancel_h = Arc::new(AtomicBool::new(false));
@@ -2399,8 +3479,8 @@ mod tests {
             session_id: session_id.to_string(),
             peer_public_addr: Some(format!("127.0.0.1:{sym_stun_port}")),
             local_udp_port: Some(host_port),
-            self_nat_type: NatType::Cone,
-            peer_nat_type: NatType::SymmetricSeq,
+            self_nat_type: NatType::ConeVerified,
+            peer_nat_type: NatType::ApdmSeq,
             peer_nat_port_delta: Some(3),
             ..Default::default()
         };
@@ -2412,8 +3492,8 @@ mod tests {
 
         assert_eq!(punched_peer.port(), sym_real_port);
         assert!(
-            elapsed >= Duration::from_millis(300) && elapsed < Duration::from_millis(1_500),
-            "expected Phase 2 hit shortly after 350ms, took {elapsed:?}"
+            elapsed < Duration::from_millis(1_500),
+            "expected immediate t=0 seq scan hit, took {elapsed:?}"
         );
     }
 
@@ -2502,8 +3582,8 @@ mod tests {
             session_id: session_id.to_string(),
             peer_public_addr: Some(format!("127.0.0.1:{host_port}")),
             local_udp_port: Some(client_primary_port),
-            self_nat_type: NatType::SymmetricRandom,
-            peer_nat_type: NatType::Cone,
+            self_nat_type: NatType::ApdmRandom,
+            peer_nat_type: NatType::ConeUnverified,
             ..Default::default()
         };
         let cancel = AtomicBool::new(false);
@@ -2520,8 +3600,8 @@ mod tests {
         assert_eq!(client_sock.local_addr().unwrap().port(), winning_aux_port);
         assert_ne!(winning_aux_port, client_primary_port);
         assert!(
-            elapsed >= Duration::from_millis(300) && elapsed < Duration::from_millis(1_500),
-            "birthday aux punch must delay to Phase 2 (>=350ms) and finish promptly, took {elapsed:?}"
+            elapsed < Duration::from_millis(1_500),
+            "birthday aux punch must start at t=0 (Wave 1) and finish promptly, took {elapsed:?}"
         );
 
         // 主 socket 及其端口租约必须在 aux 胜出后立即释放
@@ -2579,8 +3659,8 @@ mod tests {
             session_id: "phase2-stray-non-rcp2".to_string(),
             peer_public_addr: Some(format!("127.0.0.1:{stun_port}")),
             local_udp_port: Some(host_port),
-            self_nat_type: NatType::Cone,
-            peer_nat_type: NatType::SymmetricSeq,
+            self_nat_type: NatType::ConeVerified,
+            peer_nat_type: NatType::ApdmSeq,
             peer_nat_port_delta: Some(3),
             ..Default::default()
         };
@@ -2602,54 +3682,64 @@ mod tests {
     #[test]
     fn should_use_aux_sockets_only_on_symmetric_to_cone_or_unknown() {
         assert!(!should_use_aux_sockets(
-            NatType::Cone,
-            NatType::SymmetricRandom
+            NatType::ConeVerified,
+            NatType::ApdmRandom
         ));
         assert!(!should_use_aux_sockets(
-            NatType::Cone,
-            NatType::SymmetricSeq
-        ));
-        assert!(!should_use_aux_sockets(NatType::Cone, NatType::Cone));
-        assert!(!should_use_aux_sockets(NatType::Cone, NatType::Unknown));
-        assert!(!should_use_aux_sockets(NatType::Unknown, NatType::Cone));
-        assert!(!should_use_aux_sockets(
-            NatType::SymmetricRandom,
-            NatType::SymmetricRandom
+            NatType::ConeUnverified,
+            NatType::ApdmSeq
         ));
         assert!(!should_use_aux_sockets(
-            NatType::SymmetricSeq,
-            NatType::SymmetricSeq
+            NatType::ConeVerified,
+            NatType::ConeVerified
         ));
+        assert!(!should_use_aux_sockets(
+            NatType::ConeUnverified,
+            NatType::Unknown
+        ));
+        assert!(!should_use_aux_sockets(
+            NatType::Unknown,
+            NatType::ConeVerified
+        ));
+        assert!(!should_use_aux_sockets(
+            NatType::ApdmRandom,
+            NatType::ApdmRandom
+        ));
+        assert!(!should_use_aux_sockets(NatType::AdmSeq, NatType::ApdmSeq));
 
         assert!(should_use_aux_sockets(
-            NatType::SymmetricRandom,
-            NatType::Cone
+            NatType::ApdmRandom,
+            NatType::ConeVerified
         ));
+        assert!(should_use_aux_sockets(NatType::AdmRandom, NatType::Unknown));
         assert!(should_use_aux_sockets(
-            NatType::SymmetricRandom,
-            NatType::Unknown
+            NatType::ApdmSeq,
+            NatType::ConeUnverified
         ));
-        assert!(should_use_aux_sockets(NatType::SymmetricSeq, NatType::Cone));
-        assert!(should_use_aux_sockets(
-            NatType::SymmetricSeq,
-            NatType::Unknown
-        ));
+        assert!(should_use_aux_sockets(NatType::AdmSeq, NatType::Unknown));
     }
 
     #[test]
-    fn has_global_v6_or_lan_target_rejects_link_local_and_ula_v6() {
-        assert!(!has_global_v6_or_lan_target(&[
-            "[fe80::1]:50000".parse().unwrap(),
-            "[fc00::1]:50000".parse().unwrap(),
-            "[fd12:3456::1]:50000".parse().unwrap(),
-            "198.51.100.10:50000".parse().unwrap(),
-        ]));
-        assert!(has_global_v6_or_lan_target(&["[2001:db8::1]:50000"
-            .parse()
-            .unwrap(),]));
-        assert!(has_global_v6_or_lan_target(&["192.168.1.20:50000"
-            .parse()
-            .unwrap(),]));
+    fn has_global_v6_or_explicit_lan_rejects_link_local_and_ula_v6() {
+        let empty = P2pCandidates::default();
+        assert!(!has_global_v6_or_explicit_lan(
+            &empty,
+            &[
+                "[fe80::1]:50000".parse().unwrap(),
+                "[fc00::1]:50000".parse().unwrap(),
+                "[fd12:3456::1]:50000".parse().unwrap(),
+                "198.51.100.10:50000".parse().unwrap(),
+            ]
+        ));
+        assert!(has_global_v6_or_explicit_lan(
+            &empty,
+            &["[2001:db8::1]:50000".parse().unwrap()]
+        ));
+        let with_lan = P2pCandidates {
+            peer_lan_addrs: vec!["192.168.1.20:50000".to_string()],
+            ..Default::default()
+        };
+        assert!(has_global_v6_or_explicit_lan(&with_lan, &[]));
     }
 
     #[test]
@@ -2688,6 +3778,939 @@ mod tests {
         assert_eq!(
             filter_cross_site_lan_addrs(&lan, &["[240e:3b0:1::20]:60000"], &["203.0.113.9:60001"],),
             lan
+        );
+    }
+
+    #[test]
+    fn rcp2_v2_packet_encode_decode_hmac_verify_and_tamper_rejection() {
+        let secret_hex = "0123456789abcdef0123456789abcdef";
+        let secret = parse_punch_secret(Some(secret_hex)).expect("valid secret hex");
+        assert_eq!(
+            parse_punch_secret(Some("  0123456789ABCDEF0123456789ABCDEF  ")),
+            Some(secret)
+        );
+        assert!(parse_punch_secret(None).is_none());
+        assert!(parse_punch_secret(Some("")).is_none());
+        assert!(parse_punch_secret(Some("012345")).is_none());
+        assert!(parse_punch_secret(Some("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")).is_none());
+
+        let sh = derive_session_hash_v2("sess-rcp2-v2");
+        assert_eq!(sh, derive_session_hash_v2("sess-rcp2-v2"));
+        assert_ne!(sh, derive_session_hash_v2("sess-rcp2-v2-other"));
+
+        let sender_nonce = [1, 2, 3, 4, 5, 6, 7, 8];
+        let echo_nonce = [9, 10, 11, 12, 13, 14, 15, 16];
+        let wire =
+            encode_punch_packet_v2(P2pRole::Client, true, sh, sender_nonce, echo_nonce, &secret);
+        assert_eq!(wire.len(), PUNCH_V2_PACKET_LEN);
+        assert_eq!(&wire[0..4], PUNCH_MAGIC);
+        assert_eq!(wire[4], PUNCH_VERSION_V2);
+        assert_eq!(wire[5], P2pRole::Client as u8);
+        assert_eq!(wire[6], PUNCH_V2_FLAG_ACK);
+        assert_eq!(wire[7], 0);
+        assert_eq!(&wire[8..16], &sh);
+        assert_eq!(&wire[16..24], &sender_nonce);
+        assert_eq!(&wire[24..32], &echo_nonce);
+
+        let decoded = decode_and_verify_punch_packet_v2(&wire, &secret).expect("valid v2");
+        assert_eq!(decoded.version, PUNCH_VERSION_V2);
+        assert_eq!(decoded.role, P2pRole::Client);
+        assert_eq!(decoded.flags, PUNCH_V2_FLAG_ACK);
+        assert_eq!(decoded.reserved, 0);
+        assert_eq!(decoded.session_hash, sh);
+        assert_eq!(decoded.sender_nonce, sender_nonce);
+        assert_eq!(decoded.echo_nonce, echo_nonce);
+
+        // 错误密钥 / 篡改载荷 / 篡改 MAC / 非法字段均拒绝
+        let wrong_secret = [0xAAu8; 16];
+        assert!(decode_and_verify_punch_packet_v2(&wire, &wrong_secret).is_none());
+
+        let mut tampered_body = wire;
+        tampered_body[16] ^= 0x01;
+        assert!(decode_and_verify_punch_packet_v2(&tampered_body, &secret).is_none());
+
+        let mut tampered_mac = wire;
+        tampered_mac[47] ^= 0x80;
+        assert!(decode_and_verify_punch_packet_v2(&tampered_mac, &secret).is_none());
+
+        let mut bad_reserved = wire;
+        bad_reserved[7] = 1;
+        assert!(decode_and_verify_punch_packet_v2(&bad_reserved, &secret).is_none());
+
+        let mut bad_flags = wire;
+        bad_flags[6] = 0x02;
+        assert!(decode_and_verify_punch_packet_v2(&bad_flags, &secret).is_none());
+
+        assert!(decode_and_verify_punch_packet_v2(&wire[..47], &secret).is_none());
+    }
+
+    #[test]
+    fn rcp2_v2_auth_failures_silent_drop_echo_nonce_and_1x_rate_limit() {
+        struct CaptureSocket {
+            peek_results: std::collections::VecDeque<io::Result<(Vec<u8>, SocketAddr)>>,
+            recv_results: std::collections::VecDeque<io::Result<(Vec<u8>, SocketAddr)>>,
+            sent_packets: Vec<(Vec<u8>, SocketAddr)>,
+        }
+
+        impl PunchSocketOps for CaptureSocket {
+            fn peek_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+                match self.peek_results.pop_front() {
+                    Some(Ok((pkt, addr))) => {
+                        buf[..pkt.len()].copy_from_slice(&pkt);
+                        Ok((pkt.len(), addr))
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => Err(io::Error::from(ErrorKind::WouldBlock)),
+                }
+            }
+
+            fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+                match self.recv_results.pop_front() {
+                    Some(Ok((pkt, addr))) => {
+                        buf[..pkt.len()].copy_from_slice(&pkt);
+                        Ok((pkt.len(), addr))
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => Err(io::Error::from(ErrorKind::WouldBlock)),
+                }
+            }
+
+            fn send_to(&mut self, buf: &[u8], addr: SocketAddr) {
+                self.sent_packets.push((buf.to_vec(), addr));
+            }
+        }
+
+        let secret = [0x33u8; 16];
+        let wrong_secret = [0x44u8; 16];
+        let sh = derive_session_hash_v2("sess-v2-auth");
+        let other_sh = derive_session_hash_v2("sess-v2-other");
+        let local_nonce = [0x11u8; 8];
+        let peer_nonce = [0x22u8; 8];
+        let peer_addr: SocketAddr = "198.51.100.44:50000".parse().unwrap();
+        let target_canons: HashSet<SocketAddr> = [peer_addr].into_iter().collect();
+
+        let mut auth = PunchAuthMode::V2 {
+            role: P2pRole::Host,
+            secret,
+            session_hash: sh,
+            local_sender_nonce: local_nonce,
+            probe_pkt: encode_punch_packet_v2(
+                P2pRole::Host,
+                false,
+                sh,
+                local_nonce,
+                [0u8; 8],
+                &secret,
+            ),
+            rate_limiter: AckRateLimiter::default(),
+        };
+
+        // 1) 伪造 MAC、错误 session_hash、同侧 role、错误 echo_nonce 的 Ack 均必须静默丢弃且零回包，
+        //    即使来自 target_canons 也不得误判为 QUIC Initial Ready。
+        let bad_mac = encode_punch_packet_v2(
+            P2pRole::Client,
+            false,
+            sh,
+            peer_nonce,
+            [0u8; 8],
+            &wrong_secret,
+        );
+        let bad_sh = encode_punch_packet_v2(
+            P2pRole::Client,
+            false,
+            other_sh,
+            peer_nonce,
+            [0u8; 8],
+            &secret,
+        );
+        let same_role =
+            encode_punch_packet_v2(P2pRole::Host, false, sh, peer_nonce, [0u8; 8], &secret);
+        let wrong_echo_ack =
+            encode_punch_packet_v2(P2pRole::Client, true, sh, peer_nonce, [0x99u8; 8], &secret);
+
+        let mut recv_buf = [0u8; 128];
+        let mut confirmed_peer = None;
+        let mut peer_sender_nonce = None;
+        let mut sock_bad = CaptureSocket {
+            peek_results: std::collections::VecDeque::from([
+                Ok((bad_mac.to_vec(), peer_addr)),
+                Ok((bad_sh.to_vec(), peer_addr)),
+                Ok((same_role.to_vec(), peer_addr)),
+                Ok((wrong_echo_ack.to_vec(), peer_addr)),
+            ]),
+            recv_results: std::collections::VecDeque::from([
+                Ok((bad_mac.to_vec(), peer_addr)),
+                Ok((bad_sh.to_vec(), peer_addr)),
+                Ok((same_role.to_vec(), peer_addr)),
+                Ok((wrong_echo_ack.to_vec(), peer_addr)),
+            ]),
+            sent_packets: Vec::new(),
+        };
+        let out_bad = drain_punch_rx(
+            &mut recv_buf,
+            false,
+            &mut auth,
+            P2pRole::Client,
+            P2pRole::Host,
+            &target_canons,
+            &mut confirmed_peer,
+            &mut peer_sender_nonce,
+            &mut sock_bad,
+        )
+        .unwrap();
+        assert_eq!(out_bad, DrainOutcome::Continue);
+        assert!(confirmed_peer.is_none());
+        assert!(
+            sock_bad.sent_packets.is_empty(),
+            "invalid packets must yield zero replies"
+        );
+
+        // 2) 合法 Probe 连发 5 次：第 1 次严格回复 1 个等长 48B Ack（1.0x 放大系数），
+        //    其余在限频窗口内静默限频不回包。
+        let valid_probe =
+            encode_punch_packet_v2(P2pRole::Client, false, sh, peer_nonce, [0u8; 8], &secret);
+        let mut sock_rate = CaptureSocket {
+            peek_results: (0..5)
+                .map(|_| Ok((valid_probe.to_vec(), peer_addr)))
+                .collect(),
+            recv_results: (0..5)
+                .map(|_| Ok((valid_probe.to_vec(), peer_addr)))
+                .collect(),
+            sent_packets: Vec::new(),
+        };
+        let out_probe = drain_punch_rx(
+            &mut recv_buf,
+            false,
+            &mut auth,
+            P2pRole::Client,
+            P2pRole::Host,
+            &target_canons,
+            &mut confirmed_peer,
+            &mut peer_sender_nonce,
+            &mut sock_rate,
+        )
+        .unwrap();
+        assert_eq!(out_probe, DrainOutcome::Continue);
+        assert_eq!(confirmed_peer, Some(peer_addr));
+        assert_eq!(peer_sender_nonce, Some(peer_nonce));
+        assert_eq!(
+            sock_rate.sent_packets.len(),
+            1,
+            "must enforce strict 1.0x + per-IP rate limit"
+        );
+        let (ack_wire, ack_dst) = &sock_rate.sent_packets[0];
+        assert_eq!(ack_wire.len(), PUNCH_V2_PACKET_LEN);
+        assert_eq!(*ack_dst, peer_addr);
+        let ack_decoded = decode_and_verify_punch_packet_v2(ack_wire, &secret).unwrap();
+        assert_eq!(ack_decoded.flags, PUNCH_V2_FLAG_ACK);
+        assert_eq!(ack_decoded.echo_nonce, peer_nonce);
+
+        // 3) 超过限频窗口后收到携带正确 echo_nonce == local_nonce 的 Ack -> Ready
+        thread::sleep(ACK_RATE_MIN_INTERVAL + Duration::from_millis(5));
+        let valid_ack =
+            encode_punch_packet_v2(P2pRole::Client, true, sh, peer_nonce, local_nonce, &secret);
+        let mut sock_ok = CaptureSocket {
+            peek_results: std::collections::VecDeque::from([Ok((valid_ack.to_vec(), peer_addr))]),
+            recv_results: std::collections::VecDeque::from([Ok((valid_ack.to_vec(), peer_addr))]),
+            sent_packets: Vec::new(),
+        };
+        let out_ready = drain_punch_rx(
+            &mut recv_buf,
+            false,
+            &mut auth,
+            P2pRole::Client,
+            P2pRole::Host,
+            &target_canons,
+            &mut confirmed_peer,
+            &mut peer_sender_nonce,
+            &mut sock_ok,
+        )
+        .unwrap();
+        assert_eq!(out_ready, DrainOutcome::Ready(peer_addr));
+        assert_eq!(sock_ok.sent_packets.len(), 1);
+    }
+
+    #[test]
+    fn rcp2_v2_punch_udp_pair_localhost_and_v1_fallback_on_invalid_secret() {
+        let host_port = reserve_ephemeral_udp_port();
+        let client_port = reserve_ephemeral_udp_port();
+        assert_ne!(host_port, client_port);
+
+        let secret = "0123456789abcdef0123456789abcdef".to_string();
+        let host_cand = P2pCandidates {
+            session_id: "rcp2-v2-e2e".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{client_port}")),
+            local_udp_port: Some(host_port),
+            punch_secret: Some(secret.clone()),
+            ..Default::default()
+        };
+        let client_cand = P2pCandidates {
+            session_id: "rcp2-v2-e2e".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{host_port}")),
+            local_udp_port: Some(client_port),
+            punch_secret: Some(secret),
+            ..Default::default()
+        };
+
+        let cancel_h = Arc::new(AtomicBool::new(false));
+        let cancel_c = Arc::clone(&cancel_h);
+        let h_jh = thread::spawn(move || {
+            punch_udp_pair(P2pRole::Host, &host_cand, DEFAULT_PUNCH_TIMEOUT, &cancel_h)
+        });
+        let (c_sock, c_peer, _) = punch_udp_pair(
+            P2pRole::Client,
+            &client_cand,
+            DEFAULT_PUNCH_TIMEOUT,
+            &cancel_c,
+        )
+        .expect("RCP2 v2 client punch must succeed");
+        let (h_sock, h_peer, _) = h_jh
+            .join()
+            .unwrap()
+            .expect("RCP2 v2 host punch must succeed");
+        assert_eq!(c_peer.port(), host_port);
+        assert_eq!(h_peer.port(), client_port);
+        drop(c_sock);
+        drop(h_sock);
+
+        // punch_secret 非法时平滑回退 RCP2 v1 (29B) 并成功打洞
+        let host_port2 = reserve_ephemeral_udp_port();
+        let client_port2 = reserve_ephemeral_udp_port();
+        let host_fallback = P2pCandidates {
+            session_id: "rcp2-v1-fallback".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{client_port2}")),
+            local_udp_port: Some(host_port2),
+            punch_secret: Some("invalid-not-32-hex".to_string()),
+            ..Default::default()
+        };
+        let client_fallback = P2pCandidates {
+            session_id: "rcp2-v1-fallback".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{host_port2}")),
+            local_udp_port: Some(client_port2),
+            punch_secret: None,
+            ..Default::default()
+        };
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        let cancel2_c = Arc::clone(&cancel2);
+        let h_jh2 = thread::spawn(move || {
+            punch_udp_pair(
+                P2pRole::Host,
+                &host_fallback,
+                DEFAULT_PUNCH_TIMEOUT,
+                &cancel2,
+            )
+        });
+        punch_udp_pair(
+            P2pRole::Client,
+            &client_fallback,
+            DEFAULT_PUNCH_TIMEOUT,
+            &cancel2_c,
+        )
+        .expect("invalid/missing punch_secret must smoothly fallback to v1");
+        h_jh2
+            .join()
+            .unwrap()
+            .expect("host v1 fallback must succeed");
+    }
+
+    #[test]
+    fn build_predicted_targets_prioritizes_peer_nat_port_range() {
+        let candidates = P2pCandidates {
+            session_id: "range-hint-pred".to_string(),
+            peer_public_addr: Some("198.51.100.20:50005".to_string()),
+            peer_nat_type: NatType::ApdmRandom,
+            peer_nat_port_range: Some(PortRangeHint::Custom {
+                min: 50000,
+                max: 50031,
+            }),
+            ..Default::default()
+        };
+        let predicted = build_predicted_targets(&candidates, &[], false);
+        assert_eq!(predicted.len(), 512);
+        assert!(predicted[..31]
+            .iter()
+            .all(|a| (50000..=50031).contains(&a.port())));
+    }
+
+    #[test]
+    fn start_after_delay_clamps_to_500ms_and_aborts_immediately_on_cancel() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_bg = Arc::clone(&cancel);
+        let jh = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            cancel_bg.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let res = wait_start_after_delay(
+            Some(10_000),
+            started + Duration::from_secs(5),
+            cancel.as_ref(),
+        );
+        jh.join().unwrap();
+        assert!(res.is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "cancel must interrupt start_after_ms quickly, took {:?}",
+            started.elapsed()
+        );
+
+        let cancel_ok = AtomicBool::new(false);
+        let t0 = Instant::now();
+        wait_start_after_delay(Some(5_000), t0 + Duration::from_secs(5), &cancel_ok).unwrap();
+        let waited = t0.elapsed();
+        assert!(
+            waited >= Duration::from_millis(450) && waited < Duration::from_millis(750),
+            "start_after_ms=5000 must clamp to 500ms, waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn udp_blocked_fast_fails_unless_ipv6_or_lan_present() {
+        let port = reserve_ephemeral_udp_port();
+        let blocked = P2pCandidates {
+            session_id: "udp-blocked-fast-fail".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{port}")),
+            self_nat_type: NatType::UdpBlocked,
+            peer_nat_type: NatType::ConeVerified,
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let err = punch_udp_pair(P2pRole::Client, &blocked, Duration::from_secs(3), &cancel)
+            .expect_err("UdpBlocked without IPv6/LAN must fast-fail");
+        assert!(err.contains("受阻"), "unexpected error: {err}");
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "UdpBlocked fast-fail must take ~0ms, took {:?}",
+            t0.elapsed()
+        );
+
+        // 带显式 LAN 候选时不得 fast-fail，应直接命中 LAN
+        let host_port = reserve_ephemeral_udp_port();
+        let client_port = reserve_ephemeral_udp_port();
+        let host_lan = P2pCandidates {
+            session_id: "udp-blocked-with-lan".to_string(),
+            peer_lan_addrs: vec![format!("127.0.0.1:{client_port}")],
+            local_udp_port: Some(host_port),
+            self_nat_type: NatType::UdpBlocked,
+            peer_nat_type: NatType::ConeVerified,
+            ..Default::default()
+        };
+        let client_lan = P2pCandidates {
+            session_id: "udp-blocked-with-lan".to_string(),
+            peer_lan_addrs: vec![format!("127.0.0.1:{host_port}")],
+            local_udp_port: Some(client_port),
+            self_nat_type: NatType::ConeVerified,
+            peer_nat_type: NatType::UdpBlocked,
+            ..Default::default()
+        };
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        let cancel2_c = Arc::clone(&cancel2);
+        let h_jh = thread::spawn(move || {
+            punch_udp_pair(P2pRole::Host, &host_lan, DEFAULT_PUNCH_TIMEOUT, &cancel2)
+        });
+        punch_udp_pair(
+            P2pRole::Client,
+            &client_lan,
+            DEFAULT_PUNCH_TIMEOUT,
+            &cancel2_c,
+        )
+        .expect("UdpBlocked with usable explicit LAN must punch directly");
+        h_jh.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn select_punch_strategy_matrix_matches_item3_design() {
+        let base_target: SocketAddr = "198.51.100.10:40000".parse().unwrap();
+        let targets = vec![base_target];
+
+        // 1. ConeVerified <-> ConeVerified => DirectOnly
+        let c1 = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            self_nat_type: NatType::ConeVerified,
+            peer_nat_type: NatType::ConeVerified,
+            ..Default::default()
+        };
+        assert!(matches!(
+            select_punch_strategy(P2pRole::Host, &c1, &targets, &targets, false),
+            PunchStrategy::DirectOnly
+        ));
+
+        // 2. AdmSeq <-> AdmSeq => MainScanImmediate (0 aux)
+        let c2 = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            self_nat_type: NatType::AdmSeq,
+            peer_nat_type: NatType::AdmSeq,
+            peer_nat_port_delta: Some(2),
+            ..Default::default()
+        };
+        match select_punch_strategy(P2pRole::Host, &c2, &targets, &targets, false) {
+            PunchStrategy::MainScanImmediate { scan_targets } => {
+                assert!(!scan_targets.is_empty());
+            }
+            other => panic!("expected MainScanImmediate, got {other:?}"),
+        }
+
+        // 3. Cone* <-> ApdmSeq => Cone scans at t=0; Sym spawns 8 aux
+        let c3_cone = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            self_nat_type: NatType::ConeVerified,
+            peer_nat_type: NatType::ApdmSeq,
+            peer_nat_port_delta: Some(3),
+            ..Default::default()
+        };
+        assert!(matches!(
+            select_punch_strategy(P2pRole::Host, &c3_cone, &targets, &targets, false),
+            PunchStrategy::MainScanImmediate { .. }
+        ));
+        let c3_sym = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            self_nat_type: NatType::ApdmSeq,
+            peer_nat_type: NatType::ConeUnverified,
+            ..Default::default()
+        };
+        match select_punch_strategy(P2pRole::Client, &c3_sym, &targets, &targets, false) {
+            PunchStrategy::AuxPersistent {
+                aux_count,
+                scan_targets,
+                ..
+            } => {
+                assert_eq!(aux_count, AUX_SEQ_TO_CONE_COUNT);
+                assert!(scan_targets.is_empty());
+            }
+            other => panic!("expected AuxPersistent(8), got {other:?}"),
+        }
+
+        // 4. ApdmSeq <-> ApdmSeq => DirectedRendezvous (delta=1 -> 48 aux, delta=3 -> 24 aux x 3 targets)
+        let c4_d1 = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            self_nat_type: NatType::ApdmSeq,
+            peer_nat_type: NatType::ApdmSeq,
+            peer_nat_port_delta: Some(1),
+            ..Default::default()
+        };
+        match select_punch_strategy(P2pRole::Host, &c4_d1, &targets, &targets, false) {
+            PunchStrategy::DirectedRendezvous {
+                aux_count,
+                aux_targets,
+            } => {
+                assert_eq!(aux_count, AUX_APDM_SEQ_DELTA1_COUNT);
+                assert_eq!(aux_targets.len(), 1);
+                assert_eq!(aux_targets[0].port(), 40024);
+            }
+            other => panic!("expected DirectedRendezvous(48), got {other:?}"),
+        }
+        let c4_d3 = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            self_nat_type: NatType::ApdmSeq,
+            peer_nat_type: NatType::ApdmSeq,
+            peer_nat_port_delta: Some(3),
+            ..Default::default()
+        };
+        match select_punch_strategy(P2pRole::Host, &c4_d3, &targets, &targets, false) {
+            PunchStrategy::DirectedRendezvous {
+                aux_count,
+                aux_targets,
+            } => {
+                assert_eq!(aux_count, AUX_APDM_SEQ_DELTA2_4_COUNT);
+                assert_eq!(aux_targets.len(), 3);
+                assert_eq!(
+                    aux_targets.iter().map(SocketAddr::port).collect::<Vec<_>>(),
+                    vec![40072, 40073, 40074]
+                );
+            }
+            other => panic!("expected DirectedRendezvous(24, 3 targets), got {other:?}"),
+        }
+
+        // 5. Cone* <-> ApdmRandom => TwoWaveConeScan / TwoWaveBirthdayAux
+        let c5_cone = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            self_nat_type: NatType::ConeVerified,
+            peer_nat_type: NatType::ApdmRandom,
+            peer_nat_port_range: Some(PortRangeHint::LinuxEphemeral),
+            ..Default::default()
+        };
+        match select_punch_strategy(P2pRole::Host, &c5_cone, &targets, &targets, false) {
+            PunchStrategy::TwoWaveConeScan {
+                wave1_targets,
+                wave2_targets,
+            } => {
+                assert_eq!(wave1_targets.len(), CONE_SCAN_BUDGET_PER_WAVE);
+                assert_eq!(wave2_targets.len(), CONE_SCAN_BUDGET_PER_WAVE);
+            }
+            other => panic!("expected TwoWaveConeScan, got {other:?}"),
+        }
+        let c5_sym = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            self_nat_type: NatType::ApdmRandom,
+            peer_nat_type: NatType::ConeVerified,
+            ..Default::default()
+        };
+        match select_punch_strategy(P2pRole::Client, &c5_sym, &targets, &targets, false) {
+            PunchStrategy::TwoWaveBirthdayAux { aux_count } => {
+                assert_eq!(aux_count, MAX_AUX_SOCKETS_HARD_CAP);
+            }
+            other => panic!("expected TwoWaveBirthdayAux(96), got {other:?}"),
+        }
+
+        // 6. ConeUnverified <-> ConeUnverified => ConeUnverifiedProgressive
+        let c6 = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            self_nat_type: NatType::ConeUnverified,
+            peer_nat_type: NatType::ConeUnverified,
+            ..Default::default()
+        };
+        match select_punch_strategy(P2pRole::Host, &c6, &targets, &targets, false) {
+            PunchStrategy::ConeUnverifiedProgressive {
+                narrow_targets,
+                wide_targets,
+                ..
+            } => {
+                assert_eq!(narrow_targets.len(), 64);
+                assert_eq!(wide_targets.len(), CONE_SCAN_BUDGET_PER_WAVE);
+            }
+            other => panic!("expected ConeUnverifiedProgressive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn directed_rendezvous_apdm_seq_succeeds_with_independent_aux_nonces() {
+        let host_secret = "00112233445566778899aabbccddeeff";
+        let secret_bytes = parse_punch_secret(Some(host_secret)).unwrap();
+        let session_hash = derive_session_hash_v2("directed-apdm-seq");
+
+        let host_rendezvous = UdpSocket::bind("127.0.0.1:0").unwrap();
+        host_rendezvous.set_nonblocking(true).unwrap();
+        let host_target_port = host_rendezvous.local_addr().unwrap().port();
+        // 选择 peer_last = host_target_port - 24（delta=+1 时定向到 host_target_port）
+        assert!(host_target_port > 1024);
+        let peer_last_for_client = host_target_port - 24;
+
+        let client_primary_port = reserve_ephemeral_udp_port();
+        let client_cand = P2pCandidates {
+            session_id: "directed-apdm-seq".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{peer_last_for_client}")),
+            local_udp_port: Some(client_primary_port),
+            self_nat_type: NatType::ApdmSeq,
+            peer_nat_type: NatType::ApdmSeq,
+            peer_nat_port_delta: Some(1),
+            punch_secret: Some(host_secret.to_string()),
+            ..Default::default()
+        };
+
+        let host_thread = thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut seen_nonces = HashSet::new();
+            let host_nonce = [0x99u8; 8];
+            let mut ack_pkt = None;
+            let mut reply_target = None;
+            while Instant::now() < deadline {
+                match host_rendezvous.recv_from(&mut buf) {
+                    Ok((len, src)) => {
+                        if let Some(pkt) =
+                            decode_and_verify_punch_packet_v2(&buf[..len], &secret_bytes).filter(
+                                |p| p.session_hash == session_hash && p.role == P2pRole::Client,
+                            )
+                        {
+                            seen_nonces.insert(pkt.sender_nonce);
+                            if ack_pkt.is_none() {
+                                reply_target = Some(src);
+                                ack_pkt = Some(encode_punch_packet_v2(
+                                    P2pRole::Host,
+                                    true,
+                                    session_hash,
+                                    host_nonce,
+                                    pkt.sender_nonce,
+                                    &secret_bytes,
+                                ));
+                            }
+                            if seen_nonces.len() >= 2 && ack_pkt.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("host_rendezvous recv error: {err}"),
+                }
+            }
+            let target = reply_target.expect("must receive RCP2 v2 Probe from client aux socket");
+            let ack = ack_pkt.unwrap();
+            let _ = host_rendezvous.send_to(&ack, target);
+            // 再发一个 Probe 等待客户端回 Ack
+            let probe = encode_punch_packet_v2(
+                P2pRole::Host,
+                false,
+                session_hash,
+                host_nonce,
+                [0u8; 8],
+                &secret_bytes,
+            );
+            let _ = host_rendezvous.send_to(&probe, target);
+            (seen_nonces.len(), target.port())
+        });
+
+        let cancel = AtomicBool::new(false);
+        let (won_sock, peer_addr, _elapsed) = punch_udp_pair(
+            P2pRole::Client,
+            &client_cand,
+            DEFAULT_PUNCH_TIMEOUT,
+            &cancel,
+        )
+        .expect("ApdmSeq directed rendezvous must complete RCP2 v2 handshake");
+        let (nonce_count, won_port) = host_thread.join().unwrap();
+        assert_eq!(peer_addr.port(), host_target_port);
+        assert_eq!(won_sock.local_addr().unwrap().port(), won_port);
+        assert!(
+            nonce_count >= 2,
+            "multiple aux sockets must carry distinct sender_nonce values, saw {nonce_count}"
+        );
+    }
+
+    #[test]
+    fn two_wave_birthday_aux_drops_wave1_before_wave2_and_caps_at_96() {
+        let cancel = AtomicBool::new(false);
+        let capped = spawn_aux_punch_sockets(
+            200,
+            false,
+            true,
+            P2pRole::Client,
+            "cap-check",
+            None,
+            &cancel,
+        );
+        assert_eq!(capped.len(), MAX_AUX_SOCKETS_HARD_CAP);
+        drop(capped);
+
+        // 模拟 Wave 2 才开始监听的 Cone 对端（在 Wave 1 期间拒绝/丢弃，等待 600ms 后才绑定并收发）
+        let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host_port = host_sock.local_addr().unwrap().port();
+        drop(host_sock); // 先释放端口，等 Wave 2 窗口再监听
+
+        let client_port = reserve_ephemeral_udp_port();
+        let secret_hex = "ffeeddccbbaa99887766554433221100";
+        let secret_bytes = parse_punch_secret(Some(secret_hex)).unwrap();
+        let session_hash = derive_session_hash_v2("two-wave-rolling");
+        let client_cand = P2pCandidates {
+            session_id: "two-wave-rolling".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{host_port}")),
+            local_udp_port: Some(client_port),
+            self_nat_type: NatType::ApdmRandom,
+            peer_nat_type: NatType::ConeVerified,
+            punch_secret: Some(secret_hex.to_string()),
+            ..Default::default()
+        };
+
+        let host_jh = thread::spawn(move || {
+            // 等待进入 Wave 2 (timeout=1.4s -> wave2_at=700ms)
+            thread::sleep(Duration::from_millis(800));
+            let sock = UdpSocket::bind(("127.0.0.1", host_port)).unwrap();
+            sock.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut buf = [0u8; 256];
+            let host_nonce = [0x42u8; 8];
+            while Instant::now() < deadline {
+                match sock.recv_from(&mut buf) {
+                    Ok((len, src)) if src.port() != client_port => {
+                        if let Some(pkt) =
+                            decode_and_verify_punch_packet_v2(&buf[..len], &secret_bytes).filter(
+                                |p| p.session_hash == session_hash && p.role == P2pRole::Client,
+                            )
+                        {
+                            let ack = encode_punch_packet_v2(
+                                P2pRole::Host,
+                                true,
+                                session_hash,
+                                host_nonce,
+                                pkt.sender_nonce,
+                                &secret_bytes,
+                            );
+                            let _ = sock.send_to(&ack, src);
+                            let probe = encode_punch_packet_v2(
+                                P2pRole::Host,
+                                false,
+                                session_hash,
+                                host_nonce,
+                                [0u8; 8],
+                                &secret_bytes,
+                            );
+                            let _ = sock.send_to(&probe, src);
+                            return src.port();
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("host wave2 recv error: {err}"),
+                }
+            }
+            panic!("host never received Wave 2 aux probe");
+        });
+
+        let cancel_run = AtomicBool::new(false);
+        let (won_sock, peer, elapsed) = punch_udp_pair(
+            P2pRole::Client,
+            &client_cand,
+            Duration::from_millis(1_400),
+            &cancel_run,
+        )
+        .expect("Wave 2 rolling release aux punch must succeed");
+        let wave2_port = host_jh.join().unwrap();
+        assert_eq!(peer.port(), host_port);
+        assert_eq!(won_sock.local_addr().unwrap().port(), wave2_port);
+        assert!(
+            elapsed >= Duration::from_millis(650),
+            "must wait until Wave 2 activates, elapsed={elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn cone_unverified_phase2a_narrow_neighborhood_hits_after_350ms() {
+        let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        host_sock.set_nonblocking(true).unwrap();
+        let host_real_port = host_sock.local_addr().unwrap().port();
+        assert!(host_real_port > 1030);
+        // 偏移 +7 在 ±32 窄邻域内
+        let mapped_guess_port = host_real_port - 7;
+
+        let client_primary = reserve_ephemeral_udp_port();
+        let client_cand = P2pCandidates {
+            session_id: "cone-unverified-p2a".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{mapped_guess_port}")),
+            local_udp_port: Some(client_primary),
+            self_nat_type: NatType::ConeUnverified,
+            peer_nat_type: NatType::ConeUnverified,
+            ..Default::default()
+        };
+
+        let session_hash = derive_session_hash("cone-unverified-p2a");
+        let host_jh = thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match host_sock.recv_from(&mut buf) {
+                    Ok((len, src)) if decode_punch_packet(&buf[..len]).is_some() => {
+                        let ack = encode_punch_packet(&PunchPacket {
+                            version: PUNCH_VERSION,
+                            role: P2pRole::Host,
+                            ack: true,
+                            session_hash,
+                            nonce: [0x17u8; 6],
+                        });
+                        let _ = host_sock.send_to(&ack, src);
+                        let probe = encode_punch_packet(&PunchPacket {
+                            version: PUNCH_VERSION,
+                            role: P2pRole::Host,
+                            ack: false,
+                            session_hash,
+                            nonce: [0x17u8; 6],
+                        });
+                        let _ = host_sock.send_to(&probe, src);
+                        return src.port();
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("host recv error: {err}"),
+                }
+            }
+            panic!("host never received Phase 2a narrow scan packet");
+        });
+
+        let cancel = AtomicBool::new(false);
+        let (sock, peer, elapsed) = punch_udp_pair(
+            P2pRole::Client,
+            &client_cand,
+            Duration::from_secs(2),
+            &cancel,
+        )
+        .expect("ConeUnverified Phase 2a ±32 scan must hit");
+        let observed_src_port = host_jh.join().unwrap();
+        assert_eq!(peer.port(), host_real_port);
+        assert_eq!(sock.local_addr().unwrap().port(), client_primary);
+        assert_eq!(observed_src_port, client_primary);
+        assert!(
+            elapsed >= Duration::from_millis(300) && elapsed < Duration::from_millis(1_500),
+            "Phase 2a narrow scan must trigger after 350ms with 0 aux sockets, elapsed={elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn happy_eyeballs_v2_global_v6_head_start_does_not_block_ipv4_fallback() {
+        let host_v4 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        host_v4.set_nonblocking(true).unwrap();
+        let host_v4_port = host_v4.local_addr().unwrap().port();
+        let client_port = reserve_ephemeral_udp_port();
+
+        // 包含不可达的全球单播 IPv6（RFC 3849 文档网段 2001:db8::99）与可达的 IPv4（127.0.0.1）
+        let client_cand = P2pCandidates {
+            session_id: "happy-eyeballs-v2".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{host_v4_port}")),
+            peer_lan_addrs: vec![format!("[2001:db8::99]:{host_v4_port}")],
+            local_udp_port: Some(client_port),
+            ..Default::default()
+        };
+        let parsed = parse_candidate_addrs(&client_cand);
+        assert_eq!(
+            parsed[0],
+            format!("[2001:db8::99]:{host_v4_port}")
+                .parse::<SocketAddr>()
+                .unwrap(),
+            "global unicast IPv6 must sort before IPv4 even when peer_public_addrs is empty"
+        );
+
+        let session_hash = derive_session_hash("happy-eyeballs-v2");
+        let host_jh = thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match host_v4.recv_from(&mut buf) {
+                    Ok((len, src)) if decode_punch_packet(&buf[..len]).is_some() => {
+                        let ack = encode_punch_packet(&PunchPacket {
+                            version: PUNCH_VERSION,
+                            role: P2pRole::Host,
+                            ack: true,
+                            session_hash,
+                            nonce: [0x22u8; 6],
+                        });
+                        let _ = host_v4.send_to(&ack, src);
+                        let probe = encode_punch_packet(&PunchPacket {
+                            version: PUNCH_VERSION,
+                            role: P2pRole::Host,
+                            ack: false,
+                            session_hash,
+                            nonce: [0x22u8; 6],
+                        });
+                        let _ = host_v4.send_to(&probe, src);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("host_v4 recv error: {e}"),
+                }
+            }
+            panic!("unreachable global IPv6 blocked IPv4 punching");
+        });
+
+        let cancel = AtomicBool::new(false);
+        let (_sock, peer_addr, elapsed) = punch_udp_pair(
+            P2pRole::Client,
+            &client_cand,
+            Duration::from_secs(2),
+            &cancel,
+        )
+        .expect("IPv4 punch must succeed quickly despite blackholed/unreachable global IPv6");
+        host_jh.join().unwrap();
+        assert_eq!(canonicalize_socket_addr(peer_addr).port(), host_v4_port);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "Happy Eyeballs v2 must race IPv4 after <=50ms without waiting on IPv6 timeout, elapsed={elapsed:?}"
         );
     }
 }

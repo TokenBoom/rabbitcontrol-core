@@ -58,6 +58,9 @@ use crate::relay_transport::{
     E2eeRelayTransport, RelayE2eeMode, RelayRole, RelayShutdownHandle, TcpRelayTransport,
 };
 use crate::signal_client::RelayIncoming;
+use crate::switchable_transport::{
+    CandidateTransport, SwitchControlMsg, SwitchHandle, SwitchableTransport, TransportPathKind,
+};
 
 /// 默认被控端监听端口（被占用时回退临时端口 `0`）。
 pub const DEFAULT_HOST_PORT: u16 = 9901;
@@ -165,6 +168,8 @@ pub struct UiHostConfig {
     pub file_transfer_dir: Option<PathBuf>,
     /// 他人远程协助本机时是否允许使用 W2 文件传输通道（默认 `true`；同账号本人 `OwnerTicket` 自控始终豁免）。
     pub allow_assist_file_transfer: bool,
+    /// 可选信令客户端句柄（供运行期 `Relay -> P2P` 复探刷新 STUN 公网映射并重用 UDP 端口）。
+    pub signal_client: Option<Arc<crate::signal_client::SignalClientHandle>>,
 }
 
 impl Default for UiHostConfig {
@@ -187,6 +192,7 @@ impl Default for UiHostConfig {
             forbid_passwordless_auto_approve: false,
             file_transfer_dir: None,
             allow_assist_file_transfer: true,
+            signal_client: None,
         }
     }
 }
@@ -213,6 +219,7 @@ impl fmt::Debug for UiHostConfig {
                 "allow_assist_file_transfer",
                 &self.allow_assist_file_transfer,
             )
+            .field("has_signal_client", &self.signal_client.is_some())
             .finish()
     }
 }
@@ -385,6 +392,24 @@ impl BoundedRelayIncomingQueue {
         q.retain(|(enqueued_at, _)| enqueued_at.elapsed() <= ttl);
     }
 
+    fn pop_by_session_id(&self, session_id: &str, ttl: Duration) -> Option<RelayIncoming> {
+        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = None;
+        let mut kept = VecDeque::with_capacity(q.len());
+        while let Some((enqueued_at, item)) = q.pop_front() {
+            if enqueued_at.elapsed() > ttl {
+                continue;
+            }
+            if out.is_none() && item.session_id == session_id {
+                out = Some(item);
+            } else {
+                kept.push_back((enqueued_at, item));
+            }
+        }
+        *q = kept;
+        out
+    }
+
     fn purge_for_peer_before(&self, peer_device_id: Option<&str>, cutoff: Instant, ttl: Duration) {
         let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         q.retain(|(enqueued_at, item)| {
@@ -439,12 +464,41 @@ impl BoundedRelayIncomingQueue {
         is_detached: bool,
         ignore_same_peer_lan_before: Option<Instant>,
     ) -> bool {
+        self.has_preempt_candidate_with_switch(
+            ttl,
+            active_peer_id,
+            active_idle_us,
+            is_detached,
+            ignore_same_peer_lan_before,
+            false,
+        )
+    }
+
+    fn has_preempt_candidate_with_switch(
+        &self,
+        ttl: Duration,
+        active_peer_id: Option<&str>,
+        active_idle_us: u64,
+        is_detached: bool,
+        ignore_same_peer_lan_before: Option<Instant>,
+        switch_capable: bool,
+    ) -> bool {
         let q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         q.iter()
             .filter(|(enqueued_at, _)| enqueued_at.elapsed() <= ttl)
             .any(|(enqueued_at, item)| {
                 let same_peer =
                     active_peer_id.is_some_and(|cur| !cur.is_empty() && cur == item.peer_id);
+                // 若当前会话启用运行期热切，给同对端刚到达的 `is_relay_alloc == true` 令牌留出 2s 窗口
+                // 供 `SwitchControlMsg::RelayAllocReady` 认领，避免运行期 `P2P -> Relay` 切换误触发抢占断流。
+                if switch_capable
+                    && !is_detached
+                    && same_peer
+                    && item.is_relay_alloc
+                    && enqueued_at.elapsed() < Duration::from_secs(2)
+                {
+                    return false;
+                }
                 // LAN / mTLS LAN 初始宽限期内到达的同对端普通 PunchCoord（!is_relay_alloc）
                 // 一律视为本次 LAN 建连同源迟到的旧信令：无论 peer_lan_addrs 是否为空、
                 // 无论是否满 3s/4s、无论当前处于 Streaming 还是 Detached，绝不触发误抢占。
@@ -1840,6 +1894,46 @@ impl rc_capture::CaptureBackend for WallCapture {
     }
 }
 
+/// 收集被控端全部 UP 非回环网卡上的直连候选地址（多网卡/VPN IPv4 与全球单播 IPv6），
+/// 自动去重并按 `<= 16` 条上限截断；当 `listen_port == 0` 时返回空列表。
+pub fn collect_host_lan_addrs(listen_port: u16) -> Vec<String> {
+    if listen_port == 0 {
+        return Vec::new();
+    }
+    let ips = lan_discovery::detect_local_interface_ips();
+    format_host_lan_addrs_from_ips(&ips, listen_port)
+}
+
+fn format_host_lan_addrs_from_ips(
+    ips: &lan_discovery::LocalInterfaceIps,
+    listen_port: u16,
+) -> Vec<String> {
+    const MAX_HOST_LAN_ADDRS: usize = 16;
+    if listen_port == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for v4 in &ips.ipv4s {
+        if out.len() >= MAX_HOST_LAN_ADDRS {
+            break;
+        }
+        let formatted = SocketAddr::new(std::net::IpAddr::V4(*v4), listen_port).to_string();
+        if !out.contains(&formatted) {
+            out.push(formatted);
+        }
+    }
+    for v6 in &ips.global_ipv6s {
+        if out.len() >= MAX_HOST_LAN_ADDRS {
+            break;
+        }
+        let formatted = SocketAddr::new(std::net::IpAddr::V6(*v6), listen_port).to_string();
+        if !out.contains(&formatted) {
+            out.push(formatted);
+        }
+    }
+    out
+}
+
 fn format_display_addr(actual: SocketAddr) -> String {
     if actual.ip().is_unspecified() {
         let ip = lan_discovery::detect_local_lan_ipv4().unwrap_or(Ipv4Addr::LOCALHOST);
@@ -2425,6 +2519,7 @@ impl HostHandle {
             forbid_passwordless_auto_approve: cfg.forbid_passwordless_auto_approve,
             ephemeral_listen_port: cfg.listen_addr.port() == 0,
             allow_assist_file_transfer: Arc::clone(&allow_assist_file_transfer),
+            signal_client: cfg.signal_client.clone(),
         };
 
         let t_updates = Arc::clone(&updates);
@@ -2509,6 +2604,11 @@ impl HostHandle {
     /// 返回实际绑定的监听地址（已解析临时端口，并在端口回退后实时更新）。
     pub fn listen_addr(&self) -> SocketAddr {
         *self.listen_addr.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 收集当前被控端全网卡直连候选列表（多网卡/VPN IPv4 + 全球单播 IPv6，去重上限 16 条）。
+    pub fn local_lan_addrs(&self) -> Vec<String> {
+        collect_host_lan_addrs(self.listen_addr().port())
     }
 
     /// 工作线程是否仍在运行。
@@ -2686,6 +2786,7 @@ struct HostWorkerOptions {
     forbid_passwordless_auto_approve: bool,
     ephemeral_listen_port: bool,
     allow_assist_file_transfer: Arc<AtomicBool>,
+    signal_client: Option<Arc<crate::signal_client::SignalClientHandle>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3649,6 +3750,38 @@ impl RelayBitrateController {
     }
 }
 
+struct HostSwitchRuntime {
+    handle: SwitchHandle,
+    incoming: RelayIncoming,
+    mtls_bundle: Option<SessionMtlsBundle>,
+    require_mtls: bool,
+    skip_p2p_for_proxy: bool,
+    updates: Arc<BoundedHostUpdateQueue>,
+    disconnect_flag: Arc<AtomicBool>,
+    stop_flag: Arc<AtomicBool>,
+    active_relay_interrupt: Arc<Mutex<Option<ActiveRelayInterrupt>>>,
+    bg_cancel: Arc<AtomicBool>,
+    signal_client: Option<Arc<crate::signal_client::SignalClientHandle>>,
+}
+
+fn rebuild_host_p2p_mtls(
+    mtls_bundle: Option<&SessionMtlsBundle>,
+    require_mtls: bool,
+    peer_id: &str,
+    is_owner_connection: bool,
+) -> Option<rc_net::mtls::MtlsConfig> {
+    if !require_mtls {
+        return None;
+    }
+    let bundle = mtls_bundle?;
+    let expected_user = is_owner_connection.then(|| bundle.local_user_id.clone());
+    bundle
+        .clone()
+        .with_expected_peer(Some(peer_id.to_string()), expected_user)
+        .to_quic_mtls_config()
+        .ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drive_ui_host_session_inner(
     host: &mut HostSession,
@@ -3675,6 +3808,63 @@ fn drive_ui_host_session_inner(
     incoming_relay: Option<&Arc<BoundedRelayIncomingQueue>>,
     active_peer_id: Option<&str>,
     session_started_at: Instant,
+) -> DriveSessionOutcome {
+    drive_ui_host_session_with_switch(
+        host,
+        clock,
+        clock_anchor,
+        updates,
+        password_version,
+        observed_pw_ver,
+        config_version,
+        observed_cfg_ver,
+        disconnect_flag,
+        stop_flag,
+        close_reason,
+        transport_kind,
+        prefer_hardware,
+        audio_enabled,
+        hardware_video_active,
+        lock_screen_count,
+        auth_state,
+        owner_terminals,
+        wake_guard,
+        file_transfer_dir,
+        allow_assist_file_transfer,
+        incoming_relay,
+        active_peer_id,
+        session_started_at,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_ui_host_session_with_switch(
+    host: &mut HostSession,
+    clock: &SessionClock,
+    clock_anchor: Option<&HostClockAnchor>,
+    updates: &BoundedHostUpdateQueue,
+    password_version: &AtomicU64,
+    observed_pw_ver: u64,
+    config_version: &AtomicU64,
+    observed_cfg_ver: u64,
+    disconnect_flag: &AtomicBool,
+    stop_flag: &AtomicBool,
+    close_reason: &AtomicU8,
+    transport_kind: HostTransportKind,
+    prefer_hardware: bool,
+    audio_enabled: bool,
+    hardware_video_active: bool,
+    lock_screen_count: &AtomicU64,
+    auth_state: Option<&Mutex<AuthRuntimeState>>,
+    owner_terminals: &mut PersistentOwnerTerminals,
+    wake_guard: SharedWakeGuard,
+    file_transfer_dir: SharedFileTransferDir,
+    allow_assist_file_transfer: &AtomicBool,
+    incoming_relay: Option<&Arc<BoundedRelayIncomingQueue>>,
+    active_peer_id: Option<&str>,
+    session_started_at: Instant,
+    switch_rt: Option<HostSwitchRuntime>,
 ) -> DriveSessionOutcome {
     let audio_mgr =
         HostAudioManager::new(audio_enabled && prefer_hardware && hardware_video_active);
@@ -3703,6 +3893,7 @@ fn drive_ui_host_session_inner(
         active_peer_id,
         session_started_at,
         audio_mgr,
+        switch_rt,
     )
 }
 
@@ -3719,7 +3910,7 @@ fn drive_ui_host_session_with_audio(
     disconnect_flag: &AtomicBool,
     stop_flag: &AtomicBool,
     close_reason: &AtomicU8,
-    transport_kind: HostTransportKind,
+    mut transport_kind: HostTransportKind,
     prefer_hardware: bool,
     hardware_video_active: bool,
     lock_screen_count: &AtomicU64,
@@ -3732,6 +3923,7 @@ fn drive_ui_host_session_with_audio(
     active_peer_id: Option<&str>,
     mut session_started_at: Instant,
     mut audio_mgr: HostAudioManager,
+    switch_rt: Option<HostSwitchRuntime>,
 ) -> DriveSessionOutcome {
     // 启用 8s 应用层客户端失活看门狗（控制端在静屏与纯工具模式下每 1s 发送 ProbePing 心跳）。
     host.set_client_idle_timeout_us(HostSession::CLIENT_IDLE_TIMEOUT_US);
@@ -3809,9 +4001,10 @@ fn drive_ui_host_session_with_audio(
     let mut hevc_runtime_failed = false;
     let host_hevc_available =
         |failed: bool| hardware_media_active && !failed && rc_pipeline::platform_supports_hevc();
+    let transport_kind_cell = std::cell::Cell::new(transport_kind);
     let current_net_hint = |host: &HostSession| NetworkHint {
-        is_relay: transport_kind == HostTransportKind::Relay,
-        is_lan: transport_kind == HostTransportKind::Lan,
+        is_relay: transport_kind_cell.get() == HostTransportKind::Relay,
+        is_lan: transport_kind_cell.get() == HostTransportKind::Lan,
         estimated_bitrate_bps: host.current_bitrate_bps(),
         rtt_us: 0,
     };
@@ -6116,6 +6309,107 @@ fn drive_ui_host_session_with_audio(
                             break;
                         }
 
+                        if let Some(ref sw_rt) = switch_rt {
+                            for ev in sw_rt.handle.drain_path_events() {
+                                transport_kind = match ev.kind {
+                                    TransportPathKind::Relay => HostTransportKind::Relay,
+                                    TransportPathKind::P2p => HostTransportKind::P2p,
+                                    TransportPathKind::Lan => HostTransportKind::Lan,
+                                    TransportPathKind::MtlsLan => HostTransportKind::MtlsLan,
+                                };
+                                transport_kind_cell.set(transport_kind);
+                                relay_bitrate_ctrl = (transport_kind == HostTransportKind::Relay)
+                                    .then(|| {
+                                        RelayBitrateController::new(
+                                            host.current_bitrate_bps().max(1),
+                                            Instant::now(),
+                                        )
+                                    });
+                                let new_label = ev.kind.host_label(&sw_rt.incoming.peer_id);
+                                emit_peer_connected(host, &new_label, updates);
+                            }
+
+                            for ctrl_msg in sw_rt.handle.drain_control_msgs() {
+                                match ctrl_msg {
+                                    SwitchControlMsg::UseInitialRelay => {
+                                        if !sw_rt.incoming.relay_addr.is_empty()
+                                            && !sw_rt.incoming.relay_token.is_empty()
+                                        {
+                                            spawn_host_switch_relay_candidate(
+                                                sw_rt.incoming.clone(),
+                                                sw_rt.mtls_bundle.clone(),
+                                                sw_rt.require_mtls,
+                                                Arc::clone(&sw_rt.updates),
+                                                Arc::clone(&sw_rt.active_relay_interrupt),
+                                                Arc::clone(&sw_rt.bg_cancel),
+                                                Arc::clone(&sw_rt.disconnect_flag),
+                                                Arc::clone(&sw_rt.stop_flag),
+                                                sw_rt.handle.clone(),
+                                            );
+                                        }
+                                    }
+                                    SwitchControlMsg::RelayAllocReady { session_id } => {
+                                        if let Some(relay_q) = incoming_relay {
+                                            if let Some(fresh_inc) = relay_q
+                                                .pop_by_session_id(&session_id, RELAY_INCOMING_TTL)
+                                            {
+                                                spawn_host_switch_relay_candidate(
+                                                    fresh_inc,
+                                                    sw_rt.mtls_bundle.clone(),
+                                                    sw_rt.require_mtls,
+                                                    Arc::clone(&sw_rt.updates),
+                                                    Arc::clone(&sw_rt.active_relay_interrupt),
+                                                    Arc::clone(&sw_rt.bg_cancel),
+                                                    Arc::clone(&sw_rt.disconnect_flag),
+                                                    Arc::clone(&sw_rt.stop_flag),
+                                                    sw_rt.handle.clone(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    SwitchControlMsg::P2pReprobeOffer {
+                                        probe_id,
+                                        local_udp_port: peer_port,
+                                        addrs,
+                                        nat_type,
+                                        nat_port_delta,
+                                        nat_port_range,
+                                        punch_secret,
+                                    } => {
+                                        if !sw_rt.skip_p2p_for_proxy {
+                                            let reprobe_mtls = rebuild_host_p2p_mtls(
+                                                sw_rt.mtls_bundle.as_ref(),
+                                                sw_rt.require_mtls,
+                                                &sw_rt.incoming.peer_id,
+                                                sw_rt.incoming.is_owner_connection,
+                                            );
+                                            spawn_host_reprobe_p2p_candidate(
+                                                probe_id,
+                                                peer_port,
+                                                addrs,
+                                                nat_type,
+                                                nat_port_delta,
+                                                nat_port_range,
+                                                punch_secret,
+                                                sw_rt.incoming.self_nat_type,
+                                                sw_rt.incoming.self_nat_port_delta,
+                                                sw_rt.incoming.self_nat_port_range,
+                                                sw_rt.incoming.local_udp_port,
+                                                sw_rt.incoming.self_public_addr.clone(),
+                                                sw_rt.incoming.peer_public_addrs.clone(),
+                                                sw_rt.signal_client.clone(),
+                                                reprobe_mtls,
+                                                sw_rt.require_mtls,
+                                                Arc::clone(&sw_rt.bg_cancel),
+                                                sw_rt.handle.clone(),
+                                            );
+                                        }
+                                    }
+                                    SwitchControlMsg::P2pReprobeAnswer { .. } => {}
+                                }
+                            }
+                        }
+
                         if let Some(relay_q) = incoming_relay {
                             if last_preempt_check.elapsed() >= PREEMPT_CHECK_INTERVAL {
                                 last_preempt_check = Instant::now();
@@ -6134,12 +6428,16 @@ fn drive_ui_host_session_with_audio(
                                         RELAY_INCOMING_TTL,
                                     );
                                 }
-                                if relay_q.has_preempt_candidate_filtered(
+                                let sw_capable = switch_rt
+                                    .as_ref()
+                                    .is_some_and(|s| s.handle.is_switch_capable());
+                                if relay_q.has_preempt_candidate_with_switch(
                                     RELAY_INCOMING_TTL,
                                     active_peer_id.as_deref(),
                                     idle_us,
                                     false,
                                     ignore_lan_before,
+                                    sw_capable,
                                 ) {
                                     preempted_by_incoming = true;
                                     break;
@@ -6731,6 +7029,13 @@ fn build_and_handshake_transport(
     }
 }
 
+type DialedIncomingTransport = (
+    Box<dyn Transport>,
+    HostTransportKind,
+    String,
+    Option<String>,
+);
+
 #[allow(clippy::too_many_arguments)]
 fn dial_relay_for_incoming(
     incoming: &RelayIncoming,
@@ -6741,77 +7046,78 @@ fn dial_relay_for_incoming(
     session_cancel: &Arc<AtomicBool>,
     disconnect_flag: &AtomicBool,
     stop_flag: &AtomicBool,
-) -> Option<(Box<dyn Transport>, HostTransportKind, String)> {
+) -> Option<DialedIncomingTransport> {
     if incoming.relay_addr.is_empty() {
         return None;
     }
-    let (transport, shutdown_handle): (Box<dyn Transport>, RelayShutdownHandle) =
-        if let Some(bundle) = mtls_bundle {
-            let expected_user = incoming
-                .is_owner_connection
-                .then(|| bundle.local_user_id.clone());
-            let peer_bundle = bundle
-                .clone()
-                .with_expected_peer(Some(incoming.peer_id.clone()), expected_user);
-            let relay_mtls = peer_bundle.to_relay_mtls_config(None);
-            let e2ee_mode = if require_e2ee {
-                RelayE2eeMode::HostRequired(peer_bundle)
-            } else {
-                RelayE2eeMode::HostAuto(peer_bundle)
-            };
-            let t = match E2eeRelayTransport::connect_cancellable(
-                &incoming.relay_addr,
-                RelayRole::Host,
-                &incoming.relay_token,
-                RELAY_CONNECT_TIMEOUT,
-                Arc::clone(session_cancel),
-                Some(&relay_mtls),
-                e2ee_mode,
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    disconnect_flag.store(false, Ordering::Release);
-                    if !stop_flag.load(Ordering::Acquire) && !session_cancel.load(Ordering::Acquire)
-                    {
-                        let friendly = crate::session_bridge::classify_relay_connect_error(
-                            &e,
-                            require_e2ee,
-                            true,
-                        );
-                        updates.push(HostUpdate::error(format!(
-                            "{friendly} ({})",
-                            incoming.peer_id
-                        )));
-                    }
-                    return None;
-                }
-            };
-            let h = t.shutdown_handle();
-            (Box::new(t), h)
+    let (transport, shutdown_handle, peer_fp): (
+        Box<dyn Transport>,
+        RelayShutdownHandle,
+        Option<String>,
+    ) = if let Some(bundle) = mtls_bundle {
+        let expected_user = incoming
+            .is_owner_connection
+            .then(|| bundle.local_user_id.clone());
+        let peer_bundle = bundle
+            .clone()
+            .with_expected_peer(Some(incoming.peer_id.clone()), expected_user);
+        let relay_mtls = peer_bundle.to_relay_mtls_config(None);
+        let e2ee_mode = if require_e2ee {
+            RelayE2eeMode::HostRequired(peer_bundle)
         } else {
-            let t = match TcpRelayTransport::connect_cancellable(
-                &incoming.relay_addr,
-                RelayRole::Host,
-                &incoming.relay_token,
-                RELAY_CONNECT_TIMEOUT,
-                Arc::clone(session_cancel),
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    disconnect_flag.store(false, Ordering::Release);
-                    if !stop_flag.load(Ordering::Acquire) && !session_cancel.load(Ordering::Acquire)
-                    {
-                        updates.push(HostUpdate::error(format!(
-                            "中继通道连接失败 ({}): {e}",
-                            incoming.peer_id
-                        )));
-                    }
-                    return None;
-                }
-            };
-            let h = t.shutdown_handle();
-            (Box::new(t), h)
+            RelayE2eeMode::HostAuto(peer_bundle)
         };
+        let t = match E2eeRelayTransport::connect_cancellable(
+            &incoming.relay_addr,
+            RelayRole::Host,
+            &incoming.relay_token,
+            RELAY_CONNECT_TIMEOUT,
+            Arc::clone(session_cancel),
+            Some(&relay_mtls),
+            e2ee_mode,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                disconnect_flag.store(false, Ordering::Release);
+                if !stop_flag.load(Ordering::Acquire) && !session_cancel.load(Ordering::Acquire) {
+                    let friendly =
+                        crate::session_bridge::classify_relay_connect_error(&e, require_e2ee, true);
+                    updates.push(HostUpdate::error(format!(
+                        "{friendly} ({})",
+                        incoming.peer_id
+                    )));
+                }
+                return None;
+            }
+        };
+        let h = t.shutdown_handle();
+        let fp = t
+            .peer_mtls_identity()
+            .map(|id| id.cert_fingerprint_sha256.clone());
+        (Box::new(t), h, fp)
+    } else {
+        let t = match TcpRelayTransport::connect_cancellable(
+            &incoming.relay_addr,
+            RelayRole::Host,
+            &incoming.relay_token,
+            RELAY_CONNECT_TIMEOUT,
+            Arc::clone(session_cancel),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                disconnect_flag.store(false, Ordering::Release);
+                if !stop_flag.load(Ordering::Acquire) && !session_cancel.load(Ordering::Acquire) {
+                    updates.push(HostUpdate::error(format!(
+                        "中继通道连接失败 ({}): {e}",
+                        incoming.peer_id
+                    )));
+                }
+                return None;
+            }
+        };
+        let h = t.shutdown_handle();
+        (Box::new(t), h, None)
+    };
 
     *active_relay_interrupt
         .lock()
@@ -6829,14 +7135,217 @@ fn dial_relay_for_incoming(
         transport,
         HostTransportKind::Relay,
         format!("设备 {} (中继)", incoming.peer_id),
+        peer_fp,
     ))
 }
 
+/// 后台 P2P 穿透升直连窗口（允许 `ConeUnverified` Phase 2b 与两波次生日攻击完成）。
+const BACKGROUND_P2P_UPGRADE_WINDOW: Duration = Duration::from_secs(14);
+/// 默认双端同步 `Relay-first` 等待直连起跑窗口（400ms）。
+const DEFAULT_RELAY_FIRST_AFTER_MS: u64 = 400;
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_host_switch_relay_candidate(
+    incoming: RelayIncoming,
+    mtls_bundle: Option<SessionMtlsBundle>,
+    require_mtls: bool,
+    updates: Arc<BoundedHostUpdateQueue>,
+    active_relay_interrupt: Arc<Mutex<Option<ActiveRelayInterrupt>>>,
+    bg_cancel: Arc<AtomicBool>,
+    disconnect_flag: Arc<AtomicBool>,
+    stop_flag: Arc<AtomicBool>,
+    handle: SwitchHandle,
+) {
+    let _ = thread::Builder::new()
+        .name("rc-host-sw-relay".to_string())
+        .spawn(move || {
+            if bg_cancel.load(Ordering::Acquire)
+                || stop_flag.load(Ordering::Acquire)
+                || disconnect_flag.load(Ordering::Acquire)
+            {
+                return;
+            }
+            if let Some((transport, _kind, _lbl, fp)) = dial_relay_for_incoming(
+                &incoming,
+                mtls_bundle.as_ref(),
+                require_mtls,
+                &updates,
+                &active_relay_interrupt,
+                &bg_cancel,
+                &disconnect_flag,
+                &stop_flag,
+            ) {
+                let _ = handle.accept_switch_candidate(CandidateTransport {
+                    transport,
+                    kind: TransportPathKind::Relay,
+                    mtls_verified: !require_mtls || fp.is_some(),
+                    peer_cert_fingerprint: fp,
+                });
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_host_reprobe_p2p_candidate(
+    probe_id: String,
+    _peer_port: u16,
+    peer_addrs: Vec<String>,
+    peer_nat_type: crate::nat::NatType,
+    peer_nat_port_delta: Option<i16>,
+    peer_nat_port_range: Option<crate::nat::PortRangeHint>,
+    punch_secret: String,
+    initial_nat_type: crate::nat::NatType,
+    initial_nat_delta: Option<i16>,
+    initial_nat_range: Option<crate::nat::PortRangeHint>,
+    initial_local_udp_port: Option<u16>,
+    initial_self_public_addr: Option<String>,
+    initial_peer_public_addrs: Vec<String>,
+    signal_client: Option<Arc<crate::signal_client::SignalClientHandle>>,
+    p2p_mtls: Option<rc_net::mtls::MtlsConfig>,
+    require_mtls: bool,
+    bg_cancel: Arc<AtomicBool>,
+    handle: SwitchHandle,
+) {
+    let _ = thread::Builder::new()
+        .name("rc-host-reprobe-p2p".to_string())
+        .spawn(move || {
+            if bg_cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let sc_snap = signal_client
+                .as_ref()
+                .map(|sc| sc.snapshot_p2p_reprobe_info());
+            let (sc_port, sc_addrs, sc_nat, sc_delta, sc_range) = match sc_snap {
+                Some((p, addrs, nat, d, r)) => (p, addrs, Some(nat), d, r),
+                None => (None, Vec::new(), None, None, None),
+            };
+            let local_port = sc_port
+                .or(initial_local_udp_port)
+                .filter(|&p| p != 0)
+                .or_else(|| {
+                    std::net::UdpSocket::bind("0.0.0.0:0")
+                        .ok()
+                        .and_then(|s| s.local_addr().ok())
+                        .map(|a| a.port())
+                        .filter(|&p| p != 0)
+                })
+                .unwrap_or(0);
+            if local_port == 0 {
+                return;
+            }
+            let mut self_addrs = sc_addrs;
+            if let Some(ref pub_raw) = initial_self_public_addr {
+                if let Ok(sock) = pub_raw.trim().parse::<SocketAddr>() {
+                    if sock.port() != 0 {
+                        let s = sock.to_string();
+                        if !self_addrs.contains(&s) {
+                            self_addrs.push(s);
+                        }
+                    }
+                }
+            }
+            for lan in collect_host_lan_addrs(local_port) {
+                if !self_addrs.contains(&lan) {
+                    self_addrs.push(lan);
+                }
+            }
+            let self_nat_type = sc_nat
+                .filter(|n| *n != crate::nat::NatType::Unknown)
+                .unwrap_or(initial_nat_type);
+            let self_nat_port_delta = sc_delta.or(initial_nat_delta);
+            let self_nat_port_range = sc_range.or(initial_nat_range);
+            let _ = handle.send_control_msg(&SwitchControlMsg::P2pReprobeAnswer {
+                probe_id: probe_id.clone(),
+                local_udp_port: local_port,
+                addrs: self_addrs,
+                nat_type: self_nat_type,
+                nat_port_delta: self_nat_port_delta,
+                nat_port_range: self_nat_port_range,
+            });
+            let (peer_public_addrs, peer_lan_addrs) =
+                crate::signal_client::split_public_and_lan_addrs(
+                    &peer_addrs,
+                    &initial_peer_public_addrs,
+                );
+            let cands = P2pCandidates {
+                session_id: format!("reprobe-{probe_id}"),
+                peer_public_addr: peer_public_addrs.first().cloned(),
+                peer_public_addrs,
+                peer_lan_addrs,
+                local_udp_port: Some(local_port),
+                self_nat_type,
+                self_nat_port_delta,
+                self_nat_port_range,
+                peer_nat_type,
+                peer_nat_port_delta,
+                peer_nat_port_range,
+                punch_secret: Some(punch_secret),
+                start_after_ms: None,
+                relay_fallback_after_ms: None,
+            };
+            let port_hold = crate::signal_client::acquire_local_udp_port_for_p2p(Some(local_port));
+            if let Ok(p2p_conn) = p2p::attempt_p2p_quic_host_mtls(
+                &cands,
+                p2p::DEFAULT_PUNCH_TIMEOUT,
+                p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
+                &bg_cancel,
+                p2p_mtls.as_ref(),
+            ) {
+                let fp = p2p_conn
+                    .peer_mtls_identity()
+                    .map(|id| id.cert_fingerprint_sha256);
+                let held = crate::signal_client::P2pHeldTransport::new(p2p_conn, port_hold);
+                let _ = handle.accept_switch_candidate(CandidateTransport {
+                    transport: Box::new(held),
+                    kind: TransportPathKind::P2p,
+                    mtls_verified: !require_mtls || fp.is_some(),
+                    peer_cert_fingerprint: fp,
+                });
+            }
+        });
+}
+
+fn contains_non_cap_reliable(events: &[rc_net::NetEvent]) -> bool {
+    events.iter().any(|ev| match ev {
+        rc_net::NetEvent::Reliable(b) => {
+            !(b.len() >= 6 && &b[0..4] == b"RCSW" && matches!(b[5], 0x01..=0x03))
+        }
+        _ => false,
+    })
+}
+
+fn try_poll_for_first_hello(
+    transport: &mut Box<dyn Transport>,
+    prebuf: &mut Vec<rc_net::NetEvent>,
+) -> std::result::Result<bool, ()> {
+    match transport.poll(Duration::from_millis(2)) {
+        Ok(events) => {
+            for ev in events {
+                if let rc_net::NetEvent::Disconnected { .. } = ev {
+                    return Err(());
+                }
+                if let rc_net::NetEvent::Datagram(ref b) = ev {
+                    if b.len() == 14 && &b[0..4] == b"RCSW" && b[4] == 1 && b[5] == 0x01 {
+                        let mut ack = b.clone();
+                        ack[5] = 0x02;
+                        let _ = transport.send_datagram(&ack);
+                    }
+                }
+                prebuf.push(ev);
+            }
+            Ok(contains_non_cap_reliable(prebuf))
+        }
+        Err(_) => Err(()),
+    }
+}
+
 /// 处理一条入站信令会话请求：
-/// 1) 若对端提供 UDP 候选地址，优先尝试 P2P UDP 打洞 + QUIC 直连（配置了 mTLS 时自动走双向 mTLS）；
-/// 2) 打洞或 QUIC 失败，或 P2P 建连后握手阶段因超时/断链在进入 `Streaming` 前失败（H4 分裂脑恢复），
-///    均自动无缝回退至 TCP `RCR1` 中继并重新握手（配置了 mTLS 时强制走外层 mTLS，内层 `HostAuto` 自动兼容客户端开关）；
-/// 3) 完成鉴权与机主审批 → 串流驱动（含剪贴板/音频/W2/W3/W4 工具引擎）→ 干净收尾。
+/// 1) `Auto` 模式下实现双端同步 `Relay-first (400ms)` 与 **防分裂脑 `ClientHello` 并发守候**：
+///    `0..400ms` 优先快速 P2P；`t = 400ms` 仍未完成 `ClientHello` 建连则并发拨号 `:21117/tcp` mTLS 中继，
+///    以实际收到 `ClientHello` 并通过 `ServerHello` 握手的路径作为初始激活通道；
+/// 2) 若初始由中继先起流且 `!is_relay_alloc && !skip_p2p_for_proxy`，保留/启动后台 `14s` P2P 穿透
+///    （含 `ConeUnverified` Phase 2b 与两波次生日攻击），打通并过 mTLS 校验后经 [`SwitchableTransport`] 无损升直连；
+/// 3) 运行期通过 `SwitchControlMsg` 响应 `P2P -> Relay` 降级与 `Relay -> P2P` 复探切换。
 fn build_host_p2p_candidates(incoming: &RelayIncoming) -> P2pCandidates {
     let self_pubs: Vec<&str> = incoming.self_public_addr.as_deref().into_iter().collect();
     let peer_pubs: Vec<&str> = incoming
@@ -6855,8 +7364,13 @@ fn build_host_p2p_candidates(incoming: &RelayIncoming) -> P2pCandidates {
         local_udp_port: incoming.local_udp_port,
         self_nat_type: incoming.self_nat_type,
         self_nat_port_delta: incoming.self_nat_port_delta,
+        self_nat_port_range: incoming.self_nat_port_range,
         peer_nat_type: incoming.peer_nat_type,
         peer_nat_port_delta: incoming.peer_nat_port_delta,
+        peer_nat_port_range: incoming.peer_nat_port_range,
+        punch_secret: incoming.punch_secret.clone(),
+        start_after_ms: incoming.start_after_ms,
+        relay_fallback_after_ms: incoming.relay_fallback_after_ms,
     }
 }
 
@@ -6953,36 +7467,278 @@ fn serve_relay_incoming(
         ),
     };
     let candidates = build_host_p2p_candidates(&incoming);
+    let can_try_p2p = !skip_p2p_for_proxy
+        && !incoming.is_relay_alloc
+        && !p2p::parse_candidate_addrs(&candidates).is_empty();
+    let has_relay = !incoming.relay_addr.is_empty() && !incoming.relay_token.is_empty();
+    let relay_first_delay = Duration::from_millis(
+        u64::from(
+            incoming
+                .relay_fallback_after_ms
+                .unwrap_or(DEFAULT_RELAY_FIRST_AFTER_MS as u16),
+        )
+        .clamp(50, 5_000),
+    );
+    let bg_cancel = Arc::new(AtomicBool::new(false));
+    let mut active_switch_handle: Option<SwitchHandle> = None;
     let mut established: Option<EstablishedIncomingHost> = None;
 
-    if !skip_p2p_for_proxy
-        && !p2p::parse_candidate_addrs(&candidates).is_empty()
+    type PendingTransport = (
+        Box<dyn Transport>,
+        HostTransportKind,
+        String,
+        Option<String>,
+    );
+    let p2p_rx: Option<std::sync::mpsc::Receiver<Option<PendingTransport>>> = if can_try_p2p
         && !stop_flag.load(Ordering::Acquire)
         && !disconnect_flag.load(Ordering::Acquire)
     {
-        let port_hold =
-            crate::signal_client::acquire_local_udp_port_for_p2p(candidates.local_udp_port);
-        if let Ok(p2p_conn) = p2p::attempt_p2p_quic_host_mtls(
-            &candidates,
-            p2p::DEFAULT_PUNCH_TIMEOUT,
-            p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
-            &session_cancel,
-            p2p_mtls.as_ref(),
-        ) {
-            if stop_flag.load(Ordering::Acquire)
-                || disconnect_flag.load(Ordering::Acquire)
-                || session_cancel.load(Ordering::Acquire)
-            {
-                drop(p2p_conn);
-                drop(port_hold);
-                disconnect_flag.store(false, Ordering::Release);
-                return;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cands = candidates.clone();
+        let punch_timeout = if has_relay {
+            BACKGROUND_P2P_UPGRADE_WINDOW
+        } else {
+            p2p::DEFAULT_PUNCH_TIMEOUT
+        };
+        let p2p_mtls_c = rebuild_host_p2p_mtls(
+            mtls_bundle.as_ref(),
+            auth_snapshot.accept_mtls_lan,
+            &incoming.peer_id,
+            incoming.is_owner_connection,
+        );
+        let p2p_cancel = Arc::clone(&session_cancel);
+        let bg_c = Arc::clone(&bg_cancel);
+        let peer_id_c = incoming.peer_id.clone();
+        let _ = thread::Builder::new()
+            .name("rc-host-p2p-dial".to_string())
+            .spawn(move || {
+                let port_hold =
+                    crate::signal_client::acquire_local_udp_port_for_p2p(cands.local_udp_port);
+                let combined_cancel = Arc::new(AtomicBool::new(false));
+                let watch_stop = Arc::new(AtomicBool::new(false));
+                let comb_w = Arc::clone(&combined_cancel);
+                let sc_w = Arc::clone(&p2p_cancel);
+                let bg_w = Arc::clone(&bg_c);
+                let ws_w = Arc::clone(&watch_stop);
+                let watcher = thread::spawn(move || {
+                    while !ws_w.load(Ordering::Acquire) {
+                        if sc_w.load(Ordering::Acquire) || bg_w.load(Ordering::Acquire) {
+                            comb_w.store(true, Ordering::Release);
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                });
+                let dial_res = p2p::attempt_p2p_quic_host_mtls(
+                    &cands,
+                    punch_timeout,
+                    p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
+                    &combined_cancel,
+                    p2p_mtls_c.as_ref(),
+                );
+                watch_stop.store(true, Ordering::Release);
+                let _ = watcher.join();
+
+                let out = match dial_res {
+                    Ok(p2p_conn) => {
+                        let fp = p2p_conn
+                            .peer_mtls_identity()
+                            .map(|id| id.cert_fingerprint_sha256);
+                        let held_p2p =
+                            crate::signal_client::P2pHeldTransport::new(p2p_conn, port_hold);
+                        Some((
+                            Box::new(held_p2p) as Box<dyn Transport>,
+                            HostTransportKind::P2p,
+                            format!("设备 {peer_id_c} (P2P 直连)"),
+                            fp,
+                        ))
+                    }
+                    Err(_) => {
+                        drop(port_hold);
+                        None
+                    }
+                };
+                let _ = tx.send(out);
+            });
+        Some(rx)
+    } else {
+        None
+    };
+
+    // 在 0..400ms+ 窗口内防分裂脑并发守候 ClientHello，400ms 未成行则同步启动 Relay 拨号
+    let race_start = Instant::now();
+    let relay_cancel = Arc::new(AtomicBool::new(false));
+    let require_relay_e2ee = auth_snapshot.accept_mtls_lan;
+    type RelayDialRx =
+        std::sync::mpsc::Receiver<Option<(Box<dyn Transport>, HostTransportKind, String)>>;
+    let spawn_initial_relay_dial = || -> RelayDialRx {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let inc_c = incoming.clone();
+        let bundle_c = mtls_bundle.clone();
+        let upd_c = Arc::clone(updates);
+        let ari_c = Arc::new(Mutex::new(None));
+        let sc_c = Arc::clone(&session_cancel);
+        let rc_c = Arc::clone(&relay_cancel);
+        let df_c = Arc::clone(disconnect_flag);
+        let sf_c = Arc::clone(stop_flag);
+        let _ = thread::Builder::new()
+            .name("rc-host-relay-dial".to_string())
+            .spawn(move || {
+                let combined_cancel = Arc::new(AtomicBool::new(false));
+                let watch_stop = Arc::new(AtomicBool::new(false));
+                let comb_w = Arc::clone(&combined_cancel);
+                let sc_w = Arc::clone(&sc_c);
+                let rc_w = Arc::clone(&rc_c);
+                let ws_w = Arc::clone(&watch_stop);
+                let watcher = thread::spawn(move || {
+                    while !ws_w.load(Ordering::Acquire) {
+                        if sc_w.load(Ordering::Acquire) || rc_w.load(Ordering::Acquire) {
+                            comb_w.store(true, Ordering::Release);
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                });
+                let res = dial_relay_for_incoming(
+                    &inc_c,
+                    bundle_c.as_ref(),
+                    require_relay_e2ee,
+                    &upd_c,
+                    &ari_c,
+                    &combined_cancel,
+                    &df_c,
+                    &sf_c,
+                )
+                .map(|(t, k, l, _fp)| (t, k, l));
+                watch_stop.store(true, Ordering::Release);
+                let _ = watcher.join();
+                let _ = tx.send(res);
+            });
+        rx
+    };
+    let mut relay_rx: Option<RelayDialRx> = if !can_try_p2p && has_relay {
+        Some(spawn_initial_relay_dial())
+    } else {
+        None
+    };
+
+    let mut connected_p2p: Option<(Box<dyn Transport>, String, Option<String>)> = None;
+    let mut p2p_prebuf: Vec<rc_net::NetEvent> = Vec::new();
+    let mut p2p_done = p2p_rx.is_none();
+    let mut connected_relay: Option<(Box<dyn Transport>, String)> = None;
+    let mut relay_prebuf: Vec<rc_net::NetEvent> = Vec::new();
+    let mut relay_done = !has_relay;
+    let race_deadline = Instant::now() + Duration::from_secs(16);
+    let mut p2p_rx_slot = p2p_rx;
+
+    while established.is_none()
+        && Instant::now() < race_deadline
+        && !stop_flag.load(Ordering::Acquire)
+        && !disconnect_flag.load(Ordering::Acquire)
+        && !session_cancel.load(Ordering::Acquire)
+    {
+        if relay_rx.is_none()
+            && has_relay
+            && !relay_done
+            && race_start.elapsed() >= relay_first_delay
+        {
+            relay_rx = Some(spawn_initial_relay_dial());
+        }
+
+        if let Some(ref rx) = p2p_rx_slot {
+            match rx.try_recv() {
+                Ok(Some((t, _kind, lbl, fp))) => {
+                    connected_p2p = Some((t, lbl, fp));
+                    p2p_rx_slot = None;
+                }
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    p2p_done = true;
+                    p2p_rx_slot = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
-            let held_p2p = crate::signal_client::P2pHeldTransport::new(p2p_conn, port_hold);
-            let peer_label = format!("设备 {} (P2P 直连)", incoming.peer_id);
+        }
+        if let Some(ref rx) = relay_rx {
+            match rx.try_recv() {
+                Ok(Some((t, _kind, lbl))) => {
+                    connected_relay = Some((t, lbl));
+                    relay_rx = None;
+                }
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    relay_done = true;
+                    relay_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        // 检查已连上的路径是否实际收到 ClientHello
+        type ChosenHelloWinner = (
+            Box<dyn Transport>,
+            HostTransportKind,
+            String,
+            Vec<rc_net::NetEvent>,
+        );
+        let mut chosen: Option<ChosenHelloWinner> = None;
+        if let Some((mut t, lbl, fp)) = connected_p2p.take() {
+            match try_poll_for_first_hello(&mut t, &mut p2p_prebuf) {
+                Ok(true) => {
+                    let _ = fp;
+                    chosen = Some((
+                        t,
+                        HostTransportKind::P2p,
+                        lbl,
+                        std::mem::take(&mut p2p_prebuf),
+                    ));
+                }
+                Ok(false) => {
+                    connected_p2p = Some((t, lbl, fp));
+                }
+                Err(()) => {
+                    p2p_done = true;
+                    p2p_prebuf.clear();
+                }
+            }
+        }
+        if chosen.is_none() {
+            if let Some((mut t, lbl)) = connected_relay.take() {
+                match try_poll_for_first_hello(&mut t, &mut relay_prebuf) {
+                    Ok(true) => {
+                        chosen = Some((
+                            t,
+                            HostTransportKind::Relay,
+                            lbl,
+                            std::mem::take(&mut relay_prebuf),
+                        ));
+                    }
+                    Ok(false) => {
+                        connected_relay = Some((t, lbl));
+                    }
+                    Err(()) => {
+                        relay_done = true;
+                        relay_prebuf.clear();
+                    }
+                }
+            }
+        }
+
+        if let Some((raw_t, kind, peer_label, prebuf)) = chosen {
+            let sw_kind = match kind {
+                HostTransportKind::P2p => TransportPathKind::P2p,
+                HostTransportKind::Relay => TransportPathKind::Relay,
+                HostTransportKind::Lan => TransportPathKind::Lan,
+                HostTransportKind::MtlsLan => TransportPathKind::MtlsLan,
+            };
+            let (mut sw_transport, sw_handle) = SwitchableTransport::new(
+                raw_t,
+                rc_net::Role::Host,
+                sw_kind,
+                auth_snapshot.accept_mtls_lan,
+            );
+            sw_transport.push_prebuffered_events(prebuf);
             match build_and_handshake_transport(
-                Box::new(held_p2p),
-                HostTransportKind::P2p,
+                Box::new(sw_transport),
+                kind,
                 &peer_label,
                 actual_addr,
                 opts,
@@ -7001,102 +7757,122 @@ fn serve_relay_incoming(
                     live_pw_ver,
                     live_cfg_ver,
                 } => {
+                    active_switch_handle = Some(sw_handle.clone());
+                    if kind == HostTransportKind::P2p {
+                        // P2P 已完成握手胜出，立即取消任何尚未启动或在途的初始 Relay 拨号，保留服务端初始一次性 token 供 50s 内运行期降级复用
+                        relay_cancel.store(true, Ordering::Release);
+                        drop(relay_rx.take());
+                        drop(connected_relay.take());
+                    }
+                    // 若初始走 Relay，且后台 P2P 已有就绪连接或仍在穿透窗口内，提交给 SwitchableTransport 无损升直连
+                    if kind == HostTransportKind::Relay && can_try_p2p {
+                        let require_mtls = auth_snapshot.accept_mtls_lan;
+                        if let Some((t, _lbl, fp)) = connected_p2p.take() {
+                            let _ = sw_handle.accept_switch_candidate(CandidateTransport {
+                                transport: t,
+                                kind: TransportPathKind::P2p,
+                                mtls_verified: !require_mtls || fp.is_some(),
+                                peer_cert_fingerprint: fp,
+                            });
+                        } else if let Some(bg_rx) = p2p_rx_slot.take() {
+                            let bg_c = Arc::clone(&bg_cancel);
+                            let sc_c = Arc::clone(&session_cancel);
+                            let df_c = Arc::clone(disconnect_flag);
+                            let sf_c = Arc::clone(stop_flag);
+                            let _ = thread::Builder::new()
+                                .name("rc-host-bg-p2p-upgrade".to_string())
+                                .spawn(move || {
+                                    while !bg_c.load(Ordering::Acquire)
+                                        && !sc_c.load(Ordering::Acquire)
+                                        && !df_c.load(Ordering::Acquire)
+                                        && !sf_c.load(Ordering::Acquire)
+                                    {
+                                        match bg_rx.recv_timeout(Duration::from_millis(50)) {
+                                            Ok(Some((t, _k, _lbl, fp))) => {
+                                                let _ = sw_handle.accept_switch_candidate(
+                                                    CandidateTransport {
+                                                        transport: t,
+                                                        kind: TransportPathKind::P2p,
+                                                        mtls_verified: !require_mtls
+                                                            || fp.is_some(),
+                                                        peer_cert_fingerprint: fp,
+                                                    },
+                                                );
+                                                break;
+                                            }
+                                            Ok(None)
+                                            | Err(
+                                                std::sync::mpsc::RecvTimeoutError::Disconnected,
+                                            ) => {
+                                                break;
+                                            }
+                                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                        }
+                                    }
+                                });
+                        }
+                    }
                     established = Some(EstablishedIncomingHost {
                         built,
                         streaming_started,
                         live_pw_ver,
                         live_cfg_ver,
-                        transport_kind: HostTransportKind::P2p,
+                        transport_kind: kind,
                         peer_label,
                     });
+                    break;
                 }
                 HandshakeTransportOutcome::Failed(err) => {
-                    let can_fallback_relay = is_p2p_handshake_fallback_eligible(&err)
+                    let can_fallback_relay = kind == HostTransportKind::P2p
+                        && is_p2p_handshake_fallback_eligible(&err)
                         && !stop_flag.load(Ordering::Acquire)
                         && !disconnect_flag.load(Ordering::Acquire)
                         && !session_cancel.load(Ordering::Acquire)
-                        && !incoming.relay_addr.is_empty();
+                        && has_relay;
                     if !can_fallback_relay {
+                        bg_cancel.store(true, Ordering::Release);
                         disconnect_flag.store(false, Ordering::Release);
                         return;
                     }
+                    p2p_done = true;
                 }
                 HandshakeTransportOutcome::BuildError => {
+                    bg_cancel.store(true, Ordering::Release);
                     disconnect_flag.store(false, Ordering::Release);
                     return;
                 }
             }
         }
+
+        if p2p_done && connected_p2p.is_none() && relay_done && connected_relay.is_none() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 
     if stop_flag.load(Ordering::Acquire)
         || disconnect_flag.load(Ordering::Acquire)
         || session_cancel.load(Ordering::Acquire)
     {
+        relay_cancel.store(true, Ordering::Release);
+        bg_cancel.store(true, Ordering::Release);
         disconnect_flag.store(false, Ordering::Release);
         return;
     }
 
-    // 2) 若 P2P 未成功或握手前因分裂脑回退，无缝拨号 TCP RCR1 中继并构造新 HostSession 重试握手。
-    let EstablishedIncomingHost {
+    let Some(EstablishedIncomingHost {
         built,
         streaming_started,
         live_pw_ver,
         live_cfg_ver,
         transport_kind,
         peer_label,
-    } = match established {
-        Some(ready) => ready,
-        None => {
-            // 中继内层始终采用 `HostAuto`（保留 `:21117` 外层强制 mTLS），以便关闭了 S3 加密开关的客户端也可连通。
-            let require_e2ee = false;
-            let Some((raw_transport, transport_kind, peer_label)) = dial_relay_for_incoming(
-                &incoming,
-                mtls_bundle.as_ref(),
-                require_e2ee,
-                updates,
-                active_relay_interrupt,
-                &session_cancel,
-                disconnect_flag,
-                stop_flag,
-            ) else {
-                disconnect_flag.store(false, Ordering::Release);
-                return;
-            };
-            match build_and_handshake_transport(
-                raw_transport,
-                transport_kind,
-                &peer_label,
-                actual_addr,
-                opts,
-                updates,
-                approver,
-                password_state,
-                password_version,
-                auth_state,
-                config_version,
-                disconnect_flag,
-                stop_flag,
-            ) {
-                HandshakeTransportOutcome::Ready {
-                    built,
-                    streaming_started,
-                    live_pw_ver,
-                    live_cfg_ver,
-                } => EstablishedIncomingHost {
-                    built,
-                    streaming_started,
-                    live_pw_ver,
-                    live_cfg_ver,
-                    transport_kind,
-                    peer_label,
-                },
-                HandshakeTransportOutcome::Failed(_) | HandshakeTransportOutcome::BuildError => {
-                    disconnect_flag.store(false, Ordering::Release);
-                    return;
-                }
-            }
-        }
+    }) = established
+    else {
+        relay_cancel.store(true, Ordering::Release);
+        bg_cancel.store(true, Ordering::Release);
+        disconnect_flag.store(false, Ordering::Release);
+        return;
     };
 
     let BuiltUiHost {
@@ -7111,7 +7887,22 @@ fn serve_relay_incoming(
     streaming_started.store(true, Ordering::Release);
     emit_peer_connected(&host, &peer_label, updates);
 
-    let outcome = drive_ui_host_session_inner(
+    let _ = &p2p_mtls;
+    let switch_runtime = active_switch_handle.map(|handle| HostSwitchRuntime {
+        handle,
+        incoming: incoming.clone(),
+        mtls_bundle: mtls_bundle.clone(),
+        require_mtls: auth_snapshot.accept_mtls_lan,
+        skip_p2p_for_proxy,
+        updates: Arc::clone(updates),
+        disconnect_flag: Arc::clone(disconnect_flag),
+        stop_flag: Arc::clone(stop_flag),
+        active_relay_interrupt: Arc::new(Mutex::new(None)),
+        bg_cancel: Arc::clone(&bg_cancel),
+        signal_client: opts.signal_client.clone(),
+    });
+
+    let outcome = drive_ui_host_session_with_switch(
         &mut host,
         &clock,
         Some(&clock_anchor),
@@ -7136,7 +7927,9 @@ fn serve_relay_incoming(
         Some(incoming_relay),
         Some(incoming.peer_id.as_str()),
         Instant::now(),
+        switch_runtime,
     );
+    bg_cancel.store(true, Ordering::Release);
     let reason = outcome.reason;
     let last_backend = backend_label
         .lock()
@@ -9391,6 +10184,7 @@ mod tests {
                 None,
                 Instant::now(),
                 audio_mgr,
+                None,
             );
             (outcome, host.client_idle_timeout_us())
         });
@@ -9675,6 +10469,7 @@ mod tests {
                 None,
                 Instant::now(),
                 audio_mgr,
+                None,
             )
         });
 
@@ -11024,6 +11819,7 @@ mod tests {
                 None,
                 Instant::now(),
                 audio_mgr,
+                None,
             )
         });
 
@@ -11169,8 +11965,8 @@ mod tests {
                 "203.0.113.21:45000".to_string(),
                 "[2001:db8::99]:9901".to_string(),
             ],
-            self_nat_type: crate::nat::NatType::SymmetricRandom,
-            peer_nat_type: crate::nat::NatType::SymmetricRandom,
+            self_nat_type: crate::nat::NatType::ApdmRandom,
+            peer_nat_type: crate::nat::NatType::ApdmRandom,
             ..RelayIncoming::default()
         };
         let cands = build_host_p2p_candidates(&cross_site);
@@ -11459,5 +12255,122 @@ mod tests {
             Some("bob"),
             Some("alice")
         ));
+    }
+
+    #[test]
+    fn collect_host_lan_addrs_formats_multi_nic_and_global_v6_with_cap_16() {
+        assert!(collect_host_lan_addrs(0).is_empty());
+
+        let mut ips = lan_discovery::LocalInterfaceIps::default();
+        for i in 1..=20u8 {
+            ips.ipv4s.push(Ipv4Addr::new(192, 168, 10, i));
+        }
+        ips.global_ipv6s.push("2408:8207:1::5".parse().unwrap());
+        let capped = format_host_lan_addrs_from_ips(&ips, DEFAULT_HOST_PORT);
+        assert_eq!(capped.len(), 16);
+        assert_eq!(capped[0], "192.168.10.1:9901");
+
+        let mixed = lan_discovery::LocalInterfaceIps {
+            ipv4s: vec![Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(100, 64, 0, 2)],
+            global_ipv6s: vec!["2408:8207:1::5".parse().unwrap()],
+        };
+        assert_eq!(
+            format_host_lan_addrs_from_ips(&mixed, 9901),
+            vec![
+                "192.168.1.10:9901".to_string(),
+                "100.64.0.2:9901".to_string(),
+                "[2408:8207:1::5]:9901".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dial_relay_for_incoming_extracts_real_mtls_peer_cert_fingerprint() {
+        use crate::relay_transport::tests::mtls_test_certs::TestCa;
+        use crate::relay_transport::tests::{
+            build_mock_mtls_relay_server_config, spawn_mock_mtls_relay_server,
+        };
+        use crate::relay_transport::{E2eeRelayTransport, RelayE2eeMode, RelayRole};
+
+        let mut ca = TestCa::new("HostSwitchRelayCA");
+        let (srv_cert, srv_key) = ca.issue_server_for_loopback();
+        let (host_cert, host_key) = ca.issue_device("u1", "200000011");
+        let (client_cert, client_key) = ca.issue_device("u1", "100000011");
+
+        let srv_cfg = build_mock_mtls_relay_server_config(&ca.ca_pem, &srv_cert, &srv_key);
+        let (relay_addr, relay_jh) = spawn_mock_mtls_relay_server(srv_cfg);
+
+        let host_bundle = SessionMtlsBundle {
+            ca_cert_pem: ca.ca_pem.clone(),
+            cert_pem: host_cert,
+            key_pem: host_key,
+            local_user_id: "u1".to_string(),
+            expected_peer_device_id: None,
+            expected_peer_user_id: None,
+        };
+        let client_bundle = SessionMtlsBundle {
+            ca_cert_pem: ca.ca_pem.clone(),
+            cert_pem: client_cert,
+            key_pem: client_key,
+            local_user_id: "u1".to_string(),
+            expected_peer_device_id: Some("200000011".to_string()),
+            expected_peer_user_id: Some("u1".to_string()),
+        };
+
+        let cancel_c = Arc::new(AtomicBool::new(false));
+        let relay_str = relay_addr.to_string();
+        let client_bundle_c = client_bundle.clone();
+        let token = "real-fp-relay-token".to_string();
+        let token_c = token.clone();
+        let client_jh = thread::spawn(move || {
+            let relay_mtls = client_bundle_c.to_relay_mtls_config(None);
+            E2eeRelayTransport::connect_cancellable(
+                &relay_str,
+                RelayRole::Client,
+                &token_c,
+                Duration::from_secs(5),
+                cancel_c,
+                Some(&relay_mtls),
+                RelayE2eeMode::ClientRequired(client_bundle_c),
+            )
+        });
+
+        let incoming = RelayIncoming {
+            session_id: "sess-real-fp".to_string(),
+            relay_addr: relay_addr.to_string(),
+            relay_token: token,
+            peer_id: "100000011".to_string(),
+            is_owner_connection: true,
+            ..RelayIncoming::default()
+        };
+        let updates = BoundedHostUpdateQueue::new(16);
+        let active_relay_interrupt = Mutex::new(None);
+        let session_cancel = Arc::new(AtomicBool::new(false));
+        let disconnect_flag = AtomicBool::new(false);
+        let stop_flag = AtomicBool::new(false);
+
+        let (_transport, kind, _label, fp) = dial_relay_for_incoming(
+            &incoming,
+            Some(&host_bundle),
+            true,
+            &updates,
+            &active_relay_interrupt,
+            &session_cancel,
+            &disconnect_flag,
+            &stop_flag,
+        )
+        .expect("host E2EE relay dial must succeed");
+        assert_eq!(kind, HostTransportKind::Relay);
+
+        let client_res = client_jh.join().unwrap().expect("client E2EE relay dial");
+        let fp_str = fp.expect("dial_relay_for_incoming must extract real SHA-256 fingerprint");
+        assert_ne!(fp_str, "relay-mtls-verified");
+        assert_eq!(fp_str.len(), 64);
+        assert!(fp_str.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(client_res.peer_mtls_identity().is_some());
+
+        drop(_transport);
+        drop(client_res);
+        let _ = relay_jh.join();
     }
 }

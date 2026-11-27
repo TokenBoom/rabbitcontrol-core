@@ -13,7 +13,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{
-    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpStream, ToSocketAddrs,
+    UdpSocket,
 };
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
@@ -30,7 +31,8 @@ use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, TcpKeepalive, Type};
 
 use crate::cert_manager::OwnerGrantPayload;
 use crate::nat::{
-    canonicalize_socket_addr, classify_nat_mapping, is_global_unicast_ipv6, NatProfile, NatType,
+    canonicalize_socket_addr, classify_nat_samples, is_global_unicast_ipv6, is_routable_public_ip,
+    NatProbeSamples, NatProfile, NatType, PortRangeHint,
 };
 use crate::p2p::P2pQuicConnection;
 use crate::server_config::{
@@ -158,10 +160,20 @@ pub struct RelayIncoming {
     pub self_nat_type: NatType,
     /// 本端顺序对称 NAT 分配端口步长（如有）。
     pub self_nat_port_delta: Option<i16>,
+    /// 本端 NAT 外网端口区间提示（如有）。
+    pub self_nat_port_range: Option<PortRangeHint>,
     /// 对端上报的 NAT 类型。
     pub peer_nat_type: NatType,
     /// 对端顺序对称 NAT 分配端口步长（如有）。
     pub peer_nat_port_delta: Option<i16>,
+    /// 对端 NAT 外网端口区间提示（如有）。
+    pub peer_nat_port_range: Option<PortRangeHint>,
+    /// 服务端下发的会话共享 `RCP2 v2` HMAC 密钥（32 位十六进制字符串，如有）。
+    pub punch_secret: Option<String>,
+    /// 服务端协调的快侧打洞起跑延迟（毫秒）。
+    pub start_after_ms: Option<u16>,
+    /// 服务端协调的并发中继回退延迟（毫秒）。
+    pub relay_fallback_after_ms: Option<u16>,
     /// 对端上报的局域网候选地址列表。
     pub peer_lan_addrs: Vec<String>,
     /// 本端持久化 UDP `RCSP` 探测套接字绑定的本地端口（供 P2P 同端口复用以对齐 NAT 映射）。
@@ -199,12 +211,27 @@ pub struct ConnectGrant {
     /// 本端顺序对称 NAT 分配端口步长（如有）。
     #[serde(default)]
     pub self_nat_port_delta: Option<i16>,
+    /// 本端 NAT 外网端口区间提示（如有）。
+    #[serde(default)]
+    pub self_nat_port_range: Option<PortRangeHint>,
     /// 对端上报的 NAT 类型。
     #[serde(default)]
     pub peer_nat_type: NatType,
     /// 对端顺序对称 NAT 分配端口步长（如有）。
     #[serde(default)]
     pub peer_nat_port_delta: Option<i16>,
+    /// 对端 NAT 外网端口区间提示（如有）。
+    #[serde(default)]
+    pub peer_nat_port_range: Option<PortRangeHint>,
+    /// 服务端下发的会话共享 `RCP2 v2` HMAC 密钥（32 位十六进制字符串，如有）。
+    #[serde(default)]
+    pub punch_secret: Option<String>,
+    /// 服务端协调的快侧打洞起跑延迟（毫秒）。
+    #[serde(default)]
+    pub start_after_ms: Option<u16>,
+    /// 服务端协调的并发中继回退延迟（毫秒）。
+    #[serde(default)]
+    pub relay_fallback_after_ms: Option<u16>,
     /// 对端上报的局域网候选地址列表。
     pub peer_lan_addrs: Vec<String>,
     /// 本端持久化 UDP `RCSP` 探测套接字绑定的本地端口（供 P2P 同端口复用以对齐 NAT 映射）。
@@ -384,6 +411,8 @@ enum OutgoingSignalMsg {
         nat_type: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nat_port_delta: Option<i16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nat_port_range: Option<[u16; 2]>,
     },
     Heartbeat {
         lan_addrs: Vec<String>,
@@ -395,6 +424,10 @@ enum OutgoingSignalMsg {
         nat_type: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nat_port_delta: Option<i16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nat_port_range: Option<[u16; 2]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rtt_ms: Option<u32>,
     },
     UpdateAssistState {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -415,6 +448,8 @@ enum OutgoingSignalMsg {
         nat_type: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nat_port_delta: Option<i16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nat_port_range: Option<[u16; 2]>,
     },
     RelayAlloc {
         target_id: String,
@@ -438,6 +473,8 @@ enum IncomingSignalMsg {
         udp_probe_addr: Option<String>,
         #[serde(default)]
         udp_probe_alt_addr: Option<String>,
+        #[serde(default)]
+        udp_probe_alt_ip_addr: Option<String>,
         #[serde(default)]
         udp_probe_token: Option<String>,
         #[serde(default)]
@@ -481,7 +518,17 @@ enum IncomingSignalMsg {
         #[serde(default)]
         peer_nat_port_delta: Option<i16>,
         #[serde(default)]
+        self_nat_port_range: Option<[u16; 2]>,
+        #[serde(default)]
+        peer_nat_port_range: Option<[u16; 2]>,
+        #[serde(default)]
         peer_lan_addrs: Vec<String>,
+        #[serde(default)]
+        punch_secret: Option<String>,
+        #[serde(default)]
+        start_after_ms: Option<u16>,
+        #[serde(default)]
+        relay_fallback_after_ms: Option<u16>,
         relay_token: String,
         #[serde(default)]
         relay_addr: String,
@@ -670,6 +717,10 @@ struct SharedState {
     local_udp_is_ipv6: AtomicBool,
     /// 本端经 `RCSP`/`RCSA` 探测分类出的 NAT 画像与双栈观测公网端点。
     nat_profile: Mutex<NatProfile>,
+    /// 客户端测量到的信令/UDP EWMA RTT 估算（毫秒，范围 `0..=10_000`）。
+    rtt_ms: Mutex<Option<u32>>,
+    /// 最近一次发送 `Heartbeat` 的时刻（用于计算 `HeartbeatAck` RTT 样本）。
+    last_heartbeat_sent_at: Mutex<Option<Instant>>,
     /// 当前活跃连接持有的持久化 UDP 探测句柄（用于 `ConnectRequest` / `PunchCoord` 轻量热刷新）。
     active_probe: Mutex<Option<Arc<PersistentUdpProbe>>>,
     /// 是否在已连接状态下启用按路由动态局域网 IPv4 探测。
@@ -885,6 +936,11 @@ impl SharedState {
         self.local_udp_port.store(0, Ordering::Release);
         self.local_udp_is_ipv6.store(false, Ordering::Release);
         *self.nat_profile.lock().unwrap_or_else(|e| e.into_inner()) = NatProfile::default();
+        *self.rtt_ms.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .last_heartbeat_sent_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         *self.active_probe.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.server_is_loopback.store(false, Ordering::Release);
         self.proxy_active.store(false, Ordering::Release);
@@ -911,20 +967,32 @@ impl SharedState {
             .clone()
     }
 
-    fn current_nat_wire_fields(&self) -> (Option<String>, Option<i16>) {
+    fn current_nat_wire_fields(&self) -> (Option<String>, Option<i16>, Option<[u16; 2]>) {
         let profile = self
             .nat_profile
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if profile.nat_type == NatType::Unknown {
-            (None, None)
+            (None, None, None)
         } else {
             (
                 Some(profile.nat_type.as_str().to_string()),
                 profile.port_delta,
+                profile
+                    .port_range
+                    .and_then(PortRangeHint::validated)
+                    .map(PortRangeHint::to_wire_pair),
             )
         }
+    }
+
+    fn record_rtt_sample(&self, sample_ms: u32) {
+        record_rtt_sample_into(&self.rtt_ms, sample_ms);
+    }
+
+    fn current_rtt_ms(&self) -> Option<u32> {
+        *self.rtt_ms.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn observed_public_addr_matching(&self, peer_public_addr: Option<&str>) -> Option<String> {
@@ -1208,30 +1276,38 @@ impl SharedState {
         local_udp_port: u16,
         local_udp_is_ipv6: bool,
     ) -> Vec<String> {
-        if local_udp_port == 0 {
+        if local_udp_port == 0 || self.proxy_active.load(Ordering::Acquire) {
             return Vec::new();
         }
         let allow_loopback = self.server_is_loopback.load(Ordering::Acquire);
-        let mut out = if self.dynamic_lan_discovery && !local_udp_is_ipv6 {
+        let mut out = if self.dynamic_lan_discovery {
             let targets = self
                 .connected_probe_targets
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            let discovered = crate::lan_discovery::discover_local_lan_ipv4s(&targets);
-            if !discovered.is_empty() {
-                let mut combined: Vec<String> =
-                    discovered.into_iter().map(|ip| ip.to_string()).collect();
-                combined.extend(static_lan_addrs.iter().cloned());
-                effective_lan_addrs(&combined, local_udp_port, local_udp_is_ipv6, allow_loopback)
-            } else {
-                effective_lan_addrs(
-                    static_lan_addrs,
-                    local_udp_port,
-                    local_udp_is_ipv6,
-                    allow_loopback,
-                )
+            let local_ips = crate::lan_discovery::detect_local_interface_ips_for_targets(&targets);
+            let mut combined: Vec<String> = Vec::new();
+            if !local_udp_is_ipv6 {
+                for ip in local_ips.ipv4s {
+                    let s = ip.to_string();
+                    if !combined.contains(&s) {
+                        combined.push(s);
+                    }
+                }
             }
+            for v6 in local_ips.global_ipv6s {
+                let s = v6.to_string();
+                if !combined.contains(&s) {
+                    combined.push(s);
+                }
+            }
+            for raw in static_lan_addrs {
+                if !combined.contains(raw) {
+                    combined.push(raw.clone());
+                }
+            }
+            effective_lan_addrs(&combined, local_udp_port, local_udp_is_ipv6, allow_loopback)
         } else {
             effective_lan_addrs(
                 static_lan_addrs,
@@ -1241,22 +1317,29 @@ impl SharedState {
             )
         };
 
-        if !local_udp_is_ipv6 {
-            let upnp_ext = self
-                .upnp_external_addr
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            if let Some(ext) = upnp_ext {
-                let trimmed = ext.trim();
-                if !trimmed.is_empty()
-                    && trimmed.len() <= MAX_LAN_ADDR_BYTES
-                    && trimmed.bytes().all(|b| b.is_ascii_graphic())
-                    && !out.iter().any(|existing| existing == trimmed)
-                    && out.len() < MAX_LAN_ADDRS
-                {
-                    out.push(trimmed.to_string());
+        let upnp_ext = self
+            .upnp_external_addr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(ext) = upnp_ext {
+            let trimmed = ext.trim();
+            let allow_family = if let Ok(sock) = trimmed.parse::<SocketAddr>() {
+                match sock {
+                    SocketAddr::V4(_) => !local_udp_is_ipv6,
+                    SocketAddr::V6(v6) => is_global_unicast_ipv6(*v6.ip()),
                 }
+            } else {
+                !local_udp_is_ipv6
+            };
+            if allow_family
+                && !trimmed.is_empty()
+                && trimmed.len() <= MAX_LAN_ADDR_BYTES
+                && trimmed.bytes().all(|b| b.is_ascii_graphic())
+                && !out.iter().any(|existing| existing == trimmed)
+                && out.len() < MAX_LAN_ADDRS
+            {
+                out.push(trimmed.to_string());
             }
         }
         out
@@ -1349,17 +1432,25 @@ fn spawn_upnp_map_task(shared: Arc<SharedState>, bound_udp_port: u16, generation
             if shared.upnp_gen.load(Ordering::Acquire) != generation
                 || shared.local_udp_port.load(Ordering::Acquire) != bound_udp_port
                 || !shared.upnp_enabled.load(Ordering::Acquire)
+                || shared.proxy_active.load(Ordering::Acquire)
                 || shared.stop_flag.load(Ordering::Acquire)
             {
                 return;
             }
-            let res = map_udp_port(bound_udp_port, UPNP_LEASE_SECS, UPNP_MAP_TIMEOUT);
+            let res = verify_mapped_lease_or_unmap(
+                &shared,
+                generation,
+                map_udp_port(bound_udp_port, UPNP_LEASE_SECS, UPNP_MAP_TIMEOUT),
+            );
             apply_upnp_map_result(&shared, generation, res);
         });
 }
 
 fn maybe_spawn_upnp_renew(shared: &Arc<SharedState>) {
-    if !shared.upnp_enabled.load(Ordering::Acquire) || shared.stop_flag.load(Ordering::Acquire) {
+    if !shared.upnp_enabled.load(Ordering::Acquire)
+        || shared.proxy_active.load(Ordering::Acquire)
+        || shared.stop_flag.load(Ordering::Acquire)
+    {
         return;
     }
     let (generation, lease_opt) = {
@@ -1373,9 +1464,48 @@ fn maybe_spawn_upnp_renew(shared: &Arc<SharedState>) {
     let _ = thread::Builder::new()
         .name("rc-upnp-renew".to_string())
         .spawn(move || {
-            let res = renew_udp_mapping(&lease, UPNP_LEASE_SECS, UPNP_MAP_TIMEOUT);
+            let res = verify_mapped_lease_or_unmap(
+                &shared_bg,
+                generation,
+                renew_udp_mapping(&lease, UPNP_LEASE_SECS, UPNP_MAP_TIMEOUT),
+            );
             apply_upnp_map_result(&shared_bg, generation, res);
         });
+}
+
+fn verify_mapped_lease_or_unmap(
+    shared: &SharedState,
+    generation: u64,
+    result: Result<UpnpMappingLease, String>,
+) -> Result<UpnpMappingLease, String> {
+    let Ok(lease) = result else {
+        return result;
+    };
+    if shared.proxy_active.load(Ordering::Acquire)
+        || shared.upnp_gen.load(Ordering::Acquire) != generation
+        || shared.stop_flag.load(Ordering::Acquire)
+    {
+        unmap_udp_port(&lease, UPNP_UNMAP_TIMEOUT);
+        return Err("UPnP/PCP 自检前状态已失效或代理激活".to_string());
+    }
+    let probe_opt = shared
+        .active_probe
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(probe) = probe_opt {
+        if let ExternalMappingCheck::Unreachable(reason) = probe
+            .verify_external_mapping_reachability(
+                lease.external_addr,
+                &shared.nat_profile,
+                &shared.stop_flag,
+            )
+        {
+            unmap_udp_port(&lease, UPNP_UNMAP_TIMEOUT);
+            return Err(reason);
+        }
+    }
+    Ok(lease)
 }
 
 fn trigger_upnp_for_bound_udp(
@@ -1641,6 +1771,8 @@ impl SignalClientHandle {
             local_udp_port: AtomicU16::new(0),
             local_udp_is_ipv6: AtomicBool::new(false),
             nat_profile: Mutex::new(NatProfile::default()),
+            rtt_ms: Mutex::new(None),
+            last_heartbeat_sent_at: Mutex::new(None),
             active_probe: Mutex::new(None),
             dynamic_lan_discovery,
             connected_probe_targets: Mutex::new(Vec::new()),
@@ -1762,7 +1894,7 @@ impl SignalClientHandle {
             let nonce = random_hex(8);
             let local_udp_port = self.shared.local_udp_port.load(Ordering::Acquire);
             let local_udp_is_ipv6 = self.shared.local_udp_is_ipv6.load(Ordering::Acquire);
-            let (nat_type, nat_port_delta) = self.shared.current_nat_wire_fields();
+            let (nat_type, nat_port_delta, nat_port_range) = self.shared.current_nat_wire_fields();
             OutgoingSignalMsg::ConnectRequest {
                 target_id: normalized,
                 session_id: session_id.clone(),
@@ -1774,6 +1906,7 @@ impl SignalClientHandle {
                 nonce,
                 nat_type,
                 nat_port_delta,
+                nat_port_range,
             }
         };
 
@@ -2142,6 +2275,70 @@ impl SignalClientHandle {
         }
         self.shared.cleanup_upnp_on_stop();
     }
+
+    /// 轻量触发 `RCSP` 探测刷新并返回当前已知的本地 UDP 端口、公网/LAN 候选与 NAT 画像（供运行期 `Relay -> P2P` 复探）。
+    pub fn snapshot_p2p_reprobe_info(
+        &self,
+    ) -> (
+        Option<u16>,
+        Vec<String>,
+        NatType,
+        Option<i16>,
+        Option<PortRangeHint>,
+    ) {
+        if self.shared.proxy_active.load(Ordering::Acquire) {
+            return (None, Vec::new(), NatType::Unknown, None, None);
+        }
+        self.shared.trigger_lightweight_probe_refresh();
+        thread::sleep(Duration::from_millis(20));
+        self.shared.trigger_lightweight_probe_refresh();
+
+        let port = self.shared.local_udp_port.load(Ordering::Acquire);
+        let is_v6 = self.shared.local_udp_is_ipv6.load(Ordering::Acquire);
+        let profile = self
+            .shared
+            .nat_profile
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (nat_type, nat_delta, nat_range) =
+            (profile.nat_type, profile.port_delta, profile.port_range);
+
+        let mut addrs = Vec::new();
+        for pub_addr in [profile.public_v4, profile.public_v6].into_iter().flatten() {
+            let s = canonicalize_socket_addr(pub_addr).to_string();
+            if !addrs.contains(&s) {
+                addrs.push(s);
+            }
+        }
+        for lan in self
+            .shared
+            .current_effective_lan_addrs(&self.shared.lan_addrs, port, is_v6)
+        {
+            if !addrs.contains(&lan) {
+                addrs.push(lan);
+            }
+        }
+        (
+            (port != 0).then_some(port),
+            addrs,
+            nat_type,
+            nat_delta,
+            nat_range,
+        )
+    }
+}
+
+impl std::fmt::Debug for SignalClientHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalClientHandle")
+            .field("enabled", &self.shared.enabled)
+            .field(
+                "local_udp_port",
+                &self.shared.local_udp_port.load(Ordering::Acquire),
+            )
+            .finish()
+    }
 }
 
 impl Drop for SignalClientHandle {
@@ -2255,6 +2452,78 @@ fn extract_canonical_lan_ip(raw: &str, fallback_port: u16) -> Option<IpAddr> {
         }
     }
     None
+}
+
+fn is_public_routable_ip(ip: IpAddr) -> bool {
+    match canonicalize_ip(ip) {
+        IpAddr::V4(v4) => {
+            !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_unspecified()
+                && !v4.is_broadcast()
+                && !v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+            let is_ula = (seg0 & 0xfe00) == 0xfc00;
+            !v6.is_loopback()
+                && !is_link_local
+                && !is_ula
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+        }
+    }
+}
+
+/// 将候选地址列表拆分为公网候选与局域网候选（按需补齐初始信令观测到的备用公网端点）。
+pub(crate) fn split_public_and_lan_addrs(
+    addrs: &[String],
+    fallback_public: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut public_addrs = Vec::new();
+    let mut lan_addrs = Vec::new();
+    for raw in addrs {
+        let Ok(sock) = raw.trim().parse::<SocketAddr>() else {
+            continue;
+        };
+        let sock = canonicalize_socket_addr(sock);
+        if sock.port() == 0 {
+            continue;
+        }
+        let s = sock.to_string();
+        if is_public_routable_ip(sock.ip()) {
+            if !public_addrs.contains(&s) {
+                public_addrs.push(s);
+            }
+        } else if !lan_addrs.contains(&s) {
+            lan_addrs.push(s);
+        }
+    }
+    let has_v4 = public_addrs
+        .iter()
+        .any(|a| a.parse::<SocketAddr>().is_ok_and(|s| s.is_ipv4()));
+    let has_v6 = public_addrs
+        .iter()
+        .any(|a| a.parse::<SocketAddr>().is_ok_and(|s| s.is_ipv6()));
+    for raw in fallback_public {
+        let Ok(sock) = raw.trim().parse::<SocketAddr>() else {
+            continue;
+        };
+        let sock = canonicalize_socket_addr(sock);
+        if sock.port() == 0 || !is_public_routable_ip(sock.ip()) {
+            continue;
+        }
+        if (sock.is_ipv4() && has_v4) || (sock.is_ipv6() && has_v6) {
+            continue;
+        }
+        let s = sock.to_string();
+        if !public_addrs.contains(&s) {
+            public_addrs.push(s);
+        }
+    }
+    (public_addrs, lan_addrs)
 }
 
 fn validate_udp_probe_device_id(device_id: &str) -> Result<&[u8], String> {
@@ -2904,7 +3173,7 @@ fn run_single_connection(
 
     let clean_hostname = sanitize_hostname(hostname);
     let clean_lan_addrs = sanitize_lan_addrs(lan_addrs);
-    let (nat_type, nat_port_delta) = shared.current_nat_wire_fields();
+    let (nat_type, nat_port_delta, nat_port_range) = shared.current_nat_wire_fields();
     // 初始注册时尚未绑定持久化 UDP 探测端口（local_udp_port == 0），必须上报空列表，
     // 绝不把未改写的 `:9901` 泄漏为 P2P 打洞目标；待 `Registered` 后由紧随的 Heartbeat 同步。
     let reg_msg = OutgoingSignalMsg::Register {
@@ -2924,7 +3193,9 @@ fn run_single_connection(
         wol_enabled: shared.current_wol_enabled_opt(),
         nat_type,
         nat_port_delta,
+        nat_port_range,
     };
+    let reg_sent_at = Instant::now();
     let send_reg_res = match &reader {
         SignalReader::Plain(_) => match &writer_template {
             SignalWriter::Plain(w) => match w.try_clone() {
@@ -2960,6 +3231,7 @@ fn run_single_connection(
         effective_relay_addr,
         effective_udp_probe_addr,
         effective_udp_alt_addr,
+        effective_udp_alt_ip_addr,
         udp_probe_token,
     ) = loop {
         if shared.stop_flag.load(Ordering::Acquire) {
@@ -2995,9 +3267,11 @@ fn run_single_connection(
                     formatted_id,
                     udp_probe_addr,
                     udp_probe_alt_addr,
+                    udp_probe_alt_ip_addr,
                     udp_probe_token,
                     relay_addr,
                 } => {
+                    shared.record_rtt_sample(reg_sent_at.elapsed().as_millis().min(10_000) as u32);
                     let fmt_id = formatted_id
                         .filter(|s| !s.trim().is_empty())
                         .unwrap_or_else(|| format_device_id(&device_id));
@@ -3016,8 +3290,15 @@ fn run_single_connection(
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(|s| resolve_advertised_addr(s, &cfg.server_host, cfg.signal_port));
+                    let eff_alt_ip = udp_probe_alt_ip_addr
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| resolve_advertised_addr(s, &cfg.server_host, cfg.signal_port));
                     let token = parse_udp_probe_token(udp_probe_token.as_deref());
-                    break (device_id, fmt_id, eff_relay, eff_udp, eff_alt, token);
+                    break (
+                        device_id, fmt_id, eff_relay, eff_udp, eff_alt, eff_alt_ip, token,
+                    );
                 }
                 IncomingSignalMsg::Error { code, message } => {
                     if code == "token_expired" {
@@ -3086,40 +3367,54 @@ fn run_single_connection(
         );
     shared.proxy_active.store(proxy_active, Ordering::Release);
 
-    let (udp_probe_target, udp_alt_target, udp_dual_stack_target, server_is_loopback) =
-        if proxy_active {
-            (None, None, None, is_loopback_host(&cfg.server_host))
-        } else {
-            // 在 Registered 时一次性解析 UDP 探测目标（主目标、副分类端口与跨地址族双栈目标），避免每 10s 阻塞 DNS。
-            let resolved_primary_list: Vec<SocketAddr> = effective_udp_probe_addr
-                .to_socket_addrs()
-                .map(|it| it.collect())
-                .unwrap_or_default();
-            let primary = pick_preferred_socket_addr(&resolved_primary_list, peer_addr);
-            let alt = effective_udp_alt_addr
-                .as_deref()
-                .and_then(|s| resolve_udp_probe_target(s, primary.or(peer_addr)))
-                .filter(|&alt_addr| match primary {
-                    Some(p) => canonicalize_socket_addr(alt_addr) != canonicalize_socket_addr(p),
-                    None => true,
-                });
-            let dual_stack = if udp_probe_token.is_some() {
-                resolve_dual_stack_udp_target(
-                    &resolved_primary_list,
-                    primary,
-                    &cfg.server_host,
-                    &clean_lan_addrs,
-                )
-            } else {
-                None
-            };
-            (
+    let (
+        udp_probe_target,
+        udp_alt_target,
+        udp_alt_ip_target,
+        udp_dual_stack_target,
+        server_is_loopback,
+    ) = if proxy_active {
+        (None, None, None, None, is_loopback_host(&cfg.server_host))
+    } else {
+        // 在 Registered 时一次性解析 UDP 探测目标（主目标、副端口、副私有 IP 与跨地址族双栈目标），避免每 10s 阻塞 DNS。
+        let resolved_primary_list: Vec<SocketAddr> = effective_udp_probe_addr
+            .to_socket_addrs()
+            .map(|it| it.collect())
+            .unwrap_or_default();
+        let primary = pick_preferred_socket_addr(&resolved_primary_list, peer_addr);
+        let alt = effective_udp_alt_addr
+            .as_deref()
+            .and_then(|s| resolve_udp_probe_target(s, primary.or(peer_addr)))
+            .filter(|&alt_addr| match primary {
+                Some(p) => canonicalize_socket_addr(alt_addr) != canonicalize_socket_addr(p),
+                None => true,
+            });
+        let alt_ip = effective_udp_alt_ip_addr
+            .as_deref()
+            .and_then(|s| resolve_udp_probe_target(s, primary.or(peer_addr)))
+            .filter(|&alt_ip_addr| {
+                let canon_alt_ip = canonicalize_socket_addr(alt_ip_addr);
+                primary.map_or(true, |p| canon_alt_ip != canonicalize_socket_addr(p))
+                    && alt.map_or(true, |a| canon_alt_ip != canonicalize_socket_addr(a))
+            });
+        let dual_stack = if udp_probe_token.is_some() {
+            resolve_dual_stack_udp_target(
+                &resolved_primary_list,
                 primary,
-                alt,
-                dual_stack,
-                peer_addr.is_some_and(|addr| canonicalize_ip(addr.ip()).is_loopback()),
+                &cfg.server_host,
+                &clean_lan_addrs,
             )
+        } else {
+            None
         };
+        (
+            primary,
+            alt,
+            alt_ip,
+            dual_stack,
+            peer_addr.is_some_and(|addr| canonicalize_ip(addr.ip()).is_loopback()),
+        )
+    };
     shared
         .server_is_loopback
         .store(server_is_loopback, Ordering::Release);
@@ -3138,20 +3433,22 @@ fn run_single_connection(
         }
     }
 
-    // 注册成功后绑定持久化 UDP 探测套接字（SO_REUSEADDR + SO_REUSEPORT 且已 connect 至信令端口），
-    // 执行首轮 `RCSP`（v2 优先 / v1 回退）+ 副端口 NAT 分类 + 跨族双栈探测，随后发送携带改写后
-    // `lan_addrs` 与 NAT 画像的 `Heartbeat`，确保对外宣告 `Connected` 前已完成端点与 NAT 同步。
+    // 注册成功后绑定单一未连接双栈持久化 UDP 探测套接字（三平台零 SO_REUSEPORT 冲突），
+    // 执行首轮 `RCSP`（v2 优先 / v1 回退）+ 纯私有 4 样本 / 副公网 IP NAT 分类 + 跨族双栈探测，
+    // 随后发送携带改写后 `lan_addrs`、细化 NAT 画像与 RTT 估算的 `Heartbeat`。
     let udp_probe = if proxy_active {
         None
     } else {
         udp_probe_target.and_then(|target| {
+            let local_public_ips = collect_local_public_ips(&clean_lan_addrs, target);
             PersistentUdpProbe::bind_with_options(
                 target,
                 assigned_id.clone(),
                 udp_probe_token,
                 udp_alt_target,
+                udp_alt_ip_target,
                 udp_dual_stack_target,
-                |sock, addr| sock.connect(addr),
+                local_public_ips,
             )
             .map(Arc::new)
         })
@@ -3169,7 +3466,7 @@ fn run_single_connection(
         .local_udp_port
         .store(bound_udp_port, Ordering::Release);
     if let Some(ref probe) = udp_probe {
-        probe.run_initial_probe_round(&shared.nat_profile, &shared.stop_flag);
+        probe.run_initial_probe_round(&shared.nat_profile, &shared.rtt_ms, &shared.stop_flag);
         if shared.stop_flag.load(Ordering::Acquire) {
             return ConnectionOutcome::Stopped;
         }
@@ -3384,7 +3681,16 @@ fn handle_incoming_message(
     default_relay_addr: &str,
 ) -> IncomingAction {
     match msg {
-        IncomingSignalMsg::Registered { .. } | IncomingSignalMsg::HeartbeatAck { .. } => {
+        IncomingSignalMsg::Registered { .. } => IncomingAction::Continue,
+        IncomingSignalMsg::HeartbeatAck {} => {
+            if let Some(sent_at) = shared
+                .last_heartbeat_sent_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                shared.record_rtt_sample(sent_at.elapsed().as_millis().min(10_000) as u32);
+            }
             IncomingAction::Continue
         }
         IncomingSignalMsg::DeviceStatusChanged {
@@ -3453,7 +3759,12 @@ fn handle_incoming_message(
             self_public_udp_addr,
             peer_nat_type,
             peer_nat_port_delta,
+            self_nat_port_range,
+            peer_nat_port_range,
             peer_lan_addrs,
+            punch_secret,
+            start_after_ms,
+            relay_fallback_after_ms,
             relay_token,
             relay_addr,
             owner_grant,
@@ -3480,7 +3791,12 @@ fn handle_incoming_message(
                     self_public_addr: self_public_udp_addr,
                     peer_nat_type,
                     peer_nat_port_delta,
+                    self_nat_port_range,
+                    peer_nat_port_range,
                     peer_lan_addrs,
+                    punch_secret,
+                    start_after_ms,
+                    relay_fallback_after_ms,
                     owner_grant,
                     is_owner_connection,
                     is_relay_alloc: false,
@@ -3517,7 +3833,12 @@ fn handle_incoming_message(
                     self_public_addr: None,
                     peer_nat_type: None,
                     peer_nat_port_delta: None,
+                    self_nat_port_range: None,
+                    peer_nat_port_range: None,
                     peer_lan_addrs: Vec::new(),
+                    punch_secret: None,
+                    start_after_ms: None,
+                    relay_fallback_after_ms: None,
                     owner_grant,
                     is_owner_connection,
                     is_relay_alloc: true,
@@ -3643,7 +3964,12 @@ struct CoordPayload {
     self_public_addr: Option<String>,
     peer_nat_type: Option<String>,
     peer_nat_port_delta: Option<i16>,
+    self_nat_port_range: Option<[u16; 2]>,
+    peer_nat_port_range: Option<[u16; 2]>,
     peer_lan_addrs: Vec<String>,
+    punch_secret: Option<String>,
+    start_after_ms: Option<u16>,
+    relay_fallback_after_ms: Option<u16>,
     owner_grant: Option<OwnerGrantPayload>,
     is_owner_connection: bool,
     is_relay_alloc: bool,
@@ -3676,7 +4002,12 @@ fn dispatch_coord(shared: &SharedState, coord: CoordPayload) {
         self_public_addr,
         peer_nat_type,
         peer_nat_port_delta,
+        self_nat_port_range,
+        peer_nat_port_range,
         peer_lan_addrs,
+        punch_secret,
+        start_after_ms,
+        relay_fallback_after_ms,
         owner_grant,
         is_owner_connection,
         is_relay_alloc,
@@ -3690,6 +4021,13 @@ fn dispatch_coord(shared: &SharedState, coord: CoordPayload) {
         .as_deref()
         .map(NatType::parse_lossy)
         .unwrap_or(NatType::Unknown);
+    let self_nat_port_range = self_nat_port_range
+        .and_then(PortRangeHint::from_wire_pair)
+        .or(nat_profile.port_range);
+    let peer_nat_port_range = peer_nat_port_range.and_then(PortRangeHint::from_wire_pair);
+    let punch_secret = punch_secret
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let local_port = shared.local_udp_port.load(Ordering::Acquire);
     let local_udp_port = (local_port != 0).then_some(local_port);
 
@@ -3705,10 +4043,15 @@ fn dispatch_coord(shared: &SharedState, coord: CoordPayload) {
             self_public_addr,
             self_nat_type: nat_profile.nat_type,
             self_nat_port_delta: nat_profile.port_delta,
+            self_nat_port_range,
             peer_nat_type,
             peer_nat_port_delta,
+            peer_nat_port_range,
             peer_lan_addrs,
             local_udp_port,
+            punch_secret,
+            start_after_ms,
+            relay_fallback_after_ms,
             owner_grant,
             is_owner_connection,
             is_relay_alloc,
@@ -3747,10 +4090,15 @@ fn dispatch_coord(shared: &SharedState, coord: CoordPayload) {
             self_public_addr,
             self_nat_type: nat_profile.nat_type,
             self_nat_port_delta: nat_profile.port_delta,
+            self_nat_port_range,
             peer_nat_type,
             peer_nat_port_delta,
+            peer_nat_port_range,
             peer_lan_addrs,
             local_udp_port,
+            punch_secret,
+            start_after_ms,
+            relay_fallback_after_ms,
             owner_grant,
             is_owner_connection,
         }));
@@ -3923,13 +4271,20 @@ fn resolve_dual_stack_udp_target(
 }
 
 fn send_heartbeat_frame(shared: &SharedState, lan_addrs: Vec<String>) -> Result<(), String> {
-    let (nat_type, nat_port_delta) = shared.current_nat_wire_fields();
+    let (nat_type, nat_port_delta, nat_port_range) = shared.current_nat_wire_fields();
+    let rtt_ms = shared.current_rtt_ms();
+    *shared
+        .last_heartbeat_sent_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     let hb = OutgoingSignalMsg::Heartbeat {
         lan_addrs,
         mac_addr: shared.current_mac_addr_opt(),
         wol_enabled: shared.current_wol_enabled_opt(),
         nat_type,
         nat_port_delta,
+        nat_port_range,
+        rtt_ms,
     };
     shared.send_msg(&hb)
 }
@@ -4054,43 +4409,110 @@ struct UdpProbeSlotState {
 
 struct UdpProbeSlot {
     port: u16,
-    is_ipv6: bool,
+    primary_is_ipv6: bool,
+    socket_is_ipv6: bool,
     target: SocketAddr,
     state: Mutex<UdpProbeSlotState>,
 }
 
-impl UdpProbeSlot {
-    fn bind_socket_on_port(
-        port: u16,
-        is_ipv6: bool,
-        target: SocketAddr,
-        connect_fn: impl FnOnce(&UdpSocket, SocketAddr) -> io::Result<()>,
-    ) -> Option<UdpSocket> {
-        let (domain, bind_addr) = if is_ipv6 {
-            (Domain::IPV6, SocketAddr::from(([0u16; 8], port)))
-        } else {
-            (Domain::IPV4, SocketAddr::from(([0u8; 4], port)))
-        };
-        let raw = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).ok()?;
-        let _ = raw.set_reuse_address(true);
-        #[cfg(unix)]
-        let _ = raw.set_reuse_port(true);
-        raw.bind(&SockAddr::from(bind_addr)).ok()?;
-        let sock: UdpSocket = raw.into();
-        let _ = sock.set_nonblocking(true);
-        if connect_fn(&sock, target).is_err() {
-            return None;
+fn normalize_probe_addr_for_socket(addr: SocketAddr, socket_is_ipv6: bool) -> SocketAddr {
+    if socket_is_ipv6 {
+        match addr {
+            SocketAddr::V6(v6) => SocketAddr::V6(v6),
+            SocketAddr::V4(v4) => {
+                SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
+            }
         }
-        Some(sock)
+    } else {
+        canonicalize_socket_addr(addr)
+    }
+}
+
+fn record_rtt_sample_into(rtt_ms: &Mutex<Option<u32>>, sample_ms: u32) {
+    let clamped = sample_ms.min(10_000);
+    let mut guard = rtt_ms.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(match *guard {
+        Some(prev) => (prev.saturating_mul(3).saturating_add(clamped)) / 4,
+        None => clamped,
+    });
+}
+
+fn collect_local_public_ips(clean_lan_addrs: &[String], target: SocketAddr) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    let mut push_if_pub = |ip: IpAddr| {
+        let canon = canonicalize_ip(ip);
+        if is_routable_public_ip(canon) && !out.contains(&canon) {
+            out.push(canon);
+        }
+    };
+    for raw in clean_lan_addrs {
+        if let Some(ip) = extract_canonical_lan_ip(raw, 1) {
+            push_if_pub(ip);
+        }
+    }
+    let bind_addr = if target.is_ipv6() {
+        SocketAddr::from(([0u16; 8], 0))
+    } else {
+        SocketAddr::from(([0u8; 4], 0))
+    };
+    if let Ok(sock) = UdpSocket::bind(bind_addr) {
+        if sock.connect(target).is_ok() {
+            if let Ok(local) = sock.local_addr() {
+                push_if_pub(local.ip());
+            }
+        }
+    }
+    out
+}
+
+impl UdpProbeSlot {
+    /// 绑定单一未连接（unconnected）双栈 UDP 探测套接字（三平台零 `SO_REUSEPORT` 冲突）。
+    ///
+    /// 优先绑定 `AF_INET6`（`[::]:port`，`IPV6_V6ONLY = false`）以在单套接字上同时承载
+    /// IPv4（`::ffff:a.b.c.d`）与 IPv6 探测包；若双栈不可用且主目标为 IPv4 则回退纯 `AF_INET`。
+    fn bind_unconnected_probe_socket(
+        port: u16,
+        primary_target: SocketAddr,
+    ) -> Option<(UdpSocket, bool)> {
+        let try_v6_dual = || -> Option<(UdpSocket, bool)> {
+            let raw = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+            let dual_ok = raw.set_only_v6(false).is_ok();
+            if primary_target.is_ipv4() && !dual_ok {
+                return None;
+            }
+            #[cfg(unix)]
+            let _ = raw.set_reuse_address(true);
+            raw.bind(&SockAddr::from(SocketAddr::from(([0u16; 8], port))))
+                .ok()?;
+            let sock: UdpSocket = raw.into();
+            let _ = sock.set_nonblocking(true);
+            Some((sock, true))
+        };
+
+        if let Some(res) = try_v6_dual() {
+            return Some(res);
+        }
+
+        if primary_target.is_ipv4() {
+            let raw = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+            #[cfg(unix)]
+            let _ = raw.set_reuse_address(true);
+            raw.bind(&SockAddr::from(SocketAddr::from(([0u8; 4], port))))
+                .ok()?;
+            let sock: UdpSocket = raw.into();
+            let _ = sock.set_nonblocking(true);
+            return Some((sock, false));
+        }
+
+        None
     }
 
-    #[allow(dead_code)]
     fn acquire_port_hold(self: &Arc<Self>) -> SlotPortHold {
         {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard.pause_count = guard.pause_count.saturating_add(1);
-            // 在 Windows（或测试主动暂停场景）下释放并关闭占用 `local_udp_port` 的探测套接字，
-            // 让随后启动的 P2P 打洞/QUIC 套接字独占绑定同一本地端口。
+            // 跨三平台（Linux / macOS / Windows）统一释放并关闭占用 `local_udp_port` 的未连接探测套接字，
+            // 让随后启动的 P2P 打洞/QUIC 套接字独占绑定同一本地端口，避免任何 SO_REUSEPORT 分流冲突。
             drop(guard.sock.take());
         }
         SlotPortHold {
@@ -4108,41 +4530,28 @@ impl Drop for SlotPortHold {
         let mut guard = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.pause_count = guard.pause_count.saturating_sub(1);
         if guard.pause_count == 0 && !guard.closed && guard.sock.is_none() {
-            guard.sock = UdpProbeSlot::bind_socket_on_port(
-                self.slot.port,
-                self.slot.is_ipv6,
-                self.slot.target,
-                |s, addr| s.connect(addr),
-            );
+            guard.sock =
+                UdpProbeSlot::bind_unconnected_probe_socket(self.slot.port, self.slot.target)
+                    .map(|(s, _)| s);
         }
     }
 }
 
-/// P2P 打洞与直连期间持有的本地 UDP 端口暂停租约（仅非 Unix 平台实际释放探测套接字）。
+/// P2P 打洞与直连期间持有的本地 UDP 端口暂停租约（三平台统一独占释放/恢复探测套接字）。
 pub(crate) struct LocalUdpPortHoldGuard(#[allow(dead_code)] Option<SlotPortHold>);
 
-/// 在非 Unix 平台（Windows）执行 P2P 打洞前临时释放同端口的持久化 UDP 探测套接字；
+/// 在三平台（Linux / macOS / Windows）执行 P2P 打洞前临时释放同端口的持久化 UDP 探测套接字；
 /// 当返回的守卫被 `Drop`（打洞失败或 P2P 会话结束）时自动重新绑定同一本地端口。
-///
-/// Unix 平台通过 `SO_REUSEPORT` 与 P2P 套接字共享端口，直接返回无操作守卫。
 pub(crate) fn acquire_local_udp_port_for_p2p(port: Option<u16>) -> LocalUdpPortHoldGuard {
-    #[cfg(unix)]
-    {
-        let _ = port;
-        LocalUdpPortHoldGuard(None)
-    }
-    #[cfg(not(unix))]
-    {
-        let Some(p) = port.filter(|&v| v != 0) else {
-            return LocalUdpPortHoldGuard(None);
-        };
-        let slot = active_udp_probe_slots()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&p)
-            .cloned();
-        LocalUdpPortHoldGuard(slot.map(|s| s.acquire_port_hold()))
-    }
+    let Some(p) = port.filter(|&v| v != 0) else {
+        return LocalUdpPortHoldGuard(None);
+    };
+    let slot = active_udp_probe_slots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&p)
+        .cloned();
+    LocalUdpPortHoldGuard(slot.map(|s| s.acquire_port_hold()))
 }
 
 /// 绑定了端口协调租约的 P2P QUIC 传输包装：确保在 `P2pQuicConnection` 彻底释放底层
@@ -4227,77 +4636,22 @@ fn update_nat_profile_observed(nat_profile: &Mutex<NatProfile>, observed: Socket
     }
 }
 
-fn probe_once_on_connected_socket(
-    sock: &UdpSocket,
-    device_id: &str,
-    token: Option<[u8; 16]>,
-    stop_flag: &AtomicBool,
-) -> Option<SocketAddr> {
-    let mut sent_nonces = [[0u8; 8]; 3];
-    let mut buf = [0u8; 128];
-    for (attempt, &wait_budget) in UDP_PROBE_RETRY_WAITS.iter().enumerate() {
-        if stop_flag.load(Ordering::Acquire) {
-            return None;
-        }
-        let mut nonce = [0u8; 8];
-        OsRng.fill_bytes(&mut nonce);
-        sent_nonces[attempt] = nonce;
-        let pkt = build_probe_bytes_for_mode(device_id, nonce, token)?;
-        let _ = sock.send(&pkt);
-
-        let deadline = Instant::now() + wait_budget;
-        loop {
-            if stop_flag.load(Ordering::Acquire) {
-                return None;
-            }
-            match sock.recv(&mut buf) {
-                Ok(n) => {
-                    if let Some((observed, ans_nonce)) = parse_udp_answer_packet(&buf[..n]) {
-                        if sent_nonces[..=attempt].contains(&ans_nonce) {
-                            let canon = canonicalize_socket_addr(observed);
-                            if canon.port() != 0 && !canon.ip().is_unspecified() {
-                                return Some(canon);
-                            }
-                        }
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        break;
-                    }
-                    thread::sleep(UDP_PROBE_POLL_STEP.min(deadline - now));
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    if attempt >= 1 {
-                        return None;
-                    }
-                    break;
-                }
-                Err(_) => return None,
-            }
-        }
-    }
-    None
-}
-
-#[cfg(not(unix))]
 fn probe_once_unconnected_to_target(
     sock: &UdpSocket,
+    socket_is_ipv6: bool,
     target: SocketAddr,
     device_id: &str,
     token: Option<[u8; 16]>,
     stop_flag: &AtomicBool,
-) -> Option<SocketAddr> {
+) -> Option<(SocketAddr, u32)> {
+    if !socket_is_ipv6 && target.is_ipv6() {
+        return None;
+    }
     let mut sent_nonces = [[0u8; 8]; 3];
+    let mut sent_times = [Instant::now(); 3];
     let mut buf = [0u8; 128];
     let expected_peer = canonicalize_socket_addr(target);
+    let send_target = normalize_probe_addr_for_socket(expected_peer, socket_is_ipv6);
     for (attempt, &wait_budget) in UDP_PROBE_RETRY_WAITS.iter().enumerate() {
         if stop_flag.load(Ordering::Acquire) {
             return None;
@@ -4305,8 +4659,9 @@ fn probe_once_unconnected_to_target(
         let mut nonce = [0u8; 8];
         OsRng.fill_bytes(&mut nonce);
         sent_nonces[attempt] = nonce;
+        sent_times[attempt] = Instant::now();
         let pkt = build_probe_bytes_for_mode(device_id, nonce, token)?;
-        let _ = sock.send_to(&pkt, target);
+        let _ = sock.send_to(&pkt, send_target);
 
         let deadline = Instant::now() + wait_budget;
         loop {
@@ -4316,10 +4671,13 @@ fn probe_once_unconnected_to_target(
             match sock.recv_from(&mut buf) {
                 Ok((n, from)) if canonicalize_socket_addr(from) == expected_peer => {
                     if let Some((observed, ans_nonce)) = parse_udp_answer_packet(&buf[..n]) {
-                        if sent_nonces[..=attempt].contains(&ans_nonce) {
+                        if let Some(idx) =
+                            sent_nonces[..=attempt].iter().position(|n| *n == ans_nonce)
+                        {
                             let canon = canonicalize_socket_addr(observed);
                             if canon.port() != 0 && !canon.ip().is_unspecified() {
-                                return Some(canon);
+                                let rtt = sent_times[idx].elapsed().as_millis().min(10_000) as u32;
+                                return Some((canon, rtt));
                             }
                         }
                     }
@@ -4351,68 +4709,160 @@ fn probe_once_unconnected_to_target(
     None
 }
 
+/// 当 `m1 != m2` 时使用 1 个临时未连接 UDP socket 在 `< 5ms` 内连续发送主/副端口探测包，
+/// 采集 `(m3, m4)` 以验证对称 NAT 步长恒定性。
+fn probe_aux_pair_burst(
+    primary_target: SocketAddr,
+    alt_target: SocketAddr,
+    device_id: &str,
+    token: Option<[u8; 16]>,
+    stop_flag: &AtomicBool,
+) -> (Option<SocketAddr>, Option<SocketAddr>) {
+    let Some((temp_sock, temp_is_ipv6)) =
+        UdpProbeSlot::bind_unconnected_probe_socket(0, primary_target)
+    else {
+        return (None, None);
+    };
+    if !temp_is_ipv6 && alt_target.is_ipv6() {
+        return (None, None);
+    }
+
+    let primary_canon = canonicalize_socket_addr(primary_target);
+    let alt_canon = canonicalize_socket_addr(alt_target);
+    let mut nonce3 = [0u8; 8];
+    let mut nonce4 = [0u8; 8];
+    OsRng.fill_bytes(&mut nonce3);
+    OsRng.fill_bytes(&mut nonce4);
+    while nonce4 == nonce3 {
+        OsRng.fill_bytes(&mut nonce4);
+    }
+
+    let Some(pkt3) = build_probe_bytes_for_mode(device_id, nonce3, token) else {
+        return (None, None);
+    };
+    let Some(pkt4) = build_probe_bytes_for_mode(device_id, nonce4, token) else {
+        return (None, None);
+    };
+
+    let send_p = normalize_probe_addr_for_socket(primary_canon, temp_is_ipv6);
+    let send_a = normalize_probe_addr_for_socket(alt_canon, temp_is_ipv6);
+    let _ = temp_sock.send_to(&pkt3, send_p);
+    let _ = temp_sock.send_to(&pkt4, send_a);
+
+    let mut m3 = None;
+    let mut m4 = None;
+    let mut buf = [0u8; 128];
+    let deadline = Instant::now() + Duration::from_millis(120);
+
+    while m3.is_none() || m4.is_none() {
+        if stop_flag.load(Ordering::Acquire) {
+            break;
+        }
+        match temp_sock.recv_from(&mut buf) {
+            Ok((n, raw_from)) => {
+                let from = canonicalize_socket_addr(raw_from);
+                if let Some((observed, ans_nonce)) = parse_udp_answer_packet(&buf[..n]) {
+                    let canon = canonicalize_socket_addr(observed);
+                    if canon.port() != 0 && !canon.ip().is_unspecified() {
+                        if from == primary_canon && ans_nonce == nonce3 && m3.is_none() {
+                            m3 = Some(canon);
+                        } else if from == alt_canon && ans_nonce == nonce4 && m4.is_none() {
+                            m4 = Some(canon);
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                thread::sleep(UDP_PROBE_POLL_STEP.min(deadline - now));
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::Interrupted
+                        | ErrorKind::ConnectionRefused
+                        | ErrorKind::ConnectionReset
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    (m3, m4)
+}
+
 /// 轻量 `RCSP` 刷新保留的最近已发送 nonce 环形缓冲上限，避免连续刷新覆盖导致在途 `RCSA` 被误丢。
 const RECENT_LIGHTWEIGHT_NONCE_CAP: usize = 4;
 
-/// 持久化 UDP `RCSP` 探测套接字：以 `SO_REUSEADDR` + `SO_REUSEPORT` 绑定一次并 `connect` 至信令端口，
-/// 使信令服务器学习到的公网 NAT `(ip, port)` 与 P2P 打洞套接字可共享同一本地端口。
-///
-/// 若 `connect(target)` 失败则立即放弃套接字并返回 `None`，确保绝不保留未连接的
-/// `SO_REUSEPORT` 套接字抢走同端口的 P2P/QUIC 数据报。
+/// 持久化 UDP `RCSP` 探测套接字：使用单一未连接（unconnected）双栈 UDP 套接字
+/// （零 `SO_REUSEPORT` 冲突），使信令服务器学习到的公网 NAT `(ip, port)` 与 P2P 打洞共享同一本地端口；
+/// 收包时严格校验来源 `IP:port` 属于允许目标集合且 `RCSA` nonce 合法，P2P 建连期间通过
+/// [`acquire_local_udp_port_for_p2p`] 独占释放并在结束后恢复。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExternalMappingCheck {
+    Reachable,
+    Unreachable(String),
+    Skipped,
+}
+
+const SELF_CHECK_RETRY_WAITS: [Duration; 2] =
+    [Duration::from_millis(100), Duration::from_millis(180)];
+
 struct PersistentUdpProbe {
     slot: Arc<UdpProbeSlot>,
     device_id: String,
     token: Option<[u8; 16]>,
     alt_target: Option<SocketAddr>,
+    alt_ip_target: Option<SocketAddr>,
     dual_stack_target: Option<SocketAddr>,
+    local_public_ips: Vec<IpAddr>,
     recent_nonces: Mutex<VecDeque<[u8; 8]>>,
+    dual_stack_nonces: Mutex<VecDeque<[u8; 8]>>,
+    probe_rx_lock: Mutex<()>,
 }
 
 impl PersistentUdpProbe {
     #[cfg(test)]
     fn bind(target: SocketAddr) -> Option<Self> {
-        Self::bind_with(target, |sock, addr| sock.connect(addr))
-    }
-
-    #[cfg(test)]
-    fn bind_with<F>(target: SocketAddr, connect_fn: F) -> Option<Self>
-    where
-        F: FnOnce(&UdpSocket, SocketAddr) -> io::Result<()>,
-    {
         Self::bind_with_options(
             target,
             "000000000".to_string(),
             None,
             None,
             None,
-            connect_fn,
+            None,
+            Vec::new(),
         )
     }
 
-    fn bind_with_options<F>(
+    fn bind_with_options(
         target: SocketAddr,
         device_id: String,
         token: Option<[u8; 16]>,
         alt_target: Option<SocketAddr>,
+        alt_ip_target: Option<SocketAddr>,
         dual_stack_target: Option<SocketAddr>,
-        connect_fn: F,
-    ) -> Option<Self>
-    where
-        F: FnOnce(&UdpSocket, SocketAddr) -> io::Result<()>,
-    {
+        local_public_ips: Vec<IpAddr>,
+    ) -> Option<Self> {
         if target.port() == 0 || target.ip().is_unspecified() {
             return None;
         }
-        let is_ipv6 = target.is_ipv6();
-        let sock = UdpProbeSlot::bind_socket_on_port(0, is_ipv6, target, connect_fn)?;
+        let primary_canon = canonicalize_socket_addr(target);
+        let primary_is_ipv6 = primary_canon.is_ipv6();
+        let (sock, socket_is_ipv6) = UdpProbeSlot::bind_unconnected_probe_socket(0, primary_canon)?;
         let port = sock.local_addr().ok()?.port();
         if port == 0 {
             return None;
         }
         let slot = Arc::new(UdpProbeSlot {
             port,
-            is_ipv6,
-            target,
+            primary_is_ipv6,
+            socket_is_ipv6,
+            target: primary_canon,
             state: Mutex::new(UdpProbeSlotState {
                 sock: Some(sock),
                 pause_count: 0,
@@ -4427,9 +4877,13 @@ impl PersistentUdpProbe {
             slot,
             device_id,
             token,
-            alt_target,
-            dual_stack_target,
+            alt_target: alt_target.map(canonicalize_socket_addr),
+            alt_ip_target: alt_ip_target.map(canonicalize_socket_addr),
+            dual_stack_target: dual_stack_target.map(canonicalize_socket_addr),
+            local_public_ips,
             recent_nonces: Mutex::new(VecDeque::with_capacity(RECENT_LIGHTWEIGHT_NONCE_CAP)),
+            dual_stack_nonces: Mutex::new(VecDeque::with_capacity(RECENT_LIGHTWEIGHT_NONCE_CAP)),
+            probe_rx_lock: Mutex::new(()),
         })
     }
 
@@ -4438,7 +4892,14 @@ impl PersistentUdpProbe {
     }
 
     fn is_ipv6(&self) -> bool {
-        self.slot.is_ipv6
+        self.slot.primary_is_ipv6
+    }
+
+    fn is_allowed_source(&self, canon_from: SocketAddr) -> bool {
+        canon_from == self.slot.target
+            || self.alt_target.is_some_and(|a| canon_from == a)
+            || self.alt_ip_target.is_some_and(|a| canon_from == a)
+            || self.dual_stack_target.is_some_and(|a| canon_from == a)
     }
 
     #[cfg(test)]
@@ -4453,137 +4914,105 @@ impl PersistentUdpProbe {
             return;
         }
         if let Some(ref sock) = guard.sock {
-            let _ = sock.send(&pkt);
+            let dest = normalize_probe_addr_for_socket(self.slot.target, self.slot.socket_is_ipv6);
+            let _ = sock.send_to(&pkt, dest);
         }
     }
 
     fn send_lightweight_refresh(&self, nat_profile: &Mutex<NatProfile>) {
+        let Ok(_rx_guard) = self.probe_rx_lock.try_lock() else {
+            return;
+        };
         let mut buf = [0u8; 128];
-        {
-            let guard = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.pause_count > 0 || guard.closed {
-                return;
+        let guard = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.pause_count > 0 || guard.closed {
+            return;
+        }
+        let Some(ref sock) = guard.sock else {
+            return;
+        };
+
+        // 先非阻塞排空滞留的 `RCSA` 响应：严格校验来源 IP:port 在允许目标集合内且 nonce 命中。
+        while let Ok((n, raw_from)) = sock.recv_from(&mut buf) {
+            let from = canonicalize_socket_addr(raw_from);
+            if !self.is_allowed_source(from) {
+                continue;
             }
-            if let Some(ref sock) = guard.sock {
-                // 先非阻塞排空滞留的 `RCSA` 响应并更新本端观测到的公网端点。
-                while let Ok(n) = sock.recv(&mut buf) {
-                    if let Some((observed, ans_nonce)) = parse_udp_answer_packet(&buf[..n]) {
-                        let matched = self
-                            .recent_nonces
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .contains(&ans_nonce);
-                        if matched {
-                            update_nat_profile_observed(nat_profile, observed);
-                        }
-                    }
+            if let Some((observed, ans_nonce)) = parse_udp_answer_packet(&buf[..n]) {
+                let matched_primary = self
+                    .recent_nonces
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&ans_nonce);
+                let matched_ds = self
+                    .dual_stack_nonces
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&ans_nonce);
+                if matched_primary || matched_ds {
+                    update_nat_profile_observed(nat_profile, observed);
                 }
-                let mut nonce = [0u8; 8];
-                OsRng.fill_bytes(&mut nonce);
-                if let Some(pkt) = build_probe_bytes_for_mode(&self.device_id, nonce, self.token) {
+            }
+        }
+
+        let mut nonce = [0u8; 8];
+        OsRng.fill_bytes(&mut nonce);
+        if let Some(pkt) = build_probe_bytes_for_mode(&self.device_id, nonce, self.token) {
+            {
+                let mut ring = self.recent_nonces.lock().unwrap_or_else(|e| e.into_inner());
+                while ring.len() >= RECENT_LIGHTWEIGHT_NONCE_CAP {
+                    ring.pop_front();
+                }
+                ring.push_back(nonce);
+            }
+            let dest = normalize_probe_addr_for_socket(self.slot.target, self.slot.socket_is_ipv6);
+            let _ = sock.send_to(&pkt, dest);
+        }
+
+        if let (Some(tok), Some(ds_target)) = (self.token, self.dual_stack_target) {
+            if self.slot.socket_is_ipv6 || ds_target.is_ipv4() {
+                let mut ds_nonce = [0u8; 8];
+                OsRng.fill_bytes(&mut ds_nonce);
+                if let Ok(pkt) = build_udp_probe_packet_v2(&self.device_id, ds_nonce, tok) {
                     {
-                        let mut ring = self.recent_nonces.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut ring = self
+                            .dual_stack_nonces
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         while ring.len() >= RECENT_LIGHTWEIGHT_NONCE_CAP {
                             ring.pop_front();
                         }
-                        ring.push_back(nonce);
+                        ring.push_back(ds_nonce);
                     }
-                    let _ = sock.send(&pkt);
-                }
-            }
-        }
-        if let (Some(tok), Some(ds_target)) = (self.token, self.dual_stack_target) {
-            if let Some(ds_sock) = self.bind_short_lived_socket(ds_target, true) {
-                let mut nonce = [0u8; 8];
-                OsRng.fill_bytes(&mut nonce);
-                if let Ok(pkt) = build_udp_probe_packet_v2(&self.device_id, nonce, tok) {
-                    let _ = ds_sock.send(&pkt);
+                    let dest = normalize_probe_addr_for_socket(ds_target, self.slot.socket_is_ipv6);
+                    let _ = sock.send_to(&pkt, dest);
                 }
             }
         }
     }
 
-    fn bind_short_lived_socket(
+    /// 轻量异步外部可达自检：复用自有 `rc-server` 私有 `RCSP` 探测口验证网关映射公网 IP 的真实可达性与一致性
+    /// （绝不启用第三方公有 STUN）；不可达或遭遇双层 NAT 假公网时返回 `Unreachable`，避免误报假公网候选。
+    fn verify_external_mapping_reachability(
         &self,
-        target: SocketAddr,
-        require_exact_local_port: bool,
-    ) -> Option<UdpSocket> {
-        let is_v6 = target.is_ipv6();
-        let try_bind = |port: u16| -> Option<UdpSocket> {
-            let (domain, bind_addr) = if is_v6 {
-                (Domain::IPV6, SocketAddr::from(([0u16; 8], port)))
-            } else {
-                (Domain::IPV4, SocketAddr::from(([0u8; 4], port)))
-            };
-            let raw = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).ok()?;
-            if is_v6 {
-                let _ = raw.set_only_v6(true);
-            }
-            let _ = raw.set_reuse_address(true);
-            #[cfg(unix)]
-            let _ = raw.set_reuse_port(true);
-            raw.bind(&SockAddr::from(bind_addr)).ok()?;
-            let sock: UdpSocket = raw.into();
-            let _ = sock.set_nonblocking(true);
-            sock.connect(target).ok()?;
-            Some(sock)
-        };
-
-        if let Some(sock) = try_bind(self.local_port()) {
-            return Some(sock);
-        }
-        if require_exact_local_port {
-            None
-        } else {
-            try_bind(0)
-        }
-    }
-
-    fn probe_alt_same_port(
-        &self,
-        alt_target: SocketAddr,
+        mapped_addr: SocketAddr,
+        nat_profile: &Mutex<NatProfile>,
         stop_flag: &AtomicBool,
-    ) -> Option<SocketAddr> {
-        #[cfg(unix)]
-        {
-            let alt_sock = self.bind_short_lived_socket(alt_target, true)?;
-            probe_once_on_connected_socket(&alt_sock, &self.device_id, self.token, stop_flag)
+    ) -> ExternalMappingCheck {
+        let want_v6 = mapped_addr.is_ipv6();
+        let target = if self.slot.target.is_ipv6() == want_v6 {
+            self.slot.target
+        } else if let Some(ds) = self.dual_stack_target.filter(|a| a.is_ipv6() == want_v6) {
+            ds
+        } else {
+            return ExternalMappingCheck::Skipped;
+        };
+        if !self.slot.socket_is_ipv6 && target.is_ipv6() {
+            return ExternalMappingCheck::Skipped;
         }
-        #[cfg(not(unix))]
-        {
-            let _hold = self.slot.acquire_port_hold();
-            let is_v6 = alt_target.is_ipv6();
-            let (domain, bind_addr) = if is_v6 {
-                (
-                    Domain::IPV6,
-                    SocketAddr::from(([0u16; 8], self.local_port())),
-                )
-            } else {
-                (
-                    Domain::IPV4,
-                    SocketAddr::from(([0u8; 4], self.local_port())),
-                )
-            };
-            let raw = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).ok()?;
-            if is_v6 {
-                let _ = raw.set_only_v6(true);
-            }
-            let _ = raw.set_reuse_address(true);
-            raw.bind(&SockAddr::from(bind_addr)).ok()?;
-            let alt_sock: UdpSocket = raw.into();
-            let _ = alt_sock.set_nonblocking(true);
-            probe_once_unconnected_to_target(
-                &alt_sock,
-                alt_target,
-                &self.device_id,
-                self.token,
-                stop_flag,
-            )
-        }
-    }
 
-    fn run_initial_probe_round(&self, nat_profile: &Mutex<NatProfile>, stop_flag: &AtomicBool) {
-        let primary_sock = {
+        let _rx_guard = self.probe_rx_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let probe_sock = {
             let guard = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
             if guard.pause_count > 0 || guard.closed {
                 None
@@ -4591,38 +5020,201 @@ impl PersistentUdpProbe {
                 guard.sock.as_ref().and_then(|s| s.try_clone().ok())
             }
         };
-        let primary_obs = primary_sock.as_ref().and_then(|sock| {
-            probe_once_on_connected_socket(sock, &self.device_id, self.token, stop_flag)
-        });
-        drop(primary_sock);
-        if let Some(obs) = primary_obs {
-            update_nat_profile_observed(nat_profile, obs);
-        }
+        let Some(ref sock) = probe_sock else {
+            return ExternalMappingCheck::Skipped;
+        };
 
-        if let (Some(primary), Some(alt_target)) = (primary_obs, self.alt_target) {
-            if canonicalize_socket_addr(alt_target) != canonicalize_socket_addr(self.slot.target)
-                && primary.is_ipv6() == alt_target.is_ipv6()
-            {
-                if let Some(alt) = self.probe_alt_same_port(alt_target, stop_flag) {
-                    let (nat_type, port_delta) = classify_nat_mapping(primary, alt);
-                    let mut guard = nat_profile.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.nat_type = nat_type;
-                    guard.port_delta = port_delta;
+        let expected_peer = canonicalize_socket_addr(target);
+        let send_target = normalize_probe_addr_for_socket(expected_peer, self.slot.socket_is_ipv6);
+        let mut sent_nonces = [[0u8; 8]; 2];
+        let mut buf = [0u8; 128];
+
+        for (attempt, &wait_budget) in SELF_CHECK_RETRY_WAITS.iter().enumerate() {
+            if stop_flag.load(Ordering::Acquire) {
+                return ExternalMappingCheck::Skipped;
+            }
+            let mut nonce = [0u8; 8];
+            OsRng.fill_bytes(&mut nonce);
+            sent_nonces[attempt] = nonce;
+            let Some(pkt) = build_probe_bytes_for_mode(&self.device_id, nonce, self.token) else {
+                return ExternalMappingCheck::Skipped;
+            };
+            if sock.send_to(&pkt, send_target).is_err() {
+                continue;
+            }
+
+            let deadline = Instant::now() + wait_budget;
+            loop {
+                if stop_flag.load(Ordering::Acquire) {
+                    return ExternalMappingCheck::Skipped;
+                }
+                match sock.recv_from(&mut buf) {
+                    Ok((n, raw_from)) => {
+                        let from = canonicalize_socket_addr(raw_from);
+                        if !self.is_allowed_source(from) {
+                            continue;
+                        }
+                        if let Some((observed, ans_nonce)) = parse_udp_answer_packet(&buf[..n]) {
+                            let matched_self = sent_nonces[..=attempt].contains(&ans_nonce);
+                            if matched_self && from == expected_peer {
+                                let canon_obs = canonicalize_socket_addr(observed);
+                                update_nat_profile_observed(nat_profile, canon_obs);
+                                let obs_ip = canonicalize_ip(canon_obs.ip());
+                                let mapped_ip = canonicalize_ip(mapped_addr.ip());
+                                if obs_ip == mapped_ip {
+                                    return ExternalMappingCheck::Reachable;
+                                }
+                                return ExternalMappingCheck::Unreachable(format!(
+                                    "映射公网 IP ({mapped_ip}) 与自有 RCSP 观测公网 IP ({obs_ip}) 不一致（疑似双层 NAT / 假公网）"
+                                ));
+                            }
+                            let matched_recent = self
+                                .recent_nonces
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .contains(&ans_nonce)
+                                || self
+                                    .dual_stack_nonces
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .contains(&ans_nonce);
+                            if matched_recent {
+                                update_nat_profile_observed(nat_profile, observed);
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        thread::sleep(UDP_PROBE_POLL_STEP.min(deadline - now));
+                    }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
             }
         }
 
+        ExternalMappingCheck::Unreachable(
+            "UPnP/PCP/NAT-PMP 映射外部可达自检超时（自有 rc-server RCSP 未收到响应，避开假公网映射）"
+                .to_string(),
+        )
+    }
+
+    fn run_initial_probe_round(
+        &self,
+        nat_profile: &Mutex<NatProfile>,
+        rtt_ms: &Mutex<Option<u32>>,
+        stop_flag: &AtomicBool,
+    ) {
+        let probe_sock = {
+            let guard = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.pause_count > 0 || guard.closed {
+                None
+            } else {
+                guard.sock.as_ref().and_then(|s| s.try_clone().ok())
+            }
+        };
+        let Some(ref sock) = probe_sock else {
+            return;
+        };
+
+        let m1 = probe_once_unconnected_to_target(
+            sock,
+            self.slot.socket_is_ipv6,
+            self.slot.target,
+            &self.device_id,
+            self.token,
+            stop_flag,
+        )
+        .map(|(obs, sample_rtt)| {
+            record_rtt_sample_into(rtt_ms, sample_rtt);
+            update_nat_profile_observed(nat_profile, obs);
+            obs
+        });
+
+        let mut m2 = None;
+        let mut m3 = None;
+        let mut m4 = None;
+        let mut m_alt_ip = None;
+
+        if let (Some(o1), Some(alt_target)) = (m1, self.alt_target) {
+            if alt_target != self.slot.target && o1.is_ipv6() == alt_target.is_ipv6() {
+                m2 = probe_once_unconnected_to_target(
+                    sock,
+                    self.slot.socket_is_ipv6,
+                    alt_target,
+                    &self.device_id,
+                    self.token,
+                    stop_flag,
+                )
+                .map(|(obs, _)| obs);
+
+                if let Some(o2) = m2 {
+                    if o1 == o2 {
+                        if let Some(alt_ip_target) = self.alt_ip_target {
+                            if alt_ip_target != self.slot.target
+                                && alt_ip_target != alt_target
+                                && o1.is_ipv6() == alt_ip_target.is_ipv6()
+                            {
+                                m_alt_ip = probe_once_unconnected_to_target(
+                                    sock,
+                                    self.slot.socket_is_ipv6,
+                                    alt_ip_target,
+                                    &self.device_id,
+                                    self.token,
+                                    stop_flag,
+                                )
+                                .map(|(obs, _)| obs);
+                            }
+                        }
+                    } else {
+                        let (aux_p, aux_s) = probe_aux_pair_burst(
+                            self.slot.target,
+                            alt_target,
+                            &self.device_id,
+                            self.token,
+                            stop_flag,
+                        );
+                        m3 = aux_p;
+                        m4 = aux_s;
+                    }
+                }
+            }
+        }
+
+        if stop_flag.load(Ordering::Acquire) {
+            return;
+        }
+
+        let samples = NatProbeSamples {
+            primary: m1,
+            secondary: m2,
+            aux_primary: m3,
+            aux_secondary: m4,
+            alt_ip: m_alt_ip,
+            local_public_ips: self.local_public_ips.clone(),
+        };
+        let (nat_type, port_delta, port_range) = classify_nat_samples(&samples);
+        {
+            let mut guard = nat_profile.lock().unwrap_or_else(|e| e.into_inner());
+            guard.nat_type = nat_type;
+            guard.port_delta = port_delta;
+            guard.port_range = port_range;
+        }
+
         if self.token.is_some() {
             if let Some(ds_target) = self.dual_stack_target {
-                if let Some(ds_sock) = self.bind_short_lived_socket(ds_target, true) {
-                    if let Some(ds_obs) = probe_once_on_connected_socket(
-                        &ds_sock,
-                        &self.device_id,
-                        self.token,
-                        stop_flag,
-                    ) {
-                        update_nat_profile_observed(nat_profile, ds_obs);
-                    }
+                if let Some((ds_obs, _)) = probe_once_unconnected_to_target(
+                    sock,
+                    self.slot.socket_is_ipv6,
+                    ds_target,
+                    &self.device_id,
+                    self.token,
+                    stop_flag,
+                ) {
+                    update_nat_profile_observed(nat_profile, ds_obs);
                 }
             }
         }
@@ -5177,6 +5769,7 @@ mod tests {
                 peer_public_addr: Some("203.0.113.9:51234".to_string()),
                 peer_lan_addrs: vec!["192.168.1.30:9901".to_string()],
                 local_udp_port: Some(probe_port),
+                self_nat_type: NatType::UdpBlocked,
                 owner_grant: None,
                 is_owner_connection: false,
                 is_relay_alloc: false,
@@ -5493,6 +6086,8 @@ mod tests {
             local_udp_port: AtomicU16::new(45678),
             local_udp_is_ipv6: AtomicBool::new(false),
             nat_profile: Mutex::new(NatProfile::default()),
+            rtt_ms: Mutex::new(None),
+            last_heartbeat_sent_at: Mutex::new(None),
             active_probe: Mutex::new(None),
             dynamic_lan_discovery: false,
             connected_probe_targets: Mutex::new(Vec::new()),
@@ -5540,15 +6135,7 @@ mod tests {
                 peer_id: "987654321".to_string(),
                 relay_addr: "127.0.0.1:21117".to_string(),
                 relay_token: "tok-wrong".to_string(),
-                peer_public_addr: None,
-                peer_public_addrs: Vec::new(),
-                self_public_addr: None,
-                peer_nat_type: None,
-                peer_nat_port_delta: None,
-                peer_lan_addrs: Vec::new(),
-                owner_grant: None,
-                is_owner_connection: false,
-                is_relay_alloc: false,
+                ..CoordPayload::default()
             },
         );
         assert!(rx1.try_recv().is_err());
@@ -5563,15 +6150,7 @@ mod tests {
                 peer_id: "987654321".to_string(),
                 relay_addr: "127.0.0.1:21117".to_string(),
                 relay_token: "tok-bogus".to_string(),
-                peer_public_addr: None,
-                peer_public_addrs: Vec::new(),
-                self_public_addr: None,
-                peer_nat_type: None,
-                peer_nat_port_delta: None,
-                peer_lan_addrs: Vec::new(),
-                owner_grant: None,
-                is_owner_connection: false,
-                is_relay_alloc: false,
+                ..CoordPayload::default()
             },
         );
         assert!(rx1.try_recv().is_err());
@@ -5602,14 +6181,8 @@ mod tests {
                 relay_addr: "127.0.0.1:21117".to_string(),
                 relay_token: "tok-ok".to_string(),
                 peer_public_addr: Some("   ".to_string()),
-                peer_public_addrs: Vec::new(),
-                self_public_addr: None,
-                peer_nat_type: None,
-                peer_nat_port_delta: None,
                 peer_lan_addrs: vec!["10.0.0.2:50000".to_string()],
-                owner_grant: None,
-                is_owner_connection: false,
-                is_relay_alloc: false,
+                ..CoordPayload::default()
             },
         );
         let grant = rx1.try_recv().unwrap().unwrap();
@@ -5629,14 +6202,8 @@ mod tests {
                 relay_addr: "127.0.0.1:21117".to_string(),
                 relay_token: "tok-in".to_string(),
                 peer_public_addr: Some("198.51.100.7:44444".to_string()),
-                peer_public_addrs: Vec::new(),
-                self_public_addr: None,
-                peer_nat_type: None,
-                peer_nat_port_delta: None,
                 peer_lan_addrs: vec!["192.168.1.9:9901".to_string()],
-                owner_grant: None,
-                is_owner_connection: false,
-                is_relay_alloc: false,
+                ..CoordPayload::default()
             },
         );
         let inc = shared.incoming.lock().unwrap().pop_front().unwrap();
@@ -5679,7 +6246,12 @@ mod tests {
                 self_public_udp_addr: None,
                 peer_nat_type: None,
                 peer_nat_port_delta: None,
+                self_nat_port_range: None,
+                peer_nat_port_range: None,
                 peer_lan_addrs: Vec::new(),
+                punch_secret: None,
+                start_after_ms: None,
+                relay_fallback_after_ms: None,
                 relay_token: "tok-punch".to_string(),
                 relay_addr: "127.0.0.1:21117".to_string(),
                 owner_grant: None,
@@ -5967,6 +6539,8 @@ mod tests {
             local_udp_port: AtomicU16::new(0),
             local_udp_is_ipv6: AtomicBool::new(false),
             nat_profile: Mutex::new(NatProfile::default()),
+            rtt_ms: Mutex::new(None),
+            last_heartbeat_sent_at: Mutex::new(None),
             active_probe: Mutex::new(None),
             dynamic_lan_discovery: false,
             connected_probe_targets: Mutex::new(Vec::new()),
@@ -6028,9 +6602,8 @@ mod tests {
         assert_eq!(target, v4_peer);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn persistent_udp_probe_keeps_stable_port_and_coexists_with_reuseport_p2p_socket() {
+    fn persistent_udp_probe_keeps_stable_port_and_releases_exclusively_for_p2p() {
         let sig_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
         let sig_addr = sig_udp.local_addr().unwrap();
         sig_udp
@@ -6053,15 +6626,11 @@ mod tests {
         assert_eq!(n2, UDP_PROBE_LEN);
         assert_eq!(from2.port(), port);
 
-        // 在 probe 仍存活时，P2P 打洞套接字以 SO_REUSEADDR + SO_REUSEPORT 绑定同一端口，
-        // 来自外部 peer（非信令服务器）的 UDP 数据报必须全部落到 P2P 套接字上。
-        let raw = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-        raw.set_reuse_address(true).unwrap();
-        #[cfg(unix)]
-        raw.set_reuse_port(true).unwrap();
-        raw.bind(&SockAddr::from(SocketAddr::from(([0, 0, 0, 0], port))))
-            .expect("P2P socket must share local_udp_port");
-        let p2p_sock: UdpSocket = raw.into();
+        // 通过 acquire_local_udp_port_for_p2p 统一在全平台独占释放探测端口，
+        // P2P 无需 SO_REUSEPORT 即可独占绑定同一端口；释放守卫后自动恢复探测端口。
+        let hold = acquire_local_udp_port_for_p2p(Some(port));
+        let p2p_sock = UdpSocket::bind(SocketAddr::from(([0u8; 4], port)))
+            .expect("P2P socket must exclusively bind local_udp_port while hold is active");
         p2p_sock
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
@@ -6077,6 +6646,13 @@ mod tests {
             assert_eq!(&buf[..rn], &payload);
             assert_eq!(rfrom, peer.local_addr().unwrap());
         }
+
+        drop(p2p_sock);
+        drop(hold);
+        probe.send_probe("604928235");
+        let (n3, from3) = sig_udp.recv_from(&mut buf).unwrap();
+        assert_eq!(n3, UDP_PROBE_LEN);
+        assert_eq!(from3.port(), port);
     }
 
     #[test]
@@ -6179,6 +6755,8 @@ mod tests {
             local_udp_port: AtomicU16::new(50000),
             local_udp_is_ipv6: AtomicBool::new(false),
             nat_profile: Mutex::new(NatProfile::default()),
+            rtt_ms: Mutex::new(None),
+            last_heartbeat_sent_at: Mutex::new(None),
             active_probe: Mutex::new(None),
             dynamic_lan_discovery,
             connected_probe_targets: Mutex::new(vec!["192.0.2.10:21116".parse().unwrap()]),
@@ -6260,24 +6838,26 @@ mod tests {
             assert_eq!(got_v4.get(idx), Some(d));
             assert!(idx < loopback_pos);
         }
-        assert_eq!(
-            dynamic.current_effective_lan_addrs(&static_addrs, 50000, true),
-            vec!["[fd00::5]:50000".to_string()]
-        );
+        let got_v6 = dynamic.current_effective_lan_addrs(&static_addrs, 50000, true);
+        assert!(got_v6.contains(&"[fd00::5]:50000".to_string()));
+        assert!(got_v6
+            .iter()
+            .all(|s| s.parse::<SocketAddr>().is_ok_and(|a| a.is_ipv6())));
+
+        // 代理激活时 current_effective_lan_addrs 必须严格返回空列表，绝不泄漏内网/VPN/全球 IPv6/UPnP 候选
+        dynamic.proxy_active.store(true, Ordering::Release);
+        *dynamic.upnp_external_addr.lock().unwrap() = Some("203.0.113.88:50000".to_string());
+        assert!(dynamic
+            .current_effective_lan_addrs(&static_addrs, 50000, false)
+            .is_empty());
     }
 
     #[test]
-    fn persistent_udp_probe_connect_failure_drops_socket_and_clears_local_udp_port() {
-        let target: SocketAddr = "127.0.0.1:21116".parse().unwrap();
-        let failed = PersistentUdpProbe::bind_with(target, |_sock, _addr| {
-            Err(io::Error::new(
-                ErrorKind::NetworkUnreachable,
-                "simulated connect failure",
-            ))
-        });
+    fn persistent_udp_probe_invalid_target_returns_none_and_clears_local_udp_port() {
+        let failed = PersistentUdpProbe::bind("0.0.0.0:21116".parse().unwrap());
         assert!(
             failed.is_none(),
-            "failed connect must return None and never keep an unconnected SO_REUSEPORT socket"
+            "unspecified target must return None and never keep a probe socket"
         );
         // 端口为 0 或未指定地址也直接返回 None
         assert!(PersistentUdpProbe::bind("0.0.0.0:0".parse().unwrap()).is_none());
@@ -6306,6 +6886,8 @@ mod tests {
             local_udp_port: AtomicU16::new(45678),
             local_udp_is_ipv6: AtomicBool::new(false),
             nat_profile: Mutex::new(NatProfile::default()),
+            rtt_ms: Mutex::new(None),
+            last_heartbeat_sent_at: Mutex::new(None),
             active_probe: Mutex::new(None),
             dynamic_lan_discovery: false,
             connected_probe_targets: Mutex::new(Vec::new()),
@@ -6348,15 +6930,7 @@ mod tests {
                 peer_id: "111222333".to_string(),
                 relay_addr: "127.0.0.1:21117".to_string(),
                 relay_token: "tok".to_string(),
-                peer_public_addr: None,
-                peer_public_addrs: Vec::new(),
-                self_public_addr: None,
-                peer_nat_type: None,
-                peer_nat_port_delta: None,
-                peer_lan_addrs: Vec::new(),
-                owner_grant: None,
-                is_owner_connection: false,
-                is_relay_alloc: false,
+                ..CoordPayload::default()
             },
         );
         let inc = shared.incoming.lock().unwrap().pop_front().unwrap();
@@ -6789,7 +7363,7 @@ mod tests {
                     "relay_addr": ""
                 }),
             );
-            let _ = s2.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = s2.set_read_timeout(Some(Duration::from_secs(2)));
             let mut buf = [0u8; 64];
             while matches!(s2.read(&mut buf), Ok(n) if n > 0) {}
         });
@@ -6882,7 +7456,7 @@ mod tests {
                     "relay_addr": ""
                 }),
             );
-            let _ = s2.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = s2.set_read_timeout(Some(Duration::from_secs(2)));
             let mut buf = [0u8; 64];
             while matches!(s2.read(&mut buf), Ok(n) if n > 0) {}
         });
@@ -6969,6 +7543,7 @@ mod tests {
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         })
         .unwrap();
         assert!(
@@ -6993,6 +7568,7 @@ mod tests {
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         })
         .unwrap();
         assert_eq!(reg_false["allow_remote_control"], false);
@@ -7946,6 +8522,8 @@ mod tests {
             local_udp_port: AtomicU16::new(50000),
             local_udp_is_ipv6: AtomicBool::new(false),
             nat_profile: Mutex::new(NatProfile::default()),
+            rtt_ms: Mutex::new(None),
+            last_heartbeat_sent_at: Mutex::new(None),
             active_probe: Mutex::new(None),
             dynamic_lan_discovery: false,
             connected_probe_targets: Mutex::new(Vec::new()),
@@ -8921,20 +9499,20 @@ mod tests {
     #[test]
     fn mock_server_rcsp_v2_nat_classification_cone_seq_random_retry_and_refresh() {
         for (case_name, alt_port_offset, expected_nat, expected_delta, expected_wire_nat) in [
-            ("cone", 0i32, NatType::Cone, Some(0i16), "cone"),
             (
-                "seq",
-                3i32,
-                NatType::SymmetricSeq,
-                Some(3i16),
-                "symmetric_seq",
+                "cone_unverified",
+                0i32,
+                NatType::ConeUnverified,
+                Some(0i16),
+                "cone_unverified",
             ),
+            ("apdm_seq", 3i32, NatType::ApdmSeq, Some(3i16), "apdm_seq"),
             (
-                "random",
+                "apdm_random",
                 500i32,
-                NatType::SymmetricRandom,
+                NatType::ApdmRandom,
                 None,
-                "symmetric_random",
+                "apdm_random",
             ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -9070,7 +9648,12 @@ mod tests {
                         "self_public_udp_addr": observed_primary.to_string(),
                         "peer_nat_type": "symmetric_seq",
                         "peer_nat_port_delta": 4,
+                        "self_nat_port_range": [32768, 60999],
+                        "peer_nat_port_range": [49152, 65535],
                         "peer_lan_addrs": ["192.168.1.20:50000"],
+                        "punch_secret": "0123456789abcdef0123456789abcdef",
+                        "start_after_ms": 35,
+                        "relay_fallback_after_ms": 400,
                         "relay_token": "tok-nat-001",
                         "relay_addr": "127.0.0.1:21117",
                     }),
@@ -9088,7 +9671,12 @@ mod tests {
                         "self_public_udp_addr": observed_primary.to_string(),
                         "peer_nat_type": "cone",
                         "peer_nat_port_delta": 0,
+                        "self_nat_port_range": [49152, 65535],
+                        "peer_nat_port_range": [32768, 60999],
                         "peer_lan_addrs": ["192.168.1.30:50000"],
+                        "punch_secret": "fedcba9876543210fedcba9876543210",
+                        "start_after_ms": 0,
+                        "relay_fallback_after_ms": 400,
                         "relay_token": "tok-nat-002",
                         "relay_addr": "127.0.0.1:21117",
                     }),
@@ -9144,8 +9732,19 @@ mod tests {
                     "203.0.113.88:50001".to_string()
                 ]
             );
-            assert_eq!(grant.peer_nat_type, NatType::SymmetricSeq);
+            assert_eq!(grant.peer_nat_type, NatType::ApdmSeq);
             assert_eq!(grant.peer_nat_port_delta, Some(4));
+            assert_eq!(
+                grant.self_nat_port_range,
+                Some(PortRangeHint::LinuxEphemeral)
+            );
+            assert_eq!(grant.peer_nat_port_range, Some(PortRangeHint::IanaDynamic));
+            assert_eq!(
+                grant.punch_secret.as_deref(),
+                Some("0123456789abcdef0123456789abcdef")
+            );
+            assert_eq!(grant.start_after_ms, Some(35));
+            assert_eq!(grant.relay_fallback_after_ms, Some(400));
 
             let inc = {
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -9159,8 +9758,16 @@ mod tests {
             };
             assert_eq!(inc.self_nat_type, expected_nat);
             assert_eq!(inc.self_nat_port_delta, expected_delta);
-            assert_eq!(inc.peer_nat_type, NatType::Cone);
+            assert_eq!(inc.peer_nat_type, NatType::ConeUnverified);
             assert_eq!(inc.peer_nat_port_delta, Some(0));
+            assert_eq!(inc.self_nat_port_range, Some(PortRangeHint::IanaDynamic));
+            assert_eq!(inc.peer_nat_port_range, Some(PortRangeHint::LinuxEphemeral));
+            assert_eq!(
+                inc.punch_secret.as_deref(),
+                Some("fedcba9876543210fedcba9876543210")
+            );
+            assert_eq!(inc.start_after_ms, Some(0));
+            assert_eq!(inc.relay_fallback_after_ms, Some(400));
             assert_eq!(
                 inc.peer_public_addrs,
                 vec!["203.0.113.99:51111".to_string()]
@@ -9240,13 +9847,15 @@ mod tests {
                 "604928235".to_string(),
                 Some(token),
                 None,
+                None,
                 Some(v6_addr),
-                |s, a| s.connect(a),
+                Vec::new(),
             )
             .expect("bind v4+v6 dual-stack probe");
             let nat_profile = Mutex::new(NatProfile::default());
+            let rtt_ms = Mutex::new(None);
             let stop_flag = AtomicBool::new(false);
-            probe.run_initial_probe_round(&nat_profile, &stop_flag);
+            probe.run_initial_probe_round(&nat_profile, &rtt_ms, &stop_flag);
             let prof = nat_profile.lock().unwrap().clone();
             assert_eq!(prof.public_v4, Some(obs_v4));
             assert_eq!(prof.public_v6, Some(obs_v6));
@@ -9313,13 +9922,15 @@ mod tests {
             None,
             Some(primary_addr),
             None,
-            |s, a| s.connect(a),
+            None,
+            Vec::new(),
         )
         .expect("bind probe");
 
         let nat_profile = Mutex::new(NatProfile::default());
+        let rtt_ms = Mutex::new(None);
         let stop_flag = AtomicBool::new(false);
-        probe.run_initial_probe_round(&nat_profile, &stop_flag);
+        probe.run_initial_probe_round(&nat_profile, &rtt_ms, &stop_flag);
         drop(probe);
         srv.join().unwrap();
 
@@ -9403,64 +10014,364 @@ mod tests {
     }
 
     #[test]
-    fn dual_stack_probe_requires_exact_local_port_without_ephemeral_fallback() {
+    fn unconnected_dual_stack_probe_reuses_single_port_and_rejects_unlisted_source() {
         let Ok(v6_srv) = UdpSocket::bind("[::1]:0") else {
             return;
         };
         let v6_addr = v6_srv.local_addr().unwrap();
+        let _ = v6_srv.set_read_timeout(Some(Duration::from_secs(2)));
         let v4_srv = UdpSocket::bind("127.0.0.1:0").unwrap();
         let v4_addr = v4_srv.local_addr().unwrap();
-        let _ = v4_srv.set_read_timeout(Some(Duration::from_millis(80)));
+        let _ = v4_srv.set_read_timeout(Some(Duration::from_secs(2)));
+        let rogue_srv = UdpSocket::bind("127.0.0.1:0").unwrap();
 
-        let mut setup = None;
-        for _ in 0..8 {
-            let candidate = PersistentUdpProbe::bind_with_options(
-                v6_addr,
-                "604928235".to_string(),
-                Some([0x55u8; 16]),
-                None,
-                Some(v4_addr),
-                |s, a| s.connect(a),
-            )
-            .expect("bind v6 probe");
-            if let Ok(blocker) = UdpSocket::bind(("0.0.0.0", candidate.local_port())) {
-                setup = Some((candidate, blocker));
-                break;
-            }
-        }
-        let Some((probe, blocker)) = setup else {
-            return;
-        };
+        let probe = PersistentUdpProbe::bind_with_options(
+            v6_addr,
+            "604928235".to_string(),
+            Some([0x55u8; 16]),
+            None,
+            None,
+            Some(v4_addr),
+            Vec::new(),
+        )
+        .expect("bind dual-stack unconnected probe");
 
-        // 严格要求同端口时绝不回落临时端口 0
-        assert!(
-            probe.bind_short_lived_socket(v4_addr, true).is_none(),
-            "require_exact_local_port=true must return None when exact local port is occupied"
-        );
-        // 对比非严格模式会回落其他临时端口
-        let fallback_sock = probe
-            .bind_short_lived_socket(v4_addr, false)
-            .expect("non-exact fallback should bind ephemeral port");
-        assert_ne!(
-            fallback_sock.local_addr().unwrap().port(),
-            probe.local_port()
-        );
-        drop(fallback_sock);
-
-        // send_lightweight_refresh 在同端口被占时不得向双栈目标发送死端口探测包
         let nat_profile = Mutex::new(NatProfile::default());
         probe.send_lightweight_refresh(&nat_profile);
+
         let mut buf = [0u8; 64];
-        assert!(
-            v4_srv.recv_from(&mut buf).is_err(),
-            "dual-stack refresh must not send packet from a fallback ephemeral port"
+        let (n6, from6) = v6_srv.recv_from(&mut buf).expect("v6 recv");
+        assert_eq!(n6, UDP_PROBE_V2_LEN);
+        assert_eq!(from6.port(), probe.local_port());
+        let nonce6: [u8; 8] = buf[14..22].try_into().unwrap();
+
+        let (n4, from4) = v4_srv.recv_from(&mut buf).expect("v4 recv");
+        assert_eq!(n4, UDP_PROBE_V2_LEN);
+        assert_eq!(from4.port(), probe.local_port());
+        let nonce4: [u8; 8] = buf[14..22].try_into().unwrap();
+
+        // 非白名单来源伪造 RCSA（即使携带正确 nonce6）也必须被严格丢弃
+        let rogue_obs: SocketAddr = "198.51.100.250:59999".parse().unwrap();
+        let probe_v4_dst = SocketAddr::from(([127, 0, 0, 1], probe.local_port()));
+        rogue_srv
+            .send_to(&build_test_rcsa(rogue_obs, nonce6), probe_v4_dst)
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        probe.send_lightweight_refresh(&nat_profile);
+        assert!(nat_profile.lock().unwrap().public_v6.is_none());
+        assert!(nat_profile.lock().unwrap().public_v4.is_none());
+
+        // 合法白名单双栈目标回包均通过同一个未连接双栈 socket 收包更新
+        let obs_v4: SocketAddr = "198.51.100.11:41111".parse().unwrap();
+        let obs_v6: SocketAddr = "[2001:db8::11]:41111".parse().unwrap();
+        v4_srv
+            .send_to(&build_test_rcsa(obs_v4, nonce4), from4)
+            .unwrap();
+        v6_srv
+            .send_to(&build_test_rcsa(obs_v6, nonce6), from6)
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        probe.send_lightweight_refresh(&nat_profile);
+        let prof = nat_profile.lock().unwrap().clone();
+        assert_eq!(prof.public_v4, Some(obs_v4));
+        assert_eq!(prof.public_v6, Some(obs_v6));
+    }
+
+    #[test]
+    fn mock_server_4_sample_and_alt_ip_nat_classification() {
+        // 1) ConeVerified & AdmSeq via udp_probe_alt_ip_addr
+        for (case_name, alt_ip_obs_str, expected_nat, expected_delta) in [
+            (
+                "cone_verified",
+                "198.51.100.55:45000",
+                NatType::ConeVerified,
+                Some(0i16),
+            ),
+            (
+                "adm_seq",
+                "198.51.100.55:45005",
+                NatType::AdmSeq,
+                Some(5i16),
+            ),
+            (
+                "adm_random",
+                "198.51.100.99:59000",
+                NatType::AdmRandom,
+                None,
+            ),
+        ] {
+            let primary_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let alt_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let alt_ip_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let _ = primary_udp.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = alt_udp.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = alt_ip_udp.set_read_timeout(Some(Duration::from_secs(2)));
+
+            let p_addr = primary_udp.local_addr().unwrap();
+            let a_addr = alt_udp.local_addr().unwrap();
+            let aip_addr = alt_ip_udp.local_addr().unwrap();
+
+            let obs_p: SocketAddr = "198.51.100.55:45000".parse().unwrap();
+            let obs_aip: SocketAddr = alt_ip_obs_str.parse().unwrap();
+
+            let tp = thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                if let Ok((n, from)) = primary_udp.recv_from(&mut buf) {
+                    if n >= UDP_PROBE_LEN {
+                        let nonce: [u8; 8] = buf[14..22].try_into().unwrap();
+                        let _ = primary_udp.send_to(&build_test_rcsa(obs_p, nonce), from);
+                    }
+                }
+            });
+            let ta = thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                if let Ok((n, from)) = alt_udp.recv_from(&mut buf) {
+                    if n >= UDP_PROBE_LEN {
+                        let nonce: [u8; 8] = buf[14..22].try_into().unwrap();
+                        let _ = alt_udp.send_to(&build_test_rcsa(obs_p, nonce), from);
+                    }
+                }
+            });
+            let taip = thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                if let Ok((n, from)) = alt_ip_udp.recv_from(&mut buf) {
+                    if n >= UDP_PROBE_LEN {
+                        let nonce: [u8; 8] = buf[14..22].try_into().unwrap();
+                        let _ = alt_ip_udp.send_to(&build_test_rcsa(obs_aip, nonce), from);
+                    }
+                }
+            });
+
+            let probe = PersistentUdpProbe::bind_with_options(
+                p_addr,
+                "604928235".to_string(),
+                Some([0x11u8; 16]),
+                Some(a_addr),
+                Some(aip_addr),
+                None,
+                Vec::new(),
+            )
+            .expect("bind probe");
+            let nat_profile = Mutex::new(NatProfile::default());
+            let rtt_ms = Mutex::new(None);
+            let stop_flag = AtomicBool::new(false);
+            probe.run_initial_probe_round(&nat_profile, &rtt_ms, &stop_flag);
+            tp.join().unwrap();
+            ta.join().unwrap();
+            taip.join().unwrap();
+
+            let prof = nat_profile.lock().unwrap().clone();
+            assert_eq!(prof.nat_type, expected_nat, "case {case_name}");
+            assert_eq!(prof.port_delta, expected_delta, "case {case_name}");
+        }
+
+        // 2) 4 样本补采 (m3, m4)：m1->m2 为 +3，若临时 socket m3->m4 为 +17 则修正为 ApdmRandom
+        let primary_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let alt_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = primary_udp.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = alt_udp.set_read_timeout(Some(Duration::from_secs(2)));
+        let p_addr = primary_udp.local_addr().unwrap();
+        let a_addr = alt_udp.local_addr().unwrap();
+
+        let tp = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            for idx in 0..2 {
+                if let Ok((n, from)) = primary_udp.recv_from(&mut buf) {
+                    if n >= UDP_PROBE_LEN {
+                        let nonce: [u8; 8] = buf[14..22].try_into().unwrap();
+                        let obs: SocketAddr = if idx == 0 {
+                            "198.51.100.55:50000".parse().unwrap()
+                        } else {
+                            "198.51.100.55:52000".parse().unwrap()
+                        };
+                        let _ = primary_udp.send_to(&build_test_rcsa(obs, nonce), from);
+                    }
+                }
+            }
+        });
+        let ta = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            for idx in 0..2 {
+                if let Ok((n, from)) = alt_udp.recv_from(&mut buf) {
+                    if n >= UDP_PROBE_LEN {
+                        let nonce: [u8; 8] = buf[14..22].try_into().unwrap();
+                        let obs: SocketAddr = if idx == 0 {
+                            "198.51.100.55:50003".parse().unwrap()
+                        } else {
+                            "198.51.100.55:52017".parse().unwrap()
+                        };
+                        let _ = alt_udp.send_to(&build_test_rcsa(obs, nonce), from);
+                    }
+                }
+            }
+        });
+
+        let probe = PersistentUdpProbe::bind_with_options(
+            p_addr,
+            "604928235".to_string(),
+            Some([0x22u8; 16]),
+            Some(a_addr),
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("bind 4-sample probe");
+        let nat_profile = Mutex::new(NatProfile::default());
+        let rtt_ms = Mutex::new(None);
+        let stop_flag = AtomicBool::new(false);
+        probe.run_initial_probe_round(&nat_profile, &rtt_ms, &stop_flag);
+        tp.join().unwrap();
+        ta.join().unwrap();
+
+        let prof = nat_profile.lock().unwrap().clone();
+        assert_eq!(prof.nat_type, NatType::ApdmRandom);
+        assert_eq!(prof.port_delta, None);
+        assert_eq!(prof.port_range, Some(PortRangeHint::IanaDynamic));
+
+        // 3) 全超时 -> UdpBlocked
+        let dead_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead_udp.local_addr().unwrap();
+        drop(dead_udp);
+        let blocked_probe = PersistentUdpProbe::bind(dead_addr).expect("bind blocked probe");
+        let blocked_profile = Mutex::new(NatProfile::default());
+        let blocked_rtt = Mutex::new(None);
+        blocked_probe.run_initial_probe_round(&blocked_profile, &blocked_rtt, &stop_flag);
+        assert_eq!(
+            blocked_profile.lock().unwrap().nat_type,
+            NatType::UdpBlocked
+        );
+    }
+
+    #[test]
+    fn external_reachability_self_check_uses_private_rcsp_and_detects_double_nat() {
+        let srv_ok = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let srv_ok_addr = srv_ok.local_addr().unwrap();
+        let _ = srv_ok.set_read_timeout(Some(Duration::from_millis(20)));
+        let stop_ok = Arc::new(AtomicBool::new(false));
+        let stop_ok_bg = Arc::clone(&stop_ok);
+        let jh_ok = thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            while !stop_ok_bg.load(Ordering::Acquire) {
+                if let Ok((n, from)) = srv_ok.recv_from(&mut buf) {
+                    if n >= UDP_PROBE_V2_LEN && &buf[0..4] == b"RCSP" {
+                        let nonce: [u8; 8] = buf[14..22].try_into().unwrap();
+                        let obs: SocketAddr = "9.9.9.10:54321".parse().unwrap();
+                        let _ = srv_ok.send_to(&build_test_rcsa(obs, nonce), from);
+                    }
+                }
+            }
+        });
+
+        let probe = PersistentUdpProbe::bind_with_options(
+            srv_ok_addr,
+            "604928235".to_string(),
+            Some([0x33u8; 16]),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("bind self-check probe");
+        let nat_profile = Mutex::new(NatProfile::default());
+        let stop_flag = AtomicBool::new(false);
+
+        // 1) RCSA 观测公网 IP 与映射公网 IP 一致 => Reachable
+        assert_eq!(
+            probe.verify_external_mapping_reachability(
+                "9.9.9.10:49000".parse().unwrap(),
+                &nat_profile,
+                &stop_flag,
+            ),
+            ExternalMappingCheck::Reachable
         );
 
-        // 释放占用后应能绑定完全相同的本地端口
-        drop(blocker);
-        let exact_sock = probe
-            .bind_short_lived_socket(v4_addr, true)
-            .expect("exact local port should bind once free");
-        assert_eq!(exact_sock.local_addr().unwrap().port(), probe.local_port());
+        // 2) 双层 NAT 假公网（映射声称 8.8.8.8，自有 RCSP 实际观测 9.9.9.10）=> Unreachable
+        let fake_res = probe.verify_external_mapping_reachability(
+            "8.8.8.8:49000".parse().unwrap(),
+            &nat_profile,
+            &stop_flag,
+        );
+        assert!(
+            matches!(fake_res, ExternalMappingCheck::Unreachable(ref r) if r.contains("双层 NAT") || r.contains("不一致")),
+            "expected double-NAT fake-public rejection, got {fake_res:?}"
+        );
+        stop_ok.store(true, Ordering::Release);
+        jh_ok.join().unwrap();
+
+        // 3) 自有 RCSP 超时无响应 => Unreachable（避开假公网）
+        let dead_srv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead_srv.local_addr().unwrap();
+        drop(dead_srv);
+        let dead_probe = PersistentUdpProbe::bind_with_options(
+            dead_addr,
+            "604928235".to_string(),
+            Some([0x33u8; 16]),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("bind dead self-check probe");
+        let timeout_res = dead_probe.verify_external_mapping_reachability(
+            "9.9.9.10:49000".parse().unwrap(),
+            &nat_profile,
+            &stop_flag,
+        );
+        assert!(
+            matches!(timeout_res, ExternalMappingCheck::Unreachable(ref r) if r.contains("超时")),
+            "expected timeout Unreachable, got {timeout_res:?}"
+        );
+    }
+
+    #[test]
+    fn reprobe_snapshot_and_split_include_public_v4_v6_and_lan_candidates() {
+        let mixed = vec![
+            "192.168.1.50:51000".to_string(),
+            "198.51.100.20:51000".to_string(),
+            "[fd00::5]:51000".to_string(),
+            "[2001:db8::20]:51000".to_string(),
+            "198.51.100.20:51000".to_string(),
+            "bad-addr".to_string(),
+        ];
+        let (pubs, lans) = split_public_and_lan_addrs(&mixed, &["203.0.113.9:52000".to_string()]);
+        assert_eq!(
+            pubs,
+            vec![
+                "198.51.100.20:51000".to_string(),
+                "[2001:db8::20]:51000".to_string()
+            ]
+        );
+        assert_eq!(
+            lans,
+            vec![
+                "192.168.1.50:51000".to_string(),
+                "[fd00::5]:51000".to_string()
+            ]
+        );
+
+        let lan_only = vec!["192.168.1.50:51000".to_string()];
+        let (pubs_fb, lans_fb) =
+            split_public_and_lan_addrs(&lan_only, &["203.0.113.9:52000".to_string()]);
+        assert_eq!(pubs_fb, vec!["203.0.113.9:52000".to_string()]);
+        assert_eq!(lans_fb, vec!["192.168.1.50:51000".to_string()]);
+
+        let handle = SignalClientHandle::spawn(
+            ServerConfig::default(),
+            "reprobe-host".to_string(),
+            vec!["192.168.1.50".to_string()],
+        );
+        handle.shared.local_udp_port.store(51234, Ordering::Release);
+        {
+            let mut np = handle.shared.nat_profile.lock().unwrap();
+            np.public_v4 = Some("198.51.100.77:51234".parse().unwrap());
+            np.public_v6 = Some("[2001:db8::77]:51234".parse().unwrap());
+            np.nat_type = NatType::ConeVerified;
+        }
+        let (port, addrs, nat_type, _delta, _range) = handle.snapshot_p2p_reprobe_info();
+        assert_eq!(port, Some(51234));
+        assert_eq!(nat_type, NatType::ConeVerified);
+        assert!(addrs.contains(&"198.51.100.77:51234".to_string()));
+        assert!(addrs.contains(&"[2001:db8::77]:51234".to_string()));
+        assert!(addrs.contains(&"192.168.1.50:51234".to_string()));
     }
 }

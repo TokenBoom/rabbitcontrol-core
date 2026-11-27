@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use rc_client_core::app_prefs::ConnectionMode;
 use rc_client_core::host_bridge::{HostHandle, HostUpdate, UiHostConfig, TEMP_CODE_LEN};
 use rc_client_core::server_config::{
     ServerConfig, ServerConnectionState, DEFAULT_RELAY_PORT, DEFAULT_SIGNAL_PORT,
@@ -1189,8 +1190,8 @@ fn inproc_p2p_unreachable_falls_back_seamlessly_to_tcp_relay() {
         peer_public_addr: Some(format!("127.0.0.1:{dead_port_a}")),
         peer_lan_addrs: Vec::new(),
         local_udp_port: None,
-        self_nat_type: rc_client_core::nat::NatType::Cone,
-        peer_nat_type: rc_client_core::nat::NatType::Cone,
+        self_nat_type: rc_client_core::nat::NatType::ConeVerified,
+        peer_nat_type: rc_client_core::nat::NatType::ConeVerified,
         ..RelayIncoming::default()
     });
 
@@ -1214,8 +1215,8 @@ fn inproc_p2p_unreachable_falls_back_seamlessly_to_tcp_relay() {
             peer_public_addr: Some(format!("127.0.0.1:{dead_port_b}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: None,
-            self_nat_type: rc_client_core::nat::NatType::Cone,
-            peer_nat_type: rc_client_core::nat::NatType::Cone,
+            self_nat_type: rc_client_core::nat::NatType::ConeVerified,
+            peer_nat_type: rc_client_core::nat::NatType::ConeVerified,
             ..ConnectGrant::default()
         }),
         ..UiSessionConfig::default()
@@ -1886,4 +1887,459 @@ fn host_stop_with_session_switching_over_tcp_relay_notifies_client() {
 
     session.join();
     let _ = relay_thread.join();
+}
+
+#[test]
+fn relay_first_400ms_and_delayed_bg_p2p_upgrades_losslessly_with_status_update() {
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let token = "relay-first-bg-upgrade-2026".to_string();
+    let (relay_addr, relay_thread) = spawn_local_rcr1_relay(token.clone());
+    let relay_addr_str = relay_addr.to_string();
+
+    let host_udp_port = reserve_ephemeral_udp_port();
+    let client_udp_port = reserve_ephemeral_udp_port();
+    assert_ne!(host_udp_port, client_udp_port);
+
+    // 单个受控 UDP 网关：前 650ms 丢弃所有 UDP 报文（迫使 t=400ms 时 Relay-first 同步起流），
+    // 650ms 后打开双向转发，让后台 14s P2P 穿透完成并触发 Make-Before-Break 无损升级！
+    let gate_sock = UdpSocket::bind("127.0.0.1:0").expect("bind udp gate");
+    gate_sock
+        .set_read_timeout(Some(Duration::from_millis(10)))
+        .unwrap();
+    let gate_port = gate_sock.local_addr().unwrap().port();
+    let gate_stop = Arc::new(AtomicBool::new(false));
+    let gate_stop_bg = Arc::clone(&gate_stop);
+    let gate_open_at = Instant::now() + Duration::from_millis(650);
+    let gate_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut client_seen: Option<std::net::SocketAddr> = None;
+        let host_dest: std::net::SocketAddr = format!("127.0.0.1:{host_udp_port}").parse().unwrap();
+        while !gate_stop_bg.load(Ordering::Acquire) {
+            if let Ok((n, src)) = gate_sock.recv_from(&mut buf) {
+                if src.port() != host_udp_port {
+                    client_seen = Some(src);
+                }
+                if Instant::now() >= gate_open_at {
+                    if src.port() == host_udp_port {
+                        if let Some(c_addr) = client_seen {
+                            let _ = gate_sock.send_to(&buf[..n], c_addr);
+                        }
+                    } else {
+                        let _ = gate_sock.send_to(&buf[..n], host_dest);
+                    }
+                }
+            }
+        }
+    });
+
+    let mut host = HostHandle::spawn(UiHostConfig {
+        listen_addr: "127.0.0.1:0".parse().expect("loopback"),
+        password: Some("UPGRADE26".to_string()),
+        approval_timeout_us: 15_000_000,
+        prefer_hardware: false,
+        require_approval: false,
+        auto_accept_with_password: false,
+        auto_rotate_password: false,
+        clipboard_enabled: false,
+        audio_enabled: false,
+        ..UiHostConfig::default()
+    })
+    .expect("spawn host");
+
+    host.offer_relay_incoming(RelayIncoming {
+        session_id: "sess-relay-first-upgrade".to_string(),
+        relay_addr: relay_addr_str.clone(),
+        relay_token: token.clone(),
+        peer_id: "604928235".to_string(),
+        peer_public_addr: Some(format!("127.0.0.1:{gate_port}")),
+        local_udp_port: Some(host_udp_port),
+        relay_fallback_after_ms: Some(400),
+        self_nat_type: rc_client_core::nat::NatType::ConeVerified,
+        peer_nat_type: rc_client_core::nat::NatType::ConeVerified,
+        ..RelayIncoming::default()
+    });
+
+    let session = SessionHandle::spawn(UiSessionConfig {
+        connect_addr: "0.0.0.0:0".parse().expect("placeholder"),
+        password: Some("UPGRADE26".to_string()),
+        watch_only: false,
+        width: 64,
+        height: 64,
+        fps: 60,
+        bitrate_bps: 8_000_000,
+        prefer_hardware: false,
+        clipboard_enabled: false,
+        audio_enabled: false,
+        force_relay: false,
+        connection_mode: ConnectionMode::Auto,
+        relay_grant: Some(ConnectGrant {
+            session_id: "sess-relay-first-upgrade".to_string(),
+            relay_addr: relay_addr_str,
+            relay_token: token,
+            target_id: "123456789".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{gate_port}")),
+            local_udp_port: Some(client_udp_port),
+            relay_fallback_after_ms: Some(400),
+            self_nat_type: rc_client_core::nat::NatType::ConeVerified,
+            peer_nat_type: rc_client_core::nat::NatType::ConeVerified,
+            ..ConnectGrant::default()
+        }),
+        ..UiSessionConfig::default()
+    });
+
+    // 等待：1) 初始经 TCP Relay 协商起流，2) 后台放行 P2P 后无损升级到 UDP P2P
+    let updates = collect_client_until(&session, Duration::from_secs(12), |us| {
+        let saw_relay = us.iter().any(|u| {
+            matches!(
+                u,
+                SessionUpdate::Negotiated { transport, .. } if transport == "TCP Relay"
+            )
+        });
+        let saw_p2p = us.iter().any(|u| {
+            matches!(
+                u,
+                SessionUpdate::Negotiated { transport, .. } if transport == "UDP P2P"
+            )
+        });
+        let saw_p2p_hud = us.iter().any(|u| {
+            matches!(
+                u,
+                SessionUpdate::Hud(h) if h.transport == "UDP P2P"
+            )
+        });
+        saw_relay && saw_p2p && saw_p2p_hud
+    });
+
+    assert!(
+        updates.iter().any(|u| matches!(
+            u,
+            SessionUpdate::Negotiated { transport, .. } if transport == "TCP Relay"
+        )),
+        "expected initial Relay-first stream over TCP Relay, got: {updates:?}"
+    );
+    assert!(
+        updates.iter().any(|u| matches!(
+            u,
+            SessionUpdate::Negotiated { transport, .. } if transport == "UDP P2P"
+        )),
+        "expected seamless background P2P upgrade to UDP P2P, got: {updates:?}"
+    );
+    assert!(
+        !updates
+            .iter()
+            .any(|u| matches!(u, SessionUpdate::Ended { .. })),
+        "session must not drop or end during Make-Before-Break upgrade: {updates:?}"
+    );
+
+    session.send(SessionCommand::Disconnect);
+    session.join();
+    host.stop();
+    gate_stop.store(true, Ordering::Release);
+    let _ = gate_thread.join();
+    let _ = relay_thread.join();
+}
+
+#[test]
+fn p2p_only_never_dials_relay_and_tcp_relay_never_upgrades_to_p2p() {
+    use std::io::Read;
+    use std::net::{TcpListener, UdpSocket};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // 1) P2pOnly 即使携带有效 relay_addr 且 UDP 不可达，绝不拨号中继
+    let trap_listener = TcpListener::bind("127.0.0.1:0").expect("bind trap relay");
+    trap_listener.set_nonblocking(true).unwrap();
+    let trap_addr = trap_listener.local_addr().unwrap();
+    let trap_hits = Arc::new(AtomicUsize::new(0));
+    let trap_hits_bg = Arc::clone(&trap_hits);
+    let trap_stop = Arc::new(AtomicBool::new(false));
+    let trap_stop_bg = Arc::clone(&trap_stop);
+    let trap_jh = std::thread::spawn(move || {
+        while !trap_stop_bg.load(Ordering::Acquire) {
+            if let Ok((mut s, _)) = trap_listener.accept() {
+                trap_hits_bg.fetch_add(1, Ordering::AcqRel);
+                let mut b = [0u8; 8];
+                let _ = s.read(&mut b);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+
+    let dead_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead_udp.local_addr().unwrap().port();
+    let s_p2p = SessionHandle::spawn(UiSessionConfig {
+        connect_addr: "0.0.0.0:0".parse().unwrap(),
+        connection_mode: ConnectionMode::P2pOnly,
+        prefer_hardware: false,
+        clipboard_enabled: false,
+        audio_enabled: false,
+        relay_grant: Some(ConnectGrant {
+            session_id: "p2p-only-no-relay".to_string(),
+            relay_addr: trap_addr.to_string(),
+            relay_token: "must-never-be-used".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{dead_port}")),
+            self_nat_type: rc_client_core::nat::NatType::UdpBlocked,
+            peer_nat_type: rc_client_core::nat::NatType::ConeVerified,
+            ..ConnectGrant::default()
+        }),
+        ..UiSessionConfig::default()
+    });
+    let ended_p2p = collect_client_until(&s_p2p, Duration::from_secs(5), |us| {
+        us.iter().any(|u| matches!(u, SessionUpdate::Ended { .. }))
+    });
+    assert!(
+        ended_p2p
+            .iter()
+            .any(|u| matches!(u, SessionUpdate::Ended { .. })),
+        "P2pOnly must end cleanly without relay fallback: {ended_p2p:?}"
+    );
+    assert_eq!(
+        trap_hits.load(Ordering::Acquire),
+        0,
+        "P2pOnly must NEVER dial TCP Relay"
+    );
+    s_p2p.join();
+    trap_stop.store(true, Ordering::Release);
+    let _ = trap_jh.join();
+    drop(dead_udp);
+
+    // 2) TcpRelay 模式即使对端提供可达 UDP 探测口，也绝不发起 UDP 探测或后台升级
+    let udp_trap = UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp_trap.set_nonblocking(true).unwrap();
+    let udp_trap_port = udp_trap.local_addr().unwrap().port();
+    let udp_hits = Arc::new(AtomicUsize::new(0));
+    let udp_hits_bg = Arc::clone(&udp_hits);
+    let udp_stop = Arc::new(AtomicBool::new(false));
+    let udp_stop_bg = Arc::clone(&udp_stop);
+    let udp_jh = std::thread::spawn(move || {
+        let mut buf = [0u8; 256];
+        while !udp_stop_bg.load(Ordering::Acquire) {
+            if udp_trap.recv_from(&mut buf).is_ok() {
+                udp_hits_bg.fetch_add(1, Ordering::AcqRel);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+
+    let token = "tcp-relay-no-p2p-2026".to_string();
+    let (relay_addr, relay_thread) = spawn_local_rcr1_relay(token.clone());
+    let mut host = HostHandle::spawn(UiHostConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        password: Some("RELAYONLY26".to_string()),
+        require_approval: false,
+        prefer_hardware: false,
+        clipboard_enabled: false,
+        audio_enabled: false,
+        ..UiHostConfig::default()
+    })
+    .unwrap();
+    host.offer_relay_incoming(RelayIncoming {
+        session_id: "sess-tcp-relay-only".to_string(),
+        relay_addr: relay_addr.to_string(),
+        relay_token: token.clone(),
+        peer_id: "604928235".to_string(),
+        peer_public_addr: Some(format!("127.0.0.1:{udp_trap_port}")),
+        is_relay_alloc: true,
+        ..RelayIncoming::default()
+    });
+    let s_relay = SessionHandle::spawn(UiSessionConfig {
+        connect_addr: "0.0.0.0:0".parse().unwrap(),
+        password: Some("RELAYONLY26".to_string()),
+        width: 64,
+        height: 64,
+        fps: 60,
+        bitrate_bps: 8_000_000,
+        prefer_hardware: false,
+        clipboard_enabled: false,
+        audio_enabled: false,
+        connection_mode: ConnectionMode::TcpRelay,
+        relay_grant: Some(ConnectGrant {
+            session_id: "sess-tcp-relay-only".to_string(),
+            relay_addr: relay_addr.to_string(),
+            relay_token: token,
+            target_id: "123456789".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{udp_trap_port}")),
+            ..ConnectGrant::default()
+        }),
+        ..UiSessionConfig::default()
+    });
+    let relay_updates = collect_client_until(&s_relay, Duration::from_secs(6), |us| {
+        us.iter()
+            .any(|u| matches!(u, SessionUpdate::Hud(h) if h.fps > 0.0))
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        relay_updates.iter().any(|u| matches!(
+            u,
+            SessionUpdate::Negotiated { transport, .. } if transport == "TCP Relay"
+        )),
+        "expected TCP Relay stream: {relay_updates:?}"
+    );
+    assert_eq!(
+        udp_hits.load(Ordering::Acquire),
+        0,
+        "TcpRelay mode must NEVER probe UDP or upgrade in background"
+    );
+    s_relay.send(SessionCommand::Disconnect);
+    s_relay.join();
+    host.stop();
+    udp_stop.store(true, Ordering::Release);
+    let _ = udp_jh.join();
+    let _ = relay_thread.join();
+}
+
+#[test]
+fn p2p_winner_cancels_host_relay_dial_preserving_initial_token() {
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // 模拟延迟返回 0x00 的 :21117 中继：t=50ms 时 Host 发起初始 Relay 拨号，
+    // 在 0x00 回包前 P2P 于 ~120ms 胜出，验证 Host 立即置位 relay_cancel 断开该 TCP 拨号。
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed relay");
+    let relay_addr = listener.local_addr().unwrap();
+    let saw_dial = Arc::new(AtomicBool::new(false));
+    let cancelled_before_ack = Arc::new(AtomicBool::new(false));
+    let saw_dial_bg = Arc::clone(&saw_dial);
+    let cancel_bg = Arc::clone(&cancelled_before_ack);
+    let relay_jh = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(800)))
+                    .unwrap();
+                let mut hdr = [0u8; 29];
+                let _ = stream.read_exact(&mut hdr);
+                saw_dial_bg.store(true, Ordering::Release);
+                stream.set_nonblocking(true).unwrap();
+                let wait_end = Instant::now() + Duration::from_secs(3);
+                let mut tmp = [0u8; 1];
+                while Instant::now() < wait_end {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => {
+                            cancel_bg.store(true, Ordering::Release);
+                            return;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => {
+                            cancel_bg.store(true, Ordering::Release);
+                            return;
+                        }
+                        Ok(_) => {}
+                    }
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+
+    let probe_host_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let host_udp_port = probe_host_udp.local_addr().unwrap().port();
+    drop(probe_host_udp);
+
+    let probe_client_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let client_udp_port = probe_client_udp.local_addr().unwrap().port();
+    drop(probe_client_udp);
+
+    let mut host = HostHandle::spawn(UiHostConfig {
+        listen_addr: "127.0.0.1:0".parse().expect("host listen"),
+        password: Some("P2PCANCEL26".to_string()),
+        require_approval: false,
+        prefer_hardware: false,
+        clipboard_enabled: false,
+        audio_enabled: false,
+        ..UiHostConfig::default()
+    })
+    .expect("spawn host");
+
+    let token = "cancel-relay-token-2026".to_string();
+    let secret = "0123456789abcdef0123456789abcdef".to_string();
+    host.offer_relay_incoming(RelayIncoming {
+        session_id: "sess-p2p-cancels-host-relay".to_string(),
+        relay_addr: relay_addr.to_string(),
+        relay_token: token.clone(),
+        peer_id: "604928235".to_string(),
+        peer_public_addr: Some(format!("127.0.0.1:{client_udp_port}")),
+        peer_public_addrs: vec![format!("127.0.0.1:{client_udp_port}")],
+        local_udp_port: Some(host_udp_port),
+        punch_secret: Some(secret.clone()),
+        relay_fallback_after_ms: Some(50),
+        self_nat_type: rc_client_core::nat::NatType::ConeVerified,
+        peer_nat_type: rc_client_core::nat::NatType::ConeVerified,
+        ..RelayIncoming::default()
+    });
+
+    // 确定性等待 Host 的 rc-host-relay-dial 实际建连并已发送 RCR1、阻塞等待 0x00 后，再启动 Client
+    let wait_dial_deadline = Instant::now() + Duration::from_secs(2);
+    while !saw_dial.load(Ordering::Acquire) && Instant::now() < wait_dial_deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        saw_dial.load(Ordering::Acquire),
+        "expected Host relay dial to start within 2s"
+    );
+
+    let session = SessionHandle::spawn(UiSessionConfig {
+        connect_addr: "0.0.0.0:0".parse().expect("placeholder"),
+        password: Some("P2PCANCEL26".to_string()),
+        watch_only: false,
+        width: 64,
+        height: 64,
+        fps: 60,
+        bitrate_bps: 8_000_000,
+        prefer_hardware: false,
+        clipboard_enabled: false,
+        audio_enabled: false,
+        force_relay: false,
+        connection_mode: ConnectionMode::Auto,
+        relay_grant: Some(ConnectGrant {
+            session_id: "sess-p2p-cancels-host-relay".to_string(),
+            relay_addr: relay_addr.to_string(),
+            relay_token: token,
+            target_id: "123456789".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{host_udp_port}")),
+            peer_public_addrs: vec![format!("127.0.0.1:{host_udp_port}")],
+            local_udp_port: Some(client_udp_port),
+            punch_secret: Some(secret),
+            relay_fallback_after_ms: Some(400),
+            self_nat_type: rc_client_core::nat::NatType::ConeVerified,
+            peer_nat_type: rc_client_core::nat::NatType::ConeVerified,
+            ..ConnectGrant::default()
+        }),
+        ..UiSessionConfig::default()
+    });
+
+    let updates = collect_client_until(&session, Duration::from_secs(6), |us| {
+        us.iter()
+            .any(|u| matches!(u, SessionUpdate::Hud(h) if h.fps > 0.0))
+    });
+    assert!(
+        updates.iter().any(|u| matches!(
+            u,
+            SessionUpdate::Negotiated { transport, .. } if transport == "UDP P2P"
+        )),
+        "expected UDP P2P stream to win: {updates:?}"
+    );
+
+    session.send(SessionCommand::Disconnect);
+    session.join();
+    host.stop();
+    let _ = relay_jh.join();
+
+    assert!(
+        saw_dial.load(Ordering::Acquire),
+        "expected Host relay dial to start at 50ms"
+    );
+    assert!(
+        cancelled_before_ack.load(Ordering::Acquire),
+        "Host winning via P2P must immediately cancel in-flight rc-host-relay-dial"
+    );
 }
