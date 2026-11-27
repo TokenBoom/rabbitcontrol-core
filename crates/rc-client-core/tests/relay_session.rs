@@ -2081,13 +2081,14 @@ fn p2p_only_never_dials_relay_and_tcp_relay_never_upgrades_to_p2p() {
             relay_addr: trap_addr.to_string(),
             relay_token: "must-never-be-used".to_string(),
             peer_public_addr: Some(format!("127.0.0.1:{dead_port}")),
+            // 双端 UdpBlocked 触发 0ms 快速失败，避免测试等待完整的 8s P2P_ONLY_PUNCH_TIMEOUT。
             self_nat_type: rc_client_core::nat::NatType::UdpBlocked,
-            peer_nat_type: rc_client_core::nat::NatType::ConeVerified,
+            peer_nat_type: rc_client_core::nat::NatType::UdpBlocked,
             ..ConnectGrant::default()
         }),
         ..UiSessionConfig::default()
     });
-    let ended_p2p = collect_client_until(&s_p2p, Duration::from_secs(5), |us| {
+    let ended_p2p = collect_client_until(&s_p2p, Duration::from_secs(10), |us| {
         us.iter().any(|u| matches!(u, SessionUpdate::Ended { .. }))
     });
     assert!(

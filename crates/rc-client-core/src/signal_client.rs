@@ -413,6 +413,7 @@ enum OutgoingSignalMsg {
         nat_port_delta: Option<i16>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nat_port_range: Option<[u16; 2]>,
+        rcp2_v2: bool,
     },
     Heartbeat {
         lan_addrs: Vec<String>,
@@ -1013,14 +1014,64 @@ impl SharedState {
         .map(|a| a.to_string())
     }
 
-    fn trigger_lightweight_probe_refresh(&self) {
+    fn refresh_probe_and_recover_if_blocked(self: &Arc<Self>, probe: &Arc<PersistentUdpProbe>) {
+        if probe.send_lightweight_refresh(&self.nat_profile) {
+            self.maybe_spawn_udp_blocked_recovery_reprobe(probe);
+        }
+    }
+
+    fn maybe_spawn_udp_blocked_recovery_reprobe(self: &Arc<Self>, probe: &Arc<PersistentUdpProbe>) {
+        if self.stop_flag.load(Ordering::Acquire) || self.proxy_active.load(Ordering::Acquire) {
+            return;
+        }
+        if probe
+            .reprobe_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let shared = Arc::clone(self);
+        let probe_c = Arc::clone(probe);
+        let spawned = thread::Builder::new()
+            .name("rc-udp-reprobe".to_string())
+            .spawn(move || {
+                struct InflightReset<'a>(&'a AtomicBool);
+                impl Drop for InflightReset<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let _reset = InflightReset(&probe_c.reprobe_inflight);
+                if shared.stop_flag.load(Ordering::Acquire)
+                    || shared.proxy_active.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                probe_c.run_initial_probe_round(
+                    &shared.nat_profile,
+                    &shared.rtt_ms,
+                    &shared.stop_flag,
+                );
+                if !shared.stop_flag.load(Ordering::Acquire)
+                    && shared.current_nat_profile().nat_type != NatType::UdpBlocked
+                {
+                    shared.upnp_heartbeat_needed.store(true, Ordering::Release);
+                }
+            });
+        if spawned.is_err() {
+            probe.reprobe_inflight.store(false, Ordering::Release);
+        }
+    }
+
+    fn trigger_lightweight_probe_refresh(self: &Arc<Self>) {
         let probe = self
             .active_probe
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(probe) = probe {
-            probe.send_lightweight_refresh(&self.nat_profile);
+            self.refresh_probe_and_recover_if_blocked(&probe);
         }
     }
 
@@ -3194,6 +3245,7 @@ fn run_single_connection(
         nat_type,
         nat_port_delta,
         nat_port_range,
+        rcp2_v2: true,
     };
     let reg_sent_at = Instant::now();
     let send_reg_res = match &reader {
@@ -3601,7 +3653,7 @@ fn run_single_connection(
             }
             if periodic_hb_due {
                 if let Some(ref probe) = udp_probe {
-                    probe.send_lightweight_refresh(&shared.nat_profile);
+                    shared.refresh_probe_and_recover_if_blocked(probe);
                 }
                 last_heartbeat = Instant::now();
             }
@@ -3672,7 +3724,7 @@ fn run_single_connection(
 }
 
 fn handle_incoming_message(
-    shared: &SharedState,
+    shared: &Arc<SharedState>,
     local_device_id: &str,
     msg: IncomingSignalMsg,
     server_host: &str,
@@ -4385,11 +4437,11 @@ fn handle_incoming_wol_relay(shared: &SharedState, mac_addr: &str, target_lan_ad
     }
 }
 
-/// 探测发送后的短超时与重试退避（初始等待 40ms，最多快速重试 2 次每次 80ms）。
+/// 探测发送后的超时与重试退避（初始等待 250ms，最多重试 2 次分别为 450ms 与 700ms）。
 const UDP_PROBE_RETRY_WAITS: [Duration; 3] = [
-    Duration::from_millis(40),
-    Duration::from_millis(80),
-    Duration::from_millis(80),
+    Duration::from_millis(250),
+    Duration::from_millis(450),
+    Duration::from_millis(700),
 ];
 
 /// 单次 `RCSA` 读取轮询粒度。
@@ -4623,16 +4675,23 @@ fn build_probe_bytes_for_mode(
     }
 }
 
-fn update_nat_profile_observed(nat_profile: &Mutex<NatProfile>, observed: SocketAddr) {
+fn update_nat_profile_observed(nat_profile: &Mutex<NatProfile>, observed: SocketAddr) -> bool {
     let canon = canonicalize_socket_addr(observed);
     if canon.port() == 0 || canon.ip().is_unspecified() {
-        return;
+        return false;
     }
     let mut guard = nat_profile.lock().unwrap_or_else(|e| e.into_inner());
     if canon.is_ipv6() {
         guard.public_v6 = Some(canon);
     } else {
         guard.public_v4 = Some(canon);
+    }
+    if guard.nat_type == NatType::UdpBlocked {
+        // 收到有效 RCSA 响应即清除过期的 UdpBlocked 锁死（如休眠唤醒/开机丢包后恢复），降级为 ConeUnverified。
+        guard.nat_type = NatType::ConeUnverified;
+        true
+    } else {
+        false
     }
 }
 
@@ -4752,7 +4811,7 @@ fn probe_aux_pair_burst(
     let mut m3 = None;
     let mut m4 = None;
     let mut buf = [0u8; 128];
-    let deadline = Instant::now() + Duration::from_millis(120);
+    let deadline = Instant::now() + Duration::from_millis(500);
 
     while m3.is_none() || m4.is_none() {
         if stop_flag.load(Ordering::Acquire) {
@@ -4810,7 +4869,7 @@ enum ExternalMappingCheck {
 }
 
 const SELF_CHECK_RETRY_WAITS: [Duration; 2] =
-    [Duration::from_millis(100), Duration::from_millis(180)];
+    [Duration::from_millis(250), Duration::from_millis(450)];
 
 struct PersistentUdpProbe {
     slot: Arc<UdpProbeSlot>,
@@ -4823,6 +4882,7 @@ struct PersistentUdpProbe {
     recent_nonces: Mutex<VecDeque<[u8; 8]>>,
     dual_stack_nonces: Mutex<VecDeque<[u8; 8]>>,
     probe_rx_lock: Mutex<()>,
+    reprobe_inflight: AtomicBool,
 }
 
 impl PersistentUdpProbe {
@@ -4884,6 +4944,7 @@ impl PersistentUdpProbe {
             recent_nonces: Mutex::new(VecDeque::with_capacity(RECENT_LIGHTWEIGHT_NONCE_CAP)),
             dual_stack_nonces: Mutex::new(VecDeque::with_capacity(RECENT_LIGHTWEIGHT_NONCE_CAP)),
             probe_rx_lock: Mutex::new(()),
+            reprobe_inflight: AtomicBool::new(false),
         })
     }
 
@@ -4919,19 +4980,22 @@ impl PersistentUdpProbe {
         }
     }
 
-    fn send_lightweight_refresh(&self, nat_profile: &Mutex<NatProfile>) {
+    /// 执行一次非阻塞 `RCSA` 排空并发送轻量保活探测包；若本次收到的合法 `RCSA` 将状态从
+    /// `NatType::UdpBlocked` 恢复为 `NatType::ConeUnverified`，返回 `true` 以便上层按需触发异步重探。
+    fn send_lightweight_refresh(&self, nat_profile: &Mutex<NatProfile>) -> bool {
         let Ok(_rx_guard) = self.probe_rx_lock.try_lock() else {
-            return;
+            return false;
         };
         let mut buf = [0u8; 128];
         let guard = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
         if guard.pause_count > 0 || guard.closed {
-            return;
+            return false;
         }
         let Some(ref sock) = guard.sock else {
-            return;
+            return false;
         };
 
+        let mut recovered_from_udp_blocked = false;
         // 先非阻塞排空滞留的 `RCSA` 响应：严格校验来源 IP:port 在允许目标集合内且 nonce 命中。
         while let Ok((n, raw_from)) = sock.recv_from(&mut buf) {
             let from = canonicalize_socket_addr(raw_from);
@@ -4949,8 +5013,10 @@ impl PersistentUdpProbe {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .contains(&ans_nonce);
-                if matched_primary || matched_ds {
-                    update_nat_profile_observed(nat_profile, observed);
+                if (matched_primary || matched_ds)
+                    && update_nat_profile_observed(nat_profile, observed)
+                {
+                    recovered_from_udp_blocked = true;
                 }
             }
         }
@@ -4989,6 +5055,7 @@ impl PersistentUdpProbe {
                 }
             }
         }
+        recovered_from_udp_blocked
     }
 
     /// 轻量异步外部可达自检：复用自有 `rc-server` 私有 `RCSP` 探测口验证网关映射公网 IP 的真实可达性与一致性
@@ -5108,6 +5175,7 @@ impl PersistentUdpProbe {
         rtt_ms: &Mutex<Option<u32>>,
         stop_flag: &AtomicBool,
     ) {
+        let _rx_guard = self.probe_rx_lock.lock().unwrap_or_else(|e| e.into_inner());
         let probe_sock = {
             let guard = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
             if guard.pause_count > 0 || guard.closed {
@@ -6065,7 +6133,7 @@ mod tests {
     #[test]
     fn dispatch_coord_and_peer_offline_enforce_strict_role_and_session_matching() {
         let cfg = ServerConfig::default();
-        let shared = SharedState {
+        let shared = Arc::new(SharedState {
             status: Mutex::new(cfg.disabled_snapshot()),
             status_updates: Mutex::new(VecDeque::new()),
             incoming: Mutex::new(VecDeque::new()),
@@ -6115,7 +6183,7 @@ mod tests {
             proxy_override: Mutex::new(None),
             proxy_active: AtomicBool::new(false),
             wol_relay_test_sink: Mutex::new(None),
-        };
+        });
 
         let (tx1, rx1) = mpsc::sync_channel(1);
         shared.pending_connects.lock().unwrap().insert(
@@ -6982,6 +7050,7 @@ mod tests {
                 assert_eq!(reg["access_token"], "tok-round-1");
                 assert_eq!(reg["device_pubkey"], "a".repeat(64));
                 assert_eq!(reg["allow_remote_assist"], false);
+                assert_eq!(reg["rcp2_v2"], true);
 
                 let write_tls_json =
                     |s: &mut rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
@@ -7544,12 +7613,14 @@ mod tests {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: true,
         })
         .unwrap();
         assert!(
             reg_none.get("allow_remote_control").is_none(),
             "None 时 Register 不得序列化 allow_remote_control"
         );
+        assert_eq!(reg_none["rcp2_v2"], true);
 
         let reg_false = serde_json::to_value(&OutgoingSignalMsg::Register {
             device_id: None,
@@ -7569,9 +7640,11 @@ mod tests {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: true,
         })
         .unwrap();
         assert_eq!(reg_false["allow_remote_control"], false);
+        assert_eq!(reg_false["rcp2_v2"], true);
 
         let upd_assist_only = serde_json::to_value(&OutgoingSignalMsg::UpdateAssistState {
             allow_remote_assist: Some(true),
@@ -10373,5 +10446,53 @@ mod tests {
         assert!(addrs.contains(&"198.51.100.77:51234".to_string()));
         assert!(addrs.contains(&"[2001:db8::77]:51234".to_string()));
         assert!(addrs.contains(&"192.168.1.50:51234".to_string()));
+    }
+
+    #[test]
+    fn valid_rcsa_recovers_from_udp_blocked_and_probe_timeouts_are_relaxed() {
+        assert_eq!(
+            UDP_PROBE_RETRY_WAITS,
+            [
+                Duration::from_millis(250),
+                Duration::from_millis(450),
+                Duration::from_millis(700),
+            ]
+        );
+        assert_eq!(
+            SELF_CHECK_RETRY_WAITS,
+            [Duration::from_millis(250), Duration::from_millis(450)]
+        );
+
+        let srv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let srv_addr = srv.local_addr().unwrap();
+        let _ = srv.set_read_timeout(Some(Duration::from_secs(2)));
+
+        let probe = PersistentUdpProbe::bind(srv_addr).expect("bind probe");
+        let nat_profile = Mutex::new(NatProfile {
+            nat_type: NatType::UdpBlocked,
+            ..NatProfile::default()
+        });
+
+        // 1) 发送轻量刷新探测；此时尚未收到 RCSA，仍为 UdpBlocked
+        assert!(!probe.send_lightweight_refresh(&nat_profile));
+        assert_eq!(nat_profile.lock().unwrap().nat_type, NatType::UdpBlocked);
+
+        let mut buf = [0u8; 64];
+        let (n, from) = srv.recv_from(&mut buf).expect("recv RCSP");
+        assert!(n >= UDP_PROBE_LEN);
+        let nonce: [u8; 8] = buf[14..22].try_into().unwrap();
+
+        // 2) 回包有效 RCSA -> 再次轻量刷新收包后必须立即脱离 UdpBlocked 降级为 ConeUnverified
+        let obs: SocketAddr = "198.51.100.66:43210".parse().unwrap();
+        srv.send_to(&build_test_rcsa(obs, nonce), from).unwrap();
+        thread::sleep(Duration::from_millis(20));
+
+        assert!(
+            probe.send_lightweight_refresh(&nat_profile),
+            "valid RCSA while cached UdpBlocked must report recovery"
+        );
+        let prof = nat_profile.lock().unwrap().clone();
+        assert_eq!(prof.nat_type, NatType::ConeUnverified);
+        assert_eq!(prof.public_v4, Some(obs));
     }
 }

@@ -3295,16 +3295,24 @@ fn build_client_p2p_candidates(grant: &ConnectGrant) -> P2pCandidates {
     }
 }
 
+fn punch_timeout_for_mode(mode: ConnectionMode) -> Duration {
+    match mode {
+        ConnectionMode::P2pOnly => p2p::P2P_ONLY_PUNCH_TIMEOUT,
+        ConnectionMode::Auto | ConnectionMode::TcpRelay => p2p::DEFAULT_PUNCH_TIMEOUT,
+    }
+}
+
 fn dial_p2p_held_transport(
     candidates: &P2pCandidates,
     quic_mtls: Option<&rc_net::mtls::MtlsConfig>,
     encrypt_connection: bool,
     cancel: &AtomicBool,
+    punch_timeout: Duration,
 ) -> P2pDialResult {
     let port_hold = crate::signal_client::acquire_local_udp_port_for_p2p(candidates.local_udp_port);
     match p2p::attempt_p2p_quic_client_mtls(
         candidates,
-        p2p::DEFAULT_PUNCH_TIMEOUT,
+        punch_timeout,
         p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
         cancel,
         quic_mtls,
@@ -4509,6 +4517,7 @@ fn run_session_thread(
                     }
                 }
             } else {
+                let p2p_punch_timeout = punch_timeout_for_mode(effective_mode);
                 let direct_winner: Option<DirectTierWinner> = if has_lan && has_p2p {
                     let quic_mtls_ref = quic_mtls.as_ref();
                     let encrypt_conn = cfg.encrypt_connection;
@@ -4530,6 +4539,7 @@ fn run_session_thread(
                                 quic_mtls_ref,
                                 encrypt_conn,
                                 p2p_cancel,
+                                p2p_punch_timeout,
                             )
                         },
                     ) {
@@ -4575,6 +4585,7 @@ fn run_session_thread(
                         quic_mtls.as_ref(),
                         cfg.encrypt_connection,
                         &disconnect_flag,
+                        p2p_punch_timeout,
                     ) {
                         Ok((transport, peer_cert_fingerprint)) => Some(DirectTierWinner::P2p {
                             transport,
@@ -4654,6 +4665,7 @@ fn run_session_thread(
                                     quic_mtls.as_ref(),
                                     cfg.encrypt_connection,
                                     &disconnect_flag,
+                                    p2p_punch_timeout,
                                 ) {
                                     Ok((transport, peer_cert_fingerprint)) => {
                                         let p2p_path = SelectedRelayPath {
@@ -8612,6 +8624,26 @@ mod tests {
         assert!(
             !relay_touched.load(Ordering::SeqCst),
             "P2pOnly 模式严禁向 Tier 3 TCP 中继发起连接"
+        );
+    }
+
+    #[test]
+    fn punch_timeout_for_mode_uses_8s_for_p2p_only_and_2400ms_for_auto() {
+        assert_eq!(
+            punch_timeout_for_mode(ConnectionMode::P2pOnly),
+            p2p::P2P_ONLY_PUNCH_TIMEOUT
+        );
+        assert_eq!(
+            punch_timeout_for_mode(ConnectionMode::P2pOnly),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            punch_timeout_for_mode(ConnectionMode::Auto),
+            p2p::DEFAULT_PUNCH_TIMEOUT
+        );
+        assert_eq!(
+            punch_timeout_for_mode(ConnectionMode::TcpRelay),
+            p2p::DEFAULT_PUNCH_TIMEOUT
         );
     }
 

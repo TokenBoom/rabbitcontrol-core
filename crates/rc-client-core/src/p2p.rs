@@ -81,6 +81,9 @@ const MAX_ACK_RATE_TRACKED_IPS: usize = 128;
 /// 默认 UDP 打洞超时（超时后上层回退 TCP 中继）。
 pub const DEFAULT_PUNCH_TIMEOUT: Duration = Duration::from_millis(2_400);
 
+/// 纯 P2P 模式（`P2pOnly`）下的单次 UDP 打洞超时（与双端波次调度及信令协调对齐）。
+pub const P2P_ONLY_PUNCH_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// 打洞成功后默认的 QUIC 握手超时。
 pub const DEFAULT_QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -95,6 +98,13 @@ const PHASE2A_END: Duration = Duration::from_millis(1_200);
 
 /// `ConeUnverified ↔ ConeUnverified` 激活 Phase 2b（角色交替喷洒）所需的最小总超时门槛。
 const PHASE2B_MIN_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `ConeUnverified ↔ ConeUnverified` Phase 2b 角色互换的固定触发偏移（相对 `p2b_start_at`，即 `punch_start + 3.2s`）。
+const PHASE2B_ROLE_SWAP_AFTER: Duration = Duration::from_secs(2);
+
+/// 多波次策略（`TwoWaveBirthdayAux` / `TwoWaveConeScan`）在长超时（`>= 4s`）下的固定切波偏移，
+/// 避免 Client（`8s`）与 Host（`14s`）因 `remaining_after_start / 2` 错开数秒。
+const WAVE2_FIXED_SWITCH_ELAPSED: Duration = Duration::from_millis(2_500);
 
 /// RTT 同步起跑最大允许延迟上限（毫秒）。
 const MAX_START_AFTER_MS: u16 = 500;
@@ -831,6 +841,13 @@ impl PunchAuthMode {
             }),
         }
     }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::V1 { .. } => "v1",
+            Self::V2 { .. } => "v2",
+        }
+    }
 }
 
 fn has_global_v6_or_explicit_lan(candidates: &P2pCandidates, all_targets: &[SocketAddr]) -> bool {
@@ -1158,11 +1175,25 @@ enum PunchStrategy {
     },
 }
 
+impl PunchStrategy {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::DirectOnly => "DirectOnly",
+            Self::MainScanImmediate { .. } => "MainScanImmediate",
+            Self::AuxPersistent { .. } => "AuxPersistent",
+            Self::DirectedRendezvous { .. } => "DirectedRendezvous",
+            Self::TwoWaveBirthdayAux { .. } => "TwoWaveBirthdayAux",
+            Self::TwoWaveConeScan { .. } => "TwoWaveConeScan",
+            Self::ConeUnverifiedProgressive { .. } => "ConeUnverifiedProgressive",
+            Self::LegacyPhase2 { .. } => "LegacyPhase2",
+        }
+    }
+}
+
 fn select_punch_strategy(
     role: P2pRole,
     candidates: &P2pCandidates,
     targets: &[SocketAddr],
-    all_targets: &[SocketAddr],
     socket_is_ipv6: bool,
 ) -> PunchStrategy {
     let self_nat = candidates.self_nat_type;
@@ -1170,7 +1201,6 @@ fn select_punch_strategy(
 
     if self_nat == NatType::Public
         || peer_nat == NatType::Public
-        || has_global_v6_or_explicit_lan(candidates, all_targets)
         || (self_nat == NatType::ConeVerified && peer_nat == NatType::ConeVerified)
     {
         return PunchStrategy::DirectOnly;
@@ -1390,6 +1420,88 @@ fn send_paced_scan_batch(
     }
 }
 
+fn should_fast_fail_udp_blocked(candidates: &P2pCandidates, has_v6_or_lan: bool) -> bool {
+    if has_v6_or_lan {
+        return false;
+    }
+    let both_udp_blocked = candidates.self_nat_type == NatType::UdpBlocked
+        && candidates.peer_nat_type == NatType::UdpBlocked;
+    if both_udp_blocked {
+        return true;
+    }
+    let either_udp_blocked = candidates.self_nat_type == NatType::UdpBlocked
+        || candidates.peer_nat_type == NatType::UdpBlocked;
+    if !either_udp_blocked {
+        return false;
+    }
+    let has_peer_public_udp = candidates
+        .peer_public_addr
+        .as_deref()
+        .and_then(parse_valid_candidate_addr)
+        .is_some()
+        || candidates
+            .peer_public_addrs
+            .iter()
+            .any(|raw| parse_valid_candidate_addr(raw).is_some());
+    !has_peer_public_udp
+}
+
+fn compute_wave2_at(punch_start: Instant, remaining_after_start: Duration) -> Option<Instant> {
+    if remaining_after_start >= Duration::from_millis(4_000) {
+        Some(punch_start + WAVE2_FIXED_SWITCH_ELAPSED)
+    } else if remaining_after_start >= Duration::from_millis(1_000) {
+        Some(punch_start + remaining_after_start / 2)
+    } else {
+        None
+    }
+}
+
+fn compute_p2b_swap_at(
+    punch_start: Instant,
+    timeout: Duration,
+    deadline: Instant,
+) -> Option<Instant> {
+    let p2b_start_at = punch_start + PHASE2A_END;
+    let swap_at = p2b_start_at + PHASE2B_ROLE_SWAP_AFTER;
+    if timeout >= PHASE2B_MIN_TOTAL_TIMEOUT && deadline > swap_at {
+        Some(swap_at)
+    } else {
+        None
+    }
+}
+
+fn format_punch_timeout_error(
+    timeout: Duration,
+    candidates: &P2pCandidates,
+    strategy: &PunchStrategy,
+    auth: &PunchAuthMode,
+    targets: &[SocketAddr],
+) -> String {
+    let targets_diag = if targets.is_empty() {
+        "0([])".to_string()
+    } else {
+        let listed = targets
+            .iter()
+            .take(6)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let suffix = if targets.len() > 6 {
+            format!(",+{}", targets.len() - 6)
+        } else {
+            String::new()
+        };
+        format!("{}({listed}{suffix})", targets.len())
+    };
+    format!(
+        "P2P UDP 打洞超时（{timeout:?} | self_nat={:?} peer_nat={:?} strategy={} auth={} targets={targets_diag}）",
+        candidates.self_nat_type,
+        candidates.peer_nat_type,
+        strategy.label(),
+        auth.label(),
+    )
+}
+
 /// 执行双向 UDP 打洞，成功后返回已打通的非阻塞 `UdpSocket`、实测对端地址及打洞耗时。
 ///
 /// - 若双端均为 [`NatType::SymmetricRandom`] 且候选地址仅含公网 IPv4，立即快速失败以零延迟回退中继；
@@ -1429,10 +1541,7 @@ fn punch_udp_pair_with_lease(
     }
 
     let has_v6_or_lan = has_global_v6_or_explicit_lan(candidates, &all_targets);
-    if (candidates.self_nat_type == NatType::UdpBlocked
-        || candidates.peer_nat_type == NatType::UdpBlocked)
-        && !has_v6_or_lan
-    {
+    if should_fast_fail_udp_blocked(candidates, has_v6_or_lan) {
         return Err("UDP 探测受阻且无可用 IPv6/LAN 候选，跳过 UDP 打洞直接回退中继".to_string());
     }
     if candidates.self_nat_type.is_symmetric_random()
@@ -1454,7 +1563,7 @@ fn punch_udp_pair_with_lease(
     } = prepare_punch_socket_and_targets(candidates, &all_targets)?;
 
     let has_ipv4 = all_targets.iter().any(SocketAddr::is_ipv4);
-    let strategy = select_punch_strategy(role, candidates, &targets, &all_targets, socket_is_ipv6);
+    let strategy = select_punch_strategy(role, candidates, &targets, socket_is_ipv6);
     let mut target_canons: HashSet<SocketAddr> = targets
         .iter()
         .copied()
@@ -1537,25 +1646,17 @@ fn punch_udp_pair_with_lease(
                 candidates.punch_secret.as_deref(),
                 cancel,
             );
-            if remaining_after_start >= Duration::from_millis(1_000) {
-                wave2_at = Some(punch_start + remaining_after_start / 2);
-            }
+            wave2_at = compute_wave2_at(punch_start, remaining_after_start);
         }
         PunchStrategy::TwoWaveConeScan { wave1_targets, .. } => {
             scan_targets = wave1_targets.clone();
-            if remaining_after_start >= Duration::from_millis(1_000) {
-                wave2_at = Some(punch_start + remaining_after_start / 2);
-            }
+            wave2_at = compute_wave2_at(punch_start, remaining_after_start);
         }
         PunchStrategy::ConeUnverifiedProgressive { .. } | PunchStrategy::LegacyPhase2 { .. } => {}
     }
 
     let p2b_start_at = punch_start + PHASE2A_END;
-    let p2b_swap_at = if timeout >= PHASE2B_MIN_TOTAL_TIMEOUT && deadline > p2b_start_at {
-        Some(p2b_start_at + deadline.saturating_duration_since(p2b_start_at) / 2)
-    } else {
-        None
-    };
+    let p2b_swap_at = compute_p2b_swap_at(punch_start, timeout, deadline);
 
     let has_global_v6_targets = socket_is_ipv6
         && targets
@@ -1851,7 +1952,9 @@ fn punch_udp_pair_with_lease(
 
         let now_after = Instant::now();
         if now_after >= deadline {
-            return Err(format!("P2P UDP 打洞超时（{timeout:?}）"));
+            return Err(format_punch_timeout_error(
+                timeout, candidates, &strategy, &auth, &targets,
+            ));
         }
 
         let sleep_budget = POLL_STEP.min(deadline - now_after);
@@ -1912,6 +2015,28 @@ fn handle_decoded_punch_packet(
     None
 }
 
+fn send_v2_ack_burst(
+    ops: &mut dyn PunchSocketOps,
+    from_addr: SocketAddr,
+    self_role: P2pRole,
+    session_hash: [u8; 8],
+    local_sender_nonce: [u8; 8],
+    peer_sender_nonce: [u8; 8],
+    secret: &[u8; 16],
+) {
+    let reply = encode_punch_packet_v2(
+        self_role,
+        true,
+        session_hash,
+        local_sender_nonce,
+        peer_sender_nonce,
+        secret,
+    );
+    for _ in 0..IMMEDIATE_ACK_BURST {
+        ops.send_to(&reply, from_addr);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn classify_punch_datagram(
     recv_buf: &mut [u8],
@@ -1969,36 +2094,38 @@ fn classify_punch_datagram(
                     if confirmed_peer.is_none() {
                         *confirmed_peer = Some(from_addr);
                     }
-                    if rate_limiter.allow_reply(from_addr.ip(), Instant::now()) {
-                        let reply = encode_punch_packet_v2(
-                            *self_role,
-                            true,
-                            *session_hash,
-                            *local_sender_nonce,
-                            pkt.sender_nonce,
-                            secret,
-                        );
-                        ops.send_to(&reply, from_addr);
-                    }
+                    // 收到合法 Ack 准备移交 QUIC 前无条件连发 IMMEDIATE_ACK_BURST 帧，避免受 20ms 限频器拦截导致单边停在打洞循环。
+                    send_v2_ack_burst(
+                        ops,
+                        from_addr,
+                        *self_role,
+                        *session_hash,
+                        *local_sender_nonce,
+                        pkt.sender_nonce,
+                        secret,
+                    );
                     Some(from_addr)
                 } else {
                     if pkt.echo_nonce != [0u8; 8] {
                         return None;
                     }
+                    let was_unconfirmed = confirmed_peer.is_none();
                     *peer_sender_nonce = Some(pkt.sender_nonce);
-                    if confirmed_peer.is_none() {
+                    if was_unconfirmed {
                         *confirmed_peer = Some(from_addr);
                     }
-                    if rate_limiter.allow_reply(from_addr.ip(), Instant::now()) {
-                        let reply = encode_punch_packet_v2(
+                    // 先记录本次回包时间（避免 was_unconfirmed 短路导致紧邻重复 Request 绕过 20ms 节流）。
+                    let rate_ok = rate_limiter.allow_reply(from_addr.ip(), Instant::now());
+                    if was_unconfirmed || rate_ok {
+                        send_v2_ack_burst(
+                            ops,
+                            from_addr,
                             *self_role,
-                            true,
                             *session_hash,
                             *local_sender_nonce,
                             pkt.sender_nonce,
                             secret,
                         );
-                        ops.send_to(&reply, from_addr);
                     }
                     None
                 }
@@ -3965,8 +4092,8 @@ mod tests {
             "invalid packets must yield zero replies"
         );
 
-        // 2) 合法 Probe 连发 5 次：第 1 次严格回复 1 个等长 48B Ack（1.0x 放大系数），
-        //    其余在限频窗口内静默限频不回包。
+        // 2) 合法 Probe 连发 5 次：首次（未确认）立即突发回复 IMMEDIATE_ACK_BURST 帧等长 48B Ack，
+        //    其余在 20ms 限频窗口内静默限频不回包。
         let valid_probe =
             encode_punch_packet_v2(P2pRole::Client, false, sh, peer_nonce, [0u8; 8], &secret);
         let mut sock_rate = CaptureSocket {
@@ -3995,18 +4122,19 @@ mod tests {
         assert_eq!(peer_sender_nonce, Some(peer_nonce));
         assert_eq!(
             sock_rate.sent_packets.len(),
-            1,
-            "must enforce strict 1.0x + per-IP rate limit"
+            IMMEDIATE_ACK_BURST,
+            "first valid Probe must emit IMMEDIATE_ACK_BURST Ack frames and throttle duplicates within 20ms"
         );
-        let (ack_wire, ack_dst) = &sock_rate.sent_packets[0];
-        assert_eq!(ack_wire.len(), PUNCH_V2_PACKET_LEN);
-        assert_eq!(*ack_dst, peer_addr);
-        let ack_decoded = decode_and_verify_punch_packet_v2(ack_wire, &secret).unwrap();
-        assert_eq!(ack_decoded.flags, PUNCH_V2_FLAG_ACK);
-        assert_eq!(ack_decoded.echo_nonce, peer_nonce);
+        for (ack_wire, ack_dst) in &sock_rate.sent_packets {
+            assert_eq!(ack_wire.len(), PUNCH_V2_PACKET_LEN);
+            assert_eq!(*ack_dst, peer_addr);
+            let ack_decoded = decode_and_verify_punch_packet_v2(ack_wire, &secret).unwrap();
+            assert_eq!(ack_decoded.flags, PUNCH_V2_FLAG_ACK);
+            assert_eq!(ack_decoded.echo_nonce, peer_nonce);
+        }
 
-        // 3) 超过限频窗口后收到携带正确 echo_nonce == local_nonce 的 Ack -> Ready
-        thread::sleep(ACK_RATE_MIN_INTERVAL + Duration::from_millis(5));
+        // 3) 即使紧接在 20ms 限频窗口内收到携带正确 echo_nonce == local_nonce 的 Ack，
+        //    也必须无条件突发回复 IMMEDIATE_ACK_BURST 帧并立即返回 Ready 移交 QUIC（杜绝单边卡死）。
         let valid_ack =
             encode_punch_packet_v2(P2pRole::Client, true, sh, peer_nonce, local_nonce, &secret);
         let mut sock_ok = CaptureSocket {
@@ -4027,7 +4155,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out_ready, DrainOutcome::Ready(peer_addr));
-        assert_eq!(sock_ok.sent_packets.len(), 1);
+        assert_eq!(sock_ok.sent_packets.len(), IMMEDIATE_ACK_BURST);
+        for (ack_wire, ack_dst) in &sock_ok.sent_packets {
+            assert_eq!(ack_wire.len(), PUNCH_V2_PACKET_LEN);
+            assert_eq!(*ack_dst, peer_addr);
+            let ack_decoded = decode_and_verify_punch_packet_v2(ack_wire, &secret).unwrap();
+            assert_eq!(ack_decoded.flags, PUNCH_V2_FLAG_ACK);
+            assert_eq!(ack_decoded.echo_nonce, peer_nonce);
+        }
+
+        // 4) 即使限频表已近 期记录过同一 IP，只要尚未确认对端（confirmed_peer == None），
+        //    首次合法 Request 仍必须立即回复 Ack 突发。
+        let mut unconfirmed_peer = None;
+        let mut unconfirmed_nonce = None;
+        let mut sock_unconfirmed = CaptureSocket {
+            peek_results: std::collections::VecDeque::from([Ok((valid_probe.to_vec(), peer_addr))]),
+            recv_results: std::collections::VecDeque::from([Ok((valid_probe.to_vec(), peer_addr))]),
+            sent_packets: Vec::new(),
+        };
+        let out_unconfirmed = drain_punch_rx(
+            &mut recv_buf,
+            false,
+            &mut auth,
+            P2pRole::Client,
+            P2pRole::Host,
+            &target_canons,
+            &mut unconfirmed_peer,
+            &mut unconfirmed_nonce,
+            &mut sock_unconfirmed,
+        )
+        .unwrap();
+        assert_eq!(out_unconfirmed, DrainOutcome::Continue);
+        assert_eq!(unconfirmed_peer, Some(peer_addr));
+        assert_eq!(sock_unconfirmed.sent_packets.len(), IMMEDIATE_ACK_BURST);
     }
 
     #[test]
@@ -4167,21 +4327,22 @@ mod tests {
     #[test]
     fn udp_blocked_fast_fails_unless_ipv6_or_lan_present() {
         let port = reserve_ephemeral_udp_port();
+        // 双端均为 UdpBlocked 且无可用 IPv6/LAN 时，必须 0ms 快速跳过。
         let blocked = P2pCandidates {
             session_id: "udp-blocked-fast-fail".to_string(),
             peer_public_addr: Some(format!("127.0.0.1:{port}")),
             self_nat_type: NatType::UdpBlocked,
-            peer_nat_type: NatType::ConeVerified,
+            peer_nat_type: NatType::UdpBlocked,
             ..Default::default()
         };
         let cancel = AtomicBool::new(false);
         let t0 = Instant::now();
         let err = punch_udp_pair(P2pRole::Client, &blocked, Duration::from_secs(3), &cancel)
-            .expect_err("UdpBlocked without IPv6/LAN must fast-fail");
+            .expect_err("dual UdpBlocked without IPv6/LAN must fast-fail");
         assert!(err.contains("受阻"), "unexpected error: {err}");
         assert!(
             t0.elapsed() < Duration::from_millis(100),
-            "UdpBlocked fast-fail must take ~0ms, took {:?}",
+            "dual UdpBlocked fast-fail must take ~0ms, took {:?}",
             t0.elapsed()
         );
 
@@ -4220,6 +4381,42 @@ mod tests {
     }
 
     #[test]
+    fn single_side_udp_blocked_still_probes_known_peer_public_addr() {
+        let host_port = reserve_ephemeral_udp_port();
+        let client_port = reserve_ephemeral_udp_port();
+        let host_cand = P2pCandidates {
+            session_id: "single-udp-blocked".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{client_port}")),
+            local_udp_port: Some(host_port),
+            self_nat_type: NatType::ConeVerified,
+            peer_nat_type: NatType::UdpBlocked,
+            ..Default::default()
+        };
+        let client_cand = P2pCandidates {
+            session_id: "single-udp-blocked".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{host_port}")),
+            local_udp_port: Some(client_port),
+            self_nat_type: NatType::UdpBlocked,
+            peer_nat_type: NatType::ConeVerified,
+            ..Default::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_c = Arc::clone(&cancel);
+        let h_jh = thread::spawn(move || {
+            punch_udp_pair(P2pRole::Host, &host_cand, DEFAULT_PUNCH_TIMEOUT, &cancel)
+        });
+        let (_, peer_addr, _) = punch_udp_pair(
+            P2pRole::Client,
+            &client_cand,
+            DEFAULT_PUNCH_TIMEOUT,
+            &cancel_c,
+        )
+        .expect("single-side UdpBlocked with known peer_public_addr must still probe and succeed");
+        assert_eq!(peer_addr.port(), host_port);
+        h_jh.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn select_punch_strategy_matrix_matches_item3_design() {
         let base_target: SocketAddr = "198.51.100.10:40000".parse().unwrap();
         let targets = vec![base_target];
@@ -4232,7 +4429,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            select_punch_strategy(P2pRole::Host, &c1, &targets, &targets, false),
+            select_punch_strategy(P2pRole::Host, &c1, &targets, false),
             PunchStrategy::DirectOnly
         ));
 
@@ -4244,7 +4441,7 @@ mod tests {
             peer_nat_port_delta: Some(2),
             ..Default::default()
         };
-        match select_punch_strategy(P2pRole::Host, &c2, &targets, &targets, false) {
+        match select_punch_strategy(P2pRole::Host, &c2, &targets, false) {
             PunchStrategy::MainScanImmediate { scan_targets } => {
                 assert!(!scan_targets.is_empty());
             }
@@ -4260,7 +4457,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            select_punch_strategy(P2pRole::Host, &c3_cone, &targets, &targets, false),
+            select_punch_strategy(P2pRole::Host, &c3_cone, &targets, false),
             PunchStrategy::MainScanImmediate { .. }
         ));
         let c3_sym = P2pCandidates {
@@ -4269,7 +4466,7 @@ mod tests {
             peer_nat_type: NatType::ConeUnverified,
             ..Default::default()
         };
-        match select_punch_strategy(P2pRole::Client, &c3_sym, &targets, &targets, false) {
+        match select_punch_strategy(P2pRole::Client, &c3_sym, &targets, false) {
             PunchStrategy::AuxPersistent {
                 aux_count,
                 scan_targets,
@@ -4289,7 +4486,7 @@ mod tests {
             peer_nat_port_delta: Some(1),
             ..Default::default()
         };
-        match select_punch_strategy(P2pRole::Host, &c4_d1, &targets, &targets, false) {
+        match select_punch_strategy(P2pRole::Host, &c4_d1, &targets, false) {
             PunchStrategy::DirectedRendezvous {
                 aux_count,
                 aux_targets,
@@ -4307,7 +4504,7 @@ mod tests {
             peer_nat_port_delta: Some(3),
             ..Default::default()
         };
-        match select_punch_strategy(P2pRole::Host, &c4_d3, &targets, &targets, false) {
+        match select_punch_strategy(P2pRole::Host, &c4_d3, &targets, false) {
             PunchStrategy::DirectedRendezvous {
                 aux_count,
                 aux_targets,
@@ -4330,7 +4527,7 @@ mod tests {
             peer_nat_port_range: Some(PortRangeHint::LinuxEphemeral),
             ..Default::default()
         };
-        match select_punch_strategy(P2pRole::Host, &c5_cone, &targets, &targets, false) {
+        match select_punch_strategy(P2pRole::Host, &c5_cone, &targets, false) {
             PunchStrategy::TwoWaveConeScan {
                 wave1_targets,
                 wave2_targets,
@@ -4346,7 +4543,7 @@ mod tests {
             peer_nat_type: NatType::ConeVerified,
             ..Default::default()
         };
-        match select_punch_strategy(P2pRole::Client, &c5_sym, &targets, &targets, false) {
+        match select_punch_strategy(P2pRole::Client, &c5_sym, &targets, false) {
             PunchStrategy::TwoWaveBirthdayAux { aux_count } => {
                 assert_eq!(aux_count, MAX_AUX_SOCKETS_HARD_CAP);
             }
@@ -4360,7 +4557,7 @@ mod tests {
             peer_nat_type: NatType::ConeUnverified,
             ..Default::default()
         };
-        match select_punch_strategy(P2pRole::Host, &c6, &targets, &targets, false) {
+        match select_punch_strategy(P2pRole::Host, &c6, &targets, false) {
             PunchStrategy::ConeUnverifiedProgressive {
                 narrow_targets,
                 wide_targets,
@@ -4370,6 +4567,123 @@ mod tests {
                 assert_eq!(wide_targets.len(), CONE_SCAN_BUDGET_PER_WAVE);
             }
             other => panic!("expected ConeUnverifiedProgressive, got {other:?}"),
+        }
+
+        // 7. 即使携带 Global IPv6 或 peer_lan_addrs，非 Public/双 ConeVerified 组合绝不能退化为 DirectOnly
+        let v6_target: SocketAddr = "[2001:db8::10]:40000".parse().unwrap();
+        let mixed_targets = vec![v6_target, normalize_addr_for_socket(base_target, true)];
+
+        let c7_apdm_cone = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            peer_lan_addrs: vec!["192.168.1.50:40000".to_string(), v6_target.to_string()],
+            self_nat_type: NatType::ApdmSeq,
+            peer_nat_type: NatType::ConeVerified,
+            ..Default::default()
+        };
+        assert!(matches!(
+            select_punch_strategy(P2pRole::Client, &c7_apdm_cone, &mixed_targets, true),
+            PunchStrategy::AuxPersistent { .. }
+        ));
+
+        let c7_cone_apdm = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            peer_lan_addrs: vec!["192.168.1.50:40000".to_string(), v6_target.to_string()],
+            self_nat_type: NatType::ConeVerified,
+            peer_nat_type: NatType::ApdmSeq,
+            peer_nat_port_delta: Some(2),
+            ..Default::default()
+        };
+        assert!(matches!(
+            select_punch_strategy(P2pRole::Host, &c7_cone_apdm, &mixed_targets, true),
+            PunchStrategy::MainScanImmediate { .. }
+        ));
+
+        let c7_unverified = P2pCandidates {
+            peer_public_addr: Some(base_target.to_string()),
+            peer_lan_addrs: vec!["192.168.1.50:40000".to_string(), v6_target.to_string()],
+            self_nat_type: NatType::ConeUnverified,
+            peer_nat_type: NatType::ConeUnverified,
+            ..Default::default()
+        };
+        assert!(matches!(
+            select_punch_strategy(P2pRole::Host, &c7_unverified, &mixed_targets, true),
+            PunchStrategy::ConeUnverifiedProgressive { .. }
+        ));
+    }
+
+    #[test]
+    fn wave2_and_phase2b_swap_timestamps_align_for_client_8s_and_host_14s() {
+        let start = Instant::now();
+
+        // Client (8s) 与 Host (14s) 在 >= 4s 时必须精确同步在 +2500ms 切入 Wave 2
+        let w2_client = compute_wave2_at(start, P2P_ONLY_PUNCH_TIMEOUT).unwrap();
+        let w2_host = compute_wave2_at(start, Duration::from_secs(14)).unwrap();
+        assert_eq!(w2_client.duration_since(start), WAVE2_FIXED_SWITCH_ELAPSED);
+        assert_eq!(w2_host.duration_since(start), WAVE2_FIXED_SWITCH_ELAPSED);
+
+        // 短超时 (1000ms..4000ms) 保留 remaining / 2，避免破坏短超时单测
+        let w2_short = compute_wave2_at(start, Duration::from_millis(1_400)).unwrap();
+        assert_eq!(w2_short.duration_since(start), Duration::from_millis(700));
+        assert!(compute_wave2_at(start, Duration::from_millis(900)).is_none());
+
+        // Phase 2b 角色互换在 Client (8s) 与 Host (14s) 均精确落在 punch_start + 3.2s
+        let swap_client = compute_p2b_swap_at(
+            start,
+            P2P_ONLY_PUNCH_TIMEOUT,
+            start + P2P_ONLY_PUNCH_TIMEOUT,
+        )
+        .unwrap();
+        let swap_host = compute_p2b_swap_at(
+            start,
+            Duration::from_secs(14),
+            start + Duration::from_secs(14),
+        )
+        .unwrap();
+        let expected_swap = PHASE2A_END + PHASE2B_ROLE_SWAP_AFTER;
+        assert_eq!(expected_swap, Duration::from_millis(3_200));
+        assert_eq!(swap_client.duration_since(start), expected_swap);
+        assert_eq!(swap_host.duration_since(start), expected_swap);
+
+        // 低于 PHASE2B_MIN_TOTAL_TIMEOUT (5s) 时不触发互换
+        assert!(compute_p2b_swap_at(
+            start,
+            Duration::from_secs(4),
+            start + Duration::from_secs(4)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn punch_timeout_error_includes_diagnostic_details_and_p2p_only_constant() {
+        assert_eq!(P2P_ONLY_PUNCH_TIMEOUT, Duration::from_secs(8));
+
+        let blackhole_port = reserve_ephemeral_udp_port();
+        let cand = P2pCandidates {
+            session_id: "diag-timeout".to_string(),
+            peer_public_addr: Some(format!("127.0.0.1:{blackhole_port}")),
+            self_nat_type: NatType::ConeVerified,
+            peer_nat_type: NatType::ConeVerified,
+            punch_secret: Some("00112233445566778899aabbccddeeff".to_string()),
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let err = punch_udp_pair(P2pRole::Client, &cand, Duration::from_millis(80), &cancel)
+            .expect_err("unreachable peer must fail with timeout diagnostic");
+        assert!(
+            err.starts_with("P2P UDP 打洞超时"),
+            "unexpected timeout prefix: {err}"
+        );
+        for needle in [
+            "self_nat=ConeVerified",
+            "peer_nat=ConeVerified",
+            "strategy=DirectOnly",
+            "auth=v2",
+            "targets=1(",
+        ] {
+            assert!(
+                err.contains(needle),
+                "timeout error `{err}` missing `{needle}`"
+            );
         }
     }
 

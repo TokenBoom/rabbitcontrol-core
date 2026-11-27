@@ -866,6 +866,7 @@ fn make_session_clock(origin: Arc<Mutex<ClockOrigin>>) -> SessionClock {
 
 type SharedWakeGuard = Arc<Mutex<Option<Box<dyn Any + Send>>>>;
 type SharedFileTransferDir = Arc<RwLock<Option<PathBuf>>>;
+type SharedSignalClient = Arc<RwLock<Option<Arc<crate::signal_client::SignalClientHandle>>>>;
 
 /// 在 `SharedWakeGuard` 中替换新守卫，并在锁外析构旧守卫（避免持有互斥锁时调用平台释放 FFI）。
 fn replace_wake_guard(slot: &SharedWakeGuard, new_guard: Option<Box<dyn Any + Send>>) {
@@ -2334,6 +2335,7 @@ pub struct HostHandle {
     lock_screen_count: Arc<AtomicU64>,
     file_transfer_dir: SharedFileTransferDir,
     allow_assist_file_transfer: Arc<AtomicBool>,
+    signal_client: SharedSignalClient,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -2510,6 +2512,8 @@ impl HostHandle {
             (HostListener::Plain(Box::new(first_built)), actual)
         };
 
+        let shared_signal_client: SharedSignalClient =
+            Arc::new(RwLock::new(cfg.signal_client.clone()));
         let worker_opts = HostWorkerOptions {
             approval_timeout_us: cfg.approval_timeout_us,
             prefer_hardware: cfg.prefer_hardware,
@@ -2519,7 +2523,7 @@ impl HostHandle {
             forbid_passwordless_auto_approve: cfg.forbid_passwordless_auto_approve,
             ephemeral_listen_port: cfg.listen_addr.port() == 0,
             allow_assist_file_transfer: Arc::clone(&allow_assist_file_transfer),
-            signal_client: cfg.signal_client.clone(),
+            signal_client: Arc::clone(&shared_signal_client),
         };
 
         let t_updates = Arc::clone(&updates);
@@ -2592,6 +2596,7 @@ impl HostHandle {
             lock_screen_count,
             file_transfer_dir,
             allow_assist_file_transfer,
+            signal_client: shared_signal_client,
             thread: Some(handle),
         })
     }
@@ -2712,6 +2717,19 @@ impl HostHandle {
         *guard = dir;
     }
 
+    /// 运行期动态更新或清除信令客户端句柄（使后启动或重连后的 `SignalClientHandle`
+    /// 实时同步至 `P2pReprobe` 与 P2P 协调逻辑）。
+    pub fn set_signal_client(
+        &self,
+        signal_client: Option<Arc<crate::signal_client::SignalClientHandle>>,
+    ) {
+        let mut guard = self
+            .signal_client
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = signal_client;
+    }
+
     /// 运行期热更新「他人远程协助时是否允许文件传输」（即时对当前活跃非 Owner 会话及后续会话生效，不中断会话）。
     ///
     /// 同账号本人通过 Ed25519 PoP `OwnerTicket` 建立的自控会话始终豁免保持全开。
@@ -2786,7 +2804,7 @@ struct HostWorkerOptions {
     forbid_passwordless_auto_approve: bool,
     ephemeral_listen_port: bool,
     allow_assist_file_transfer: Arc<AtomicBool>,
-    signal_client: Option<Arc<crate::signal_client::SignalClientHandle>>,
+    signal_client: SharedSignalClient,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3781,7 +3799,7 @@ struct HostSwitchRuntime {
     stop_flag: Arc<AtomicBool>,
     active_relay_interrupt: Arc<Mutex<Option<ActiveRelayInterrupt>>>,
     bg_cancel: Arc<AtomicBool>,
-    signal_client: Option<Arc<crate::signal_client::SignalClientHandle>>,
+    signal_client: SharedSignalClient,
 }
 
 fn rebuild_host_p2p_mtls(
@@ -6423,7 +6441,7 @@ fn drive_ui_host_session_with_audio(
                                                 sw_rt.incoming.local_udp_port,
                                                 sw_rt.incoming.self_public_addr.clone(),
                                                 sw_rt.incoming.peer_public_addrs.clone(),
-                                                sw_rt.signal_client.clone(),
+                                                Arc::clone(&sw_rt.signal_client),
                                                 reprobe_mtls,
                                                 sw_rt.require_mtls,
                                                 Arc::clone(&sw_rt.bg_cancel),
@@ -7226,7 +7244,7 @@ fn spawn_host_reprobe_p2p_candidate(
     initial_local_udp_port: Option<u16>,
     initial_self_public_addr: Option<String>,
     initial_peer_public_addrs: Vec<String>,
-    signal_client: Option<Arc<crate::signal_client::SignalClientHandle>>,
+    signal_client: SharedSignalClient,
     p2p_mtls: Option<rc_net::mtls::MtlsConfig>,
     require_mtls: bool,
     bg_cancel: Arc<AtomicBool>,
@@ -7239,6 +7257,8 @@ fn spawn_host_reprobe_p2p_candidate(
                 return;
             }
             let sc_snap = signal_client
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
                 .map(|sc| sc.snapshot_p2p_reprobe_info());
             let (sc_port, sc_addrs, sc_nat, sc_delta, sc_range) = match sc_snap {
@@ -7524,7 +7544,7 @@ fn serve_relay_incoming(
         let punch_timeout = if has_relay {
             BACKGROUND_P2P_UPGRADE_WINDOW
         } else {
-            p2p::DEFAULT_PUNCH_TIMEOUT
+            p2p::P2P_ONLY_PUNCH_TIMEOUT
         };
         let p2p_mtls_c = rebuild_host_p2p_mtls(
             mtls_bundle.as_ref(),
@@ -7925,7 +7945,7 @@ fn serve_relay_incoming(
         stop_flag: Arc::clone(stop_flag),
         active_relay_interrupt: Arc::new(Mutex::new(None)),
         bg_cancel: Arc::clone(&bg_cancel),
-        signal_client: opts.signal_client.clone(),
+        signal_client: Arc::clone(&opts.signal_client),
     });
 
     let outcome = drive_ui_host_session_with_switch(
@@ -12551,5 +12571,58 @@ mod tests {
         drop(_transport);
         drop(client_res);
         let _ = relay_jh.join();
+    }
+
+    #[test]
+    fn host_handle_set_signal_client_updates_shared_runtime_slot_live() {
+        let cfg = UiHostConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            prefer_hardware: false,
+            require_approval: false,
+            signal_client: None,
+            ..UiHostConfig::default()
+        };
+
+        let mut handle = HostHandle::spawn(cfg).expect("spawn HostHandle");
+        assert!(
+            handle.signal_client.read().unwrap().is_none(),
+            "initial signal_client slot must be None"
+        );
+
+        let sc1 = Arc::new(crate::signal_client::SignalClientHandle::spawn(
+            crate::server_config::ServerConfig::default(),
+            "host-sc1".to_string(),
+            Vec::new(),
+        ));
+        handle.set_signal_client(Some(Arc::clone(&sc1)));
+        let slot_after_set = handle.signal_client.read().unwrap().clone();
+        assert!(
+            slot_after_set
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &sc1)),
+            "set_signal_client(Some(sc1)) must update shared slot immediately"
+        );
+
+        let sc2 = Arc::new(crate::signal_client::SignalClientHandle::spawn(
+            crate::server_config::ServerConfig::default(),
+            "host-sc2".to_string(),
+            Vec::new(),
+        ));
+        handle.set_signal_client(Some(Arc::clone(&sc2)));
+        let slot_after_swap = handle.signal_client.read().unwrap().clone();
+        assert!(
+            slot_after_swap
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &sc2)),
+            "set_signal_client(Some(sc2)) must replace live slot"
+        );
+
+        handle.set_signal_client(None);
+        assert!(
+            handle.signal_client.read().unwrap().is_none(),
+            "set_signal_client(None) must clear shared slot"
+        );
+
+        handle.stop();
     }
 }
