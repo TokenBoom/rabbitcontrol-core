@@ -471,6 +471,26 @@ pub enum SessionUpdate {
         /// 结构化用户可读错误模型（错误码为 `tool.forbidden`）。
         ui_error: UiError,
     },
+    /// 被控端通告的本人远程终端锁屏校验状态。
+    TerminalLockState {
+        /// 是否需要完成一次系统密码校验方可使用终端。
+        required: bool,
+        /// 当前会话终端是否已解锁放行。
+        unlocked: bool,
+        /// 被控端系统登录用户名（可选）。
+        username: Option<String>,
+        /// 防爆破冷却剩余秒数。
+        retry_after_secs: u32,
+    },
+    /// 被控端返回的终端系统密码校验结果。
+    TerminalUnlockResult {
+        /// 校验是否通过。
+        ok: bool,
+        /// 失败原因。
+        error: Option<String>,
+        /// 防爆破冷却剩余秒数。
+        retry_after_secs: u32,
+    },
     /// 会话结束（正常 `Bye` / 对端断开 / 驱动错误 / 线程 panic）。
     Ended {
         /// 人类可读的结束原因。
@@ -906,6 +926,15 @@ impl ToolClientHub {
             pending_opens: VecDeque::new(),
             pending_attaches: BTreeSet::new(),
         }
+    }
+
+    fn reset_terminal(&mut self) {
+        self.terminal = TerminalClientEngine::new();
+        self.host_live_ids.clear();
+        self.active_terminals.clear();
+        self.attached_terminals.clear();
+        self.pending_opens.clear();
+        self.pending_attaches.clear();
     }
 
     fn apply_terminal_event(&mut self, ev: &TerminalEvent) {
@@ -1438,15 +1467,38 @@ impl ToolClientHandle {
         if perms.allows_channel(channel) {
             Ok(())
         } else {
-            let ui_error = crate::ui_error::tool_forbidden_ui_error(
-                channel,
-                crate::ui_error::current_platform(),
-                None,
-            );
-            let msg = ui_error.message.clone();
-            self.update_tx
-                .push(SessionUpdate::ToolPermissionDenied { channel, ui_error });
-            Err(msg)
+            Err(self.emit_tool_forbidden(channel))
+        }
+    }
+
+    fn emit_tool_forbidden(&self, channel: u8) -> String {
+        let ui_error = crate::ui_error::tool_forbidden_ui_error(
+            channel,
+            crate::ui_error::current_platform(),
+            None,
+        );
+        let msg = ui_error.message.clone();
+        self.update_tx
+            .push(SessionUpdate::ToolPermissionDenied { channel, ui_error });
+        msg
+    }
+
+    /// 原子持锁后校验通道权限，严格遵循 `tools_hub -> tool_permissions -> portmap_latest` 全局锁序，
+    /// 消除授权撤销（如 `ToolPermissionsState`）与 `ToolClientHandle` 并发操作的 TOCTOU 竞态。
+    fn lock_hub_for_channel(
+        &self,
+        channel: u8,
+    ) -> Result<std::sync::MutexGuard<'_, ToolClientHub>, String> {
+        let hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let perms = *self
+            .tool_permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if perms.allows_channel(channel) {
+            Ok(hub)
+        } else {
+            drop(hub);
+            Err(self.emit_tool_forbidden(channel))
         }
     }
 
@@ -1569,7 +1621,7 @@ impl ToolClientHandle {
             None => None,
         };
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_TERMINAL)?;
         if !hub.terminal.can_enqueue() {
             return Err("终端控制队列繁忙，请稍后重试".to_string());
         }
@@ -1589,7 +1641,7 @@ impl ToolClientHandle {
     /// 请求远端主机返回当前后台托管的活跃终端会话列表。
     pub fn terminal_list(&self) -> Result<(), String> {
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_TERMINAL)?;
         if !hub.terminal.can_enqueue() {
             return Err("终端控制队列繁忙，请稍后重试".to_string());
         }
@@ -1603,7 +1655,7 @@ impl ToolClientHandle {
             return Err("终端行列数必须在 1–512 之间".to_string());
         }
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_TERMINAL)?;
         if !hub.terminal.can_enqueue() {
             return Err("终端控制队列繁忙，请稍后重试".to_string());
         }
@@ -1617,7 +1669,7 @@ impl ToolClientHandle {
     /// 请求脱离远端指定 PTY 终端视图（仅停止实时输出流，保留后台 PTY 继续运行）。
     pub fn terminal_detach(&self, term_id: u32) -> Result<(), String> {
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_TERMINAL)?;
         hub.attached_terminals.remove(&term_id);
         hub.pending_attaches.remove(&term_id);
         for (req_id, want_attach) in &mut hub.pending_opens {
@@ -1633,7 +1685,7 @@ impl ToolClientHandle {
     pub fn terminal_rename(&self, term_id: u32, name: &str) -> Result<(), String> {
         let valid_name = validate_terminal_name(name)?;
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_TERMINAL)?;
         if !hub.terminal.can_enqueue() {
             return Err("终端控制队列繁忙，请稍后重试".to_string());
         }
@@ -1644,7 +1696,7 @@ impl ToolClientHandle {
     /// 请求被控端枚举其系统已安装字体列表（结果通过 `terminal://event` 的 `fontList` 推送）。
     pub fn terminal_list_remote_fonts(&self) -> Result<(), String> {
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_TERMINAL)?;
         if !hub.terminal.can_enqueue() {
             return Err("终端控制队列繁忙，请稍后重试".to_string());
         }
@@ -1655,7 +1707,7 @@ impl ToolClientHandle {
     /// 请求从被控端拉取指定 `font_id` 的字体字节流（完成后通过 `fontReady` 事件通知）。
     pub fn terminal_fetch_remote_font(&self, font_id: String) -> Result<u32, String> {
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_TERMINAL)?;
         if !hub.terminal.can_enqueue() {
             return Err("终端控制队列繁忙，请稍后重试".to_string());
         }
@@ -1690,7 +1742,7 @@ impl ToolClientHandle {
             return Err("单次终端输入不能超过 64 KiB".to_string());
         }
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_TERMINAL)?;
         if !hub.active_terminals.contains(&term_id) {
             return Err("目标终端会话不存在或已关闭".to_string());
         }
@@ -1708,7 +1760,7 @@ impl ToolClientHandle {
             return Err("终端行列数必须在 1–512 之间".to_string());
         }
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_TERMINAL)?;
         hub.terminal.resize(term_id, cols, rows);
         Ok(())
     }
@@ -1716,7 +1768,7 @@ impl ToolClientHandle {
     /// 请求关闭并终止远端指定 PTY 终端会话。
     pub fn terminal_close(&self, term_id: u32) -> Result<(), String> {
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_TERMINAL)?;
         if !hub.terminal.can_enqueue() {
             return Err("终端控制队列繁忙，请稍后重试".to_string());
         }
@@ -1815,7 +1867,7 @@ impl ToolClientHandle {
         }
         crate::model::validate_target_addr(&target_addr)?;
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_PORTMAP)?;
         let rule = hub.portmap.add_rule_with_enabled(
             name,
             local_port,
@@ -1838,7 +1890,7 @@ impl ToolClientHandle {
         enabled: bool,
     ) -> Result<(PortMapRuleSnapshot, Vec<PortMapRuleSnapshot>), String> {
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_PORTMAP)?;
         let rule = hub.portmap.set_rule_enabled(id, enabled)?;
         let all = hub.portmap.list_rules();
         *self
@@ -1851,7 +1903,7 @@ impl ToolClientHandle {
     /// 删除指定 TCP 端口映射规则，返回最新完整规则列表（`hub -> portmap_latest` 严格串行化）。
     pub fn portmap_delete(&self, id: u64) -> Result<Vec<PortMapRuleSnapshot>, String> {
         self.ensure_running()?;
-        let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hub = self.lock_hub_for_channel(TOOL_CHANNEL_PORTMAP)?;
         hub.portmap.delete_rule(id)?;
         let all = hub.portmap.list_rules();
         *self
@@ -1910,21 +1962,80 @@ fn encode_audio_ctrl_muted(muted: bool) -> Vec<u8> {
 }
 
 /// 冲刷单个工具通道的待发送队列：遇到瞬态背压 `Err` 时停止并保留队首，
-/// 遇到不可恢复的配置/超限错误（`is_fatal_err` 返回 `true`）时丢弃该非法帧以免永久阻塞后续可靠控制消息。
+/// 遇到不可恢复的配置/超限错误（`is_fatal_err` 返回 `true`）时丢弃该非法帧以免永久阻塞后续可靠控制消息；
+/// `zeroize_popped` 为 `true` 时在出队后擦除敏感帧缓冲（用于携带 `TerminalUnlockRequest` 的显示控制队列）。
 fn flush_pending_tool_queue_checked<E>(
     pending: &mut VecDeque<Vec<u8>>,
     mut send_fn: impl FnMut(Vec<u8>) -> Result<(), E>,
     is_fatal_err: impl Fn(&E) -> bool,
 ) -> bool {
+    flush_pending_tool_queue_impl(pending, false, &mut send_fn, &is_fatal_err)
+}
+
+struct ZeroizingByteQueue(VecDeque<Vec<u8>>);
+
+impl ZeroizingByteQueue {
+    fn new() -> Self {
+        Self(VecDeque::new())
+    }
+}
+
+impl std::ops::Deref for ZeroizingByteQueue {
+    type Target = VecDeque<Vec<u8>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ZeroizingByteQueue {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ZeroizingByteQueue {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for mut item in self.0.drain(..) {
+            item.zeroize();
+        }
+    }
+}
+
+fn flush_pending_display_tx_checked<E>(
+    pending: &mut VecDeque<Vec<u8>>,
+    mut send_fn: impl FnMut(Vec<u8>) -> Result<(), E>,
+    is_fatal_err: impl Fn(&E) -> bool,
+) -> bool {
+    flush_pending_tool_queue_impl(pending, true, &mut send_fn, &is_fatal_err)
+}
+
+fn flush_pending_tool_queue_impl<E>(
+    pending: &mut VecDeque<Vec<u8>>,
+    zeroize_popped: bool,
+    send_fn: &mut impl FnMut(Vec<u8>) -> Result<(), E>,
+    is_fatal_err: &impl Fn(&E) -> bool,
+) -> bool {
+    use zeroize::Zeroize;
+
     let mut sent_any = false;
     while let Some(front) = pending.front() {
-        match send_fn(front.clone()) {
+        let copy = front.clone();
+        match send_fn(copy) {
             Ok(()) => {
-                pending.pop_front();
+                if let Some(mut popped) = pending.pop_front() {
+                    if zeroize_popped {
+                        popped.zeroize();
+                    }
+                }
                 sent_any = true;
             }
             Err(ref e) if is_fatal_err(e) => {
-                pending.pop_front();
+                if let Some(mut popped) = pending.pop_front() {
+                    if zeroize_popped {
+                        popped.zeroize();
+                    }
+                }
             }
             Err(_) => break,
         }
@@ -2209,6 +2320,42 @@ impl SessionHandle {
     /// 取消当前正在进行的远程更新或中转推送。
     pub fn cancel_remote_update(&self) {
         self.send_display_ctrl(DisplayControlMsg::UpdateCancel);
+    }
+
+    /// 提交被控端锁屏下远程终端的系统密码校验请求（仅校验系统密码，绝不解锁物理屏幕）。
+    pub fn submit_terminal_unlock(
+        &self,
+        password: String,
+        username: Option<String>,
+    ) -> Result<(), String> {
+        let mut password = zeroize::Zeroizing::new(password);
+        if !self.is_running() {
+            return Err("请先建立远控会话".to_string());
+        }
+        let perms = self.tool_permissions();
+        if !perms.allows_channel(TOOL_CHANNEL_TERMINAL) {
+            let ui_error = crate::ui_error::tool_forbidden_ui_error(
+                TOOL_CHANNEL_TERMINAL,
+                crate::ui_error::current_platform(),
+                None,
+            );
+            let msg = ui_error.message.clone();
+            self.update_rx.push(SessionUpdate::ToolPermissionDenied {
+                channel: TOOL_CHANNEL_TERMINAL,
+                ui_error,
+            });
+            return Err(msg);
+        }
+        if password.is_empty() || password.len() > 512 {
+            return Err("请输入有效的系统登录密码".to_string());
+        }
+        self.send_display_ctrl(DisplayControlMsg::TerminalUnlockRequest {
+            password: crate::display_ctrl::RedactedSecret(std::mem::take(&mut *password)),
+            username: username
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty()),
+        });
+        Ok(())
     }
 
     /// 动态切换当前会话的只读观看模式标记（供 `set_session_watch_only` 同步控制输入通道与采集器）。
@@ -4085,7 +4232,7 @@ fn run_session_thread(
     let mut pending_file_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_term_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_portmap_tx: VecDeque<Vec<u8>> = VecDeque::new();
-    let mut pending_display_tx: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut pending_display_tx = ZeroizingByteQueue::new();
     let mut pending_update_tx: VecDeque<(bool, Vec<u8>)> = VecDeque::new();
     let mut client_decode_caps =
         codec_selector::cached_or_platform_decode_caps(cfg.prefer_hardware && is_hardware_decoder);
@@ -4422,7 +4569,10 @@ fn run_session_thread(
                         pending_update_tx.push_back((is_update_trigger, payload));
                     } else {
                         while pending_display_tx.len() >= COMMAND_CHANNEL_CAP {
-                            pending_display_tx.pop_front();
+                            if let Some(mut evicted) = pending_display_tx.pop_front() {
+                                use zeroize::Zeroize;
+                                evicted.zeroize();
+                            }
                         }
                         pending_display_tx.push_back(payload);
                     }
@@ -4714,14 +4864,33 @@ fn run_session_thread(
                                         allow_terminal: *allow_terminal,
                                         allow_port_map: *allow_port_map,
                                     };
-                                    *tool_permissions.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        peer_tool_perms;
                                     if !peer_tool_perms.allow_file_transfer {
                                         pending_file_in.clear();
                                         pending_file_tx.clear();
                                         file_worker.abort_all_active(
                                             "目标设备已禁用文件传输权限，当前传输已中止",
                                         );
+                                    }
+                                    if !peer_tool_perms.allow_terminal {
+                                        pending_term_tx.clear();
+                                    }
+                                    if !peer_tool_perms.allow_port_map {
+                                        pending_portmap_tx.clear();
+                                        last_portmap_snapshot.clear();
+                                    }
+                                    // 严格遵循 `tools_hub -> tool_permissions -> portmap_latest` 全局锁序，
+                                    // 原子更新权限标志并同步清理已撤销工具引擎状态，彻底消除 TOCTOU。
+                                    let mut hub =
+                                        tools_hub.lock().unwrap_or_else(|e| e.into_inner());
+                                    *tool_permissions.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        peer_tool_perms;
+                                    if !peer_tool_perms.allow_terminal {
+                                        hub.reset_terminal();
+                                    }
+                                    if !peer_tool_perms.allow_port_map {
+                                        hub.portmap = PortMapClientEngine::new();
+                                        *portmap_latest.lock().unwrap_or_else(|e| e.into_inner()) =
+                                            Some(Vec::new());
                                     }
                                 }
                                 _ => {}
@@ -4871,34 +5040,38 @@ fn run_session_thread(
                     let mut pm_dirty = false;
                     for (channel, payload) in non_file_incoming {
                         match channel {
-                            TOOL_CHANNEL_TERMINAL => {
+                            TOOL_CHANNEL_TERMINAL if peer_tool_perms.allow_terminal => {
                                 let evs = hub.terminal.handle_incoming(&payload);
                                 for ev in &evs {
                                     hub.apply_terminal_event(ev);
                                 }
                                 new_term_events.extend(evs);
                             }
-                            TOOL_CHANNEL_PORTMAP if hub.portmap.handle_incoming(&payload) => {
+                            TOOL_CHANNEL_PORTMAP
+                                if peer_tool_perms.allow_port_map
+                                    && hub.portmap.handle_incoming(&payload) =>
+                            {
                                 pm_dirty = true;
                             }
                             _ => {}
                         }
                     }
 
-                    let t_out = if poll_term {
+                    let t_out = if poll_term && peer_tool_perms.allow_terminal {
                         hub.terminal.poll_outgoing(MAX_TOOL_FRAMES_PER_TICK)
                     } else {
                         Vec::new()
                     };
-                    let p_out = if poll_portmap {
+                    let p_out = if poll_portmap && peer_tool_perms.allow_port_map {
                         hub.portmap.poll_outgoing(MAX_TOOL_FRAMES_PER_TICK)
                     } else {
                         Vec::new()
                     };
 
-                    if pm_dirty
+                    if (pm_dirty
                         || !p_out.is_empty()
-                        || last_portmap_poll_at.elapsed() >= PORTMAP_SNAPSHOT_INTERVAL
+                        || last_portmap_poll_at.elapsed() >= PORTMAP_SNAPSHOT_INTERVAL)
+                        && peer_tool_perms.allow_port_map
                     {
                         last_portmap_poll_at = Instant::now();
                         let cur_rules = hub.portmap.list_rules();
@@ -4996,7 +5169,7 @@ fn run_session_thread(
                             update_tx.push(SessionUpdate::RemoteUpdateStatus(rprog));
                         }
                     }
-                    if flush_pending_tool_queue_checked(
+                    if flush_pending_display_tx_checked(
                         &mut pending_display_tx,
                         |frame| client.send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, frame),
                         |e| matches!(e, rc_types::Error::InvalidConfig(_)),
@@ -5941,6 +6114,26 @@ fn handle_display_ctrl_msg(
                 ),
             })
         }
+        DisplayControlMsg::TerminalLockState {
+            required,
+            unlocked,
+            username,
+            retry_after_secs,
+        } => Some(SessionUpdate::TerminalLockState {
+            required,
+            unlocked,
+            username,
+            retry_after_secs,
+        }),
+        DisplayControlMsg::TerminalUnlockResult {
+            ok,
+            error,
+            retry_after_secs,
+        } => Some(SessionUpdate::TerminalUnlockResult {
+            ok,
+            error,
+            retry_after_secs,
+        }),
         DisplayControlMsg::SetStream { .. }
         | DisplayControlMsg::LockScreen
         | DisplayControlMsg::SetCodec { .. }
@@ -5961,6 +6154,7 @@ fn handle_display_ctrl_msg(
         | DisplayControlMsg::CreateVirtualDisplay { .. }
         | DisplayControlMsg::RemoveVirtualDisplay { .. }
         | DisplayControlMsg::SetMediaPaused { .. }
+        | DisplayControlMsg::TerminalUnlockRequest { .. }
         | DisplayControlMsg::StillTileRefine { .. }
         | DisplayControlMsg::StillRefineConfig { .. } => None,
     }
@@ -9054,8 +9248,8 @@ mod tests {
         let perms_upd = handle_display_ctrl_msg(
             DisplayControlMsg::ToolPermissionsState {
                 allow_file_transfer: false,
-                allow_terminal: true,
-                allow_port_map: true,
+                allow_terminal: false,
+                allow_port_map: false,
             },
             &mut w,
             &mut h,
@@ -9065,13 +9259,15 @@ mod tests {
             perms_upd,
             Some(SessionUpdate::ToolPermissionsUpdated(ToolPermissions {
                 allow_file_transfer: false,
-                allow_terminal: true,
-                allow_port_map: true,
+                allow_terminal: false,
+                allow_port_map: false,
             }))
         );
         let perms_json = serde_json::to_value(perms_upd.unwrap()).expect("serialize perms upd");
         assert_eq!(perms_json["kind"], "tool_permissions_updated");
         assert_eq!(perms_json["data"]["allow_file_transfer"], false);
+        assert_eq!(perms_json["data"]["allow_terminal"], false);
+        assert_eq!(perms_json["data"]["allow_port_map"], false);
 
         let denied_upd = handle_display_ctrl_msg(
             DisplayControlMsg::ToolPermissionDenied {
@@ -9092,7 +9288,7 @@ mod tests {
             other => panic!("expected ToolPermissionDenied, got {other:?}"),
         }
 
-        // 2) 端到端 HostHandle + SessionHandle：非 Owner 被控端关闭协助文件传输 + 运行期热开关不中断会话。
+        // 2) 端到端 HostHandle + SessionHandle：非 Owner 被控端禁止终端/端口映射并受协助文件开关控制 + 运行期热开关不中断会话。
         let mut host = crate::host_bridge::HostHandle::spawn(crate::host_bridge::UiHostConfig {
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             allow_assist_file_transfer: false,
@@ -9120,7 +9316,7 @@ mod tests {
         while Instant::now() < deadline {
             while let Some(upd) = session.try_recv_update() {
                 if let SessionUpdate::ToolPermissionsUpdated(p) = upd {
-                    if !p.allow_file_transfer && p.allow_terminal && p.allow_port_map {
+                    if !p.allow_file_transfer && !p.allow_terminal && !p.allow_port_map {
                         saw_initial_denied_perm = true;
                     }
                 }
@@ -9132,9 +9328,22 @@ mod tests {
         }
         assert!(
             saw_initial_denied_perm,
-            "controller must receive ToolPermissionsUpdated(allow_file_transfer=false)"
+            "controller must receive ToolPermissionsUpdated(all false for non-owner with assist file off)"
         );
         assert!(!session.tool_permissions().allow_file_transfer);
+        assert!(!session.tool_permissions().allow_terminal);
+        assert!(!session.tool_permissions().allow_port_map);
+
+        let term_err = session
+            .tools()
+            .terminal_open(80, 24)
+            .expect_err("non-owner terminal_open must be blocked");
+        assert!(term_err.contains("远程终端"), "unexpected err: {term_err}");
+        let pm_err = session
+            .tools()
+            .portmap_add("pm".to_string(), 18080, "127.0.0.1".to_string(), 80)
+            .expect_err("non-owner portmap_add must be blocked");
+        assert!(pm_err.contains("端口映射"), "unexpected err: {pm_err}");
 
         // 控制端尝试发起文件列表与上传请求 -> ToolClientHandle 入口前置拦截，返回 Err、不创建僵尸 Active 任务，
         // 并输出结构化 UiError(tool.forbidden)。
@@ -9881,5 +10090,67 @@ mod tests {
         );
         assert!(lan_cancelled_on_mtls.load(Ordering::Acquire));
         assert!(matches!(res6, Err(DirectTierRaceError::FatalMtls(_))));
+    }
+
+    #[test]
+    fn tool_hub_revocation_resets_terminal_and_portmap_state_cleanly() {
+        let mut hub = ToolClientHub::new();
+        let tid = hub
+            .terminal
+            .open_with_options(80, 24, Some("sh".into()), true);
+        hub.pending_opens.push_back((tid, true));
+        hub.active_terminals.insert(tid);
+        hub.attached_terminals.insert(tid);
+        let _ = hub.terminal.poll_outgoing(8);
+
+        hub.reset_terminal();
+        assert!(hub.active_terminals.is_empty());
+        assert!(hub.attached_terminals.is_empty());
+        assert!(hub.pending_opens.is_empty());
+        assert!(hub.terminal.poll_outgoing(8).is_empty());
+
+        let rule = hub
+            .portmap
+            .add_rule_with_enabled(
+                "db".to_string(),
+                19432,
+                "127.0.0.1".to_string(),
+                5432,
+                false,
+            )
+            .expect("rule added disabled");
+        assert_eq!(rule.local_port, 19432);
+        assert_eq!(hub.portmap.list_rules().len(), 1);
+        hub.portmap = PortMapClientEngine::new();
+        assert!(hub.portmap.list_rules().is_empty());
+
+        // 验证 ToolClientHandle::lock_hub_for_channel 在权限撤销后持 hub 锁内原子拒绝终端与端口映射操作。
+        let perms = Arc::new(Mutex::new(ToolPermissions::all_allowed()));
+        let hub_arc = Arc::new(Mutex::new(ToolClientHub::new()));
+        let portmap_latest = Arc::new(Mutex::new(None));
+        let update_tx = Arc::new(BoundedUpdateQueue::new(16));
+        let (fw, fh) = FileClientWorker::spawn(Arc::new(BoundedQueue::new(16)));
+        let handle = ToolClientHandle {
+            running: Arc::new(AtomicBool::new(true)),
+            tool_permissions: Arc::clone(&perms),
+            file: fh,
+            hub: Arc::clone(&hub_arc),
+            portmap_latest: Arc::clone(&portmap_latest),
+            update_tx: Arc::clone(&update_tx),
+        };
+        {
+            let _h = hub_arc.lock().unwrap();
+            *perms.lock().unwrap() = ToolPermissions {
+                allow_file_transfer: true,
+                allow_terminal: false,
+                allow_port_map: false,
+            };
+        }
+        assert!(handle.terminal_open(80, 24).is_err());
+        assert!(handle
+            .portmap_add("web".into(), 18080, "127.0.0.1".into(), 8080)
+            .is_err());
+        assert!(hub_arc.lock().unwrap().portmap.list_rules().is_empty());
+        drop(fw);
     }
 }

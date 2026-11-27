@@ -160,6 +160,22 @@ pub trait ClientPlatformHooks: Send + Sync {
         false
     }
 
+    /// 返回当前被控端系统登录用户名（用于在锁屏终端校验界面展示提示）。
+    fn current_system_username(&self) -> Option<String> {
+        None
+    }
+
+    /// 仅校验密码是否匹配当前系统用户登录密码，绝不实际解锁物理屏幕。
+    ///
+    /// 返回 `Ok(true)` 表示密码正确，`Ok(false)` 表示密码错误，`Err(msg)` 表示系统校验接口不可用。
+    fn verify_system_password(
+        &self,
+        _username: Option<&str>,
+        _password: &str,
+    ) -> Result<bool, String> {
+        Err("当前平台暂不支持系统密码校验".to_string())
+    }
+
     /// 开启或更新被控端物理防窥隐私幕布（遮挡所有物理屏但对屏幕采集排除）；
     /// `mode` 为 `"privacy"` / `"black"` / `"off"`。
     fn set_privacy_curtain(
@@ -437,6 +453,21 @@ pub fn is_display_asleep() -> bool {
 /// 判断宿主当前桌面会话是否处于锁屏状态。
 pub fn is_screen_locked() -> bool {
     PLATFORM_HOOKS.get().is_some_and(|h| h.is_screen_locked())
+}
+
+/// 读取当前宿主系统登录用户名。
+pub fn current_system_username() -> Option<String> {
+    PLATFORM_HOOKS
+        .get()
+        .and_then(|h| h.current_system_username())
+}
+
+/// 仅校验密码是否匹配当前系统用户登录密码，绝不实际解锁物理屏幕。
+pub fn verify_system_password(username: Option<&str>, password: &str) -> Result<bool, String> {
+    match PLATFORM_HOOKS.get() {
+        Some(h) => h.verify_system_password(username, password),
+        None => Err("当前平台未注册系统密码校验钩子".to_string()),
+    }
 }
 
 /// 开启或更新被控端物理防窥隐私幕布。

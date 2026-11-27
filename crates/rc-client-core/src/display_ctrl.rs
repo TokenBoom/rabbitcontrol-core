@@ -213,6 +213,32 @@ pub struct DisplayDescriptor {
     pub is_virtual: bool,
 }
 
+/// 自动脱敏的敏感字符串包装类型：JSON 序列化/反序列化透明，但 `Debug` 固定输出 `"[REDACTED]"`，
+/// 防止系统密码经 `{:?}` 诊断日志泄漏；析构时自动通过 `zeroize` 擦除底层内存。
+#[derive(Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct RedactedSecret(pub String);
+
+impl RedactedSecret {
+    /// 将内部密码零拷贝移入 [`zeroize::Zeroizing<String>`]，同时在 `self` 析构前清零原字段。
+    pub fn into_zeroizing(mut self) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(std::mem::take(&mut self.0))
+    }
+}
+
+impl Drop for RedactedSecret {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
+
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
 /// 经 `TOOL_CHANNEL_DISPLAY_CTRL`（可靠 Stream A）双向传递的显示控制消息。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -564,6 +590,41 @@ pub enum DisplayControlMsg {
         /// `true` = 开启静止无损增强；`false` = 立即暂停并清空待发队列。
         #[serde(default = "default_true_bool")]
         enabled: bool,
+    },
+    /// 被控端 → 控制端：通告本人远程终端的锁屏系统密码校验状态。
+    TerminalLockState {
+        /// 当前会话是否要求先完成一次系统密码校验方可使用终端。
+        #[serde(default)]
+        required: bool,
+        /// 当前会话是否已完成终端安全校验（或本轮未锁屏无需校验）。
+        #[serde(default)]
+        unlocked: bool,
+        /// 当前被控端系统登录用户名（脱敏展示用，如 `"yii"`）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        /// 若触发防爆破退避冷却，剩余需等待秒数。
+        #[serde(default)]
+        retry_after_secs: u32,
+    },
+    /// 控制端 → 被控端：提交被控端系统登录密码以开启锁屏下的远程终端（仅校验密码，不解锁物理屏幕）。
+    TerminalUnlockRequest {
+        /// 被控端系统登录密码（`Debug` 自动脱敏）。
+        password: RedactedSecret,
+        /// 可选指定系统用户名（主要用于 `LoginWindow` 阶段）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+    },
+    /// 被控端 → 控制端：返回远程终端系统密码校验结果。
+    TerminalUnlockResult {
+        /// 校验是否通过。
+        #[serde(default)]
+        ok: bool,
+        /// 校验失败时的可读错误信息。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// 若触发防爆破退避冷却，剩余需等待秒数。
+        #[serde(default)]
+        retry_after_secs: u32,
     },
 }
 
@@ -1699,5 +1760,60 @@ mod tests {
         let val_min: serde_json::Value = serde_json::from_slice(&encoded_min).unwrap();
         assert!(val_min.get("reason").is_none());
         assert_eq!(decode_display_ctrl(&encoded_min), Some(denied_no_reason));
+    }
+
+    #[test]
+    fn terminal_lock_and_unlock_messages_roundtrip_and_redact_secret() {
+        let state_msg = DisplayControlMsg::TerminalLockState {
+            required: true,
+            unlocked: false,
+            username: Some("yii".to_string()),
+            retry_after_secs: 30,
+        };
+        let encoded_state = encode_display_ctrl(&state_msg).expect("encode terminal_lock_state");
+        let val_state: serde_json::Value = serde_json::from_slice(&encoded_state).unwrap();
+        assert_eq!(val_state["kind"], "terminal_lock_state");
+        assert_eq!(val_state["required"], true);
+        assert_eq!(val_state["unlocked"], false);
+        assert_eq!(val_state["username"], "yii");
+        assert_eq!(val_state["retry_after_secs"], 30);
+        assert_eq!(decode_display_ctrl(&encoded_state), Some(state_msg));
+
+        let secret = "SuperSecretMacPass#2026".to_string();
+        let req_msg = DisplayControlMsg::TerminalUnlockRequest {
+            password: RedactedSecret(secret.clone()),
+            username: Some("yii".to_string()),
+        };
+        let dbg = format!("{req_msg:?}");
+        assert!(
+            dbg.contains("[REDACTED]"),
+            "Debug must redact secret: {dbg}"
+        );
+        assert!(
+            !dbg.contains(&secret),
+            "Debug must never expose plaintext secret: {dbg}"
+        );
+        let encoded_req = encode_display_ctrl(&req_msg).expect("encode terminal_unlock_request");
+        let val_req: serde_json::Value = serde_json::from_slice(&encoded_req).unwrap();
+        assert_eq!(val_req["kind"], "terminal_unlock_request");
+        assert_eq!(val_req["password"], secret);
+        assert_eq!(val_req["username"], "yii");
+        assert_eq!(decode_display_ctrl(&encoded_req), Some(req_msg));
+
+        let res_msg = DisplayControlMsg::TerminalUnlockResult {
+            ok: false,
+            error: Some("系统密码错误".to_string()),
+            retry_after_secs: 15,
+        };
+        let encoded_res = encode_display_ctrl(&res_msg).expect("encode terminal_unlock_result");
+        let val_res: serde_json::Value = serde_json::from_slice(&encoded_res).unwrap();
+        assert_eq!(val_res["kind"], "terminal_unlock_result");
+        assert_eq!(val_res["ok"], false);
+        assert_eq!(val_res["error"], "系统密码错误");
+        assert_eq!(val_res["retry_after_secs"], 15);
+        assert_eq!(decode_display_ctrl(&encoded_res), Some(res_msg));
+
+        let moved = RedactedSecret("TransientPass!99".to_string()).into_zeroizing();
+        assert_eq!(moved.as_str(), "TransientPass!99");
     }
 }

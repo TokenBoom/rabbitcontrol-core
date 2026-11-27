@@ -950,6 +950,198 @@ impl MidSessionWakeDriver {
     }
 }
 
+// (secret string zeroization handled safely via `zeroize::Zeroize` / `zeroize::Zeroizing`)
+
+/// 本人（Owner）远程终端的锁屏安全校验门禁（对齐 UU 远程语义）：
+/// - 仅在会话建立时若被控端已处于系统锁屏状态则开启拦截；
+/// - 校验系统密码通过或检测到物理屏幕已解锁后放行；
+/// - 仅当通过密码核验解锁（`unlocked_by_password == true`）时对重复解锁请求幂等回传 `ok: true`，
+///   若因物理解锁或初始未锁屏而放行，绝不对未校验口令的请求误发 `ok: true`；
+/// - **关键语义**：一旦会话内处于已放行态（初始未锁屏或已验证通过），被控期间中途锁屏
+///   绝不打断或重新锁定当前已授权的终端会话（「被控期间锁屏不影响正常使用」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalLockGate {
+    locked: bool,
+    unlocked_by_password: bool,
+}
+
+impl TerminalLockGate {
+    fn new(initial_screen_locked: bool) -> Self {
+        Self {
+            locked: initial_screen_locked,
+            unlocked_by_password: false,
+        }
+    }
+
+    fn is_locked(&self) -> bool {
+        self.locked
+    }
+
+    fn is_unlocked_by_password(&self) -> bool {
+        !self.locked && self.unlocked_by_password
+    }
+
+    /// 250ms 巡检观察到当前系统锁屏态时更新状态；仅当从待校验转为已解锁时返回 `true`。
+    fn on_screen_lock_observed(&mut self, screen_locked: bool) -> bool {
+        if self.locked && !screen_locked {
+            self.locked = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 系统密码核验通过后解除终端门禁；若原先处于待校验态则返回 `true`。
+    fn on_verified_ok(&mut self) -> bool {
+        if self.locked {
+            self.locked = false;
+            self.unlocked_by_password = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// 终端系统密码核验防爆破阶梯限流器（全局跨会话共享，防止通过重连绕过）。
+#[derive(Debug, Default)]
+struct TerminalUnlockRateLimiter {
+    consecutive_failures: u32,
+    locked_until: Option<Instant>,
+}
+
+impl TerminalUnlockRateLimiter {
+    fn retry_after_secs(&self, now: Instant) -> u32 {
+        let Some(until) = self.locked_until else {
+            return 0;
+        };
+        if now >= until {
+            return 0;
+        }
+        let rem = until.saturating_duration_since(now);
+        let secs = rem.as_secs();
+        let extra = u64::from(rem.subsec_nanos() > 0);
+        u32::try_from(secs.saturating_add(extra)).unwrap_or(u32::MAX)
+    }
+
+    fn record_failure(&mut self, now: Instant) -> u32 {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let cooldown_secs = if self.consecutive_failures >= 15 {
+            120
+        } else if self.consecutive_failures >= 10 {
+            60
+        } else if self.consecutive_failures >= 5 {
+            30
+        } else {
+            0
+        };
+        if cooldown_secs > 0 {
+            self.locked_until = Some(now + Duration::from_secs(u64::from(cooldown_secs)));
+        }
+        cooldown_secs
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.locked_until = None;
+    }
+}
+
+fn global_terminal_unlock_limiter() -> &'static Mutex<TerminalUnlockRateLimiter> {
+    static LIMITER: std::sync::OnceLock<Mutex<TerminalUnlockRateLimiter>> =
+        std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| Mutex::new(TerminalUnlockRateLimiter::default()))
+}
+
+/// 终端系统密码单在途后台核验驱动器：
+/// - 绝不在 `rc-ui-host` 会话主循环中同步等待 OpenDirectory/PBKDF2（可能耗时数十毫秒）；
+/// - 同一时刻至多一个后台核验线程在途，完成后经 `try_recv()` 非阻塞收割；
+/// - 密码在后台线程核验后立刻就地清零。
+struct TerminalVerifyDriver {
+    in_flight: Arc<AtomicBool>,
+    rx: Option<mpsc::Receiver<Result<bool, String>>>,
+}
+
+impl TerminalVerifyDriver {
+    fn new() -> Self {
+        Self {
+            in_flight: Arc::new(AtomicBool::new(false)),
+            rx: None,
+        }
+    }
+
+    fn is_in_flight(&self) -> bool {
+        self.rx.is_some() || self.in_flight.load(Ordering::Acquire)
+    }
+
+    fn poll_completed(&mut self) -> Option<Result<bool, String>> {
+        let rx = self.rx.as_ref()?;
+        match rx.try_recv() {
+            Ok(res) => {
+                self.rx = None;
+                Some(res)
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.rx = None;
+                Some(Err("系统密码核验线程意外退出".to_string()))
+            }
+        }
+    }
+
+    fn spawn<F>(&mut self, verify_fn: F) -> bool
+    where
+        F: FnOnce() -> Result<bool, String> + Send + 'static,
+    {
+        if self.is_in_flight() {
+            return false;
+        }
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let (tx, rx) = mpsc::sync_channel::<Result<bool, String>>(1);
+        let flag = Arc::clone(&self.in_flight);
+        match thread::Builder::new()
+            .name("rc-term-verify".to_string())
+            .spawn(move || {
+                let _reset = AtomicFlagReset(flag);
+                let res = verify_fn();
+                let _ = tx.send(res);
+            }) {
+            Ok(_) => {
+                self.rx = Some(rx);
+                true
+            }
+            Err(e) => {
+                self.in_flight.store(false, Ordering::Release);
+                eprintln!("[rc-ui-host] 派发系统密码核验线程失败: {e}");
+                false
+            }
+        }
+    }
+}
+
+fn encode_terminal_lock_state(is_owner: bool, gate: &TerminalLockGate) -> Option<Vec<u8>> {
+    if !is_owner {
+        return None;
+    }
+    let retry_after_secs = global_terminal_unlock_limiter()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retry_after_secs(Instant::now());
+    let locked = gate.is_locked();
+    display_ctrl::encode_display_ctrl(&DisplayControlMsg::TerminalLockState {
+        required: locked,
+        unlocked: !locked,
+        username: crate::platform::current_system_username(),
+        retry_after_secs,
+    })
+}
+
 #[derive(Clone)]
 struct HostClockAnchor {
     origin: Arc<Mutex<ClockOrigin>>,
@@ -1666,7 +1858,10 @@ const TOOL_PERMISSION_DENIED_THROTTLE: Duration = Duration::from_secs(1);
 
 /// 按会话归属（是否通过 Ed25519 PoP `OwnerTicket` 自控认证）与远程协助文件开关计算生效工具权限。
 ///
-/// 安全红线：仅 `is_owner_session == true` 豁免保持全开；所有非 Owner 会话均受 `allow_assist_file_transfer` 门控。
+/// 安全红线：
+/// - 仅 `is_owner_session == true` 豁免保持全开（文件传输、远程终端、端口映射全部可用）；
+/// - 他人远程协助（`is_owner_session == false`）仅允许远程桌面与受控文件传输，
+///   硬禁用远程终端与端口映射（`allow_terminal: false, allow_port_map: false`）。
 fn compute_effective_tool_permissions(
     is_owner_session: bool,
     allow_assist_file_transfer: bool,
@@ -1676,8 +1871,345 @@ fn compute_effective_tool_permissions(
     } else {
         rc_session::ToolPermissions {
             allow_file_transfer: allow_assist_file_transfer,
-            allow_terminal: true,
-            allow_port_map: true,
+            allow_terminal: false,
+            allow_port_map: false,
+        }
+    }
+}
+
+const DISPLAY_CTRL_QUEUE_CAP: usize = 64;
+
+/// 被控端显示/控制通道出站队列：
+/// - 关键粘性状态（工具权限 / 终端锁屏状态 / 宿主屏幕锁屏挂起状态 / 显示能力）保存在各自覆盖最新的粘性槽位中，
+///   在背压或瞬态消息满载淘汰时绝不被 FIFO 静默挤掉，且发送时优先于普通瞬态消息；
+/// - 其余瞬态消息走 64 槽位有界 drop-oldest FIFO 队列。
+#[derive(Default)]
+struct HostDisplayCtrlOutbox {
+    sticky_tool_perms: Option<Vec<u8>>,
+    sticky_terminal_lock: Option<Vec<u8>>,
+    sticky_screen_state: Option<Vec<u8>>,
+    sticky_caps: Option<Vec<u8>>,
+    queue: VecDeque<Vec<u8>>,
+}
+
+impl HostDisplayCtrlOutbox {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.sticky_tool_perms.is_none()
+            && self.sticky_terminal_lock.is_none()
+            && self.sticky_screen_state.is_none()
+            && self.sticky_caps.is_none()
+            && self.queue.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.sticky_tool_perms = None;
+        self.sticky_terminal_lock = None;
+        self.sticky_screen_state = None;
+        self.sticky_caps = None;
+        self.queue.clear();
+    }
+
+    fn set_tool_perms(&mut self, payload: Vec<u8>) {
+        self.sticky_tool_perms = Some(payload);
+    }
+
+    fn set_terminal_lock(&mut self, payload: Vec<u8>) {
+        self.sticky_terminal_lock = Some(payload);
+    }
+
+    fn set_screen_state(&mut self, payload: Vec<u8>) {
+        self.sticky_screen_state = Some(payload);
+    }
+
+    fn set_caps(&mut self, payload: Vec<u8>) {
+        self.sticky_caps = Some(payload);
+    }
+
+    fn push_transient(&mut self, payload: Vec<u8>) {
+        while self.queue.len() >= DISPLAY_CTRL_QUEUE_CAP {
+            self.queue.pop_front();
+        }
+        self.queue.push_back(payload);
+    }
+
+    fn flush_slot<E>(
+        slot: &mut Option<Vec<u8>>,
+        remaining_budget: &mut usize,
+        sent_any: &mut bool,
+        send_fn: &mut impl FnMut(Vec<u8>) -> Result<(), E>,
+        is_fatal_err: &impl Fn(&E) -> bool,
+    ) -> bool {
+        if *remaining_budget == 0 {
+            return false;
+        }
+        let Some(frame) = slot.take() else {
+            return true;
+        };
+        match send_fn(frame.clone()) {
+            Ok(()) => {
+                *sent_any = true;
+                *remaining_budget -= 1;
+                true
+            }
+            Err(ref e) if is_fatal_err(e) => true,
+            Err(_) => {
+                *slot = Some(frame);
+                false
+            }
+        }
+    }
+
+    fn flush<E>(
+        &mut self,
+        max_frames: usize,
+        mut send_fn: impl FnMut(Vec<u8>) -> Result<(), E>,
+        is_fatal_err: impl Fn(&E) -> bool,
+    ) -> bool {
+        let mut budget = max_frames;
+        let mut sent_any = false;
+        let sticky_ok = Self::flush_slot(
+            &mut self.sticky_tool_perms,
+            &mut budget,
+            &mut sent_any,
+            &mut send_fn,
+            &is_fatal_err,
+        ) && Self::flush_slot(
+            &mut self.sticky_terminal_lock,
+            &mut budget,
+            &mut sent_any,
+            &mut send_fn,
+            &is_fatal_err,
+        ) && Self::flush_slot(
+            &mut self.sticky_screen_state,
+            &mut budget,
+            &mut sent_any,
+            &mut send_fn,
+            &is_fatal_err,
+        ) && Self::flush_slot(
+            &mut self.sticky_caps,
+            &mut budget,
+            &mut sent_any,
+            &mut send_fn,
+            &is_fatal_err,
+        );
+        if !sticky_ok {
+            return sent_any;
+        }
+        while budget > 0 {
+            let Some(front) = self.queue.front() else {
+                break;
+            };
+            match send_fn(front.clone()) {
+                Ok(()) => {
+                    self.queue.pop_front();
+                    sent_any = true;
+                    budget -= 1;
+                }
+                Err(ref e) if is_fatal_err(e) => {
+                    self.queue.pop_front();
+                }
+                Err(_) => break,
+            }
+        }
+        sent_any
+    }
+}
+
+fn requested_username_matches_current(requested: Option<&str>, current: Option<&str>) -> bool {
+    let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    let Some(cur) = current.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    req == cur
+}
+
+fn handle_terminal_unlock_request(
+    is_owner: bool,
+    password: display_ctrl::RedactedSecret,
+    username: Option<String>,
+    gate: &TerminalLockGate,
+    verify_driver: &mut TerminalVerifyDriver,
+    outbox: &mut HostDisplayCtrlOutbox,
+) {
+    let pw = password.into_zeroizing();
+    let push_result =
+        |tx: &mut HostDisplayCtrlOutbox, ok: bool, error: Option<String>, retry: u32| {
+            if let Some(payload) =
+                display_ctrl::encode_display_ctrl(&DisplayControlMsg::TerminalUnlockResult {
+                    ok,
+                    error,
+                    retry_after_secs: retry,
+                })
+            {
+                tx.push_transient(payload);
+            }
+        };
+
+    if !is_owner {
+        push_result(
+            outbox,
+            false,
+            Some("远程终端仅限本人账号使用".to_string()),
+            0,
+        );
+        return;
+    }
+    if !gate.is_locked() {
+        if gate.is_unlocked_by_password() {
+            push_result(outbox, true, None, 0);
+        }
+        if let Some(state_payload) = encode_terminal_lock_state(true, gate) {
+            outbox.set_terminal_lock(state_payload);
+        }
+        return;
+    }
+    let retry = global_terminal_unlock_limiter()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retry_after_secs(Instant::now());
+    if retry > 0 {
+        push_result(
+            outbox,
+            false,
+            Some(format!("密码错误次数过多，请 {retry} 秒后再试")),
+            retry,
+        );
+        return;
+    }
+    if pw.is_empty() || pw.len() > 512 {
+        push_result(
+            outbox,
+            false,
+            Some("请输入有效的系统登录密码".to_string()),
+            0,
+        );
+        return;
+    }
+    if !requested_username_matches_current(
+        username.as_deref(),
+        crate::platform::current_system_username().as_deref(),
+    ) {
+        let retry = global_terminal_unlock_limiter()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_failure(Instant::now());
+        let err_msg = if retry > 0 {
+            format!("系统用户名不匹配，请 {retry} 秒后再试")
+        } else {
+            "系统用户名与当前登录用户不匹配".to_string()
+        };
+        push_result(outbox, false, Some(err_msg), retry);
+        return;
+    }
+    if verify_driver.is_in_flight() {
+        push_result(
+            outbox,
+            false,
+            Some("正在验证系统密码，请稍候".to_string()),
+            0,
+        );
+        return;
+    }
+    let spawned = verify_driver
+        .spawn(move || crate::platform::verify_system_password(username.as_deref(), &pw));
+    if !spawned {
+        push_result(
+            outbox,
+            false,
+            Some("启动系统密码校验失败，请重试".to_string()),
+            0,
+        );
+    }
+}
+
+fn handle_terminal_verify_completion(
+    verify_res: Result<bool, String>,
+    is_owner: bool,
+    gate: &mut TerminalLockGate,
+    outbox: &mut HostDisplayCtrlOutbox,
+) {
+    if !gate.is_locked() {
+        // 物理屏已在异步核验返回前解锁（gate 已放行）：
+        // - 若本次核验恰好为 Ok(true)，正常清零限流并回传 ok=true；
+        // - 若为 Ok(false) 或 Err(_)，绝不记录失败限流，也不发送 TerminalUnlockResult
+        //   （既不误报失败，也不得误发 ok=true 导致客户端将错误密码保存到钥匙串），仅刷新已解锁 LockState。
+        if matches!(verify_res, Ok(true)) {
+            global_terminal_unlock_limiter()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_success();
+            if let Some(payload) =
+                display_ctrl::encode_display_ctrl(&DisplayControlMsg::TerminalUnlockResult {
+                    ok: true,
+                    error: None,
+                    retry_after_secs: 0,
+                })
+            {
+                outbox.push_transient(payload);
+            }
+        }
+        if let Some(state_payload) = encode_terminal_lock_state(is_owner, gate) {
+            outbox.set_terminal_lock(state_payload);
+        }
+        return;
+    }
+
+    match verify_res {
+        Ok(true) => {
+            global_terminal_unlock_limiter()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_success();
+            gate.on_verified_ok();
+            if let Some(payload) =
+                display_ctrl::encode_display_ctrl(&DisplayControlMsg::TerminalUnlockResult {
+                    ok: true,
+                    error: None,
+                    retry_after_secs: 0,
+                })
+            {
+                outbox.push_transient(payload);
+            }
+            if let Some(state_payload) = encode_terminal_lock_state(is_owner, gate) {
+                outbox.set_terminal_lock(state_payload);
+            }
+        }
+        Ok(false) => {
+            let retry = global_terminal_unlock_limiter()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_failure(Instant::now());
+            let err_msg = if retry > 0 {
+                format!("系统密码错误，请 {retry} 秒后再试")
+            } else {
+                "系统密码错误，请输入被控端系统登录密码".to_string()
+            };
+            if let Some(payload) =
+                display_ctrl::encode_display_ctrl(&DisplayControlMsg::TerminalUnlockResult {
+                    ok: false,
+                    error: Some(err_msg),
+                    retry_after_secs: retry,
+                })
+            {
+                outbox.push_transient(payload);
+            }
+        }
+        Err(err) => {
+            if let Some(payload) =
+                display_ctrl::encode_display_ctrl(&DisplayControlMsg::TerminalUnlockResult {
+                    ok: false,
+                    error: Some(err),
+                    retry_after_secs: 0,
+                })
+            {
+                outbox.push_transient(payload);
+            }
         }
     }
 }
@@ -3240,7 +3772,7 @@ fn drive_ui_host_session_with_audio(
     let mut pending_file_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_term_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_portmap_tx: VecDeque<Vec<u8>> = VecDeque::new();
-    let mut pending_display_tx: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut pending_display_tx = HostDisplayCtrlOutbox::new();
     let mut pending_update_tx = crate::updater::PendingUpdateTxQueue::new();
     let (mut session_native_res, mut session_max_res) =
         compute_host_display_bounds(host, prefer_hardware, hardware_video_active);
@@ -3287,6 +3819,10 @@ fn drive_ui_host_session_with_audio(
     let mut last_reported_screen_state: Option<(bool, bool)> = None;
     let mut last_screen_state_check = Instant::now();
     let mut mid_session_wake = MidSessionWakeDriver::new();
+    let initial_screen_locked = crate::platform::is_screen_locked();
+    let mut terminal_lock_gate = TerminalLockGate::new(initial_screen_locked);
+    let mut terminal_verify_driver = TerminalVerifyDriver::new();
+    let mut last_terminal_lock_prompt_sent: Option<Instant> = None;
     let mut current_tool_perms = compute_effective_tool_permissions(
         host.authenticated_owner().is_some(),
         allow_assist_file_transfer.load(Ordering::Acquire),
@@ -3296,7 +3832,12 @@ fn drive_ui_host_session_with_audio(
 
     if host.state() == SessionState::Streaming {
         if let Some(perm_payload) = encode_tool_permissions_state(current_tool_perms) {
-            pending_display_tx.push_back(perm_payload);
+            pending_display_tx.set_tool_perms(perm_payload);
+        }
+        if let Some(term_lock_payload) =
+            encode_terminal_lock_state(use_owner_terminals, &terminal_lock_gate)
+        {
+            pending_display_tx.set_terminal_lock(term_lock_payload);
         }
         let presets = build_hardware_display_presets(
             prefer_hardware,
@@ -3313,17 +3854,14 @@ fn drive_ui_host_session_with_audio(
             hardware_media_active,
             still_refine.stream_epoch(),
         ) {
-            pending_display_tx.push_back(payload);
+            pending_display_tx.set_caps(payload);
         }
         if prefer_hardware && hardware_video_active {
             if let Some(disp_payload) = encode_host_displays_state(active_display_id) {
-                pending_display_tx.push_back(disp_payload);
+                pending_display_tx.push_transient(disp_payload);
             }
         }
-        let init_screen_state = (
-            crate::platform::is_screen_locked(),
-            host.is_capture_suspended(),
-        );
+        let init_screen_state = (initial_screen_locked, host.is_capture_suspended());
         if init_screen_state.0 || init_screen_state.1 {
             if let Some(payload) =
                 display_ctrl::encode_display_ctrl(&DisplayControlMsg::HostScreenState {
@@ -3331,7 +3869,7 @@ fn drive_ui_host_session_with_audio(
                     capture_suspended: init_screen_state.1,
                 })
             {
-                pending_display_tx.push_back(payload);
+                pending_display_tx.set_screen_state(payload);
             }
         }
         last_reported_screen_state = Some(init_screen_state);
@@ -3371,7 +3909,7 @@ fn drive_ui_host_session_with_audio(
                         file_worker = FileHostWorker::spawn(Arc::clone(&file_transfer_dir));
                     }
                     if let Some(perm_payload) = encode_tool_permissions_state(current_tool_perms) {
-                        pending_display_tx.push_back(perm_payload);
+                        pending_display_tx.set_tool_perms(perm_payload);
                     }
                 }
 
@@ -3383,14 +3921,20 @@ fn drive_ui_host_session_with_audio(
                 match host.tick(poll_budget) {
                     Ok(r) => {
                         if r.closed.is_some() {
-                            for (channel, payload) in host.drain_tool_messages() {
-                                if channel == TOOL_CHANNEL_DISPLAY_CTRL
-                                    && matches!(
-                                        display_ctrl::decode_display_ctrl(&payload),
-                                        Some(DisplayControlMsg::LockScreen)
-                                    )
-                                {
-                                    pending_lock_on_exit = true;
+                            for (channel, mut payload) in host.drain_tool_messages() {
+                                if channel == TOOL_CHANNEL_DISPLAY_CTRL {
+                                    match display_ctrl::decode_display_ctrl(&payload) {
+                                        Some(DisplayControlMsg::LockScreen) => {
+                                            pending_lock_on_exit = true;
+                                        }
+                                        Some(DisplayControlMsg::TerminalUnlockRequest {
+                                            ..
+                                        }) => {
+                                            use zeroize::Zeroize;
+                                            payload.zeroize();
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                             break;
@@ -3514,7 +4058,7 @@ fn drive_ui_host_session_with_audio(
                                     hardware_media_active,
                                     still_refine.stream_epoch(),
                                 ) {
-                                    pending_display_tx.push_back(cp);
+                                    pending_display_tx.set_caps(cp);
                                 }
                             }
                         }
@@ -3569,7 +4113,7 @@ fn drive_ui_host_session_with_audio(
                                             data_base64,
                                         },
                                     ) {
-                                        pending_display_tx.push_back(wp_payload);
+                                        pending_display_tx.push_transient(wp_payload);
                                     }
                                 }
                                 Err(mpsc::TryRecvError::Empty) => {}
@@ -3615,15 +4159,12 @@ fn drive_ui_host_session_with_audio(
                                             )),
                                         },
                                     ) {
-                                        pending_display_tx.push_back(denied_payload);
+                                        pending_display_tx.push_transient(denied_payload);
                                     }
                                 }
                             }
-                            while pending_display_tx.len() > 64 {
-                                pending_display_tx.pop_front();
-                            }
                         }
-                        for (channel, payload) in incoming_tools {
+                        for (channel, mut payload) in incoming_tools {
                             match channel {
                                 TOOL_CHANNEL_FILE => {
                                     if current_tool_perms.allow_file_transfer {
@@ -3631,13 +4172,36 @@ fn drive_ui_host_session_with_audio(
                                     }
                                 }
                                 TOOL_CHANNEL_TERMINAL => {
-                                    if use_owner_terminals {
-                                        owner_terminals.engine.handle_incoming(&payload);
-                                    } else {
-                                        guest_term_host.handle_incoming(&payload);
+                                    if current_tool_perms.allow_terminal && use_owner_terminals {
+                                        if terminal_lock_gate.is_locked() {
+                                            let now_prompt = Instant::now();
+                                            let should_emit = last_terminal_lock_prompt_sent
+                                                .map_or(true, |prev| {
+                                                    now_prompt.saturating_duration_since(prev)
+                                                        >= TOOL_PERMISSION_DENIED_THROTTLE
+                                                });
+                                            if should_emit {
+                                                last_terminal_lock_prompt_sent = Some(now_prompt);
+                                                if let Some(lock_payload) =
+                                                    encode_terminal_lock_state(
+                                                        true,
+                                                        &terminal_lock_gate,
+                                                    )
+                                                {
+                                                    pending_display_tx
+                                                        .set_terminal_lock(lock_payload);
+                                                }
+                                            }
+                                        } else {
+                                            owner_terminals.engine.handle_incoming(&payload);
+                                        }
                                     }
                                 }
-                                TOOL_CHANNEL_PORTMAP => portmap_host.handle_incoming(&payload),
+                                TOOL_CHANNEL_PORTMAP => {
+                                    if current_tool_perms.allow_port_map {
+                                        portmap_host.handle_incoming(&payload);
+                                    }
+                                }
                                 TOOL_CHANNEL_AUDIO_CTRL => {
                                     if let Some(muted) = parse_audio_ctrl_muted(&payload) {
                                         if audio_muted && !muted {
@@ -3647,7 +4211,15 @@ fn drive_ui_host_session_with_audio(
                                     }
                                 }
                                 TOOL_CHANNEL_DISPLAY_CTRL => {
-                                    match display_ctrl::decode_display_ctrl(&payload) {
+                                    let decoded = display_ctrl::decode_display_ctrl(&payload);
+                                    if matches!(
+                                        &decoded,
+                                        Some(DisplayControlMsg::TerminalUnlockRequest { .. })
+                                    ) {
+                                        use zeroize::Zeroize;
+                                        payload.zeroize();
+                                    }
+                                    match decoded {
                                         Some(DisplayControlMsg::SetStream {
                                             width,
                                             height,
@@ -3884,7 +4456,7 @@ fn drive_ui_host_session_with_audio(
                                                     hardware_media_active,
                                                     still_refine.stream_epoch(),
                                                 ) {
-                                                    pending_display_tx.push_back(caps_payload);
+                                                    pending_display_tx.set_caps(caps_payload);
                                                 }
                                             }
                                         }
@@ -4013,7 +4585,7 @@ fn drive_ui_host_session_with_audio(
                                                 hardware_media_active,
                                                 still_refine.stream_epoch(),
                                             ) {
-                                                pending_display_tx.push_back(caps_payload);
+                                                pending_display_tx.set_caps(caps_payload);
                                             }
                                         }
                                         Some(DisplayControlMsg::StillRefineConfig { enabled }) => {
@@ -4152,7 +4724,7 @@ fn drive_ui_host_session_with_audio(
                                                             still_refine.stream_epoch(),
                                                         )
                                                     {
-                                                        pending_display_tx.push_back(caps_payload);
+                                                        pending_display_tx.set_caps(caps_payload);
                                                     }
                                                 }
                                             }
@@ -4317,7 +4889,7 @@ fn drive_ui_host_session_with_audio(
                                                 hardware_media_active,
                                                 still_refine.stream_epoch(),
                                             ) {
-                                                pending_display_tx.push_back(caps_payload);
+                                                pending_display_tx.set_caps(caps_payload);
                                             }
                                         }
                                         Some(DisplayControlMsg::SetPrivacyMode {
@@ -4483,7 +5055,7 @@ fn drive_ui_host_session_with_audio(
                                                     supported,
                                                 },
                                             ) {
-                                                pending_display_tx.push_back(p);
+                                                pending_display_tx.push_transient(p);
                                             }
                                             if hevc_fell_back {
                                                 let (caps_native, presets) =
@@ -4521,7 +5093,7 @@ fn drive_ui_host_session_with_audio(
                                                     hardware_media_active,
                                                     still_refine.stream_epoch(),
                                                 ) {
-                                                    pending_display_tx.push_back(cp);
+                                                    pending_display_tx.set_caps(cp);
                                                 }
                                             }
                                         }
@@ -4553,7 +5125,7 @@ fn drive_ui_host_session_with_audio(
                                                     supported,
                                                 },
                                             ) {
-                                                pending_display_tx.push_back(p);
+                                                pending_display_tx.push_transient(p);
                                             }
                                         }
                                         Some(DisplayControlMsg::SetMouseMode { mode }) => {
@@ -4629,7 +5201,7 @@ fn drive_ui_host_session_with_audio(
                                                     mode: reported_mode.to_string(),
                                                 },
                                             ) {
-                                                pending_display_tx.push_back(p);
+                                                pending_display_tx.push_transient(p);
                                             }
                                             if hevc_fell_back {
                                                 let (caps_native, presets) =
@@ -4667,7 +5239,7 @@ fn drive_ui_host_session_with_audio(
                                                     hardware_media_active,
                                                     still_refine.stream_epoch(),
                                                 ) {
-                                                    pending_display_tx.push_back(cp);
+                                                    pending_display_tx.set_caps(cp);
                                                 }
                                             }
                                         }
@@ -4676,7 +5248,7 @@ fn drive_ui_host_session_with_audio(
                                                 if let Some(p) =
                                                     encode_host_displays_state(active_display_id)
                                                 {
-                                                    pending_display_tx.push_back(p);
+                                                    pending_display_tx.push_transient(p);
                                                 }
                                             }
                                         }
@@ -4848,7 +5420,7 @@ fn drive_ui_host_session_with_audio(
                                                             hardware_media_active,
                                                             still_refine.stream_epoch(),
                                                         ) {
-                                                            pending_display_tx.push_back(cp);
+                                                            pending_display_tx.set_caps(cp);
                                                         }
                                                     } else {
                                                         active_display_id = prev_active;
@@ -4863,7 +5435,7 @@ fn drive_ui_host_session_with_audio(
                                                 if let Some(dp) =
                                                     encode_host_displays_state(active_display_id)
                                                 {
-                                                    pending_display_tx.push_back(dp);
+                                                    pending_display_tx.push_transient(dp);
                                                 }
                                             }
                                         }
@@ -4881,7 +5453,7 @@ fn drive_ui_host_session_with_audio(
                                                         },
                                                     )
                                                 {
-                                                    pending_display_tx.push_back(ep);
+                                                    pending_display_tx.push_transient(ep);
                                                 }
                                             } else if hw_cleanup.virtual_display_count
                                                 >= MAX_VIRTUAL_DISPLAYS_PER_SESSION
@@ -4895,7 +5467,7 @@ fn drive_ui_host_session_with_audio(
                                                         },
                                                     )
                                                 {
-                                                    pending_display_tx.push_back(ep);
+                                                    pending_display_tx.push_transient(ep);
                                                 }
                                             } else {
                                                 let req_w = if width >= 640 {
@@ -5016,7 +5588,7 @@ fn drive_ui_host_session_with_audio(
                                                                     )
                                                                 {
                                                                     pending_display_tx
-                                                                        .push_back(cp);
+                                                                        .set_caps(cp);
                                                                 }
                                                             }
                                                             Err(err) => {
@@ -5040,7 +5612,7 @@ fn drive_ui_host_session_with_audio(
                                                                     )
                                                                 {
                                                                     pending_display_tx
-                                                                        .push_back(ep);
+                                                                        .push_transient(ep);
                                                                 }
                                                             }
                                                         }
@@ -5049,7 +5621,7 @@ fn drive_ui_host_session_with_audio(
                                                                 active_display_id,
                                                             )
                                                         {
-                                                            pending_display_tx.push_back(dp);
+                                                            pending_display_tx.push_transient(dp);
                                                         }
                                                     }
                                                     Err(msg) => {
@@ -5060,7 +5632,7 @@ fn drive_ui_host_session_with_audio(
                                                                 },
                                                             )
                                                         {
-                                                            pending_display_tx.push_back(ep);
+                                                            pending_display_tx.push_transient(ep);
                                                         }
                                                     }
                                                 }
@@ -5183,13 +5755,13 @@ fn drive_ui_host_session_with_audio(
                                                     hardware_media_active,
                                                     still_refine.stream_epoch(),
                                                 ) {
-                                                    pending_display_tx.push_back(cp);
+                                                    pending_display_tx.set_caps(cp);
                                                 }
                                             }
                                             if let Some(dp) =
                                                 encode_host_displays_state(active_display_id)
                                             {
-                                                pending_display_tx.push_back(dp);
+                                                pending_display_tx.push_transient(dp);
                                             }
                                         }
                                         Some(DisplayControlMsg::SetMediaPaused { paused }) => {
@@ -5200,7 +5772,7 @@ fn drive_ui_host_session_with_audio(
                                                 if let Some(mp) = display_ctrl::encode_display_ctrl(
                                                     &DisplayControlMsg::MediaState { paused: true },
                                                 ) {
-                                                    pending_display_tx.push_back(mp);
+                                                    pending_display_tx.push_transient(mp);
                                                 }
                                             } else {
                                                 let wanted_hevc =
@@ -5253,7 +5825,7 @@ fn drive_ui_host_session_with_audio(
                                                             hardware_media_active,
                                                             still_refine.stream_epoch(),
                                                         ) {
-                                                            pending_display_tx.push_back(cp);
+                                                            pending_display_tx.set_caps(cp);
                                                         }
                                                         if prefer_hardware && hardware_video_active
                                                         {
@@ -5262,7 +5834,8 @@ fn drive_ui_host_session_with_audio(
                                                                     active_display_id,
                                                                 )
                                                             {
-                                                                pending_display_tx.push_back(dp);
+                                                                pending_display_tx
+                                                                    .push_transient(dp);
                                                             }
                                                         }
                                                         let screen_state = (
@@ -5277,7 +5850,8 @@ fn drive_ui_host_session_with_audio(
                                                                 },
                                                             )
                                                         {
-                                                            pending_display_tx.push_back(sp);
+                                                            pending_display_tx
+                                                                .set_screen_state(sp);
                                                         }
                                                         last_reported_screen_state =
                                                             Some(screen_state);
@@ -5290,7 +5864,7 @@ fn drive_ui_host_session_with_audio(
                                                                 },
                                                             )
                                                         {
-                                                            pending_display_tx.push_back(mp);
+                                                            pending_display_tx.push_transient(mp);
                                                         }
                                                     }
                                                     Err(err) => {
@@ -5304,7 +5878,7 @@ fn drive_ui_host_session_with_audio(
                                                                 },
                                                             )
                                                         {
-                                                            pending_display_tx.push_back(mp);
+                                                            pending_display_tx.push_transient(mp);
                                                         }
                                                     }
                                                 }
@@ -5329,14 +5903,37 @@ fn drive_ui_host_session_with_audio(
                                                 host.authenticated_owner().is_some(),
                                             );
                                         }
+                                        Some(DisplayControlMsg::TerminalUnlockRequest {
+                                            password,
+                                            username,
+                                        }) => {
+                                            handle_terminal_unlock_request(
+                                                host.authenticated_owner().is_some()
+                                                    && current_tool_perms.allow_terminal,
+                                                password,
+                                                username,
+                                                &terminal_lock_gate,
+                                                &mut terminal_verify_driver,
+                                                &mut pending_display_tx,
+                                            );
+                                        }
                                         _ => {}
-                                    }
-                                    while pending_display_tx.len() > 64 {
-                                        pending_display_tx.pop_front();
                                     }
                                 }
                                 _ => {}
                             }
+                        }
+
+                        if let Some(verify_res) = terminal_verify_driver.poll_completed() {
+                            tools_busy = true;
+                            let is_owner = host.authenticated_owner().is_some()
+                                && current_tool_perms.allow_terminal;
+                            handle_terminal_verify_completion(
+                                verify_res,
+                                is_owner,
+                                &mut terminal_lock_gate,
+                                &mut pending_display_tx,
+                            );
                         }
 
                         let is_owner_for_update = host.authenticated_owner().is_some();
@@ -5366,7 +5963,7 @@ fn drive_ui_host_session_with_audio(
                         }
 
                         // 2.5) 接收后台唤醒结果并节流巡检被控端锁屏与采集挂起态（250ms）：
-                        // 变化时通知控制端；熄屏且未锁屏时异步派发单在途后台唤醒，绝不阻塞会话主循环。
+                        // 变化时通知控制端；活跃桌面远控遇到采集挂起且显示器休眠时异步派发单在途后台唤醒（锁屏期间亦允许唤醒，以便显示锁屏画面并直接键鼠解锁）。
                         mid_session_wake.poll_completed(&wake_guard, Instant::now());
                         if last_screen_state_check.elapsed() >= Duration::from_millis(250) {
                             let now_screen = Instant::now();
@@ -5385,17 +5982,25 @@ fn drive_ui_host_session_with_audio(
                                         capture_suspended,
                                     },
                                 ) {
-                                    pending_display_tx.push_back(payload);
-                                    while pending_display_tx.len() > 64 {
-                                        pending_display_tx.pop_front();
-                                    }
+                                    pending_display_tx.set_screen_state(payload);
                                 }
                             }
                             last_reported_screen_state = Some(cur_state);
 
-                            if prefer_hardware
+                            if terminal_lock_gate.on_screen_lock_observed(screen_locked)
+                                && use_owner_terminals
+                                && current_tool_perms.allow_terminal
+                            {
+                                if let Some(state_payload) =
+                                    encode_terminal_lock_state(true, &terminal_lock_gate)
+                                {
+                                    pending_display_tx.set_terminal_lock(state_payload);
+                                }
+                            }
+
+                            if !host.is_media_paused()
+                                && prefer_hardware
                                 && capture_suspended
-                                && !screen_locked
                                 && crate::platform::is_display_asleep()
                             {
                                 mid_session_wake.maybe_spawn(now_screen, || {
@@ -5419,35 +6024,36 @@ fn drive_ui_host_session_with_audio(
                         } else {
                             pending_file_tx.clear();
                         }
-                        if flush_tool_channel_with_retry(
-                            &mut pending_term_tx,
-                            MAX_TOOL_FRAMES_PER_TICK,
-                            |n| {
-                                if use_owner_terminals {
-                                    owner_terminals.engine.poll_outgoing(n)
-                                } else {
-                                    guest_term_host.poll_outgoing(n)
-                                }
-                            },
-                            |frame| host.send_tool_message(TOOL_CHANNEL_TERMINAL, frame),
-                        ) {
-                            tools_busy = true;
-                        }
-                        if !use_owner_terminals {
+                        if current_tool_perms.allow_terminal && use_owner_terminals {
+                            if terminal_lock_gate.is_locked() {
+                                pending_term_tx.clear();
+                                owner_terminals.sync_auth_and_poll(auth_state);
+                            } else if flush_tool_channel_with_retry(
+                                &mut pending_term_tx,
+                                MAX_TOOL_FRAMES_PER_TICK,
+                                |n| owner_terminals.engine.poll_outgoing(n),
+                                |frame| host.send_tool_message(TOOL_CHANNEL_TERMINAL, frame),
+                            ) {
+                                tools_busy = true;
+                            }
+                        } else {
+                            pending_term_tx.clear();
                             owner_terminals.sync_auth_and_poll(auth_state);
                         }
-                        if flush_tool_channel_with_retry(
-                            &mut pending_portmap_tx,
-                            MAX_TOOL_FRAMES_PER_TICK,
-                            |n| portmap_host.poll_outgoing(n),
-                            |frame| host.send_tool_message(TOOL_CHANNEL_PORTMAP, frame),
-                        ) {
-                            tools_busy = true;
+                        if current_tool_perms.allow_port_map {
+                            if flush_tool_channel_with_retry(
+                                &mut pending_portmap_tx,
+                                MAX_TOOL_FRAMES_PER_TICK,
+                                |n| portmap_host.poll_outgoing(n),
+                                |frame| host.send_tool_message(TOOL_CHANNEL_PORTMAP, frame),
+                            ) {
+                                tools_busy = true;
+                            }
+                        } else {
+                            pending_portmap_tx.clear();
                         }
-                        if flush_tool_channel_with_retry_checked(
-                            &mut pending_display_tx,
+                        if pending_display_tx.flush(
                             MAX_TOOL_FRAMES_PER_TICK,
-                            |_| Vec::new(),
                             |frame| host.send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, frame),
                             |e| matches!(e, rc_types::Error::InvalidConfig(_)),
                         ) {
@@ -5683,11 +6289,11 @@ fn drive_ui_host_session_with_audio(
                             hardware_media_active,
                             still_refine.stream_epoch(),
                         ) {
-                            pending_display_tx.push_back(payload);
+                            pending_display_tx.set_caps(payload);
                         }
                         if prefer_hardware && hardware_video_active {
                             if let Some(dp) = encode_host_displays_state(active_display_id) {
-                                pending_display_tx.push_back(dp);
+                                pending_display_tx.push_transient(dp);
                             }
                         }
                         if update_worker.has_active_or_pending_relay() {
@@ -5704,6 +6310,7 @@ fn drive_ui_host_session_with_audio(
                             crate::platform::is_screen_locked(),
                             host.is_capture_suspended(),
                         );
+                        terminal_lock_gate.on_screen_lock_observed(resumed_screen_state.0);
                         // 断线恢复后无条件重发一次最新状态（含 `(false, false)`），避免对端卡死在断线前收到的锁屏/挂起提示。
                         if let Some(payload) =
                             display_ctrl::encode_display_ctrl(&DisplayControlMsg::HostScreenState {
@@ -5711,7 +6318,7 @@ fn drive_ui_host_session_with_audio(
                                 capture_suspended: resumed_screen_state.1,
                             })
                         {
-                            pending_display_tx.push_back(payload);
+                            pending_display_tx.set_screen_state(payload);
                         }
                         last_reported_screen_state = Some(resumed_screen_state);
                         last_screen_state_check = Instant::now();
@@ -5728,7 +6335,12 @@ fn drive_ui_host_session_with_audio(
                         if let Some(perm_payload) =
                             encode_tool_permissions_state(current_tool_perms)
                         {
-                            pending_display_tx.push_back(perm_payload);
+                            pending_display_tx.set_tool_perms(perm_payload);
+                        }
+                        if let Some(term_lock_payload) =
+                            encode_terminal_lock_state(use_owner_terminals, &terminal_lock_gate)
+                        {
+                            pending_display_tx.set_terminal_lock(term_lock_payload);
                         }
                         emit_peer_connected(host, &host.peer_addr().to_string(), updates);
                     }
@@ -5834,11 +6446,11 @@ fn drive_ui_host_session_with_audio(
                             hardware_media_active,
                             still_refine.stream_epoch(),
                         ) {
-                            pending_display_tx.push_back(payload);
+                            pending_display_tx.set_caps(payload);
                         }
                         if prefer_hardware && hardware_video_active {
                             if let Some(dp) = encode_host_displays_state(active_display_id) {
-                                pending_display_tx.push_back(dp);
+                                pending_display_tx.push_transient(dp);
                             }
                         }
                         update_worker.reset();
@@ -5862,11 +6474,14 @@ fn drive_ui_host_session_with_audio(
                                     capture_suspended: replaced_screen_state.1,
                                 },
                             ) {
-                                pending_display_tx.push_back(payload);
+                                pending_display_tx.set_screen_state(payload);
                             }
                         }
                         last_reported_screen_state = Some(replaced_screen_state);
                         last_screen_state_check = Instant::now();
+                        terminal_lock_gate = TerminalLockGate::new(replaced_screen_state.0);
+                        terminal_verify_driver = TerminalVerifyDriver::new();
+                        last_terminal_lock_prompt_sent = None;
                         current_tool_perms = compute_effective_tool_permissions(
                             host.authenticated_owner().is_some(),
                             allow_assist_file_transfer.load(Ordering::Acquire),
@@ -5876,7 +6491,7 @@ fn drive_ui_host_session_with_audio(
                         if let Some(perm_payload) =
                             encode_tool_permissions_state(current_tool_perms)
                         {
-                            pending_display_tx.push_back(perm_payload);
+                            pending_display_tx.set_tool_perms(perm_payload);
                         }
                         file_worker = FileHostWorker::spawn(Arc::clone(&file_transfer_dir));
                         if use_owner_terminals {
@@ -5891,6 +6506,11 @@ fn drive_ui_host_session_with_audio(
                             }
                             None => false,
                         };
+                        if let Some(term_lock_payload) =
+                            encode_terminal_lock_state(use_owner_terminals, &terminal_lock_gate)
+                        {
+                            pending_display_tx.set_terminal_lock(term_lock_payload);
+                        }
                         portmap_host = PortMapHostEngine::new();
                         emit_peer_connected(host, &host.peer_addr().to_string(), updates);
                     }
@@ -9897,14 +10517,18 @@ mod tests {
         );
         assert_eq!(
             compute_effective_tool_permissions(false, true),
-            rc_session::ToolPermissions::all_allowed()
+            rc_session::ToolPermissions {
+                allow_file_transfer: true,
+                allow_terminal: false,
+                allow_port_map: false,
+            }
         );
         assert_eq!(
             compute_effective_tool_permissions(false, false),
             rc_session::ToolPermissions {
                 allow_file_transfer: false,
-                allow_terminal: true,
-                allow_port_map: true,
+                allow_terminal: false,
+                allow_port_map: false,
             }
         );
 
@@ -9954,8 +10578,8 @@ mod tests {
                 m,
                 DisplayControlMsg::ToolPermissionsState {
                     allow_file_transfer: true,
-                    allow_terminal: true,
-                    allow_port_map: true,
+                    allow_terminal: false,
+                    allow_port_map: false,
                 }
             )
         });
@@ -9964,10 +10588,11 @@ mod tests {
                 m,
                 DisplayControlMsg::ToolPermissionsState {
                     allow_file_transfer: true,
-                    ..
+                    allow_terminal: false,
+                    allow_port_map: false,
                 }
             )),
-            "entering Streaming must push initial ToolPermissionsState(true): {init_msgs:?}"
+            "entering Streaming must push initial ToolPermissionsState(file=true,term=false,pm=false): {init_msgs:?}"
         );
 
         // 运行期热关闭协助文件传输，会话不中断且立即推送 ToolPermissionsState(false)。
@@ -9977,8 +10602,8 @@ mod tests {
                 m,
                 DisplayControlMsg::ToolPermissionsState {
                     allow_file_transfer: false,
-                    allow_terminal: true,
-                    allow_port_map: true,
+                    allow_terminal: false,
+                    allow_port_map: false,
                 }
             )
         });
@@ -10526,5 +11151,313 @@ mod tests {
 
         stop_flag.store(true, Ordering::Release);
         let _ = driver.join().expect("join host driver");
+    }
+
+    #[test]
+    fn build_host_p2p_candidates_filters_cross_site_private_lan_addrs() {
+        let cross_site = RelayIncoming {
+            session_id: "host-cross".to_string(),
+            relay_addr: "192.0.2.10:21117".to_string(),
+            relay_token: "tok".to_string(),
+            peer_id: "111222333".to_string(),
+            self_public_addr: Some("198.51.100.10:50000".to_string()),
+            peer_public_addr: Some("203.0.113.20:60000".to_string()),
+            peer_public_addrs: vec!["203.0.113.20:60000".to_string()],
+            peer_lan_addrs: vec![
+                "192.168.1.10:9901".to_string(),
+                "172.16.5.20:9901".to_string(),
+                "203.0.113.21:45000".to_string(),
+                "[2001:db8::99]:9901".to_string(),
+            ],
+            self_nat_type: crate::nat::NatType::SymmetricRandom,
+            peer_nat_type: crate::nat::NatType::SymmetricRandom,
+            ..RelayIncoming::default()
+        };
+        let cands = build_host_p2p_candidates(&cross_site);
+        assert_eq!(
+            cands.peer_lan_addrs,
+            vec![
+                "203.0.113.21:45000".to_string(),
+                "[2001:db8::99]:9901".to_string(),
+            ]
+        );
+
+        let cross_family = RelayIncoming {
+            self_public_addr: Some("[2001:db8::10]:50000".to_string()),
+            peer_public_addr: Some("203.0.113.20:60000".to_string()),
+            peer_public_addrs: vec!["203.0.113.20:60000".to_string()],
+            ..cross_site
+        };
+        let cands_cf = build_host_p2p_candidates(&cross_family);
+        assert_eq!(cands_cf.peer_lan_addrs.len(), 4);
+    }
+
+    #[test]
+    fn terminal_lock_gate_respects_initial_lock_unlock_and_mid_session_relock_without_interrupt() {
+        // 1) 初始锁屏：进入待校验态；期间观察到屏幕仍锁屏不变化；物理/桌面解锁后自动放行；
+        //    之后被控期间中途重新锁屏绝不重新锁定终端（「被控期间锁屏不影响正常使用」）。
+        let mut gate = TerminalLockGate::new(true);
+        assert!(gate.is_locked());
+        assert!(!gate.on_screen_lock_observed(true));
+        assert!(gate.is_locked());
+        assert!(gate.on_screen_lock_observed(false));
+        assert!(!gate.is_locked());
+        assert!(!gate.on_screen_lock_observed(true));
+        assert!(!gate.is_locked());
+
+        // 2) 初始锁屏：系统密码核验通过后直接放行，再次核验幂等返回 false；中途锁屏仍放行。
+        let mut verified_gate = TerminalLockGate::new(true);
+        assert!(verified_gate.on_verified_ok());
+        assert!(!verified_gate.is_locked());
+        assert!(!verified_gate.on_verified_ok());
+        assert!(!verified_gate.on_screen_lock_observed(true));
+        assert!(!verified_gate.is_locked());
+
+        // 3) 初始未锁屏：全程保持放行，即使中途锁屏也不拦截。
+        let mut unlocked_gate = TerminalLockGate::new(false);
+        assert!(!unlocked_gate.is_locked());
+        assert!(!unlocked_gate.on_screen_lock_observed(true));
+        assert!(!unlocked_gate.is_locked());
+    }
+
+    #[test]
+    fn terminal_unlock_rate_limiter_enforces_tiered_cooldown_and_resets_on_success() {
+        let mut limiter = TerminalUnlockRateLimiter::default();
+        let t0 = Instant::now();
+        assert_eq!(limiter.retry_after_secs(t0), 0);
+
+        for i in 1..=4 {
+            assert_eq!(
+                limiter.record_failure(t0),
+                0,
+                "failure #{i} must not trigger cooldown yet"
+            );
+            assert_eq!(limiter.retry_after_secs(t0), 0);
+        }
+
+        // 第 5 次失败触发 30s 冷却。
+        assert_eq!(limiter.record_failure(t0), 30);
+        assert_eq!(limiter.retry_after_secs(t0), 30);
+        assert!(limiter.retry_after_secs(t0 + Duration::from_secs(29)) >= 1);
+        assert_eq!(limiter.retry_after_secs(t0 + Duration::from_secs(30)), 0);
+
+        // 第 10 次触发 60s，第 15 次触发 120s。
+        for _ in 6..=9 {
+            let _ = limiter.record_failure(t0);
+        }
+        assert_eq!(limiter.record_failure(t0), 60);
+        for _ in 11..=14 {
+            let _ = limiter.record_failure(t0);
+        }
+        assert_eq!(limiter.record_failure(t0), 120);
+
+        // 成功后立即清零计数与冷却。
+        limiter.record_success();
+        assert_eq!(limiter.retry_after_secs(t0), 0);
+        assert_eq!(limiter.record_failure(t0), 0);
+    }
+
+    #[test]
+    fn terminal_lock_gate_blocks_terminal_frames_until_unlocked() {
+        let mut locked_gate = TerminalLockGate::new(true);
+        let mut driver = TerminalVerifyDriver::new();
+        let mut tx = HostDisplayCtrlOutbox::new();
+
+        // 非 Owner 请求必须被拒绝，且不会解除 gate。
+        handle_terminal_unlock_request(
+            false,
+            display_ctrl::RedactedSecret("pass123".to_string()),
+            None,
+            &locked_gate,
+            &mut driver,
+            &mut tx,
+        );
+        let denied = tx
+            .queue
+            .pop_front()
+            .and_then(|b| display_ctrl::decode_display_ctrl(&b))
+            .expect("must emit TerminalUnlockResult");
+        assert!(matches!(
+            denied,
+            DisplayControlMsg::TerminalUnlockResult { ok: false, .. }
+        ));
+        assert!(locked_gate.is_locked());
+
+        // 模拟密码通过后直接放行，再次请求幂等成功。
+        assert!(locked_gate.on_verified_ok());
+        handle_terminal_unlock_request(
+            true,
+            display_ctrl::RedactedSecret("pass123".to_string()),
+            None,
+            &locked_gate,
+            &mut driver,
+            &mut tx,
+        );
+        let ok_res = tx
+            .queue
+            .pop_front()
+            .and_then(|b| display_ctrl::decode_display_ctrl(&b))
+            .expect("must emit ok TerminalUnlockResult");
+        assert!(matches!(
+            ok_res,
+            DisplayControlMsg::TerminalUnlockResult { ok: true, .. }
+        ));
+        let ok_state = tx
+            .sticky_terminal_lock
+            .take()
+            .and_then(|b| display_ctrl::decode_display_ctrl(&b))
+            .expect("must emit TerminalLockState");
+        assert!(matches!(
+            ok_state,
+            DisplayControlMsg::TerminalLockState {
+                required: false,
+                unlocked: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn host_display_ctrl_outbox_preserves_sticky_slots_under_burst_and_backpressure() {
+        let mut outbox = HostDisplayCtrlOutbox::new();
+        outbox.set_tool_perms(b"perms-v1".to_vec());
+        outbox.set_tool_perms(b"perms-v2".to_vec());
+        outbox.set_terminal_lock(b"lock-latest".to_vec());
+        outbox.set_screen_state(b"screen-latest".to_vec());
+        outbox.set_caps(b"caps-latest".to_vec());
+
+        // 推入超过 64 条瞬态消息，绝不能挤掉 4 个粘性状态槽。
+        for i in 0..100u32 {
+            outbox.push_transient(format!("transient-{i}").into_bytes());
+        }
+        assert_eq!(outbox.queue.len(), DISPLAY_CTRL_QUEUE_CAP);
+
+        // 模拟首次发送 screen-latest 时触发背压失败（保留全部粘性槽位与队列队首）。
+        let mut fail_screen = true;
+        let sent_first = outbox.flush(
+            8,
+            |frame| -> std::result::Result<(), &'static str> {
+                if fail_screen && frame == b"screen-latest" {
+                    fail_screen = false;
+                    Err("backpressure")
+                } else {
+                    Ok(())
+                }
+            },
+            |_| false,
+        );
+        assert!(sent_first);
+        // perms 与 lock 已发，screen 因背压保留在 sticky_screen_state，caps 也仍在。
+        assert!(outbox.sticky_tool_perms.is_none());
+        assert!(outbox.sticky_terminal_lock.is_none());
+        assert_eq!(
+            outbox.sticky_screen_state.as_deref(),
+            Some(b"screen-latest".as_slice())
+        );
+        assert_eq!(
+            outbox.sticky_caps.as_deref(),
+            Some(b"caps-latest".as_slice())
+        );
+
+        // 第二轮背压恢复，应先发出保留的 screen-latest 与 caps-latest，再发队列中的 transient-36..。
+        let mut flushed = Vec::new();
+        assert!(outbox.flush(
+            8,
+            |frame| -> std::result::Result<(), &'static str> {
+                flushed.push(frame);
+                Ok(())
+            },
+            |_| false,
+        ));
+        assert_eq!(flushed[0], b"screen-latest");
+        assert_eq!(flushed[1], b"caps-latest");
+        assert_eq!(flushed[2], b"transient-36");
+    }
+
+    #[test]
+    fn stale_verify_failure_after_physical_unlock_neither_penalizes_nor_emits_result() {
+        let mut gate = TerminalLockGate::new(true);
+        // 先物理解锁，使 gate 变为已放行态。
+        assert!(gate.on_screen_lock_observed(false));
+        assert!(!gate.is_locked());
+
+        let t0 = Instant::now();
+        assert_eq!(
+            global_terminal_unlock_limiter()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retry_after_secs(t0),
+            0
+        );
+
+        let mut outbox = HostDisplayCtrlOutbox::new();
+        handle_terminal_verify_completion(Ok(false), true, &mut gate, &mut outbox);
+
+        // 既不发 TerminalUnlockResult（既不误报失败也不误发 ok=true），也不累计限流失败；仅同步已解锁状态。
+        assert!(outbox.queue.is_empty());
+        let state = outbox
+            .sticky_terminal_lock
+            .take()
+            .and_then(|b| display_ctrl::decode_display_ctrl(&b))
+            .expect("must refresh unlocked TerminalLockState");
+        assert!(matches!(
+            state,
+            DisplayControlMsg::TerminalLockState {
+                required: false,
+                unlocked: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            global_terminal_unlock_limiter()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retry_after_secs(Instant::now()),
+            0
+        );
+
+        // 物理解锁后若有迟到的 TerminalUnlockRequest（未经过密码核验）抵达，
+        // 绝不得误发 TerminalUnlockResult { ok: true } 导致客户端保存未校验密码，仅同步 TerminalLockState。
+        let mut driver = TerminalVerifyDriver::new();
+        handle_terminal_unlock_request(
+            true,
+            display_ctrl::RedactedSecret("wrong-or-unverified".to_string()),
+            None,
+            &gate,
+            &mut driver,
+            &mut outbox,
+        );
+        assert!(outbox.queue.is_empty());
+        let state2 = outbox
+            .sticky_terminal_lock
+            .take()
+            .and_then(|b| display_ctrl::decode_display_ctrl(&b))
+            .expect("must still emit refreshed unlocked TerminalLockState");
+        assert!(matches!(
+            state2,
+            DisplayControlMsg::TerminalLockState {
+                required: false,
+                unlocked: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn requested_username_matches_current_rejects_mismatch_only() {
+        assert!(requested_username_matches_current(None, Some("alice")));
+        assert!(requested_username_matches_current(
+            Some("  "),
+            Some("alice")
+        ));
+        assert!(requested_username_matches_current(Some("bob"), None));
+        assert!(requested_username_matches_current(
+            Some(" alice "),
+            Some("alice")
+        ));
+        assert!(!requested_username_matches_current(
+            Some("bob"),
+            Some("alice")
+        ));
     }
 }

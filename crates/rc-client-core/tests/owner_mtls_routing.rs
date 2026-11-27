@@ -1199,39 +1199,40 @@ fn owner_background_terminals_persist_across_reconnect_and_isolate_guests() {
         "guest negotiate failed: {guest_neg:?}"
     );
 
-    let guest_tools = guest.tools();
-    guest_tools.terminal_list().expect("guest list");
-    let mut guest_listed = None;
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline && guest_listed.is_none() {
-        while let Some(ev) = guest.try_recv_terminal_event() {
-            if let TerminalEvent::SessionList { sessions } = ev {
-                guest_listed = Some(sessions);
-            }
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    // Guest receives ToolPermissionsUpdated restricting terminal & portmap while keeping file transfer.
+    let has_guest_perms = |u: &SessionUpdate| {
+        matches!(
+            u,
+            SessionUpdate::ToolPermissionsUpdated(p)
+                if p.allow_file_transfer && !p.allow_terminal && !p.allow_port_map
+        )
+    };
+    let guest_perms = if guest_neg.iter().any(&has_guest_perms) {
+        guest_neg
+    } else {
+        collect_client_until(&guest, Duration::from_secs(6), |us| {
+            us.iter().any(&has_guest_perms)
+        })
+    };
     assert!(
-        guest_listed.expect("guest SessionList").is_empty(),
-        "non-owner guest must never see owner's persistent terminals"
+        guest_perms.iter().any(has_guest_perms),
+        "guest must receive ToolPermissionsUpdated disabling terminal and portmap: {guest_perms:?}"
     );
-
-    // Guest opens a session-scoped terminal, then disconnects (guest terminal must not leak to owner).
-    let guest_tid = guest_tools.terminal_open(80, 24).expect("guest open");
-    let mut guest_opened = false;
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline && !guest_opened {
-        while let Some(ev) = guest.try_recv_terminal_event() {
-            if matches!(
-                ev,
-                TerminalEvent::Opened { term_id, ok: true, .. } if term_id == guest_tid
-            ) {
-                guest_opened = true;
-            }
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(guest_opened);
+    let guest_tools = guest.tools();
+    assert!(
+        guest_tools.terminal_list().is_err(),
+        "non-owner guest must be blocked from terminal_list"
+    );
+    assert!(
+        guest_tools.terminal_open(80, 24).is_err(),
+        "non-owner guest must be blocked from terminal_open"
+    );
+    assert!(
+        guest_tools
+            .portmap_add("guest-pm".to_string(), 18081, "127.0.0.1".to_string(), 80)
+            .is_err(),
+        "non-owner guest must be blocked from portmap_add"
+    );
     drain_host_updates(&host);
     guest.send(SessionCommand::Disconnect);
     guest.join();

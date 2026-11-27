@@ -1252,9 +1252,76 @@ fn inproc_p2p_unreachable_falls_back_seamlessly_to_tcp_relay() {
     drop((dead_sock_a, dead_sock_b));
 }
 
+fn make_test_owner_auth(
+    session_id: &str,
+) -> (
+    std::sync::Arc<dyn rc_session::auth::OwnerTicketVerifier>,
+    rc_client_core::cert_manager::OwnerGrantPayload,
+    std::sync::Arc<dyn rc_session::auth::OwnerTicketSigner>,
+) {
+    use rc_client_core::cert_manager::{
+        owner_grant_signing_message, OwnerGrantPayload, RcOwnerTicketSigner, RcOwnerTicketVerifier,
+    };
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let hex_lower = |bytes: &[u8]| -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(&mut s, "{b:02x}");
+        }
+        s
+    };
+
+    let rng = SystemRandom::new();
+    let srv_pk8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("gen server key");
+    let srv_kp = Ed25519KeyPair::from_pkcs8(srv_pk8.as_ref()).expect("server keypair");
+    let srv_pub_hex = hex_lower(srv_kp.public_key().as_ref());
+
+    let caller_pk8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("gen caller key");
+    let caller_kp = Ed25519KeyPair::from_pkcs8(caller_pk8.as_ref()).expect("caller keypair");
+    let caller_pub_hex = hex_lower(caller_kp.public_key().as_ref());
+
+    let verifier: Arc<dyn rc_session::auth::OwnerTicketVerifier> = Arc::new(
+        RcOwnerTicketVerifier::new(
+            &srv_pub_hex,
+            "owner-uid".to_string(),
+            "200000002".to_string(),
+        )
+        .expect("verifier"),
+    );
+
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut grant = OwnerGrantPayload {
+        ticket_id: "aa".repeat(16),
+        user_id: "owner-uid".to_string(),
+        caller_device_id: "100000001".to_string(),
+        caller_pubkey_hex: caller_pub_hex,
+        target_device_id: "200000002".to_string(),
+        session_id: session_id.to_string(),
+        expires_at_unix_sec: now_unix + 300,
+        signature_hex: String::new(),
+    };
+    let msg = owner_grant_signing_message(&grant).expect("signing msg");
+    grant.signature_hex = hex_lower(srv_kp.sign(&msg).as_ref());
+    let signer: Arc<dyn rc_session::auth::OwnerTicketSigner> = Arc::new(
+        RcOwnerTicketSigner::new(grant.clone(), caller_pk8.as_ref().to_vec()).expect("signer"),
+    );
+
+    (verifier, grant, signer)
+}
+
 #[test]
 fn inproc_tools_file_terminal_and_portmap_work_end_to_end_over_session() {
     use rc_tools::{FileEvent, TransferStatus};
+
+    let (owner_verifier, owner_grant, owner_signer) = make_test_owner_auth("tools-e2e-owner");
 
     let mut host = HostHandle::spawn(UiHostConfig {
         listen_addr: "127.0.0.1:0".parse().expect("loopback"),
@@ -1266,13 +1333,14 @@ fn inproc_tools_file_terminal_and_portmap_work_end_to_end_over_session() {
         auto_rotate_password: false,
         clipboard_enabled: false,
         audio_enabled: false,
+        owner_verifier: Some(owner_verifier),
         ..UiHostConfig::default()
     })
     .expect("spawn host");
 
     let session = SessionHandle::spawn(UiSessionConfig {
         connect_addr: host.listen_addr(),
-        password: Some("TOOLS2026".to_string()),
+        password: None,
         watch_only: false,
         width: 64,
         height: 64,
@@ -1283,6 +1351,8 @@ fn inproc_tools_file_terminal_and_portmap_work_end_to_end_over_session() {
         audio_enabled: true,
         relay_grant: None,
         force_relay: false,
+        owner_grant: Some(owner_grant),
+        owner_signer: Some(owner_signer),
         ..UiSessionConfig::default()
     });
 
@@ -1629,6 +1699,8 @@ fn inproc_p2p_split_brain_handshake_drop_falls_back_to_tcp_relay() {
 
 #[test]
 fn inproc_tools_validation_rejects_bad_terminal_args_and_duplicate_portmap_port() {
+    let (owner_verifier, owner_grant, owner_signer) = make_test_owner_auth("tools-val-owner");
+
     let mut host = HostHandle::spawn(UiHostConfig {
         listen_addr: "127.0.0.1:0".parse().expect("loopback"),
         password: Some("VALID2026".to_string()),
@@ -1639,13 +1711,14 @@ fn inproc_tools_validation_rejects_bad_terminal_args_and_duplicate_portmap_port(
         auto_rotate_password: false,
         clipboard_enabled: false,
         audio_enabled: false,
+        owner_verifier: Some(owner_verifier),
         ..UiHostConfig::default()
     })
     .expect("spawn host");
 
     let session = SessionHandle::spawn(UiSessionConfig {
         connect_addr: host.listen_addr(),
-        password: Some("VALID2026".to_string()),
+        password: None,
         watch_only: false,
         width: 64,
         height: 64,
@@ -1656,6 +1729,8 @@ fn inproc_tools_validation_rejects_bad_terminal_args_and_duplicate_portmap_port(
         audio_enabled: false,
         relay_grant: None,
         force_relay: false,
+        owner_grant: Some(owner_grant),
+        owner_signer: Some(owner_signer),
         ..UiSessionConfig::default()
     });
 
