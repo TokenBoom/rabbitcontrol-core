@@ -1189,6 +1189,8 @@ fn inproc_p2p_unreachable_falls_back_seamlessly_to_tcp_relay() {
         peer_public_addr: Some(format!("127.0.0.1:{dead_port_a}")),
         peer_lan_addrs: Vec::new(),
         local_udp_port: None,
+        self_nat_type: rc_client_core::nat::NatType::Cone,
+        peer_nat_type: rc_client_core::nat::NatType::Cone,
         ..RelayIncoming::default()
     });
 
@@ -1212,6 +1214,8 @@ fn inproc_p2p_unreachable_falls_back_seamlessly_to_tcp_relay() {
             peer_public_addr: Some(format!("127.0.0.1:{dead_port_b}")),
             peer_lan_addrs: Vec::new(),
             local_udp_port: None,
+            self_nat_type: rc_client_core::nat::NatType::Cone,
+            peer_nat_type: rc_client_core::nat::NatType::Cone,
             ..ConnectGrant::default()
         }),
         ..UiSessionConfig::default()
