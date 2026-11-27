@@ -189,9 +189,26 @@ jobs:
             --release-id "${RELEASE_ID}" \
             --file dist/release-manifest.json
 
+      - name: Check GitHub App dispatch credentials
+        id: app-cfg
+        env:
+          HAS_APP_ID: ${{ secrets.RELEASE_APP_ID != '' }}
+          HAS_APP_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [ "${HAS_APP_ID}" != "${HAS_APP_KEY}" ]; then
+            echo "::error::RELEASE_APP_ID and RELEASE_APP_PRIVATE_KEY must both be configured."
+            exit 1
+          fi
+          if [ "${HAS_APP_ID}" = "true" ]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Generate GitHub App dispatch token
         id: app-token
-        if: ${{ secrets.RELEASE_APP_ID != '' && secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+        if: steps.app-cfg.outputs.enabled == 'true'
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
@@ -204,8 +221,7 @@ jobs:
       - name: Dispatch downstream platform builds
         env:
           DISPATCH_TOKEN: ${{ steps.app-token.outputs.token }}
-          HAS_APP_ID: ${{ secrets.RELEASE_APP_ID != '' }}
-          HAS_APP_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+          APP_ENABLED: ${{ steps.app-cfg.outputs.enabled }}
           CORE_TAG: ${{ steps.resolve.outputs.tag }}
           CORE_VERSION: ${{ steps.manifest.outputs.version }}
           CORE_COMMIT: ${{ steps.resolve.outputs.tag_commit }}
@@ -217,12 +233,8 @@ jobs:
           EXPECTED_PLATFORMS_JSON: ${{ steps.resolve.outputs.expected_platforms_json }}
         run: |
           set -euo pipefail
-          if [ "${HAS_APP_ID}" != "${HAS_APP_KEY}" ]; then
-            echo "::error::RELEASE_APP_ID and RELEASE_APP_PRIVATE_KEY must both be configured."
-            exit 1
-          fi
           if [ -z "${DISPATCH_TOKEN}" ]; then
-            if [ "${HAS_APP_ID}" = "true" ]; then
+            if [ "${APP_ENABLED}" = "true" ]; then
               echo "::error::GitHub App dispatch token generation yielded an empty token."
               exit 1
             fi
