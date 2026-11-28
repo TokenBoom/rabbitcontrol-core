@@ -72,11 +72,14 @@ pub const PUNCH_V2_PACKET_LEN: usize = 48;
 /// `RCP2 v2` `flags` 字段确认位掩码（`bit 0 = Ack`）。
 pub const PUNCH_V2_FLAG_ACK: u8 = 0x01;
 
-/// `RCP2 v2` 单源 IP 回复 Ack 的最小限频间隔（严格 1.0x 等长 48B 回复，防反射放大）。
+/// `RCP2 v2` 单对端端点（`SocketAddr`）回复 Ack 的最小限频间隔（严格 1.0x 等长 48B 回复，防反射放大）。
 const ACK_RATE_MIN_INTERVAL: Duration = Duration::from_millis(20);
 
-/// `RCP2 v2` 单源 IP 限频表最大跟踪 IP 数。
-const MAX_ACK_RATE_TRACKED_IPS: usize = 128;
+/// `RCP2 v2` 限频表最大跟踪对端 `SocketAddr` 数量。
+const MAX_ACK_RATE_TRACKED_ENDPOINTS: usize = 128;
+
+/// 跨不同公网出口时作为低优先级兜底保留的私网/CGNAT `SocketAddr` 最大数量（支持 VPN/专线/单向可访内网）。
+const MAX_CROSS_SITE_PRIVATE_LAN_FALLBACK: usize = 4;
 
 /// 默认 UDP 打洞超时（超时后上层回退 TCP 中继）。
 pub const DEFAULT_PUNCH_TIMEOUT: Duration = Duration::from_millis(2_400);
@@ -723,27 +726,27 @@ struct AuxPunchSocket {
 
 #[derive(Default)]
 struct AckRateLimiter {
-    last_reply_by_ip: HashMap<IpAddr, Instant>,
+    last_reply_by_endpoint: HashMap<SocketAddr, Instant>,
 }
 
 impl AckRateLimiter {
-    fn allow_reply(&mut self, ip: IpAddr, now: Instant) -> bool {
-        let canon_ip = canonicalize_ip(ip);
-        if let Some(&last) = self.last_reply_by_ip.get(&canon_ip) {
+    fn allow_reply(&mut self, addr: SocketAddr, now: Instant) -> bool {
+        let canon_addr = canonicalize_socket_addr(addr);
+        if let Some(&last) = self.last_reply_by_endpoint.get(&canon_addr) {
             if now.saturating_duration_since(last) < ACK_RATE_MIN_INTERVAL {
                 return false;
             }
-        } else if self.last_reply_by_ip.len() >= MAX_ACK_RATE_TRACKED_IPS {
-            if let Some(oldest_ip) = self
-                .last_reply_by_ip
+        } else if self.last_reply_by_endpoint.len() >= MAX_ACK_RATE_TRACKED_ENDPOINTS {
+            if let Some(oldest_addr) = self
+                .last_reply_by_endpoint
                 .iter()
                 .min_by_key(|(_, ts)| *ts)
                 .map(|(k, _)| *k)
             {
-                self.last_reply_by_ip.remove(&oldest_ip);
+                self.last_reply_by_endpoint.remove(&oldest_addr);
             }
         }
-        self.last_reply_by_ip.insert(canon_ip, now);
+        self.last_reply_by_endpoint.insert(canon_addr, now);
         true
     }
 }
@@ -850,19 +853,43 @@ impl PunchAuthMode {
     }
 }
 
+fn is_link_local_ip(ip: IpAddr) -> bool {
+    match canonicalize_ip(ip) {
+        IpAddr::V4(v4) => {
+            v4.is_link_local() || v4.is_broadcast() || v4.octets()[0] == 0 || v4.octets()[0] >= 240
+        }
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+fn is_usable_cross_site_private_fallback(addr: SocketAddr) -> bool {
+    let canon = canonicalize_socket_addr(addr);
+    let ip = canon.ip();
+    canon.port() != 0
+        && !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !is_link_local_ip(ip)
+        && !is_routable_public_ip(ip)
+}
+
 fn has_global_v6_or_explicit_lan(candidates: &P2pCandidates, all_targets: &[SocketAddr]) -> bool {
     let has_global_v6 = all_targets
         .iter()
         .any(|addr| matches!(addr, SocketAddr::V6(v6) if is_global_unicast_ipv6(*v6.ip())));
-    let has_explicit_lan = candidates
-        .peer_lan_addrs
-        .iter()
-        .any(|raw| parse_valid_candidate_addr(raw).is_some());
+    let has_explicit_lan = candidates.peer_lan_addrs.iter().any(|raw| {
+        parse_valid_candidate_addr(raw).is_some_and(|addr| {
+            let ip = addr.ip();
+            !ip.is_multicast() && !is_link_local_ip(ip)
+        })
+    });
     has_global_v6 || has_explicit_lan
 }
 
-/// 当双端处于不同可路由公网 IP（跨站点）时，过滤掉不可达的私网/本地 LAN 候选，
-/// 同时保留全球单播 IPv6 与可路由公网 IPv4（例如 UPnP 映射公网地址）。
+/// 当双端处于不同可路由公网 IP（跨站点，如 VPN/专线/单向可访内网）时：
+/// - 先保留全部有效可路由公网 IPv4 与全球单播 IPv6 地址（例如 UPnP 映射公网地址）；
+/// - 再作为低优先级兜底追加保留最多 [`MAX_CROSS_SITE_PRIVATE_LAN_FALLBACK`]（4）条去重后的有效
+///   私网/CGNAT `SocketAddr`（拒绝端口 0、未指定、回环、链路本地 `169.254/fe80` 与组播）。
 ///
 /// 若双端同处同一公网 IP 或无法同族比较（如跨族 `v6` vs `v4`、`same_public_ip_any` 返回 `None`），
 /// 则原样返回 `lan_addrs.to_vec()`。
@@ -875,24 +902,42 @@ pub fn filter_cross_site_lan_addrs(
         return lan_addrs.to_vec();
     }
 
-    lan_addrs
-        .iter()
-        .filter(|raw| {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return false;
+    let mut out = Vec::new();
+    let mut seen_addrs: HashSet<SocketAddr> = HashSet::new();
+    let mut seen_bare_ips: HashSet<IpAddr> = HashSet::new();
+
+    for raw in lan_addrs {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(addr) = parse_valid_candidate_addr(trimmed) {
+            if is_routable_public_ip(addr.ip()) && seen_addrs.insert(addr) {
+                out.push(trimmed.to_string());
             }
-            let Ok(ip) = trimmed
-                .parse::<SocketAddr>()
-                .map(|s| s.ip())
-                .or_else(|_| trimmed.parse::<IpAddr>())
-            else {
-                return false;
-            };
-            is_routable_public_ip(ip)
-        })
-        .cloned()
-        .collect()
+        } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
+            let canon_ip = canonicalize_ip(ip);
+            if is_routable_public_ip(canon_ip) && seen_bare_ips.insert(canon_ip) {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+
+    let mut private_fallback_count = 0usize;
+    for raw in lan_addrs {
+        if private_fallback_count >= MAX_CROSS_SITE_PRIVATE_LAN_FALLBACK {
+            break;
+        }
+        let Some(addr) = parse_valid_candidate_addr(raw) else {
+            continue;
+        };
+        if is_usable_cross_site_private_fallback(addr) && seen_addrs.insert(addr) {
+            out.push(addr.to_string());
+            private_fallback_count += 1;
+        }
+    }
+
+    out
 }
 
 fn should_use_aux_sockets(self_nat: NatType, peer_nat: NatType) -> bool {
@@ -1470,12 +1515,16 @@ fn compute_p2b_swap_at(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_punch_timeout_error(
     timeout: Duration,
     candidates: &P2pCandidates,
     strategy: &PunchStrategy,
     auth: &PunchAuthMode,
     targets: &[SocketAddr],
+    actual_local_port: u16,
+    wanted_local_port: u16,
+    valid_rx_count: u32,
 ) -> String {
     let targets_diag = if targets.is_empty() {
         "0([])".to_string()
@@ -1494,7 +1543,7 @@ fn format_punch_timeout_error(
         format!("{}({listed}{suffix})", targets.len())
     };
     format!(
-        "P2P UDP 打洞超时（{timeout:?} | self_nat={:?} peer_nat={:?} strategy={} auth={} targets={targets_diag}）",
+        "P2P UDP 打洞超时（{timeout:?} | self_nat={:?} peer_nat={:?} strategy={} auth={} targets={targets_diag} local={actual_local_port}(want={wanted_local_port}) rx={valid_rx_count}）",
         candidates.self_nat_type,
         candidates.peer_nat_type,
         strategy.label(),
@@ -1561,6 +1610,9 @@ fn punch_udp_pair_with_lease(
         targets,
         socket_is_ipv6,
     } = prepare_punch_socket_and_targets(candidates, &all_targets)?;
+    let wanted_local_port = candidates.local_udp_port.unwrap_or(0);
+    let actual_local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let mut valid_rx_count: u32 = 0;
 
     let has_ipv4 = all_targets.iter().any(SocketAddr::is_ipv4);
     let strategy = select_punch_strategy(role, candidates, &targets, socket_is_ipv6);
@@ -1894,6 +1946,7 @@ fn punch_udp_pair_with_lease(
             &target_canons,
             &mut confirmed_peer,
             &mut peer_sender_nonce,
+            &mut valid_rx_count,
             &mut socket_ref,
         )?;
         if let DrainOutcome::Ready(peer_addr) = drain_outcome {
@@ -1921,6 +1974,7 @@ fn punch_udp_pair_with_lease(
                     &target_canons,
                     &mut aux.confirmed_peer,
                     &mut aux.peer_sender_nonce,
+                    &mut valid_rx_count,
                     &mut aux_ref,
                 )
             };
@@ -1953,7 +2007,14 @@ fn punch_udp_pair_with_lease(
         let now_after = Instant::now();
         if now_after >= deadline {
             return Err(format_punch_timeout_error(
-                timeout, candidates, &strategy, &auth, &targets,
+                timeout,
+                candidates,
+                &strategy,
+                &auth,
+                &targets,
+                actual_local_port,
+                wanted_local_port,
+                valid_rx_count,
             ));
         }
 
@@ -1991,6 +2052,7 @@ impl PunchSocketOps for &UdpSocket {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_decoded_punch_packet(
     pkt: PunchPacket,
     from_addr: SocketAddr,
@@ -1998,19 +2060,19 @@ fn handle_decoded_punch_packet(
     expected_role: P2pRole,
     ack_pkt: &[u8],
     confirmed_peer: &mut Option<SocketAddr>,
+    valid_rx_count: &mut u32,
     ops: &mut dyn PunchSocketOps,
 ) -> Option<SocketAddr> {
     if pkt.session_hash != session_hash || pkt.role != expected_role {
         return None;
     }
+    *valid_rx_count = valid_rx_count.saturating_add(1);
+    *confirmed_peer = Some(from_addr);
     for _ in 0..IMMEDIATE_ACK_BURST {
         ops.send_to(ack_pkt, from_addr);
     }
     if pkt.ack {
         return Some(from_addr);
-    }
-    if confirmed_peer.is_none() {
-        *confirmed_peer = Some(from_addr);
     }
     None
 }
@@ -2049,6 +2111,7 @@ fn classify_punch_datagram(
     target_canons: &HashSet<SocketAddr>,
     confirmed_peer: &mut Option<SocketAddr>,
     peer_sender_nonce: &mut Option<[u8; 8]>,
+    valid_rx_count: &mut u32,
     ops: &mut dyn PunchSocketOps,
 ) -> Option<SocketAddr> {
     if n >= PUNCH_MAGIC.len() && &recv_buf[..PUNCH_MAGIC.len()] == PUNCH_MAGIC {
@@ -2070,6 +2133,7 @@ fn classify_punch_datagram(
                     expected_role,
                     ack_pkt,
                     confirmed_peer,
+                    valid_rx_count,
                     ops,
                 )
             }
@@ -2090,10 +2154,9 @@ fn classify_punch_datagram(
                     if pkt.echo_nonce != *local_sender_nonce {
                         return None;
                     }
+                    *valid_rx_count = valid_rx_count.saturating_add(1);
+                    *confirmed_peer = Some(from_addr);
                     *peer_sender_nonce = Some(pkt.sender_nonce);
-                    if confirmed_peer.is_none() {
-                        *confirmed_peer = Some(from_addr);
-                    }
                     // 收到合法 Ack 准备移交 QUIC 前无条件连发 IMMEDIATE_ACK_BURST 帧，避免受 20ms 限频器拦截导致单边停在打洞循环。
                     send_v2_ack_burst(
                         ops,
@@ -2109,14 +2172,14 @@ fn classify_punch_datagram(
                     if pkt.echo_nonce != [0u8; 8] {
                         return None;
                     }
-                    let was_unconfirmed = confirmed_peer.is_none();
+                    *valid_rx_count = valid_rx_count.saturating_add(1);
+                    let is_new_endpoint = confirmed_peer.map(canonicalize_socket_addr)
+                        != Some(canonicalize_socket_addr(from_addr));
+                    // 始终成对更新 (confirmed_peer, peer_sender_nonce)，避免辅 socket 销毁后切换主 socket 发生地址/nonce 错配死锁。
+                    *confirmed_peer = Some(from_addr);
                     *peer_sender_nonce = Some(pkt.sender_nonce);
-                    if was_unconfirmed {
-                        *confirmed_peer = Some(from_addr);
-                    }
-                    // 先记录本次回包时间（避免 was_unconfirmed 短路导致紧邻重复 Request 绕过 20ms 节流）。
-                    let rate_ok = rate_limiter.allow_reply(from_addr.ip(), Instant::now());
-                    if was_unconfirmed || rate_ok {
+                    let rate_ok = rate_limiter.allow_reply(from_addr, Instant::now());
+                    if is_new_endpoint || rate_ok {
                         send_v2_ack_burst(
                             ops,
                             from_addr,
@@ -2158,6 +2221,7 @@ fn drain_punch_rx(
     target_canons: &HashSet<SocketAddr>,
     confirmed_peer: &mut Option<SocketAddr>,
     peer_sender_nonce: &mut Option<[u8; 8]>,
+    valid_rx_count: &mut u32,
     ops: &mut dyn PunchSocketOps,
 ) -> Result<DrainOutcome, String> {
     let mut consecutive_transient_errors = 0usize;
@@ -2177,6 +2241,7 @@ fn drain_punch_rx(
                     target_canons,
                     confirmed_peer,
                     peer_sender_nonce,
+                    valid_rx_count,
                     ops,
                 ) {
                     return Ok(DrainOutcome::Ready(peer));
@@ -2219,6 +2284,7 @@ fn drain_punch_rx(
                                 target_canons,
                                 confirmed_peer,
                                 peer_sender_nonce,
+                                valid_rx_count,
                                 ops,
                             ) {
                                 return Ok(DrainOutcome::Ready(peer));
@@ -3339,6 +3405,7 @@ mod tests {
             ack_pkt: local_ack,
         };
         let mut peer_nonce1 = None;
+        let mut valid_rx1 = 0u32;
         let res = drain_punch_rx(
             &mut recv_buf,
             false,
@@ -3348,15 +3415,18 @@ mod tests {
             &target_canons,
             &mut confirmed_peer,
             &mut peer_nonce1,
+            &mut valid_rx1,
             &mut fake1,
         )
         .expect("transient errors followed by ACK must succeed");
         assert_eq!(res, DrainOutcome::Ready(peer_addr));
         assert_eq!(fake1.sent, IMMEDIATE_ACK_BURST);
+        assert_eq!(valid_rx1, 1);
 
         // 2) 连续超过 MAX_CONSECUTIVE_TRANSIENT_ERRORS (64) 次瞬态错误时必须主动 break，避免饿死超时/取消
         let mut confirmed_peer2 = None;
         let mut peer_nonce2 = None;
+        let mut valid_rx2 = 0u32;
         let mut fake2 = FakePunchSocket {
             peek_results: (0..100)
                 .map(|_| Err(io::Error::from(ErrorKind::Interrupted)))
@@ -3374,6 +3444,7 @@ mod tests {
             &target_canons,
             &mut confirmed_peer2,
             &mut peer_nonce2,
+            &mut valid_rx2,
             &mut fake2,
         )
         .expect("capped transient errors must break cleanly");
@@ -3383,6 +3454,7 @@ mod tests {
         // 3) 非瞬态硬错误立即向上返回 Err
         let mut confirmed_peer3 = None;
         let mut peer_nonce3 = None;
+        let mut valid_rx3 = 0u32;
         let mut fake3 = FakePunchSocket {
             peek_results: std::collections::VecDeque::from([Err(io::Error::from(
                 ErrorKind::InvalidInput,
@@ -3400,6 +3472,7 @@ mod tests {
             &target_canons,
             &mut confirmed_peer3,
             &mut peer_nonce3,
+            &mut valid_rx3,
             &mut fake3,
         )
         .unwrap_err();
@@ -3408,6 +3481,7 @@ mod tests {
         // 4) ConnectionReset 后由 recv_from 返回来自已知对端的非 RCP2（如 QUIC Initial）报文也必须返回 Ready
         let mut confirmed_peer4 = None;
         let mut peer_nonce4 = None;
+        let mut valid_rx4 = 0u32;
         let quic_initial_like = b"\xc0\x00\x00\x00\x01QUIC-INITIAL".to_vec();
         let mut fake4 = FakePunchSocket {
             peek_results: std::collections::VecDeque::from([Err(io::Error::from(
@@ -3426,6 +3500,7 @@ mod tests {
             &target_canons,
             &mut confirmed_peer4,
             &mut peer_nonce4,
+            &mut valid_rx4,
             &mut fake4,
         )
         .expect(
@@ -3436,6 +3511,7 @@ mod tests {
         // 5) ConnectionReset 清错路径中若 recv_from 返回非瞬态硬错误，不得吞错而应立即向上返回 Err
         let mut confirmed_peer5 = None;
         let mut peer_nonce5 = None;
+        let mut valid_rx5 = 0u32;
         let mut fake5 = FakePunchSocket {
             peek_results: std::collections::VecDeque::from([Err(io::Error::from(
                 ErrorKind::ConnectionReset,
@@ -3455,6 +3531,7 @@ mod tests {
             &target_canons,
             &mut confirmed_peer5,
             &mut peer_nonce5,
+            &mut valid_rx5,
             &mut fake5,
         )
         .unwrap_err();
@@ -3880,11 +3957,17 @@ mod tests {
             "127.0.0.1:50005".to_string(),
             "[fe80::1]:50006".to_string(),
             "[fd00::1]:50007".to_string(),
+            "192.168.1.20:50000".to_string(),     // 重复私网应去重
+            "0.0.0.0:50008".to_string(),          // 未指定 IP 拒绝
+            "192.168.1.21:0".to_string(),         // 0 端口拒绝
+            "224.0.0.1:50009".to_string(),        // 组播拒绝
+            "[ff02::1]:50010".to_string(),        // IPv6 组播拒绝
             "203.0.113.45:51234".to_string(),     // UPnP 公网 IPv4
             "[240e:3b0:1::10]:51235".to_string(), // 全球单播 IPv6
         ];
 
-        // 公网 IPv4 不同 -> 剔除 RFC 1918 / CGNAT / 链路本地 / 回环 / 非全球 IPv6，保留 UPnP 公网 IPv4 与全球 IPv6
+        // 公网 IPv4 不同 -> 先保留全部可路由公网 IPv4 / 全球 IPv6，再作为低优先级兜底追加最多 4 条合法私网/CGNAT 地址；
+        // 剔除 169.254/fe80 链路本地、127.0.0.1 回环、0 端口、未指定、组播与重复项。
         let filtered =
             filter_cross_site_lan_addrs(&lan, &["198.51.100.22:60000"], &["203.0.113.9:60001"]);
         assert_eq!(
@@ -3892,6 +3975,10 @@ mod tests {
             vec![
                 "203.0.113.45:51234".to_string(),
                 "[240e:3b0:1::10]:51235".to_string(),
+                "192.168.1.20:50000".to_string(),
+                "10.0.0.8:50001".to_string(),
+                "172.16.1.9:50002".to_string(),
+                "100.64.1.2:50003".to_string(),
             ]
         );
 
@@ -4058,6 +4145,7 @@ mod tests {
         let mut recv_buf = [0u8; 128];
         let mut confirmed_peer = None;
         let mut peer_sender_nonce = None;
+        let mut valid_rx = 0u32;
         let mut sock_bad = CaptureSocket {
             peek_results: std::collections::VecDeque::from([
                 Ok((bad_mac.to_vec(), peer_addr)),
@@ -4082,11 +4170,13 @@ mod tests {
             &target_canons,
             &mut confirmed_peer,
             &mut peer_sender_nonce,
+            &mut valid_rx,
             &mut sock_bad,
         )
         .unwrap();
         assert_eq!(out_bad, DrainOutcome::Continue);
         assert!(confirmed_peer.is_none());
+        assert_eq!(valid_rx, 0);
         assert!(
             sock_bad.sent_packets.is_empty(),
             "invalid packets must yield zero replies"
@@ -4114,12 +4204,14 @@ mod tests {
             &target_canons,
             &mut confirmed_peer,
             &mut peer_sender_nonce,
+            &mut valid_rx,
             &mut sock_rate,
         )
         .unwrap();
         assert_eq!(out_probe, DrainOutcome::Continue);
         assert_eq!(confirmed_peer, Some(peer_addr));
         assert_eq!(peer_sender_nonce, Some(peer_nonce));
+        assert_eq!(valid_rx, 5);
         assert_eq!(
             sock_rate.sent_packets.len(),
             IMMEDIATE_ACK_BURST,
@@ -4151,10 +4243,12 @@ mod tests {
             &target_canons,
             &mut confirmed_peer,
             &mut peer_sender_nonce,
+            &mut valid_rx,
             &mut sock_ok,
         )
         .unwrap();
         assert_eq!(out_ready, DrainOutcome::Ready(peer_addr));
+        assert_eq!(valid_rx, 6);
         assert_eq!(sock_ok.sent_packets.len(), IMMEDIATE_ACK_BURST);
         for (ack_wire, ack_dst) in &sock_ok.sent_packets {
             assert_eq!(ack_wire.len(), PUNCH_V2_PACKET_LEN);
@@ -4164,10 +4258,11 @@ mod tests {
             assert_eq!(ack_decoded.echo_nonce, peer_nonce);
         }
 
-        // 4) 即使限频表已近 期记录过同一 IP，只要尚未确认对端（confirmed_peer == None），
+        // 4) 即使限频表已近期记录过同一端点，只要尚未确认对端（confirmed_peer == None），
         //    首次合法 Request 仍必须立即回复 Ack 突发。
         let mut unconfirmed_peer = None;
         let mut unconfirmed_nonce = None;
+        let mut unconfirmed_rx = 0u32;
         let mut sock_unconfirmed = CaptureSocket {
             peek_results: std::collections::VecDeque::from([Ok((valid_probe.to_vec(), peer_addr))]),
             recv_results: std::collections::VecDeque::from([Ok((valid_probe.to_vec(), peer_addr))]),
@@ -4182,12 +4277,66 @@ mod tests {
             &target_canons,
             &mut unconfirmed_peer,
             &mut unconfirmed_nonce,
+            &mut unconfirmed_rx,
             &mut sock_unconfirmed,
         )
         .unwrap();
         assert_eq!(out_unconfirmed, DrainOutcome::Continue);
         assert_eq!(unconfirmed_peer, Some(peer_addr));
+        assert_eq!(unconfirmed_rx, 1);
         assert_eq!(sock_unconfirmed.sent_packets.len(), IMMEDIATE_ACK_BURST);
+
+        // 5) 对端从旧辅助端口（50000）迁移到同 IP 新主端口（50001）发送新 Request（携带新 sender_nonce）：
+        //    即使距 50000 仅 0ms（< 20ms），也必须成对刷新 (confirmed_peer, peer_sender_nonce) 并立即 3 帧突发回复新端口。
+        let migrated_addr: SocketAddr = "198.51.100.44:50001".parse().unwrap();
+        let migrated_nonce = [0x77u8; 8];
+        let migrated_probe = encode_punch_packet_v2(
+            P2pRole::Client,
+            false,
+            sh,
+            migrated_nonce,
+            [0u8; 8],
+            &secret,
+        );
+        let mut sock_migrated = CaptureSocket {
+            peek_results: std::collections::VecDeque::from([Ok((
+                migrated_probe.to_vec(),
+                migrated_addr,
+            ))]),
+            recv_results: std::collections::VecDeque::from([Ok((
+                migrated_probe.to_vec(),
+                migrated_addr,
+            ))]),
+            sent_packets: Vec::new(),
+        };
+        let out_migrated = drain_punch_rx(
+            &mut recv_buf,
+            false,
+            &mut auth,
+            P2pRole::Client,
+            P2pRole::Host,
+            &target_canons,
+            &mut confirmed_peer,
+            &mut peer_sender_nonce,
+            &mut valid_rx,
+            &mut sock_migrated,
+        )
+        .unwrap();
+        assert_eq!(out_migrated, DrainOutcome::Continue);
+        assert_eq!(confirmed_peer, Some(migrated_addr));
+        assert_eq!(peer_sender_nonce, Some(migrated_nonce));
+        assert_eq!(valid_rx, 7);
+        assert_eq!(
+            sock_migrated.sent_packets.len(),
+            IMMEDIATE_ACK_BURST,
+            "new endpoint on same IP must immediately burst Ack to new port without being blocked by old port's 20ms limit"
+        );
+        for (ack_wire, ack_dst) in &sock_migrated.sent_packets {
+            assert_eq!(*ack_dst, migrated_addr);
+            let ack_decoded = decode_and_verify_punch_packet_v2(ack_wire, &secret).unwrap();
+            assert_eq!(ack_decoded.flags, PUNCH_V2_FLAG_ACK);
+            assert_eq!(ack_decoded.echo_nonce, migrated_nonce);
+        }
     }
 
     #[test]
@@ -4658,9 +4807,11 @@ mod tests {
         assert_eq!(P2P_ONLY_PUNCH_TIMEOUT, Duration::from_secs(8));
 
         let blackhole_port = reserve_ephemeral_udp_port();
+        let wanted_port = reserve_ephemeral_udp_port();
         let cand = P2pCandidates {
             session_id: "diag-timeout".to_string(),
             peer_public_addr: Some(format!("127.0.0.1:{blackhole_port}")),
+            local_udp_port: Some(wanted_port),
             self_nat_type: NatType::ConeVerified,
             peer_nat_type: NatType::ConeVerified,
             punch_secret: Some("00112233445566778899aabbccddeeff".to_string()),
@@ -4673,18 +4824,30 @@ mod tests {
             err.starts_with("P2P UDP 打洞超时"),
             "unexpected timeout prefix: {err}"
         );
+        let expected_local = format!("local={wanted_port}(want={wanted_port}) rx=0");
         for needle in [
             "self_nat=ConeVerified",
             "peer_nat=ConeVerified",
             "strategy=DirectOnly",
             "auth=v2",
             "targets=1(",
+            expected_local.as_str(),
         ] {
             assert!(
                 err.contains(needle),
                 "timeout error `{err}` missing `{needle}`"
             );
         }
+
+        // AckRateLimiter 按 SocketAddr 维度限频：同 IP 不同端口互不挤占 20ms 配额
+        let mut limiter = AckRateLimiter::default();
+        let now = Instant::now();
+        let ep1: SocketAddr = "198.51.100.44:50001".parse().unwrap();
+        let ep2: SocketAddr = "198.51.100.44:50002".parse().unwrap();
+        let ep1_v6_mapped: SocketAddr = "[::ffff:198.51.100.44]:50001".parse().unwrap();
+        assert!(limiter.allow_reply(ep1, now));
+        assert!(!limiter.allow_reply(ep1_v6_mapped, now));
+        assert!(limiter.allow_reply(ep2, now));
     }
 
     #[test]

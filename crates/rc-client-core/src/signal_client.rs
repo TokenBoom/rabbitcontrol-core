@@ -17,7 +17,7 @@ use std::net::{
     UdpSocket,
 };
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -4589,21 +4589,78 @@ impl Drop for SlotPortHold {
     }
 }
 
-/// P2P 打洞与直连期间持有的本地 UDP 端口暂停租约（三平台统一独占释放/恢复探测套接字）。
-pub(crate) struct LocalUdpPortHoldGuard(#[allow(dead_code)] Option<SlotPortHold>);
+/// 跨进程 UDP 端口租约外部回调钩子：当本进程 `ACTIVE_UDP_PROBE_SLOTS` 未持有指定端口时，
+/// 由平台宿主层（如 `rc-host-agent` / `rc-ui`）通过 IPC 请求对端进程临时释放该 UDP 探测端口，
+/// 并返回一个 RAII 租约守卫（`Drop` 时自动通知对端恢复探测）。
+pub type ExternalUdpPortHoldHook =
+    Arc<dyn Fn(u16) -> Option<Box<dyn std::any::Any + Send + Sync>> + Send + Sync>;
+
+static EXTERNAL_UDP_PORT_HOLD_HOOK: OnceLock<RwLock<Option<ExternalUdpPortHoldHook>>> =
+    OnceLock::new();
+
+fn external_udp_port_hold_hook_slot() -> &'static RwLock<Option<ExternalUdpPortHoldHook>> {
+    EXTERNAL_UDP_PORT_HOLD_HOOK.get_or_init(|| RwLock::new(None))
+}
+
+/// 注册或清除跨进程 UDP 端口租约回调钩子（传 `None` 清除钩子）。
+pub fn set_external_udp_port_hold_hook(hook: Option<ExternalUdpPortHoldHook>) {
+    let mut guard = external_udp_port_hold_hook_slot()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = hook;
+}
+
+/// P2P 打洞与直连期间持有的本地 UDP 端口暂停租约（三平台统一独占释放/恢复探测套接字，
+/// 未命中本进程槽位时按需委托 [`ExternalUdpPortHoldHook`] 执行跨进程端口暂停/恢复）。
+pub struct LocalUdpPortHoldGuard {
+    slot_hold: Option<SlotPortHold>,
+    _external_hold: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl LocalUdpPortHoldGuard {
+    /// 当真正暂停了本进程 `ACTIVE_UDP_PROBE_SLOTS` 中的本地探测端口槽位时返回 `true`。
+    pub fn is_holding_local_slot(&self) -> bool {
+        self.slot_hold.is_some()
+    }
+
+    /// 当持有任意有效端口租约（本进程探测槽位暂停或跨进程外部租约句柄）时返回 `true`。
+    pub fn is_holding(&self) -> bool {
+        self.slot_hold.is_some() || self._external_hold.is_some()
+    }
+}
 
 /// 在三平台（Linux / macOS / Windows）执行 P2P 打洞前临时释放同端口的持久化 UDP 探测套接字；
 /// 当返回的守卫被 `Drop`（打洞失败或 P2P 会话结束）时自动重新绑定同一本地端口。
-pub(crate) fn acquire_local_udp_port_for_p2p(port: Option<u16>) -> LocalUdpPortHoldGuard {
+///
+/// 优先命中本进程 `ACTIVE_UDP_PROBE_SLOTS`（不触发外部钩子）；本进程未命中时，先读锁克隆并立即释放
+/// [`ExternalUdpPortHoldHook`] 锁，再在无锁状态下调用外部钩子以委托跨进程持有者暂停端口。
+pub fn acquire_local_udp_port_for_p2p(port: Option<u16>) -> LocalUdpPortHoldGuard {
     let Some(p) = port.filter(|&v| v != 0) else {
-        return LocalUdpPortHoldGuard(None);
+        return LocalUdpPortHoldGuard {
+            slot_hold: None,
+            _external_hold: None,
+        };
     };
     let slot = active_udp_probe_slots()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&p)
         .cloned();
-    LocalUdpPortHoldGuard(slot.map(|s| s.acquire_port_hold()))
+    if let Some(slot_hold) = slot.map(|s| s.acquire_port_hold()) {
+        return LocalUdpPortHoldGuard {
+            slot_hold: Some(slot_hold),
+            _external_hold: None,
+        };
+    }
+    let hook = external_udp_port_hold_hook_slot()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let external_hold = hook.and_then(|cb| cb(p));
+    LocalUdpPortHoldGuard {
+        slot_hold: None,
+        _external_hold: external_hold,
+    }
 }
 
 /// 绑定了端口协调租约的 P2P QUIC 传输包装：确保在 `P2pQuicConnection` 彻底释放底层
@@ -10494,5 +10551,90 @@ mod tests {
         let prof = nat_profile.lock().unwrap().clone();
         assert_eq!(prof.nat_type, NatType::ConeUnverified);
         assert_eq!(prof.public_v4, Some(obs));
+    }
+
+    #[test]
+    fn external_udp_port_hold_hook_respects_local_slot_priority_and_drops_guard() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_send<T: Send>() {}
+        assert_send_sync::<LocalUdpPortHoldGuard>();
+        assert_send::<P2pHeldTransport>();
+
+        struct ResetHookGuard;
+        impl Drop for ResetHookGuard {
+            fn drop(&mut self) {
+                set_external_udp_port_hold_hook(None);
+            }
+        }
+        struct ExternalGuard {
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for ExternalGuard {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let _reset_hook = ResetHookGuard;
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_last_port = Arc::new(AtomicU16::new(0));
+        let dropped_count = Arc::new(AtomicUsize::new(0));
+        let return_guard = Arc::new(AtomicBool::new(true));
+
+        let calls_c = Arc::clone(&hook_calls);
+        let last_port_c = Arc::clone(&hook_last_port);
+        let dropped_c = Arc::clone(&dropped_count);
+        let return_c = Arc::clone(&return_guard);
+        set_external_udp_port_hold_hook(Some(Arc::new(move |port| {
+            calls_c.fetch_add(1, Ordering::AcqRel);
+            last_port_c.store(port, Ordering::Release);
+            if return_c.load(Ordering::Acquire) {
+                Some(Box::new(ExternalGuard {
+                    dropped: Arc::clone(&dropped_c),
+                }))
+            } else {
+                None
+            }
+        })));
+
+        // 0) None / Some(0) 直接返回空守卫，不触发外部 hook
+        let g_none = acquire_local_udp_port_for_p2p(None);
+        assert!(!g_none.is_holding_local_slot());
+        assert!(!g_none.is_holding());
+        let g_zero = acquire_local_udp_port_for_p2p(Some(0));
+        assert!(!g_zero.is_holding_local_slot());
+        assert!(!g_zero.is_holding());
+        assert_eq!(hook_calls.load(Ordering::Acquire), 0);
+
+        // 1) 本进程存在 UdpProbeSlot 时优先命中本进程且绝不触发外部 hook
+        let srv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let probe = PersistentUdpProbe::bind(srv.local_addr().unwrap()).expect("bind probe");
+        let local_port = probe.local_port();
+        let local_guard = acquire_local_udp_port_for_p2p(Some(local_port));
+        assert!(local_guard.is_holding_local_slot());
+        assert!(local_guard.is_holding());
+        assert_eq!(hook_calls.load(Ordering::Acquire), 0);
+        drop(local_guard);
+        drop(probe);
+
+        // 2) 本进程未命中时（模拟跨进程端口由 rc-host-agent 持有），触发外部 hook 并在 Drop 时清理
+        let other_port = local_port.saturating_add(1).max(1025);
+        let ext_guard = acquire_local_udp_port_for_p2p(Some(other_port));
+        assert_eq!(hook_calls.load(Ordering::Acquire), 1);
+        assert_eq!(hook_last_port.load(Ordering::Acquire), other_port);
+        assert!(!ext_guard.is_holding_local_slot());
+        assert!(ext_guard.is_holding());
+        assert_eq!(dropped_count.load(Ordering::Acquire), 0);
+
+        // 验证持锁期间再次读写或重置 hook 不会发生死锁
+        drop(ext_guard);
+        assert_eq!(dropped_count.load(Ordering::Acquire), 1);
+
+        // 3) 外部 hook 返回 None 时 is_holding() 应为 false
+        return_guard.store(false, Ordering::Release);
+        let miss_guard = acquire_local_udp_port_for_p2p(Some(other_port));
+        assert_eq!(hook_calls.load(Ordering::Acquire), 2);
+        assert!(!miss_guard.is_holding_local_slot());
+        assert!(!miss_guard.is_holding());
     }
 }
