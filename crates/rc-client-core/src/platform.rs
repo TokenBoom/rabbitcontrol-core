@@ -15,6 +15,81 @@ use std::time::Instant;
 
 use rc_render::Renderer;
 use rc_types::Resolution;
+use serde::{Deserialize, Serialize};
+
+pub(crate) fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+pub(crate) const MAX_CPU_MODEL_BYTES: usize = 128;
+pub(crate) const MAX_MAC_ADDRESS_BYTES: usize = 64;
+pub(crate) const MAX_OS_VERSION_BYTES: usize = 128;
+pub(crate) const MAX_GPU_MODEL_BYTES: usize = 128;
+pub(crate) const MAX_TOTAL_MEMORY_MB: u64 = i64::MAX as u64;
+
+/// 清洗平台文本字段：去除控制字符与 `\0`，裁剪首尾空白并按 UTF-8 字符边界截断至 `<= max_bytes`。
+pub(crate) fn sanitize_text_field(raw: &str, max_bytes: usize) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|&ch| !ch.is_control() && ch != '\0')
+        .collect();
+    let trimmed = cleaned.trim();
+    let mut end = 0usize;
+    for (idx, ch) in trimmed.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    trimmed[..end].trim_end().to_string()
+}
+
+/// 宿主设备的静态硬件与系统版本元数据（用于设备清单展示与服务端上报）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceHardwareInfo {
+    /// CPU 型号（如 `"Apple M3 Max"`）。
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub cpu_model: String,
+    /// 主网卡单播 MAC 地址（如 `"aa:bb:cc:dd:ee:ff"`）。
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub mac_address: String,
+    /// 物理内存总容量（MB，如 `32768`）。
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub total_memory_mb: u64,
+    /// 操作系统版本描述（如 `"macOS 15.1"`）。
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub os_version: String,
+    /// GPU 型号（如 `"Apple M3 Max"`）。
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub gpu_model: String,
+}
+
+impl DeviceHardwareInfo {
+    /// 判断全部硬件信息字段是否均为空或 `0`。
+    pub fn is_empty(&self) -> bool {
+        self.cpu_model.trim().is_empty()
+            && self.mac_address.trim().is_empty()
+            && self.total_memory_mb == 0
+            && self.os_version.trim().is_empty()
+            && self.gpu_model.trim().is_empty()
+    }
+
+    /// 清洗并裁剪硬件字段，确保满足服务端 UTF-8 字节上限、无控制字符/`\0` 及 `total_memory_mb <= i64::MAX` 约束。
+    pub fn sanitized(&self) -> Self {
+        Self {
+            cpu_model: sanitize_text_field(&self.cpu_model, MAX_CPU_MODEL_BYTES),
+            mac_address: sanitize_text_field(&self.mac_address, MAX_MAC_ADDRESS_BYTES),
+            total_memory_mb: self.total_memory_mb.min(MAX_TOTAL_MEMORY_MB),
+            os_version: sanitize_text_field(&self.os_version, MAX_OS_VERSION_BYTES),
+            gpu_model: sanitize_text_field(&self.gpu_model, MAX_GPU_MODEL_BYTES),
+        }
+    }
+}
 
 /// 在平台主线程预分配的渲染表面句柄（例如 macOS `CAMetalLayer*`），
 /// 通过不透明指针整型与类型擦除守卫跨线程移交并在析构时安全回收。
@@ -303,6 +378,11 @@ pub trait ClientPlatformHooks: Send + Sync {
     /// 读取当前宿主设备主有线/无线网卡的单播 MAC 地址（供 Wake-on-LAN 上报，未实现时返回 `None`）。
     fn primary_mac_address(&self) -> Option<String> {
         None
+    }
+
+    /// 读取当前宿主设备的静态硬件与系统版本元数据（未实现时返回空结构体，零破坏其他端）。
+    fn device_hardware_info(&self) -> DeviceHardwareInfo {
+        DeviceHardwareInfo::default()
     }
 }
 
@@ -673,4 +753,148 @@ pub fn resolve_system_proxy() -> Option<crate::proxy::ProxyConfig> {
 /// 查询宿主设备主网卡单播 MAC 地址（供 Wake-on-LAN 上报；未注册钩子或不可用时返回 `None`）。
 pub fn primary_mac_address() -> Option<String> {
     PLATFORM_HOOKS.get().and_then(|h| h.primary_mac_address())
+}
+
+/// 查询宿主设备静态硬件与系统版本元数据（未注册平台钩子时返回默认空结构体，并自动清洗越界/控制字符）。
+pub fn device_hardware_info() -> DeviceHardwareInfo {
+    #[cfg(test)]
+    if let Some(ov) = TEST_DEVICE_HARDWARE_INFO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return ov.sanitized();
+    }
+    PLATFORM_HOOKS
+        .get()
+        .map(|h| h.device_hardware_info().sanitized())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+static TEST_DEVICE_HARDWARE_INFO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+static TEST_DEVICE_HARDWARE_INFO: std::sync::Mutex<Option<DeviceHardwareInfo>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct TestDeviceHardwareInfoGuard {
+    _serial_guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestDeviceHardwareInfoGuard {
+    pub(crate) fn set(&self, info: Option<DeviceHardwareInfo>) {
+        *TEST_DEVICE_HARDWARE_INFO
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = info;
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDeviceHardwareInfoGuard {
+    fn drop(&mut self) {
+        *TEST_DEVICE_HARDWARE_INFO
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_test_device_hardware_info() -> TestDeviceHardwareInfoGuard {
+    let serial_guard = TEST_DEVICE_HARDWARE_INFO_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *TEST_DEVICE_HARDWARE_INFO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    TestDeviceHardwareInfoGuard {
+        _serial_guard: serial_guard,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DefaultHooks;
+    impl ClientPlatformHooks for DefaultHooks {}
+
+    struct CustomHooks;
+    impl ClientPlatformHooks for CustomHooks {
+        fn device_hardware_info(&self) -> DeviceHardwareInfo {
+            DeviceHardwareInfo {
+                cpu_model: "Apple M3 Max".to_string(),
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                total_memory_mb: 32768,
+                os_version: "macOS 15.1".to_string(),
+                gpu_model: "Apple M3 Max".to_string(),
+            }
+        }
+    }
+
+    #[test]
+    fn device_hardware_info_serde_and_default_hooks() {
+        let guard = lock_test_device_hardware_info();
+        let empty = DeviceHardwareInfo::default();
+        assert!(empty.is_empty());
+        assert_eq!(DefaultHooks.device_hardware_info(), empty);
+        assert_eq!(device_hardware_info(), empty);
+
+        // 缺省字段与 null 值均可安全反序列化
+        let from_empty_obj: DeviceHardwareInfo = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty_obj, empty);
+
+        let from_nulls: DeviceHardwareInfo = serde_json::from_str(
+            r#"{
+                "cpu_model": null,
+                "mac_address": null,
+                "total_memory_mb": null,
+                "os_version": null,
+                "gpu_model": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(from_nulls, empty);
+
+        // 全字段 roundtrip
+        let full = CustomHooks.device_hardware_info();
+        assert!(!full.is_empty());
+        let json = serde_json::to_string(&full).unwrap();
+        let parsed: DeviceHardwareInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, full);
+
+        // 同一串行守卫作用域内测试覆写与清理，避免并行单测竞争
+        guard.set(Some(full.clone()));
+        assert_eq!(device_hardware_info(), full);
+        guard.set(None);
+        assert_eq!(device_hardware_info(), empty);
+
+        // 脏控制字符、NUL、首尾空白、多字节 UTF-8 越界截断与 total_memory_mb 上限钳制
+        let dirty = DeviceHardwareInfo {
+            cpu_model: format!("  Apple\0 M3\r\n {}", "芯".repeat(50)),
+            mac_address: format!(" aa:bb:cc:dd:ee:ff\n\t{}", "x".repeat(80)),
+            total_memory_mb: u64::MAX,
+            os_version: format!("macOS 15.2\0\r\n {}", "a".repeat(200)),
+            gpu_model: format!("  GPU\t\0Model {}  ", "中".repeat(50)),
+        };
+        guard.set(Some(dirty));
+        let sanitized = device_hardware_info();
+        assert!(!sanitized.cpu_model.contains('\0'));
+        assert!(!sanitized.cpu_model.chars().any(char::is_control));
+        assert!(sanitized.cpu_model.len() <= MAX_CPU_MODEL_BYTES);
+        assert!(sanitized.cpu_model.starts_with("Apple M3 "));
+        assert!(!sanitized.mac_address.chars().any(char::is_control));
+        assert!(sanitized.mac_address.len() <= MAX_MAC_ADDRESS_BYTES);
+        assert_eq!(sanitized.total_memory_mb, MAX_TOTAL_MEMORY_MB);
+        assert!(!sanitized.os_version.contains('\0'));
+        assert!(!sanitized.os_version.chars().any(char::is_control));
+        assert!(sanitized.os_version.len() <= MAX_OS_VERSION_BYTES);
+        assert!(!sanitized.gpu_model.contains('\0'));
+        assert!(!sanitized.gpu_model.chars().any(char::is_control));
+        assert!(sanitized.gpu_model.len() <= MAX_GPU_MODEL_BYTES);
+        guard.set(None);
+        assert_eq!(device_hardware_info(), empty);
+    }
 }

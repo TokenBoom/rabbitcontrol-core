@@ -37,7 +37,7 @@ pub mod stats;
 pub use mtls::{cert_sha256_hex, parse_rc_san_uri, MtlsConfig, PeerMtlsIdentity};
 
 use std::net::SocketAddr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use rc_types::Result;
@@ -142,6 +142,31 @@ pub trait Transport: Send {
     /// 累计因发送队列溢出而淘汰的媒体数据报数量（默认 0）。
     fn tx_dropped_datagrams(&self) -> u64 {
         0
+    }
+
+    /// 批量发送媒体数据报（默认逐条委托 [`Transport::send_datagram`]；`QuicTransport` 等可合并加锁与唤醒）。
+    fn send_datagrams_batch(&mut self, datagrams: &[Vec<u8>]) -> Result<usize> {
+        let mut sent = 0usize;
+        for d in datagrams {
+            self.send_datagram(d)?;
+            sent += 1;
+        }
+        Ok(sent)
+    }
+
+    /// 当前发送端可靠控制流（Stream A）排队待发送消息数（用于提前感知流控背压，默认 0）。
+    fn reliable_tx_queued_len(&self) -> usize {
+        0
+    }
+
+    /// 底层传输是否自带实时逐包 RTT 估计（QUIC 为 `true`，TCP Relay 等为 `false`）。
+    fn has_live_rtt(&self) -> bool {
+        false
+    }
+
+    /// 可选唤醒回调：上层（如控制端输入队列）入队后调用以立刻打断空闲 `Transport::poll` 阻塞等待。
+    fn wake_handle(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        None
     }
 }
 

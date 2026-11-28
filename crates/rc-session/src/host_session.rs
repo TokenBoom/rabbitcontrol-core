@@ -50,8 +50,8 @@ use crate::clipboard::{
     ClipboardAction, ClipboardBackend, ClipboardChannel, ClipboardConfig, ClipboardStats,
 };
 use crate::proto::{
-    AudioFramePacket, AuthStatus, ByeReason, ControlMessage, Hello, HostFlags, SessionParams,
-    ToolPermissions, Welcome,
+    AudioFramePacket, AuthStatus, ByeReason, ControlMessage, ControllerMeta, Hello, HostFlags,
+    SessionParams, ToolPermissions, Welcome,
 };
 use crate::reconnect::{
     ReconnectConfig, ReconnectRequest, ReconnectStats, ResumeWindow, DEFAULT_RESUME_TTL,
@@ -88,6 +88,14 @@ const MAX_PENDING_TOOL_MESSAGES: usize = 2048;
 const MAX_REJECTED_TOOL_CHANNELS: usize = 64;
 /// 音频帧接收队列有界容量上限（低延迟优先，满时丢弃最旧帧）。
 const MAX_PENDING_AUDIO_FRAMES: usize = 32;
+
+/// QUIC Pacer 最低平滑发送速率（bps）：8 Mbps 足够小 P 帧快速发包，同时避免在慢速 WAN/Wi-Fi P2P 链路上以 200 Mbps 微突发挤爆路由器队列。
+const MIN_PACING_RATE_BPS: u64 = 8_000_000;
+
+/// 按当前目标编码码率推导 Pacer 发送速率（1.5× 突发余量，最低 8 Mbps）。
+fn compute_pacing_rate_bps(bitrate_bps: u32) -> u64 {
+    (u64::from(bitrate_bps).saturating_mul(3) / 2).max(MIN_PACING_RATE_BPS)
+}
 
 /// 被控端应用层客户端失活看门狗推荐超时（微秒）：8s 无任何对端可靠控制/输入消息即判为断链。
 ///
@@ -315,6 +323,14 @@ pub struct HostSession {
     /// 握手协商分辨率时是否保持 `cfg.caps` 宽高比（默认 `false` 保持逐字段 `min` 兼容；
     /// 真实显示器场景置 `true`，消除 ScreenCaptureKit 宽高比不匹配导致的黑边与光标偏移）。
     preserve_caps_aspect: bool,
+    /// 是否在 `Welcome.host_flags` 中通告支持像素级连续滚轮（默认 `false`）。
+    supports_pixel_scroll: bool,
+    /// 是否在 `Welcome.host_flags` 中通告支持控制端元数据 `ControllerMeta`（默认 `false`）。
+    supports_controller_meta: bool,
+    /// 对端上报的控制端元数据（旧端未上报或尚未收到时为 `None`）。
+    controller_meta: Option<ControllerMeta>,
+    /// 控制端元数据单调递增代次（用于宿主感知 `ControllerMeta` 到达与更新）。
+    controller_meta_gen: u64,
     /// 热切换重建管线时的帧序号偏移量（保证线上 `frame_seq` 跨管线严格单调递增，不被对端重组器丢弃）。
     frame_seq_offset: u64,
     /// 本会话已发出的最高线上 `frame_seq`（用于热切换时推算下一代 `frame_seq_offset`）。
@@ -336,6 +352,8 @@ pub struct HostSession {
     /// 应用层客户端失活看门狗超时阈值（微秒；`0` 表示默认禁用以兼容离线静默测试，
     /// 上层经 [`HostSession::set_client_idle_timeout_us`] 传入 [`HOST_CLIENT_IDLE_TIMEOUT_US`] 启用）。
     client_idle_timeout_us: u64,
+    /// `BwProbeRequest` 突发期间临时抬高 pacing 速率，Pacer 排空后自动恢复常规速率。
+    bw_probe_pacing_boost: bool,
 }
 
 impl Drop for HostSession {
@@ -428,6 +446,10 @@ impl HostSession {
             tool_rx_overflow_dropped: 0,
             audio_rx: VecDeque::new(),
             preserve_caps_aspect: false,
+            supports_pixel_scroll: false,
+            supports_controller_meta: false,
+            controller_meta: None,
+            controller_meta_gen: 0,
             frame_seq_offset: 0,
             last_sent_frame_seq: None,
             active_codec,
@@ -438,6 +460,7 @@ impl HostSession {
             media_paused: false,
             last_client_rx_us: None,
             client_idle_timeout_us: 0,
+            bw_probe_pacing_boost: false,
         })
     }
 
@@ -513,6 +536,10 @@ impl HostSession {
             tool_rx_overflow_dropped: 0,
             audio_rx: VecDeque::new(),
             preserve_caps_aspect: false,
+            supports_pixel_scroll: false,
+            supports_controller_meta: false,
+            controller_meta: None,
+            controller_meta_gen: 0,
             frame_seq_offset: 0,
             last_sent_frame_seq: None,
             active_codec,
@@ -523,7 +550,48 @@ impl HostSession {
             media_paused: false,
             last_client_rx_us: None,
             client_idle_timeout_us: 0,
+            bw_probe_pacing_boost: false,
         })
+    }
+
+    /// 控制端在协商参数时是否允许使用 `MouseWheelPixel`（默认 `false`）。
+    ///
+    /// 为兼容部署在外的旧版客户端（如 `v0.2.7`，`HostFlags::KNOWN_MASK == 0x03` 拒收任何未知高位 bit），
+    /// `HostSession::new` / `with_parts` 默认不在 `Welcome.host_flags` 中置 bit2；应用层通过
+    /// `DisplayControlMsg::Capabilities` 协商，或受控测试/显式场景调用
+    /// [`HostSession::set_supports_pixel_scroll`] 显式开启。
+    pub fn set_supports_pixel_scroll(&mut self, supported: bool) {
+        self.supports_pixel_scroll = supported;
+    }
+
+    /// 是否在 `Welcome.host_flags` 中通告支持接收 `ControllerMeta`（默认 `false`）。
+    ///
+    /// 默认关闭以兼容旧版客户端（`HostFlags::KNOWN_MASK == 0x03`）；应用层通过
+    /// `DisplayControlMsg::Capabilities` 协商，或测试可通过
+    /// [`HostSession::set_supports_controller_meta`] 显式开启。
+    pub fn set_supports_controller_meta(&mut self, supported: bool) {
+        self.supports_controller_meta = supported;
+    }
+
+    /// 获取对端控制端在当前会话中上报的元数据（若旧端未上报或尚未收到则返回 `None`）。
+    pub fn controller_meta(&self) -> Option<&ControllerMeta> {
+        self.controller_meta.as_ref()
+    }
+
+    /// 控制端元数据更新代次（每次收到 `ControllerMeta` 递增）。
+    pub fn controller_meta_gen(&self) -> u64 {
+        self.controller_meta_gen
+    }
+
+    fn capability_host_flags(&self) -> u8 {
+        let mut flags = 0;
+        if self.supports_pixel_scroll {
+            flags |= HostFlags::SUPPORTS_PIXEL_SCROLL;
+        }
+        if self.supports_controller_meta {
+            flags |= HostFlags::SUPPORTS_CONTROLLER_META;
+        }
+        flags
     }
 
     /// 启用或关闭按 `cfg.caps` 宽高比等比缩放协商分辨率（默认关闭）。
@@ -797,6 +865,30 @@ impl HostSession {
         self.authenticated_owner.as_ref()
     }
 
+    /// 底层 QUIC 监听端点引用（仅真网络 `new` 构造路径存在，用于忙时非阻塞拒收直连 LAN）。
+    pub fn endpoint(&self) -> Option<&QuicEndpoint> {
+        self.endpoint.as_ref()
+    }
+
+    /// 处于活跃 `Streaming` 态时非阻塞检查是否有额外直连 LAN 接入请求，并立即以 `HostBusyControlled` 拒收。
+    pub fn reject_busy_incoming_once(&mut self) -> Result<bool> {
+        if self.state != SessionState::Streaming {
+            return Ok(false);
+        }
+        let Some(ep) = self.endpoint.as_ref() else {
+            return Ok(false);
+        };
+        let mut busy_transport = match ep.try_accept_nonblocking(Duration::from_millis(200), None) {
+            Ok(Some(t)) => t,
+            Ok(None) => return Ok(false),
+            Err(_) => return Ok(false),
+        };
+        let caps = self.negotiated.unwrap_or(self.cfg.caps);
+        let _ =
+            reject_transport_busy_controlled(&mut busy_transport, caps, Duration::from_millis(200));
+        Ok(true)
+    }
+
     /// 一拍（run_real 形态的最小单元）：
     /// ① `transport.poll(poll_budget)` 单点分发——`ReliableUrgent`→
     /// `rc_input::channel::inject_message` 解码注入；`Reliable`→控制分发
@@ -899,6 +991,15 @@ impl HostSession {
             }
         }
 
+        if self.bw_probe_pacing_boost {
+            let restore_bps = compute_pacing_rate_bps(self.current_bitrate_bps());
+            if let Some(t) = self.transport.as_mut() {
+                if t.tx_queued_bytes() == 0 {
+                    t.set_pacing_rate(restore_bps);
+                    self.bw_probe_pacing_boost = false;
+                }
+            }
+        }
         // 仅当本拍完全空闲且管线无待处理任务时，才在拍尾做 ≤500µs 的短轮询，
         // 避免阻塞期间到帧被延迟发送。
         const MAX_IDLE_TAIL_POLL: Duration = Duration::from_micros(500);
@@ -1395,7 +1496,7 @@ impl HostSession {
         self.active_codec = actual_codec;
         self.live_display_id = pcfg.display_id;
         self.live_shows_cursor = pcfg.shows_cursor;
-        let pacing_bps = u64::from(target_bitrate).saturating_mul(2).max(200_000_000);
+        let pacing_bps = compute_pacing_rate_bps(target_bitrate);
         if let Some(t) = self.transport.as_mut() {
             t.set_pacing_rate(pacing_bps);
         }
@@ -1729,7 +1830,7 @@ impl HostSession {
         self.active_codec = actual_codec;
         self.live_display_id = pcfg.display_id;
         self.live_shows_cursor = pcfg.shows_cursor;
-        let pacing_bps = u64::from(target_bitrate).saturating_mul(2).max(200_000_000);
+        let pacing_bps = compute_pacing_rate_bps(target_bitrate);
         if let Some(t) = self.transport.as_mut() {
             t.set_pacing_rate(pacing_bps);
         }
@@ -2167,7 +2268,7 @@ impl HostSession {
             granted: self.negotiated.unwrap_or(self.cfg.caps),
             auth_status: AuthStatus::Ok,
             host_flags: if hit {
-                HostFlags(HostFlags::RESUME_ACCEPTED | epoch_bit)
+                HostFlags(HostFlags::RESUME_ACCEPTED | epoch_bit | self.capability_host_flags())
             } else {
                 HostFlags(0)
             },
@@ -2703,20 +2804,19 @@ impl HostSession {
         //(client 侧 `refresh_pending && !bit1` 即 Err)；消费点移到「进入
         // Streaming 后收到对端后续证据」或 resume 命中（见
         // `pending_epoch_reset` 字段文档），期间重试 Hello 持续带 bit1。
-        let host_flags = if self.pending_epoch_reset {
-            HostFlags(HostFlags::CLOCK_EPOCH_RESET)
+        let epoch_bit = if self.pending_epoch_reset {
+            HostFlags::CLOCK_EPOCH_RESET
         } else {
-            HostFlags(0)
+            0
         };
+        let host_flags = HostFlags(epoch_bit | self.capability_host_flags());
         let welcome = ControlMessage::Welcome(Welcome {
             session_id,
             granted,
             auth_status: AuthStatus::Ok,
             host_flags,
         });
-        let pacing_bps = u64::from(granted.bitrate_bps)
-            .saturating_mul(2)
-            .max(200_000_000);
+        let pacing_bps = compute_pacing_rate_bps(granted.bitrate_bps);
         if let Some(t) = self.transport.as_mut() {
             t.set_pacing_rate(pacing_bps);
         }
@@ -2762,6 +2862,7 @@ impl HostSession {
         self.audio_ctrl_rx = None;
         self.tool_rx_overflow_dropped = 0;
         self.audio_rx.clear();
+        self.controller_meta = None;
         self.media_paused = false;
         self.last_client_rx_us = Some(u64::from((self.clock)()));
         Ok(())
@@ -2777,6 +2878,7 @@ impl HostSession {
         self.rejected_tool_channels.clear();
         self.audio_ctrl_rx = None;
         self.audio_rx.clear();
+        self.controller_meta = None;
         if self.state != SessionState::Closed {
             self.state = SessionState::Closed;
             self.closed_reason = Some(StopReason::Disconnected(format!("handshake failed: {e}")));
@@ -2919,6 +3021,11 @@ impl HostSession {
                 });
                 Ok(ControlFlow::Handled)
             }
+            ControlMessage::ControllerMeta(meta) => {
+                self.controller_meta = Some(meta);
+                self.controller_meta_gen = self.controller_meta_gen.wrapping_add(1);
+                Ok(ControlFlow::Handled)
+            }
             ControlMessage::Bye { reason } => Ok(ControlFlow::Bye(reason)),
             other => {
                 self.log_ignore_once(ignore_tag_host(&other));
@@ -2951,7 +3058,8 @@ impl HostSession {
             self.last_manual_bitrate_gen = self.last_manual_bitrate_gen.wrapping_add(1);
             self.last_remote_probe_bitrate = None;
         }
-        let pacing_bps = u64::from(bps).saturating_mul(2).max(200_000_000);
+        self.bw_probe_pacing_boost = false;
+        let pacing_bps = compute_pacing_rate_bps(bps);
         if let Some(t) = self.transport.as_mut() {
             t.set_pacing_rate(pacing_bps);
         }
@@ -2974,10 +3082,15 @@ impl HostSession {
             ));
         };
         let chunks = crate::probe::bw_probe_chunks(*probe_id, *total_bytes)?;
+        let cur_pacing = compute_pacing_rate_bps(self.current_bitrate_bps());
         let transport = self
             .transport
             .as_mut()
             .ok_or_else(|| Error::InvalidConfig("bw probe requires a live transport".into()))?;
+        if cur_pacing < rc_net::quic::DEFAULT_INITIAL_PACING_BPS {
+            transport.set_pacing_rate(rc_net::quic::DEFAULT_INITIAL_PACING_BPS);
+            self.bw_probe_pacing_boost = true;
+        }
         for chunk in &chunks {
             transport.send_datagram(chunk)?;
             // 发现 10：探测块单独计数——datagrams_sent 的文档语义只计
@@ -3038,6 +3151,13 @@ impl HostSession {
             .map_or(0, |t| t.tx_dropped_datagrams())
     }
 
+    /// 当前底层传输层 Stream A 可靠控制流排队待发送消息数（无活跃传输层时返回 0）。
+    pub fn transport_reliable_tx_queued_len(&self) -> usize {
+        self.transport
+            .as_ref()
+            .map_or(0, |t| t.reliable_tx_queued_len())
+    }
+
     /// stderr 记一次忽略日志（按标签限流，不刷屏）。
     fn log_ignore_once(&mut self, tag: &'static str) {
         if !self.logged_ignore.contains(&tag) {
@@ -3057,20 +3177,14 @@ impl HostSession {
         }
     }
 
-    /// 逐条发送数据报（尽力）：连接已断时丢弃剩余（网络丢失，如实计数）。
+    /// 逐帧批量发送数据报（尽力）：单锁入队整帧并合并唤醒；连接已断时停止（S7）。
     /// 返回成功发出的条数。
     fn send_datagrams_best_effort(&mut self, datagrams: &[Vec<u8>]) -> usize {
-        let mut sent = 0usize;
         let transport = match self.transport.as_mut() {
             Some(t) => t,
             None => return 0,
         };
-        for d in datagrams {
-            match transport.send_datagram(d) {
-                Ok(()) => sent += 1,
-                Err(_) => break, // 连接已死：剩余按网络丢失处理，不缓存（S7）
-            }
-        }
+        let sent = transport.send_datagrams_batch(datagrams).unwrap_or(0);
         self.datagrams_sent_total += sent;
         sent
     }
@@ -3104,25 +3218,7 @@ impl HostSession {
             // 给真 QUIC 一个短排空窗口（MockTransport 忽略超时立即返回 empty），
             // 避免 `QuicTransport::drop` 立即发送 `CONNECTION_CLOSE` 吞掉尚未 ACK 的 `Bye`。
             if let Some(t) = self.transport.as_mut() {
-                let deadline = std::time::Instant::now() + Duration::from_millis(50);
-                for _ in 0..8 {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    match t.poll(remaining) {
-                        Ok(ev) if ev.is_empty() => break,
-                        Ok(ev) => {
-                            if ev
-                                .iter()
-                                .any(|e| matches!(e, rc_net::NetEvent::Disconnected { .. }))
-                            {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
+                drain_transport_until_quiet_or_disconnected(t.as_mut(), Duration::from_millis(50));
             }
         }
         self.tool_rx.clear();
@@ -3324,6 +3420,7 @@ fn ignore_tag_host(m: &ControlMessage) -> &'static str {
         ControlMessage::ClipboardNotify { .. } => "ClipboardNotify(非 Streaming 态到达，忽略)",
         ControlMessage::ToolChannel { .. } => "ToolChannel(非 Streaming 态到达，忽略)",
         ControlMessage::AudioFrame { .. } => "AudioFrame(非 Streaming 态到达，忽略)",
+        ControlMessage::ControllerMeta(_) => "ControllerMeta(非 Streaming 态到达，忽略)",
         _ => "未知方向消息",
     }
 }
@@ -3401,6 +3498,131 @@ fn stamp_and_track_datagrams(
         }
         *last_sent_frame_seq =
             Some(last_sent_frame_seq.map_or(wire_seq, |prev| prev.max(wire_seq)));
+    }
+}
+
+/// 向已有活跃控制端冲突的额外入站传输发送 `Welcome{Rejected, HostFlags::BUSY_CONTROLLED}` 并短排空后返回。
+pub fn reject_transport_busy_controlled(
+    transport: &mut dyn Transport,
+    caps: SessionParams,
+    poll_timeout: Duration,
+) -> Result<()> {
+    reject_transport_busy_controlled_cancelable(transport, caps, poll_timeout, None)
+}
+
+/// 可取消版本的 [`reject_transport_busy_controlled`]（供后台拒忙辅助线程在会话退出/切换时即时中断）。
+pub fn reject_transport_busy_controlled_cancelable(
+    transport: &mut dyn Transport,
+    caps: SessionParams,
+    poll_timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<()> {
+    let slice = if cancel.is_some() {
+        poll_timeout
+            .min(HANDSHAKE_POLL_SLICE)
+            .min(Duration::from_millis(20))
+    } else {
+        poll_timeout.min(HANDSHAKE_POLL_SLICE)
+    };
+    let deadline = std::time::Instant::now() + poll_timeout;
+    let mut hello_sid: Option<u64> = None;
+
+    while hello_sid.is_none() {
+        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+            return Err(Error::Network("cancelled".into()));
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let step = slice.min(deadline - now);
+        let t_start = std::time::Instant::now();
+        let events = transport.poll(step)?;
+        let empty = events.is_empty();
+        for ev in events {
+            match ev {
+                NetEvent::Reliable(bytes) => match ControlMessage::decode(&bytes) {
+                    Ok(ControlMessage::Hello(hello)) => {
+                        hello_sid = Some(hello.session_id);
+                        break;
+                    }
+                    Ok(ControlMessage::ReconnectRequest { session_id, .. }) => {
+                        hello_sid = Some(session_id);
+                        break;
+                    }
+                    _ => {
+                        return Err(Error::Protocol {
+                            offset: 0,
+                            msg: "unexpected reliable message before Hello/ReconnectRequest on busy transport"
+                                .into(),
+                        });
+                    }
+                },
+                NetEvent::Disconnected { reason } => {
+                    return Err(Error::Network(reason));
+                }
+                NetEvent::Connected
+                | NetEvent::PathChanged
+                | NetEvent::Datagram(_)
+                | NetEvent::ReliableUrgent(_) => {}
+            }
+        }
+        if hello_sid.is_none() && empty && t_start.elapsed() < Duration::from_millis(1) {
+            std::thread::sleep(
+                Duration::from_millis(2)
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
+        }
+    }
+
+    let session_id = hello_sid.ok_or(Error::Timeout(poll_timeout))?;
+    let reject = ControlMessage::Welcome(Welcome {
+        session_id,
+        granted: caps,
+        auth_status: AuthStatus::Rejected,
+        host_flags: HostFlags(HostFlags::BUSY_CONTROLLED),
+    });
+    let mut buf = Vec::new();
+    reject.encode(&mut buf);
+    transport.send_reliable(&buf)?;
+
+    drain_transport_until_quiet_or_disconnected(transport, Duration::from_millis(50));
+    Ok(())
+}
+
+/// 在不适合发送 `BUSY_CONTROLLED` 的冲突/接管窗口内，向已 accept 的入站传输显式发送 `Bye(reason)` 并短排空。
+pub fn send_bye_and_drain(transport: &mut dyn Transport, reason: ByeReason) -> Result<()> {
+    let mut buf = Vec::new();
+    ControlMessage::Bye { reason }.encode(&mut buf);
+    transport.send_reliable(&buf)?;
+    drain_transport_until_quiet_or_disconnected(transport, Duration::from_millis(50));
+    Ok(())
+}
+
+/// 在给定短窗口内持续排空传输层事件，直至链接静默（`poll` 返回空）、
+/// 对端断开（`NetEvent::Disconnected`）、传输报错或截止时间到达。
+///
+/// 不设固定迭代次数上限，防止客户端高频上行输入/心跳包提前耗尽轮次导致
+/// 在途控制帧（如 `ByeReason::Preempted` 或 `Welcome{Rejected}`）被 `CONNECTION_CLOSE` 抢断。
+fn drain_transport_until_quiet_or_disconnected(transport: &mut dyn Transport, window: Duration) {
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match transport.poll(remaining) {
+            Ok(ev) if ev.is_empty() => break,
+            Ok(ev) => {
+                if ev
+                    .iter()
+                    .any(|e| matches!(e, rc_net::NetEvent::Disconnected { .. }))
+                {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
     }
 }
 
@@ -3735,6 +3957,8 @@ mod tests {
                 assert_eq!(w.granted, caps());
                 assert_eq!(w.auth_status, AuthStatus::Ok);
                 assert_eq!(w.host_flags, HostFlags(0));
+                assert!(!w.host_flags.supports_pixel_scroll());
+                assert!(!w.host_flags.supports_controller_meta());
             }
             other => panic!("应回 Welcome，实际 {other:?}"),
         }
@@ -7199,5 +7423,299 @@ mod tests {
         assert!(!handle.datagrams_sent().is_empty());
 
         host.close(ByeReason::Normal).expect("close");
+    }
+
+    /// 默认构造下 `Welcome.host_flags` 绝不置位超出 `v0.2.7` `KNOWN_MASK(0x03)` 的新能力 bit，
+    /// 保障对旧客户端的前向兼容；显式开启 `set_supports_pixel_scroll(true)` /
+    /// `set_supports_controller_meta(true)` 时才置对应位。
+    #[test]
+    fn host_can_disable_pixel_scroll_capability_flag() {
+        let (inj, _events) = RecordingInjector::new();
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&hello_msg(caps(), proto::AuthMethod::None));
+        let handle = mock.clone();
+        let mut host = HostSession::with_parts(
+            host_cfg(Box::new(inj)),
+            Box::new(mock),
+            fake_capture(FakeContent::Dynamic),
+            fake_encoder(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+        host.handshake().expect("handshake ok");
+
+        match &handle.reliable_decoded()[0] {
+            ControlMessage::Welcome(w) => {
+                assert_eq!(w.host_flags, HostFlags(0));
+                assert_eq!(
+                    w.host_flags.0 & !(HostFlags::RESUME_ACCEPTED | HostFlags::CLOCK_EPOCH_RESET),
+                    0,
+                    "default HostSession Welcome.host_flags must stay within v0.2.7 KNOWN_MASK 0x03"
+                );
+                assert!(!w.host_flags.supports_pixel_scroll());
+                assert!(!w.host_flags.supports_controller_meta());
+            }
+            other => panic!("应回 Welcome，实际 {other:?}"),
+        }
+        host.close(ByeReason::Normal).expect("close");
+
+        // 显式开启两项能力位时，Welcome.host_flags 按需通告 bit2 | bit3。
+        let (inj2, _) = RecordingInjector::new();
+        let mut mock2 = MockTransport::new();
+        mock2.deliver_reliable(&hello_msg(caps(), proto::AuthMethod::None));
+        let handle2 = mock2.clone();
+        let mut host2 = HostSession::with_parts(
+            host_cfg(Box::new(inj2)),
+            Box::new(mock2),
+            fake_capture(FakeContent::Dynamic),
+            fake_encoder(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+        host2.set_supports_pixel_scroll(true);
+        host2.set_supports_controller_meta(true);
+        host2.handshake().expect("handshake ok");
+        match &handle2.reliable_decoded()[0] {
+            ControlMessage::Welcome(w) => {
+                assert_eq!(
+                    w.host_flags,
+                    HostFlags(
+                        HostFlags::SUPPORTS_PIXEL_SCROLL | HostFlags::SUPPORTS_CONTROLLER_META
+                    )
+                );
+                assert!(w.host_flags.supports_pixel_scroll());
+                assert!(w.host_flags.supports_controller_meta());
+            }
+            other => panic!("应回 Welcome，实际 {other:?}"),
+        }
+        host2.close(ByeReason::Normal).expect("close");
+    }
+
+    /// 新客户端上报 `ControllerMeta` 时保存并递增代次；旧客户端未发 `ControllerMeta` 时绝不报错且正常串流。
+    #[test]
+    fn host_stores_controller_meta_and_allows_legacy_clients_without_it() {
+        let (inj, _) = RecordingInjector::new();
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&hello_msg(caps(), proto::AuthMethod::None));
+        let mut handle = mock.clone();
+        let mut host = HostSession::with_parts(
+            host_cfg(Box::new(inj)),
+            Box::new(mock),
+            fake_capture(FakeContent::Dynamic),
+            fake_encoder(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+
+        host.handshake().expect("handshake ok");
+        assert!(host.controller_meta().is_none());
+        assert_eq!(host.controller_meta_gen(), 0);
+
+        // 旧客户端未发 ControllerMeta，直接 tick 必须正常串流不报错。
+        let rep = host
+            .tick(Duration::ZERO)
+            .expect("tick without ControllerMeta");
+        assert!(rep.closed.is_none());
+        assert!(host.controller_meta().is_none());
+
+        // 随后收到 ControllerMeta（如 watch_only 模式）保存并更新代次。
+        let meta = proto::ControllerMeta {
+            device_id: "111222333".to_string(),
+            device_name: "Alice Mac".to_string(),
+            os: "macos".to_string(),
+            mode: proto::CONTROLLER_MODE_WATCH_ONLY,
+        };
+        handle.deliver_reliable(&ControlMessage::controller_meta(meta.clone()).unwrap());
+        host.tick(Duration::ZERO).expect("tick with ControllerMeta");
+        assert_eq!(host.controller_meta(), Some(&meta));
+        assert_eq!(host.controller_meta_gen(), 1);
+
+        // 再次收到更新（例如切换回 remote_control）同步覆写并递增代次。
+        let meta2 = proto::ControllerMeta {
+            mode: proto::CONTROLLER_MODE_REMOTE_CONTROL,
+            ..meta
+        };
+        handle.deliver_reliable(&ControlMessage::controller_meta(meta2.clone()).unwrap());
+        host.tick(Duration::ZERO)
+            .expect("tick with updated ControllerMeta");
+        assert_eq!(host.controller_meta(), Some(&meta2));
+        assert_eq!(host.controller_meta_gen(), 2);
+
+        host.close(ByeReason::Normal).expect("close");
+    }
+
+    #[test]
+    fn compute_pacing_rate_bps_scales_with_bitrate_without_200mbps_floor() {
+        assert_eq!(compute_pacing_rate_bps(2_000_000), 8_000_000);
+        assert_eq!(compute_pacing_rate_bps(14_000_000), 21_000_000);
+        assert_eq!(compute_pacing_rate_bps(40_000_000), 60_000_000);
+        assert_eq!(compute_pacing_rate_bps(150_000_000), 225_000_000);
+    }
+
+    #[test]
+    fn reject_transport_busy_controlled_replies_busy_flag_to_client_hello() {
+        struct SleepingPollTransport(crate::MockTransport);
+        impl Transport for SleepingPollTransport {
+            fn send_datagram(&mut self, data: &[u8]) -> Result<()> {
+                self.0.send_datagram(data)
+            }
+            fn send_reliable(&mut self, data: &[u8]) -> Result<()> {
+                self.0.send_reliable(data)
+            }
+            fn send_reliable_urgent(&mut self, data: &[u8]) -> Result<()> {
+                self.0.send_reliable_urgent(data)
+            }
+            fn poll(&mut self, timeout: Duration) -> Result<Vec<NetEvent>> {
+                let ev = self.0.poll(timeout)?;
+                if ev.is_empty() {
+                    std::thread::sleep(Duration::from_millis(2).min(timeout));
+                }
+                Ok(ev)
+            }
+            fn stats(&self) -> rc_net::NetStats {
+                self.0.stats()
+            }
+        }
+        let (t_client, mut t_host) = crate::pair();
+        let client_join = std::thread::spawn(move || {
+            let mut client = crate::ClientSession::with_parts(
+                crate::ClientSessionConfig::new(
+                    "127.0.0.1:9901".parse().unwrap(),
+                    caps(),
+                    99,
+                    Box::new(crate::testkit::ScriptedCapture::from_timeline(Vec::new()).unwrap()),
+                ),
+                Box::new(SleepingPollTransport(t_client)),
+                Box::new(
+                    rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig::default()).unwrap(),
+                ),
+                Box::new(
+                    rc_render::FakeRenderer::new(rc_render::FakeRendererConfig::default()).unwrap(),
+                ),
+                Arc::new(|| 0),
+            )
+            .expect("client with_parts");
+            let err = client
+                .handshake()
+                .expect_err("busy controlled must reject client handshake");
+            assert!(client.handshake_busy_controlled(), "err={err}");
+            assert!(err.to_string().contains("HostBusyControlled"), "err={err}");
+        });
+
+        // ClientSession::handshake() sends Hello first; pair() delivers synchronously.
+        reject_transport_busy_controlled(&mut t_host, caps(), Duration::from_millis(500))
+            .expect("reject_transport_busy_controlled");
+        client_join.join().expect("client thread");
+    }
+
+    #[test]
+    fn reject_transport_busy_controlled_replies_busy_flag_to_reconnect_request() {
+        let (mut t_client, mut t_host) = crate::pair();
+        let mut req_buf = Vec::new();
+        ControlMessage::ReconnectRequest {
+            session_id: 777,
+            resume: true,
+        }
+        .encode(&mut req_buf);
+        t_client
+            .send_reliable(&req_buf)
+            .expect("send ReconnectRequest");
+
+        reject_transport_busy_controlled(&mut t_host, caps(), Duration::from_millis(500))
+            .expect("reject_transport_busy_controlled on ReconnectRequest");
+
+        let events = t_client
+            .poll(Duration::from_millis(100))
+            .expect("poll welcome");
+        let welcome = events
+            .into_iter()
+            .find_map(|ev| match ev {
+                NetEvent::Reliable(bytes) => match ControlMessage::decode(&bytes).ok()? {
+                    ControlMessage::Welcome(w) => Some(w),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("must receive Welcome{Rejected, BUSY_CONTROLLED}");
+        assert_eq!(welcome.session_id, 777);
+        assert_eq!(welcome.auth_status, AuthStatus::Rejected);
+        assert!(welcome.host_flags.busy_controlled());
+    }
+
+    #[test]
+    fn host_close_bye_drains_past_eight_non_disconnected_batches_before_drop() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct HighFreqDrainTransport {
+            inner: crate::MockTransport,
+            bye_sent: Arc<AtomicBool>,
+            drain_polls: Arc<AtomicUsize>,
+        }
+
+        impl Transport for HighFreqDrainTransport {
+            fn send_datagram(&mut self, data: &[u8]) -> Result<()> {
+                self.inner.send_datagram(data)
+            }
+            fn send_reliable(&mut self, data: &[u8]) -> Result<()> {
+                if matches!(
+                    ControlMessage::decode(data),
+                    Ok(ControlMessage::Bye {
+                        reason: ByeReason::Preempted
+                    })
+                ) {
+                    self.bye_sent.store(true, Ordering::Release);
+                }
+                self.inner.send_reliable(data)
+            }
+            fn send_reliable_urgent(&mut self, data: &[u8]) -> Result<()> {
+                self.inner.send_reliable_urgent(data)
+            }
+            fn poll(&mut self, timeout: Duration) -> Result<Vec<NetEvent>> {
+                if self.bye_sent.load(Ordering::Acquire) {
+                    let n = self.drain_polls.fetch_add(1, Ordering::AcqRel) + 1;
+                    if n <= 15 {
+                        return Ok(vec![NetEvent::ReliableUrgent(vec![0x01])]);
+                    }
+                    return Ok(vec![NetEvent::Disconnected {
+                        reason: "peer closed after bye".into(),
+                    }]);
+                }
+                self.inner.poll(timeout)
+            }
+            fn stats(&self) -> rc_net::NetStats {
+                self.inner.stats()
+            }
+        }
+
+        let (ta, mut tb) = crate::pair();
+        let bye_sent = Arc::new(AtomicBool::new(false));
+        let drain_polls = Arc::new(AtomicUsize::new(0));
+        let (inj, _) = RecordingInjector::new();
+        let mut host = HostSession::with_parts(
+            host_cfg(Box::new(inj)),
+            Box::new(HighFreqDrainTransport {
+                inner: ta,
+                bye_sent: Arc::clone(&bye_sent),
+                drain_polls: Arc::clone(&drain_polls),
+            }),
+            fake_capture(FakeContent::Dynamic),
+            fake_encoder(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+
+        let mut hello_bytes = Vec::new();
+        hello_msg(caps(), proto::AuthMethod::None).encode(&mut hello_bytes);
+        tb.send_reliable(&hello_bytes).expect("send Hello");
+        host.handshake().expect("handshake");
+
+        host.close(ByeReason::Preempted).expect("close preempted");
+        assert!(bye_sent.load(Ordering::Acquire));
+        assert_eq!(
+            drain_polls.load(Ordering::Acquire),
+            16,
+            "stop_with 排空循环不得在 8 批非 Disconnected 事件后提前退出"
+        );
+        assert_eq!(host.state(), SessionState::Closed);
     }
 }

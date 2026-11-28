@@ -528,6 +528,28 @@ impl IntoUiError for rc_types::Error {
     }
 }
 
+/// 构造「目标设备正在被控中，需要确认接管」的结构化 [`UiError`]（对齐 `signal.target_in_session`）。
+pub fn target_in_session_ui_error(detail: Option<String>) -> UiError {
+    resolve_ui_error(
+        codes::SIGNAL_TARGET_IN_SESSION,
+        current_platform(),
+        &[],
+        None,
+        detail,
+    )
+}
+
+/// 构造「当前连接已被其他设备接管」的结构化 [`UiError`]（`session.preempted`，严禁自动重连）。
+pub fn preempted_ui_error(detail: Option<String>) -> UiError {
+    resolve_ui_error(
+        codes::SESSION_PREEMPTED,
+        current_platform(),
+        &[],
+        None,
+        detail,
+    )
+}
+
 /// 将信令通道错误字符串或 wire error code 归因为结构化 [`UiError`]。
 pub fn classify_signal_error(raw: &str, platform: ErrorPlatform) -> UiError {
     let trimmed = raw.trim();
@@ -536,7 +558,15 @@ pub fn classify_signal_error(raw: &str, platform: ErrorPlatform) -> UiError {
     }
 
     let lower = trimmed.to_ascii_lowercase();
-    let code = if lower.contains("token_reuse") || trimmed.contains("重放") {
+    let code = if lower.contains("target_in_session")
+        || lower.contains("hostbusycontrolled")
+        || lower.contains("host_busy_controlled")
+        || trimmed.contains("正在被控制")
+        || trimmed.contains("正在被控中")
+        || trimmed.contains("需要确认接管")
+    {
+        codes::SIGNAL_TARGET_IN_SESSION
+    } else if lower.contains("token_reuse") || trimmed.contains("重放") {
         codes::AUTH_TOKEN_REUSE_DETECTED
     } else if lower.contains("token_revoked") || trimmed.contains("令牌已吊销") {
         codes::AUTH_TOKEN_REVOKED
@@ -649,7 +679,17 @@ pub fn classify_session_reason(reason: &str, platform: ErrorPlatform) -> UiError
     }
 
     let lower = trimmed.to_ascii_lowercase();
-    let code = if trimmed.contains("切换系统桌面") || lower.contains("sessionswitching") {
+    let code = if lower.contains("preempted") || trimmed.contains("已被其他设备接管") {
+        codes::SESSION_PREEMPTED
+    } else if lower.contains("target_in_session")
+        || lower.contains("hostbusycontrolled")
+        || lower.contains("host_busy_controlled")
+        || trimmed.contains("正在被控制")
+        || trimmed.contains("正在被控中")
+        || trimmed.contains("需要确认接管")
+    {
+        codes::SIGNAL_TARGET_IN_SESSION
+    } else if trimmed.contains("切换系统桌面") || lower.contains("sessionswitching") {
         codes::SESSION_SWITCHING
     } else if trimmed.contains("用户主动断开")
         || trimmed.contains("已取消")
@@ -1184,5 +1224,62 @@ mod tests {
             ErrorPlatform::Macos,
         );
         assert_eq!(connect_err.code, codes::PROXY_CONNECT_FAILED);
+    }
+
+    #[test]
+    fn classify_target_in_session_and_preempted_errors() {
+        assert_eq!(
+            resolve_wire_alias("target_in_session"),
+            Some(codes::SIGNAL_TARGET_IN_SESSION)
+        );
+        assert_eq!(
+            resolve_wire_alias("session_preempted"),
+            Some(codes::SESSION_PREEMPTED)
+        );
+        assert_eq!(
+            resolve_wire_alias("preempted"),
+            Some(codes::SESSION_PREEMPTED)
+        );
+
+        let direct_busy = target_in_session_ui_error(Some("target_in_session".to_string()));
+        assert_eq!(direct_busy.code, codes::SIGNAL_TARGET_IN_SESSION);
+        assert_eq!(direct_busy.severity, ErrorSeverity::Warning);
+        assert_eq!(direct_busy.presentation, ErrorPresentation::Modal);
+        assert_eq!(direct_busy.action, ErrorAction::Retry);
+        assert!(direct_busy.retryable);
+
+        let direct_preempted = preempted_ui_error(Some("ByeReceived(Preempted)".to_string()));
+        assert_eq!(direct_preempted.code, codes::SESSION_PREEMPTED);
+        assert_eq!(direct_preempted.severity, ErrorSeverity::Warning);
+        assert_eq!(direct_preempted.presentation, ErrorPresentation::Modal);
+        assert_eq!(direct_preempted.action, ErrorAction::None);
+        assert!(!direct_preempted.retryable);
+
+        let sig_busy = classify_signal_error("target_in_session", ErrorPlatform::Macos);
+        assert_eq!(sig_busy.code, codes::SIGNAL_TARGET_IN_SESSION);
+        assert!(sig_busy.retryable);
+
+        let lan_busy = classify_signal_error(
+            "HostBusyControlled: host already has an active controller",
+            ErrorPlatform::Macos,
+        );
+        assert_eq!(lan_busy.code, codes::SIGNAL_TARGET_IN_SESSION);
+        assert!(lan_busy.retryable);
+
+        let sess_busy = classify_session_reason(
+            "HostBusyControlled: host already has an active controller",
+            ErrorPlatform::Macos,
+        );
+        assert_eq!(sess_busy.code, codes::SIGNAL_TARGET_IN_SESSION);
+        assert!(sess_busy.retryable);
+
+        let preempted = classify_session_reason("ByeReceived(Preempted)", ErrorPlatform::Macos);
+        assert_eq!(preempted.code, codes::SESSION_PREEMPTED);
+        assert!(!preempted.retryable);
+
+        let preempted_zh =
+            classify_session_reason("当前连接已被其他设备接管", ErrorPlatform::Macos);
+        assert_eq!(preempted_zh.code, codes::SESSION_PREEMPTED);
+        assert!(!preempted_zh.retryable);
     }
 }

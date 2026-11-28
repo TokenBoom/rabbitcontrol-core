@@ -288,6 +288,12 @@ pub enum DisplayControlMsg {
         /// 被控端当前静止无损补帧流纪元号（切分辨率/切显示器/重连时递增，供控制端 `StillRefineReceiver` 精确同步；旧版缺省为 `0`）。
         #[serde(default, skip_serializing_if = "is_zero_u64")]
         still_stream_epoch: u64,
+        /// 被控端是否支持像素级连续滚轮（`rc_input::InputEvent::MouseWheelPixel`；旧版缺省为 `false`）。
+        #[serde(default)]
+        supports_pixel_scroll: bool,
+        /// 被控端是否支持接收控制端元数据 `ControllerMeta`（`0x16`；旧版缺省为 `false`）。
+        #[serde(default)]
+        supports_controller_meta: bool,
     },
     /// 控制端 → 被控端：握手入流后上报本端非对称解码能力、细化能力、选型偏好与扩展包头位支持标志。
     ClientMediaCaps {
@@ -1218,6 +1224,8 @@ mod tests {
             supports_ext_codec_flags: true,
             codec_generation: 3,
             still_stream_epoch: 2,
+            supports_pixel_scroll: true,
+            supports_controller_meta: true,
         };
         let encoded_caps = encode_display_ctrl(&caps).expect("encode capabilities");
         assert_eq!(decode_display_ctrl(&encoded_caps), Some(caps));
@@ -1256,6 +1264,8 @@ mod tests {
                 supports_ext_codec_flags: false,
                 codec_generation: 0,
                 still_stream_epoch: 0,
+                supports_pixel_scroll: false,
+                supports_controller_meta: false,
             }
         );
 

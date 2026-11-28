@@ -23,8 +23,8 @@ pub const DEFAULT_BITRATE_PRESET: &str = "14m";
 /// 默认码率（bps：14 Mbps）。
 pub const DEFAULT_BITRATE_BPS: u32 = 14_000_000;
 
-/// 默认目标帧率（fps）。
-pub const DEFAULT_FPS: u32 = 144;
+/// 默认目标帧率（fps；与苹果端 VideoToolbox 低延迟码控甜点及常见 60Hz 显示器对齐）。
+pub const DEFAULT_FPS: u32 = 60;
 
 /// 允许的码率下限（1 Mbps）。
 pub const MIN_BITRATE_BPS: u32 = 1_000_000;
@@ -171,7 +171,7 @@ pub struct AppPrefs {
     /// 当前目标码率（bps，默认 `14_000_000`）。
     #[serde(default = "default_bitrate_bps")]
     pub bitrate_bps: u32,
-    /// 当前目标帧率（fps，默认 `144`）。
+    /// 当前目标帧率（fps，默认 `60`）。
     #[serde(default = "default_fps")]
     pub fps: u32,
     /// 记住的远控流分辨率宽度（`None` 表示跟随自动协商）。
@@ -1462,7 +1462,7 @@ mod tests {
         assert!(!prefs.allow_remote_assist);
         assert_eq!(prefs.bitrate_preset, "14m");
         assert_eq!(prefs.bitrate_bps, 14_000_000);
-        assert_eq!(prefs.fps, 144);
+        assert_eq!(prefs.fps, 60);
         assert_eq!(prefs.resolution_width, None);
         assert_eq!(prefs.resolution_height, None);
         assert!(prefs.show_hud);
@@ -1472,7 +1472,7 @@ mod tests {
         assert_eq!(json_val["allowRemoteAssist"], false);
         assert_eq!(json_val["bitratePreset"], "14m");
         assert_eq!(json_val["bitrateBps"], 14_000_000);
-        assert_eq!(json_val["fps"], 144);
+        assert_eq!(json_val["fps"], 60);
         assert!(json_val["resolutionWidth"].is_null());
         assert!(json_val["resolutionHeight"].is_null());
         assert_eq!(json_val["showHud"], true);

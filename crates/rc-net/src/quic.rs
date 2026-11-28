@@ -48,7 +48,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -122,6 +122,9 @@ const TRACK_STALE_US: u32 = FRAME_STALE_US;
 /// 64 条对键鼠事件是数秒的缓冲余量，连这也填满即视为消费侧已卡死，
 /// 上层应当降频或合并移动类事件后重试。
 const URGENT_QUEUE_CAPACITY: usize = 64;
+
+/// 控制流（Stream A）发送入队口容量（异步写线程隔离流控反压，避免阻塞视频/输入 tick）。
+const RELIABLE_SEND_CAPACITY: usize = 128;
 
 /// 控制流（Stream A）可靠接收的有界通道容量。
 ///
@@ -230,6 +233,7 @@ impl Drop for EndpointCloser {
 ///
 /// 一个端点可以同时做两件事（QUIC 天然支持）；本卡的用法是
 /// Host `accept`、Controller `connect`。
+#[derive(Clone)]
 pub struct QuicEndpoint {
     closer: Arc<EndpointCloser>,
     mtu: usize,
@@ -531,6 +535,133 @@ impl QuicEndpoint {
         self.accept_inner(expected_peer, timeout, None, Some(cancel))
     }
 
+    /// 非阻塞检查是否已有待接入连接；若无则立即返回 `Ok(None)`（零阻塞/零休眠）。
+    ///
+    /// 若已有待接入连接，则在 `handshake_timeout` 预算内完成 QUIC 握手与双引导流建立。
+    pub fn try_accept_nonblocking(
+        &self,
+        handshake_timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<QuicTransport>> {
+        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+            return Err(Error::Network("cancelled".into()));
+        }
+        struct NoopWaker;
+        impl std::task::Wake for NoopWaker {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(self.endpoint().accept());
+        let incoming = match fut.as_mut().poll(&mut cx) {
+            Poll::Pending => return Ok(None),
+            Poll::Ready(None) => {
+                return Err(Error::Network(ENDPOINT_STOPPED_ERROR_MSG.into()));
+            }
+            Poll::Ready(Some(inc)) => inc,
+        };
+        drop(fut);
+        let hs_deadline = Instant::now()
+            .checked_add(handshake_timeout)
+            .ok_or_else(|| Error::InvalidConfig("accept handshake timeout overflow".into()))?;
+        match self.finish_accept_incoming(
+            incoming,
+            hs_deadline,
+            handshake_timeout,
+            cancel,
+            false,
+        )? {
+            Some(t) => Ok(Some(t)),
+            None => Ok(None),
+        }
+    }
+
+    fn finish_accept_incoming(
+        &self,
+        incoming: quinn::Incoming,
+        hs_deadline: Instant,
+        hs_timeout: Duration,
+        cancel: Option<&AtomicBool>,
+        continue_on_peer_err: bool,
+    ) -> Result<Option<QuicTransport>> {
+        // Incoming → Connecting：0.11.12 里 Incoming 本身不是 Future。
+        let connecting = match incoming.accept() {
+            Ok(c) => c,
+            Err(_) if continue_on_peer_err => return Ok(None),
+            Err(e) => return Err(Error::Network(format!("accept: {e}"))),
+        };
+        let conn = match block_on_deadline_cancelable(connecting, hs_deadline, cancel, || {
+            Error::Timeout(hs_timeout)
+        }) {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(_)) if continue_on_peer_err => return Ok(None),
+            Ok(Err(e)) => return Err(Error::Network(format!("handshake: {e}"))),
+            Err(err) => return Err(err),
+        };
+        // 接受对端打开的两条 reliable 双向流。**角色按流 ID 序号判定**
+        // （先打开的 = control、后打开的 = urgent，见 [`control_is_first`]）：
+        // 弱网丢包重传会让 accept_bi 的交付顺序与打开顺序颠倒，按到达
+        // 顺序分配角色会让两条流静默互换（输入进了控制流、控制进了
+        // 输入流）——流 ID 是打开顺序的权威记录，不受乱序影响。
+        let first = match accept_stream(&conn, hs_deadline, hs_timeout, cancel) {
+            Ok(s) => s,
+            Err(Error::Timeout(t)) => {
+                conn.close(quinn::VarInt::from(0u32), b"handshake timeout");
+                return Err(Error::Timeout(t));
+            }
+            Err(_) if cancel.is_some_and(|c| c.load(Ordering::Acquire)) => {
+                conn.close(quinn::VarInt::from(0u32), b"cancelled");
+                return Err(Error::Network("cancelled".into()));
+            }
+            Err(_) if continue_on_peer_err => {
+                conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
+                return Ok(None);
+            }
+            Err(err) => {
+                conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
+                return Err(err);
+            }
+        };
+        let second = match accept_stream(&conn, hs_deadline, hs_timeout, cancel) {
+            Ok(s) => s,
+            Err(Error::Timeout(t)) => {
+                conn.close(quinn::VarInt::from(0u32), b"handshake timeout");
+                return Err(Error::Timeout(t));
+            }
+            Err(_) if cancel.is_some_and(|c| c.load(Ordering::Acquire)) => {
+                conn.close(quinn::VarInt::from(0u32), b"cancelled");
+                return Err(Error::Network("cancelled".into()));
+            }
+            Err(_) if continue_on_peer_err => {
+                conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
+                return Ok(None);
+            }
+            Err(err) => {
+                conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
+                return Err(err);
+            }
+        };
+        let (control, urgent) = match order_by_stream_index(first, second) {
+            Ok(pair) => pair,
+            Err(_) if continue_on_peer_err => {
+                conn.close(quinn::VarInt::from(0u32), b"invalid streams");
+                return Ok(None);
+            }
+            Err(err) => {
+                conn.close(quinn::VarInt::from(0u32), b"invalid streams");
+                return Err(err);
+            }
+        };
+        let _ = urgent.send.set_priority(URGENT_STREAM_PRIORITY);
+        Ok(Some(QuicTransport::new(
+            conn,
+            control,
+            urgent,
+            self.mtu,
+            Arc::clone(&self.closer),
+        )?))
+    }
+
     fn accept_inner(
         &self,
         expected_peer: Option<SocketAddr>,
@@ -578,76 +709,15 @@ impl QuicEndpoint {
                 None => (wait_deadline, wait_timeout),
             };
 
-            // Incoming → Connecting：0.11.12 里 Incoming 本身不是 Future。
-            let connecting = match incoming.accept() {
-                Ok(c) => c,
-                Err(_) if expected_canon.is_some() => continue,
-                Err(e) => return Err(Error::Network(format!("accept: {e}"))),
-            };
-            let conn = match block_on_deadline_cancelable(connecting, hs_deadline, cancel, || {
-                Error::Timeout(hs_timeout)
-            }) {
-                Ok(Ok(conn)) => conn,
-                Ok(Err(_)) if expected_canon.is_some() => continue,
-                Ok(Err(e)) => return Err(Error::Network(format!("handshake: {e}"))),
-                Err(err) => return Err(err),
-            };
-            // 接受对端打开的两条 reliable 双向流。**角色按流 ID 序号判定**
-            // （先打开的 = control、后打开的 = urgent，见 [`control_is_first`]）：
-            // 弱网丢包重传会让 accept_bi 的交付顺序与打开顺序颠倒，按到达
-            // 顺序分配角色会让两条流静默互换（输入进了控制流、控制进了
-            // 输入流）——流 ID 是打开顺序的权威记录，不受乱序影响。
-            let first = match accept_stream(&conn, hs_deadline, hs_timeout, cancel) {
-                Ok(s) => s,
-                Err(Error::Timeout(t)) => {
-                    conn.close(quinn::VarInt::from(0u32), b"handshake timeout");
-                    return Err(Error::Timeout(t));
-                }
-                Err(_) if cancel.is_some_and(|c| c.load(Ordering::Acquire)) => {
-                    conn.close(quinn::VarInt::from(0u32), b"cancelled");
-                    return Err(Error::Network("cancelled".into()));
-                }
-                Err(_) if expected_canon.is_some() => {
-                    conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
-                    continue;
-                }
-                Err(err) => {
-                    conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
-                    return Err(err);
-                }
-            };
-            let second = match accept_stream(&conn, hs_deadline, hs_timeout, cancel) {
-                Ok(s) => s,
-                Err(Error::Timeout(t)) => {
-                    conn.close(quinn::VarInt::from(0u32), b"handshake timeout");
-                    return Err(Error::Timeout(t));
-                }
-                Err(_) if cancel.is_some_and(|c| c.load(Ordering::Acquire)) => {
-                    conn.close(quinn::VarInt::from(0u32), b"cancelled");
-                    return Err(Error::Network("cancelled".into()));
-                }
-                Err(_) if expected_canon.is_some() => {
-                    conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
-                    continue;
-                }
-                Err(err) => {
-                    conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
-                    return Err(err);
-                }
-            };
-            let (control, urgent) = match order_by_stream_index(first, second) {
-                Ok(pair) => pair,
-                Err(_) if expected_canon.is_some() => {
-                    conn.close(quinn::VarInt::from(0u32), b"invalid streams");
-                    continue;
-                }
-                Err(err) => {
-                    conn.close(quinn::VarInt::from(0u32), b"invalid streams");
-                    return Err(err);
-                }
-            };
-            let _ = urgent.send.set_priority(URGENT_STREAM_PRIORITY);
-            return QuicTransport::new(conn, control, urgent, self.mtu, Arc::clone(&self.closer));
+            if let Some(t) = self.finish_accept_incoming(
+                incoming,
+                hs_deadline,
+                hs_timeout,
+                cancel,
+                expected_canon.is_some(),
+            )? {
+                return Ok(t);
+            }
         }
     }
 
@@ -819,6 +889,8 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     tc.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(IDLE_TIMEOUT).expect("10s fits in VarInt idle timeout"),
     ));
+    tc.initial_rtt(Duration::from_millis(30));
+    tc.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     Arc::new(tc)
 }
 
@@ -837,11 +909,19 @@ struct Shared {
     /// 让 [`Transport::poll`] 在任意通道到达事件或关闭时 < 1ms 唤醒。
     event_wake_seq: Mutex<u64>,
     event_wake_cv: Condvar,
+    /// 指示 [`Transport::poll`] 当前是否处于排空→休眠窗口，避免活跃流每 datagram 争抢 `event_wake_seq` 锁。
+    poll_waiting: AtomicBool,
+    /// 外部调用 [`Transport::wake_handle`] 时的单调打断序号，使 `poll()` 立即返回空切片处理上层新任务（如用户输入）。
+    external_wake_seq: AtomicU64,
     trace: Mutex<TraceCollector>,
     session_start: Instant,
     sent_bytes: AtomicU64,
     recv_bytes: AtomicU64,
     datagram_send_errors: AtomicU64,
+    /// Stream A 发送队列深度（含已入队等待 `reliable_writer` 写出的消息数）。
+    reliable_tx_queued: AtomicUsize,
+    /// `reliable_writer` 正常排空后通知 `Drop`，确保收尾 `Bye` 在关闭连接前尽量发出。
+    reliable_drained: (Mutex<bool>, Condvar),
 }
 
 impl Shared {
@@ -852,6 +932,13 @@ impl Shared {
             .unwrap_or_else(|e| e.into_inner());
         *seq = seq.wrapping_add(1);
         self.event_wake_cv.notify_all();
+    }
+
+    fn notify_event_if_waiting(&self) {
+        fence(Ordering::SeqCst);
+        if self.poll_waiting.load(Ordering::SeqCst) {
+            self.notify_event();
+        }
     }
 }
 
@@ -877,8 +964,9 @@ pub struct QuicTransport {
     /// `Option` 用于在 [`Drop`] 阶段先释放接收端，立即解除可能阻塞在
     /// `sync_channel::send` 的控制流读线程，避免 `join` 死锁。
     reliable_rx: Option<Receiver<Vec<u8>>>,
-    /// 控制流的发送半边（单流，天然保序）
-    send_stream: quinn::SendStream,
+    /// 控制流（Stream A）发送入队口：由 `rc-net-reliable-writer` 后台写线程消费，
+    /// 避免 Stream A 流控反压阻塞视频/输入主循环；`Option` 供 [`Drop`] 提前关闭。
+    reliable_tx: Option<SyncSender<Vec<u8>>>,
     /// urgent（输入）流的发送入队口：专职写线程持有流本体。
     ///
     /// 为什么 urgent 不直接 `write_all`：QUIC 的 connection 级流控窗口
@@ -932,16 +1020,23 @@ impl QuicTransport {
             pacer_cv: Condvar::new(),
             event_wake_seq: Mutex::new(0),
             event_wake_cv: Condvar::new(),
+            poll_waiting: AtomicBool::new(false),
+            external_wake_seq: AtomicU64::new(0),
             trace: Mutex::new(TraceCollector::new(4096)),
             session_start: Instant::now(),
             sent_bytes: AtomicU64::new(0),
             recv_bytes: AtomicU64::new(0),
             datagram_send_errors: AtomicU64::new(0),
+            reliable_tx_queued: AtomicUsize::new(0),
+            reliable_drained: (Mutex::new(false), Condvar::new()),
         });
         let last_remote = conn.remote_address();
 
         // 连接就绪事件排队，poll 首次调用即可见。
         let _ = tx.send(NetEvent::Connected);
+
+        let (reliable_send_tx, reliable_send_rx) =
+            std::sync::mpsc::sync_channel::<Vec<u8>>(RELIABLE_SEND_CAPACITY);
 
         // urgent 专职写线程：吸收 connection 级流控的等待，让
         // send_reliable_urgent 对调用方永不被控制流反压挡住。
@@ -966,6 +1061,10 @@ impl QuicTransport {
                 let shared = shared.clone();
                 move || urgent_stream_reader(urgent_recv, tx, shared)
             }),
+            spawn_named("rc-net-reliable-writer", {
+                let shared = shared.clone();
+                move || reliable_writer(send_stream, reliable_send_rx, shared)
+            }),
             spawn_named("rc-net-urgent-writer", {
                 let shared = shared.clone();
                 move || urgent_writer(urgent_send, urgent_rx, shared)
@@ -981,7 +1080,7 @@ impl QuicTransport {
             shared,
             events_rx,
             reliable_rx: Some(reliable_rx),
-            send_stream,
+            reliable_tx: Some(reliable_send_tx),
             urgent_tx: Some(urgent_tx),
             last_remote,
             mtu,
@@ -1261,11 +1360,43 @@ impl Transport for QuicTransport {
         Ok(())
     }
 
+    fn send_datagrams_batch(&mut self, datagrams: &[Vec<u8>]) -> Result<usize> {
+        if datagrams.is_empty() {
+            return Ok(0);
+        }
+        let max = self.max_datagram();
+        for d in datagrams {
+            if d.len() > max {
+                return Err(Error::Network(format!(
+                    "datagram {} bytes exceeds budget {max} (N2: mtu - QUIC_OVERHEAD)",
+                    d.len()
+                )));
+            }
+        }
+        {
+            let mut p = self.shared.pacer.lock().expect("pacer");
+            for d in datagrams {
+                p.enqueue(d.clone());
+            }
+        }
+        self.shared.pacer_cv.notify_one();
+        Ok(datagrams.len())
+    }
+
     fn send_reliable(&mut self, data: &[u8]) -> Result<()> {
-        let n = write_framed(&mut self.send_stream, data)?;
+        ensure_reliable_len(data)?;
+        let Some(tx) = self.reliable_tx.as_ref() else {
+            return Err(Error::Network("reliable writer stopped".into()));
+        };
         self.shared
-            .sent_bytes
-            .fetch_add(n as u64, Ordering::Relaxed);
+            .reliable_tx_queued
+            .fetch_add(1, Ordering::AcqRel);
+        if tx.send(data.to_vec()).is_err() {
+            self.shared
+                .reliable_tx_queued
+                .fetch_sub(1, Ordering::AcqRel);
+            return Err(Error::Network("reliable writer stopped".into()));
+        }
         Ok(())
     }
 
@@ -1334,7 +1465,9 @@ impl Transport for QuicTransport {
         // N4 + H1：最多阻塞到 deadline；任一通道（events_rx 或有界 reliable_rx）
         // 已有就绪事件时立即返回，不空等 timeout；均为空时通过 condvar 在 < 1ms
         // 内响应任意通道的新事件或退出信号。
+        let init_ext_wake = self.shared.external_wake_seq.load(Ordering::SeqCst);
         loop {
+            self.shared.poll_waiting.store(true, Ordering::SeqCst);
             let observed_seq = *self
                 .shared
                 .event_wake_seq
@@ -1352,6 +1485,7 @@ impl Transport for QuicTransport {
             if !out.is_empty()
                 || !deferred_disconnected.is_empty()
                 || (events_disc && reliable_disc)
+                || self.shared.external_wake_seq.load(Ordering::SeqCst) != init_ext_wake
             {
                 break;
             }
@@ -1389,6 +1523,7 @@ impl Transport for QuicTransport {
             }
             drop(seq_guard);
         }
+        self.shared.poll_waiting.store(false, Ordering::Release);
 
         // 本批次内把 Disconnected 排在已就绪 Reliable 帧之后，确保收尾消息不被提前截断。
         out.extend(deferred_disconnected);
@@ -1431,15 +1566,47 @@ impl Transport for QuicTransport {
     fn set_pacing_rate(&mut self, bps: u64) {
         QuicTransport::set_pacing_rate(self, bps);
     }
+
+    fn tx_queued_bytes(&self) -> usize {
+        self.shared.pacer.lock().expect("pacer").queued_bytes()
+    }
+
+    fn tx_dropped_datagrams(&self) -> u64 {
+        let pacer_dropped = self.shared.pacer.lock().expect("pacer").dropped_packets();
+        pacer_dropped.saturating_add(self.shared.datagram_send_errors.load(Ordering::Relaxed))
+    }
+
+    fn reliable_tx_queued_len(&self) -> usize {
+        self.shared.reliable_tx_queued.load(Ordering::Acquire)
+    }
+
+    fn has_live_rtt(&self) -> bool {
+        true
+    }
+
+    fn wake_handle(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let shared = Arc::clone(&self.shared);
+        Some(Arc::new(move || {
+            shared.external_wake_seq.fetch_add(1, Ordering::SeqCst);
+            shared.notify_event_if_waiting();
+        }))
+    }
 }
 
 impl Drop for QuicTransport {
     fn drop(&mut self) {
+        // 先关闭 reliable_tx 并短暂等待（≤20ms）排空收尾消息（如 Bye），再置停机并关闭 QUIC 连接。
+        self.reliable_tx = None;
+        self.urgent_tx = None;
+        {
+            let (lock, cv) = &self.shared.reliable_drained;
+            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if !*guard {
+                let _ = cv.wait_timeout(guard, Duration::from_millis(20));
+            }
+        }
         self.shared.stop.store(true, Ordering::Relaxed);
         self.shared.pacer_cv.notify_all();
-        // 先关闭 urgent 入队口：写线程的 recv_timeout 立即以 Disconnected
-        // 返回，不必再多空等一轮 50ms 的 WORKER_IDLE_WAIT。
-        self.urgent_tx = None;
         // 先丢弃有界 reliable 接收端：若控制流读线程正因队列满阻塞在
         // sync_channel::send，此处立即以 SendError 解除阻塞再 join。
         self.reliable_rx = None;
@@ -1479,7 +1646,7 @@ fn datagram_reader(conn: quinn::Connection, tx: Sender<NetEvent>, shared: Arc<Sh
                 if tx.send(NetEvent::Datagram(bytes.to_vec())).is_err() {
                     return; // 接收端已销毁
                 }
-                shared.notify_event();
+                shared.notify_event_if_waiting();
             }
             Err(e) => {
                 // 连接断开（正常关闭 / 超时 / 出错）是最后一个事件。
@@ -1607,6 +1774,34 @@ fn urgent_enqueue_error(err: TrySendError<Vec<u8>>) -> Error {
     }
 }
 
+/// Stream A（控制流）专职写线程：隔离 QUIC 流控反压，避免阻塞视频/输入 tick，并在连接断开或队列排空时退出。
+fn reliable_writer(mut stream: quinn::SendStream, rx: Receiver<Vec<u8>>, shared: Arc<Shared>) {
+    struct DrainedGuard<'a>(&'a Shared);
+    impl Drop for DrainedGuard<'_> {
+        fn drop(&mut self) {
+            let (lock, cv) = &self.0.reliable_drained;
+            let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *done = true;
+            cv.notify_all();
+        }
+    }
+    let _drained = DrainedGuard(&shared);
+    loop {
+        match rx.recv() {
+            Ok(msg) => {
+                shared.reliable_tx_queued.fetch_sub(1, Ordering::AcqRel);
+                match write_framed(&mut stream, &msg) {
+                    Ok(n) => {
+                        shared.sent_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    Err(_) => return,
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 /// urgent（输入）流专职写线程：从入队口取消息写入流。
 ///
 /// 它存在的意义是吸收 connection 级流控的等待：控制流把共享窗口占满时，
@@ -1635,6 +1830,15 @@ fn urgent_writer(mut stream: quinn::SendStream, rx: Receiver<Vec<u8>>, shared: A
 /// `pacer_worker` 前瞻合并窗口：允许将 250µs 内即将到期的包合批发送，消除 per-packet `wait_timeout(20us)` 抖动。
 const PACER_COALESCE_HORIZON: Duration = Duration::from_micros(250);
 
+/// 低中速路径（< 60 Mbps）关闭前瞻合并，避免 P2P/WAN 产生多包微突发；高速 LAN 保留 250µs 合并消除定时器抖动。
+fn effective_coalesce_horizon(rate_bps: u64) -> Duration {
+    if rate_bps > 0 && rate_bps < 60_000_000 {
+        Duration::ZERO
+    } else {
+        PACER_COALESCE_HORIZON
+    }
+}
+
 /// 发送线程：按 pacing 速率把数据报写进 QUIC（N3）。
 fn pacer_worker(shared: Arc<Shared>) {
     loop {
@@ -1642,11 +1846,12 @@ fn pacer_worker(shared: Arc<Shared>) {
             return;
         }
         let now = Instant::now();
-        let due = shared
-            .pacer
-            .lock()
-            .expect("pacer")
-            .poll_coalesced(now, PACER_COALESCE_HORIZON);
+        let (due, observed_seq) = {
+            let mut p = shared.pacer.lock().expect("pacer");
+            let horizon = effective_coalesce_horizon(p.rate_bps());
+            let due = p.poll_coalesced(now, horizon);
+            (due, p.enqueue_seq())
+        };
         for d in due {
             let n = d.len() as u64;
             // 帧尾包离栈 = 整帧发出：打 Sent 点（rc-trace 语义）。
@@ -1673,11 +1878,18 @@ fn pacer_worker(shared: Arc<Shared>) {
             }
         }
 
-        // 睡到下一个放行时刻；入队会经 condvar 提前唤醒。
+        // 睡到下一个放行时刻；必须同时检查队列非空与 enqueue_seq 变化，
+        // 避免持锁外发送期间 `poll_coalesced` 刚将 `next_release` 复位为 `None` 时丢失新入队唤醒并误睡 50ms。
         let p = shared.pacer.lock().expect("pacer");
-        let wait = match p.next_release_at() {
-            Some(t) => t.saturating_duration_since(Instant::now()),
-            None => WORKER_IDLE_WAIT,
+        let wait = if !p.is_empty() {
+            match p.next_release_at() {
+                Some(t) => t.saturating_duration_since(Instant::now()),
+                None => Duration::ZERO,
+            }
+        } else if p.enqueue_seq() != observed_seq {
+            Duration::ZERO
+        } else {
+            WORKER_IDLE_WAIT
         };
         if !wait.is_zero() {
             drop(shared.pacer_cv.wait_timeout(p, wait).expect("pacer cv"));
@@ -2441,5 +2653,86 @@ mod tests {
             is_endpoint_stopped_error(&stopped_err),
             "stopped endpoint must satisfy is_endpoint_stopped_error, got: {stopped_err}"
         );
+    }
+
+    #[test]
+    fn quic_pacer_coalesce_horizon_scales_by_rate_and_wake_handle_interrupts_poll() {
+        assert_eq!(effective_coalesce_horizon(8_000_000), Duration::ZERO);
+        assert_eq!(effective_coalesce_horizon(14_000_000), Duration::ZERO);
+        assert_eq!(effective_coalesce_horizon(59_999_999), Duration::ZERO);
+        assert_eq!(
+            effective_coalesce_horizon(60_000_000),
+            PACER_COALESCE_HORIZON
+        );
+        assert_eq!(effective_coalesce_horizon(0), PACER_COALESCE_HORIZON);
+
+        const CERT_PEM: &str = include_str!("../tests/certs/server-cert.pem");
+        const KEY_PEM: &str = include_str!("../tests/certs/server-key.pem");
+        let ident = Identity::from_pem(CERT_PEM, KEY_PEM).expect("identity");
+        let certs = Identity::certs_from_pem(CERT_PEM).expect("certs");
+
+        let host_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+            &ident,
+        )
+        .expect("host ep");
+        let host_addr = host_ep.local_addr().expect("host addr");
+        let client_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Controller, "127.0.0.1:0".parse().unwrap()),
+            &ident,
+        )
+        .expect("client ep");
+
+        let client_jh = std::thread::spawn(move || {
+            client_ep
+                .connect(host_addr, &certs, "rabbitcontrol", Duration::from_secs(3))
+                .expect("client connect")
+        });
+        let mut host = host_ep.accept(Duration::from_secs(3)).expect("host accept");
+        let mut client = client_jh.join().expect("client join");
+
+        assert!(host.has_live_rtt());
+        assert!(client.has_live_rtt());
+        // Drain initial Connected event.
+        let _ = client
+            .poll(Duration::from_millis(50))
+            .expect("drain connected");
+        let _ = host
+            .poll(Duration::from_millis(50))
+            .expect("drain connected");
+
+        // wake_handle must interrupt an idle poll() long before its 2s timeout.
+        let wake = client.wake_handle().expect("quic wake_handle");
+        let waker_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            wake();
+        });
+        let poll_start = Instant::now();
+        let _ = client.poll(Duration::from_secs(2)).expect("woken poll");
+        let waited = poll_start.elapsed();
+        assert!(
+            waited < Duration::from_millis(500),
+            "wake_handle must interrupt idle poll promptly (waited={waited:?})"
+        );
+        waker_thread.join().expect("waker join");
+
+        // send_datagrams_batch delivers an entire frame atomically under one pacer lock.
+        let pkt0 = vec![0xAAu8; 64];
+        let pkt1 = vec![0xBBu8; 64];
+        let sent = host
+            .send_datagrams_batch(&[pkt0.clone(), pkt1.clone()])
+            .expect("send_datagrams_batch");
+        assert_eq!(sent, 2);
+
+        let mut received = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while received.len() < 2 && Instant::now() < deadline {
+            for ev in client.poll(Duration::from_millis(20)).expect("poll batch") {
+                if let NetEvent::Datagram(d) = ev {
+                    received.push(d);
+                }
+            }
+        }
+        assert_eq!(received, vec![pkt0, pkt1]);
     }
 }

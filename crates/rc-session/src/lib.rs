@@ -65,14 +65,18 @@ pub use clipboard::{
     CLIPBOARD_MIN_NOTIFY_INTERVAL_US,
 };
 pub use host_session::{
-    DetachOutcome, HostRunSummary, HostSession, HostSessionConfig, HostTickReport,
+    reject_transport_busy_controlled, reject_transport_busy_controlled_cancelable,
+    send_bye_and_drain, DetachOutcome, HostRunSummary, HostSession, HostSessionConfig,
+    HostTickReport,
 };
 pub use proto::{
-    AudioFramePacket, AuthMethod, ControlMessage, ToolPermissions, AUDIO_CODEC_IMA_ADPCM,
-    AUDIO_CODEC_PCM16, MAX_AUDIO_FRAME_BYTES, MAX_AUDIO_SAMPLE_RATE, MAX_OWNER_SIGNATURE_LEN,
+    AudioFramePacket, AuthMethod, ControlMessage, ControllerMeta, ToolPermissions,
+    AUDIO_CODEC_IMA_ADPCM, AUDIO_CODEC_PCM16, CONTROLLER_MODE_REMOTE_CONTROL,
+    CONTROLLER_MODE_TOOLS, CONTROLLER_MODE_WATCH_ONLY, MAX_AUDIO_FRAME_BYTES,
+    MAX_AUDIO_SAMPLE_RATE, MAX_CONTROLLER_META_FIELD_BYTES, MAX_OWNER_SIGNATURE_LEN,
     MAX_OWNER_TICKET_PAYLOAD_LEN, MAX_TOOL_PAYLOAD_BYTES, MIN_AUDIO_SAMPLE_RATE,
     TOOL_CHANNEL_AUDIO_CTRL, TOOL_CHANNEL_DISPLAY_CTRL, TOOL_CHANNEL_FILE, TOOL_CHANNEL_PORTMAP,
-    TOOL_CHANNEL_TERMINAL, TYPE_OWNER_AUTH_RESPONSE,
+    TOOL_CHANNEL_TERMINAL, TYPE_CONTROLLER_META, TYPE_OWNER_AUTH_RESPONSE,
 };
 pub use reconnect::{
     Backoff, ReconnectConfig, ReconnectStats, RefreshGuard, ResumeWindow, DEFAULT_BACKOFF_INITIAL,

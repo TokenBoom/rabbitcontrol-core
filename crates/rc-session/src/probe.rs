@@ -216,6 +216,11 @@ impl ProbeEngine {
         Some(u64::try_from(local).unwrap_or(0))
     }
 
+    /// 最近一次成功探测样本的瞬时 RTT（微秒），供不具备传输层实时 RTT 的路径快速响应变化。
+    pub fn latest_rtt_us(&self) -> Option<u64> {
+        self.samples.back().map(|s| s.rtt_us)
+    }
+
     /// 统计快照（中位数取当前窗口）。
     pub fn stats(&self) -> ProbeStats {
         let rtts: Vec<u64> = self.samples.iter().map(|s| s.rtt_us).collect();

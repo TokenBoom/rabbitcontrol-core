@@ -34,7 +34,11 @@ use rc_pipeline::{ControllerPipeline, DiffMode, PipelineConfig};
 use rc_render::Renderer;
 use rc_session::auth::OwnerTicketSigner;
 use rc_session::dev_cert::{dev_server_cert_pem, DEV_CERT_PEM, DEV_KEY_PEM, DEV_SERVER_NAME};
-use rc_session::proto::{BitrateReason, ByeReason, ControlMessage, SessionParams};
+use rc_session::proto::{
+    BitrateReason, ByeReason, ControlMessage, ControllerMeta, SessionParams,
+    CONTROLLER_MODE_REMOTE_CONTROL, CONTROLLER_MODE_TOOLS, CONTROLLER_MODE_WATCH_ONLY,
+    MAX_CONTROLLER_META_FIELD_BYTES,
+};
 use rc_session::{
     AudioFramePacket, ClientAuthConfig, ClientSession, ClientSessionConfig, ClipboardBackend,
     ReconnectOutcome, SessionClock, SessionState, ToolPermissions, AUDIO_CODEC_IMA_ADPCM,
@@ -195,6 +199,15 @@ pub struct UiSessionConfig {
     /// 可选目标 9 位设备码（配合 `signal_client` 发起运行期 `request_relay`）。
     #[serde(skip)]
     pub target_device_id: Option<String>,
+    /// 本端控制端设备 ID（如 9 位设备码，供 `ControllerMeta.device_id` 上报）。
+    #[serde(default)]
+    pub self_device_id: Option<String>,
+    /// 本端控制端设备名称（供 `ControllerMeta.device_name` 上报）。
+    #[serde(default)]
+    pub self_device_name: Option<String>,
+    /// 本端控制端操作系统标识（供 `ControllerMeta.os` 上报；`None` 时默认使用 `std::env::consts::OS`）。
+    #[serde(default)]
+    pub self_os: Option<String>,
 }
 
 impl Default for UiSessionConfig {
@@ -221,6 +234,9 @@ impl Default for UiSessionConfig {
             lan_direct_addr: None,
             signal_client: None,
             target_device_id: None,
+            self_device_id: None,
+            self_device_name: None,
+            self_os: None,
         }
     }
 }
@@ -258,6 +274,9 @@ impl fmt::Debug for UiSessionConfig {
             .field("lan_direct_addr", &self.lan_direct_addr)
             .field("has_signal_client", &self.signal_client.is_some())
             .field("target_device_id", &self.target_device_id)
+            .field("self_device_id", &self.self_device_id)
+            .field("self_device_name", &self.self_device_name)
+            .field("self_os", &self.self_os)
             .finish()
     }
 }
@@ -505,6 +524,23 @@ pub enum SessionUpdate {
         /// 防爆破冷却剩余秒数。
         retry_after_secs: u32,
     },
+    /// 会话断连结构化通知（紧邻 `Ended` 之前推送，透传接管、目标被控中与自动重连资格）。
+    Disconnected {
+        /// 人类可读的断开原因。
+        reason: String,
+        /// 是否因其他设备发起接管而被踢出（收到 `ByeReason::Preempted`）。
+        #[serde(default)]
+        preempted: bool,
+        /// 目标设备是否正处于被控中（直连 `HostBusyControlled` 或信令 `target_in_session`）。
+        #[serde(default)]
+        busy_controlled: bool,
+        /// 是否允许上层触发自动重连（`Preempted`、`HostBusyControlled`、`Normal` 主动关闭等强制为 `false`）。
+        #[serde(default)]
+        auto_reconnect_eligible: bool,
+        /// 结构化用户可读错误模型（可选）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui_error: Option<UiError>,
+    },
     /// 会话结束（正常 `Bye` / 对端断开 / 驱动错误 / 线程 panic）。
     Ended {
         /// 人类可读的结束原因。
@@ -607,6 +643,7 @@ fn is_critical_input(ev: &InputEvent) -> bool {
 struct BoundedInputQueue {
     cap: usize,
     inner: Mutex<VecDeque<InputEvent>>,
+    wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl BoundedInputQueue {
@@ -614,30 +651,45 @@ impl BoundedInputQueue {
         Self {
             cap,
             inner: Mutex::new(VecDeque::with_capacity(cap)),
+            wake: Mutex::new(None),
         }
     }
 
+    fn set_wake_handle(&self, wake: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.wake.lock().unwrap_or_else(|e| e.into_inner()) = wake;
+    }
+
     fn push(&self, ev: InputEvent) {
-        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if q.len() >= self.cap {
-            if is_critical_input(&ev) {
-                // 关键事件：优先挤掉队列中最旧的非关键事件；若全为关键事件则丢最旧。
-                if let Some(pos) = q.iter().position(|e| !is_critical_input(e)) {
-                    q.remove(pos);
-                } else {
-                    q.pop_front();
-                }
-                q.push_back(ev);
-            } else {
-                // 非关键事件（MouseMove/Sync）：只淘汰最旧的非关键事件；
-                // 若队列已满载关键事件则丢弃本条移动事件，不挤占关键输入。
-                if let Some(pos) = q.iter().position(|e| !is_critical_input(e)) {
-                    q.remove(pos);
+        let should_wake = {
+            let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let was_empty = q.is_empty();
+            if q.len() >= self.cap {
+                if is_critical_input(&ev) {
+                    // 关键事件：优先挤掉队列中最旧的非关键事件；若全为关键事件则丢最旧。
+                    if let Some(pos) = q.iter().position(|e| !is_critical_input(e)) {
+                        q.remove(pos);
+                    } else {
+                        q.pop_front();
+                    }
                     q.push_back(ev);
+                } else {
+                    // 非关键事件（MouseMove/Sync）：只淘汰最旧的非关键事件；
+                    // 若队列已满载关键事件则丢弃本条移动事件，不挤占关键输入。
+                    if let Some(pos) = q.iter().position(|e| !is_critical_input(e)) {
+                        q.remove(pos);
+                        q.push_back(ev);
+                    }
                 }
+            } else {
+                q.push_back(ev);
             }
-        } else {
-            q.push_back(ev);
+            was_empty && !q.is_empty()
+        };
+        if should_wake {
+            let cb = self.wake.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(wake) = cb {
+                wake();
+            }
         }
     }
 
@@ -790,10 +842,21 @@ fn apply_stage_rect_to_slot(
     }
 }
 
-/// 共享渲染器包装：让会话线程在不改 `ControllerPipeline` API 的前提下无阻塞响应 `StageRect` resize。
+/// 共享渲染器包装：让会话线程在不改 `ControllerPipeline` API 的前提下无阻塞响应 `StageRect` resize 与光标更新。
 struct SharedRenderer {
     inner: RendererHandle,
     pending_resize: Arc<AtomicU64>,
+    pending_cursor: Arc<Mutex<Option<(i32, i32, bool)>>>,
+}
+
+impl SharedRenderer {
+    fn new(inner: RendererHandle, pending_resize: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            pending_resize,
+            pending_cursor: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 impl Renderer for SharedRenderer {
@@ -805,6 +868,14 @@ impl Renderer for SharedRenderer {
             if w > 0 && h > 0 {
                 let _ = guard.resize((w, h));
             }
+        }
+        if let Some((x, y, visible)) = self
+            .pending_cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            guard.set_cursor((x, y), visible);
         }
         guard.present(frame)
     }
@@ -823,10 +894,30 @@ impl Renderer for SharedRenderer {
     }
 
     fn set_cursor(&mut self, pos: (i32, i32), visible: bool) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_cursor(pos, visible);
+        match self.inner.try_lock() {
+            Ok(mut guard) => {
+                *self
+                    .pending_cursor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                guard.set_cursor(pos, visible);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // `present()` 正在等待 `CAMetalLayer::nextDrawable()` 回收时，绝不阻塞主会话循环，
+                // 缓存最新光标等待 `present()` 在持锁区间原子补刷。
+                *self
+                    .pending_cursor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((pos.0, pos.1, visible));
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                *self
+                    .pending_cursor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                poisoned.into_inner().set_cursor(pos, visible);
+            }
+        }
     }
 
     fn apply_still_tile(&mut self, patch: &rc_render::StillTilePatch) -> rc_types::Result<()> {
@@ -971,6 +1062,18 @@ impl Transport for BridgeTransport {
 
     fn tx_dropped_datagrams(&self) -> u64 {
         self.inner.tx_dropped_datagrams()
+    }
+
+    fn reliable_tx_queued_len(&self) -> usize {
+        self.inner.reliable_tx_queued_len()
+    }
+
+    fn has_live_rtt(&self) -> bool {
+        self.inner.has_live_rtt()
+    }
+
+    fn wake_handle(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        self.inner.wake_handle()
     }
 }
 
@@ -2154,6 +2257,106 @@ impl Drop for RelayInterruptSlotGuard<'_> {
 // SessionHandle（公开 API）
 // ─────────────────────────────────────────────────────────────────
 
+/// 会话级滚动分发状态：持有对端是否支持像素滚轮的能力位及跨事件亚像素/亚行累加器。
+struct ScrollDispatchState {
+    peer_supports_pixel_scroll: AtomicBool,
+    wheel_accumulator: Mutex<crate::input_bridge::WheelAccumulator>,
+}
+
+impl ScrollDispatchState {
+    fn new() -> Self {
+        Self {
+            peer_supports_pixel_scroll: AtomicBool::new(false),
+            wheel_accumulator: Mutex::new(crate::input_bridge::WheelAccumulator::new()),
+        }
+    }
+
+    fn update_peer_capability(&self, supported: bool) {
+        self.peer_supports_pixel_scroll
+            .store(supported, Ordering::Release);
+    }
+
+    fn reset_accumulator(&self) {
+        self.wheel_accumulator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset();
+    }
+}
+
+/// 轻量可克隆的高频输入发送句柄（供 UI 在不持 `AppState::session` 锁的前提下直接投递键鼠与滚轮事件）。
+#[derive(Clone)]
+pub struct SessionInputHandle {
+    input_tx: Arc<BoundedInputQueue>,
+    watch_only: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    scroll_state: Arc<ScrollDispatchState>,
+}
+
+impl SessionInputHandle {
+    /// 查询会话是否仍在运行。
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    /// 经会话级 `WheelAccumulator` 与 `SUPPORTS_PIXEL_SCROLL` 协商能力分发 DOM / UI 输入事件。
+    ///
+    /// 返回 `true` 表示遇到了未收录的 DOM `KeyboardEvent.code`（已静默丢弃，供上层计数）。
+    pub fn send_ui_input(
+        &self,
+        ev: &crate::input_bridge::UiInputEvent,
+        video_size: Option<(u32, u32)>,
+    ) -> bool {
+        dispatch_ui_input_to_queue(
+            &self.input_tx,
+            &self.watch_only,
+            &self.running,
+            &self.scroll_state,
+            ev,
+            video_size,
+        )
+    }
+
+    /// 发送一条原生 [`InputEvent`]；观看模式（`watch_only`）或会话已结束时静默丢弃。
+    pub fn send_input(&self, ev: InputEvent) {
+        if self.watch_only.load(Ordering::Acquire) || !self.is_running() {
+            return;
+        }
+        self.input_tx.push(ev);
+    }
+}
+
+fn dispatch_ui_input_to_queue(
+    input_tx: &BoundedInputQueue,
+    watch_only: &AtomicBool,
+    running: &AtomicBool,
+    scroll_state: &ScrollDispatchState,
+    ev: &crate::input_bridge::UiInputEvent,
+    video_size: Option<(u32, u32)>,
+) -> bool {
+    if watch_only.load(Ordering::Acquire) || !running.load(Ordering::Acquire) {
+        return false;
+    }
+    let pixel_scroll = scroll_state
+        .peer_supports_pixel_scroll
+        .load(Ordering::Acquire);
+    let (mapped, unmapped_key) =
+        if matches!(ev, crate::input_bridge::UiInputEvent::MouseWheel { .. }) {
+            let mut acc = scroll_state
+                .wheel_accumulator
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::input_bridge::map_ui_input_event(ev, video_size, &mut acc, pixel_scroll)
+        } else {
+            let mut scratch = crate::input_bridge::WheelAccumulator::default();
+            crate::input_bridge::map_ui_input_event(ev, video_size, &mut scratch, pixel_scroll)
+        };
+    for input_ev in mapped {
+        input_tx.push(input_ev);
+    }
+    unmapped_key
+}
+
 /// UI 侧会话句柄：持有有界通道与后台会话线程。
 ///
 /// 通道容量（铁律 1 UI 侧延伸 / U6）：
@@ -2180,6 +2383,7 @@ pub struct SessionHandle {
     watch_only: Arc<AtomicBool>,
     tool_permissions: Arc<Mutex<ToolPermissions>>,
     still_refine_metrics: Arc<Mutex<crate::still_refine::StillRefineMetrics>>,
+    scroll_state: Arc<ScrollDispatchState>,
     encrypt_connection: bool,
     base_config: UiSessionConfig,
     layer_lease: Arc<Mutex<Option<LayerLease>>>,
@@ -2221,6 +2425,7 @@ impl SessionHandle {
         let still_refine_metrics = Arc::new(Mutex::new(
             crate::still_refine::StillRefineMetrics::default(),
         ));
+        let scroll_state = Arc::new(ScrollDispatchState::new());
         let encrypt_connection = cfg.encrypt_connection;
         let base_config = cfg.clone();
 
@@ -2238,6 +2443,7 @@ impl SessionHandle {
         let t_watch_only = Arc::clone(&watch_only);
         let t_tool_permissions = Arc::clone(&tool_permissions);
         let t_still_refine_metrics = Arc::clone(&still_refine_metrics);
+        let t_scroll_state = Arc::clone(&scroll_state);
         let t_layer = Arc::clone(&layer_lease);
         let t_upgrade_surface = Arc::clone(&upgrade_surface);
 
@@ -2266,6 +2472,7 @@ impl SessionHandle {
                         t_watch_only,
                         t_tool_permissions,
                         t_still_refine_metrics,
+                        t_scroll_state,
                     )
                 }));
                 let end = match res {
@@ -2285,13 +2492,32 @@ impl SessionHandle {
                         reason: end.reason.clone(),
                     });
                 }
-                let ui_error = Some(crate::ui_error::classify_session_reason(
-                    &end.reason,
-                    crate::ui_error::current_platform(),
-                ));
+                let ui_error = if end.preempted {
+                    Some(crate::ui_error::preempted_ui_error(Some(
+                        end.reason.clone(),
+                    )))
+                } else if end.busy_controlled {
+                    Some(crate::ui_error::target_in_session_ui_error(Some(
+                        end.reason.clone(),
+                    )))
+                } else {
+                    Some(crate::ui_error::classify_session_reason(
+                        &end.reason,
+                        crate::ui_error::current_platform(),
+                    ))
+                };
+                let auto_reconnect_eligible =
+                    end.recoverable && !end.preempted && !end.busy_controlled;
+                t_update.push(SessionUpdate::Disconnected {
+                    reason: end.reason.clone(),
+                    preempted: end.preempted,
+                    busy_controlled: end.busy_controlled,
+                    auto_reconnect_eligible,
+                    ui_error: ui_error.clone(),
+                });
                 t_update.push(SessionUpdate::Ended {
                     reason: end.reason,
-                    recoverable: end.recoverable,
+                    recoverable: auto_reconnect_eligible,
                     ui_error,
                 });
             })
@@ -2314,6 +2540,7 @@ impl SessionHandle {
             watch_only,
             tool_permissions,
             still_refine_metrics,
+            scroll_state,
             encrypt_connection,
             base_config,
             layer_lease,
@@ -2434,6 +2661,16 @@ impl SessionHandle {
     /// 动态切换当前会话的只读观看模式标记（供 `set_session_watch_only` 同步控制输入通道与采集器）。
     pub fn set_watch_only(&self, enabled: bool) {
         self.watch_only.store(enabled, Ordering::Release);
+        if enabled {
+            self.scroll_state.reset_accumulator();
+        }
+    }
+
+    /// 查询对端是否支持像素级连续滚轮（`HostFlags::SUPPORTS_PIXEL_SCROLL`）。
+    pub fn peer_supports_pixel_scroll(&self) -> bool {
+        self.scroll_state
+            .peer_supports_pixel_scroll
+            .load(Ordering::Acquire)
     }
 
     /// 发送一条输入事件；观看模式（`watch_only`）或会话已结束时静默丢弃（U9 / U10）。
@@ -2442,6 +2679,53 @@ impl SessionHandle {
             return;
         }
         self.input_tx.push(ev);
+    }
+
+    /// 获取轻量可克隆的高频输入发送句柄（供 UI 绕开会话粗锁直投键鼠事件）。
+    pub fn input_handle(&self) -> SessionInputHandle {
+        SessionInputHandle {
+            input_tx: Arc::clone(&self.input_tx),
+            watch_only: Arc::clone(&self.watch_only),
+            running: Arc::clone(&self.running),
+            scroll_state: Arc::clone(&self.scroll_state),
+        }
+    }
+
+    /// 经会话级 `WheelAccumulator` 与 `SUPPORTS_PIXEL_SCROLL` 协商能力分发 DOM / UI 输入事件。
+    ///
+    /// 返回 `true` 表示遇到了未收录的 DOM `KeyboardEvent.code`（已静默丢弃，供上层计数）。
+    pub fn send_ui_input(
+        &self,
+        ev: &crate::input_bridge::UiInputEvent,
+        video_size: Option<(u32, u32)>,
+    ) -> bool {
+        dispatch_ui_input_to_queue(
+            &self.input_tx,
+            &self.watch_only,
+            &self.running,
+            &self.scroll_state,
+            ev,
+            video_size,
+        )
+    }
+
+    /// 便捷接口：直接发送一条滚轮事件（经会话级 `WheelAccumulator` 累积并根据对端能力分发）。
+    pub fn send_wheel(
+        &self,
+        delta_x_px: f64,
+        delta_y_px: f64,
+        line_height_px: f64,
+        delta_mode: u8,
+    ) {
+        let _ = self.send_ui_input(
+            &crate::input_bridge::UiInputEvent::MouseWheel {
+                delta_y_px,
+                line_height_px,
+                delta_x_px,
+                delta_mode,
+            },
+            None,
+        );
     }
 
     /// 非阻塞拉取一条状态更新（`commands.rs` 轮询后 emit 给前端）。
@@ -2659,6 +2943,18 @@ impl Transport for LanQuicTransport {
     fn tx_dropped_datagrams(&self) -> u64 {
         self.transport.tx_dropped_datagrams()
     }
+
+    fn reliable_tx_queued_len(&self) -> usize {
+        self.transport.reliable_tx_queued_len()
+    }
+
+    fn has_live_rtt(&self) -> bool {
+        self.transport.has_live_rtt()
+    }
+
+    fn wake_handle(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        self.transport.wake_handle()
+    }
 }
 
 pub(crate) fn is_mtls_cert_or_config_error(msg: &str) -> bool {
@@ -2777,8 +3073,9 @@ pub fn classify_relay_connect_error(
 
 const RELAY_RTT_MIN_BITRATE_BPS: u32 = 2_000_000;
 const RELAY_RTT_INFLATE_ABS_US: u64 = 45_000;
-const RELAY_RTT_COOLDOWN: Duration = Duration::from_secs(2);
-const RELAY_RTT_MIN_WINDOW: Duration = Duration::from_secs(20);
+const RELAY_RTT_BACKOFF_COOLDOWN: Duration = Duration::from_secs(2);
+const RELAY_RTT_RAMP_COOLDOWN: Duration = Duration::from_secs(1);
+const RELAY_RTT_MIN_WINDOW: Duration = Duration::from_secs(10);
 
 /// 控制端 TCP Relay 基于 `ProbePong` RTT 膨胀的辅助调速器（捕获 Server→Client 段 TCP 队列膨胀）。
 struct RelayRttController {
@@ -2787,6 +3084,7 @@ struct RelayRttController {
     window_min_rtt_us: Option<u64>,
     cap_bps: u32,
     current_bps: u32,
+    inflated_probes: u32,
     clean_probes: u32,
     last_pongs: u64,
     last_adjust: Instant,
@@ -2801,6 +3099,7 @@ impl RelayRttController {
             window_min_rtt_us: None,
             cap_bps: cap,
             current_bps: cap,
+            inflated_probes: 0,
             clean_probes: 0,
             last_pongs: 0,
             last_adjust: now,
@@ -2811,6 +3110,7 @@ impl RelayRttController {
         let v = bps.max(1);
         self.cap_bps = v;
         self.current_bps = v;
+        self.inflated_probes = 0;
         self.clean_probes = 0;
         self.last_adjust = now;
     }
@@ -2852,10 +3152,14 @@ impl RelayRttController {
         if rtt > min_rtt.saturating_add(RELAY_RTT_INFLATE_ABS_US) && rtt > min_rtt.saturating_mul(2)
         {
             self.clean_probes = 0;
-            if now.saturating_duration_since(self.last_adjust) >= RELAY_RTT_COOLDOWN {
+            self.inflated_probes = self.inflated_probes.saturating_add(1);
+            if self.inflated_probes >= 2
+                && now.saturating_duration_since(self.last_adjust) >= RELAY_RTT_BACKOFF_COOLDOWN
+            {
                 let floor = RELAY_RTT_MIN_BITRATE_BPS.min(self.cap_bps).max(1);
                 let next = (((self.current_bps as f64) * 0.75) as u32).clamp(floor, self.cap_bps);
                 self.last_adjust = now;
+                self.inflated_probes = 0;
                 if next != self.current_bps {
                     self.current_bps = next;
                     return Some(next);
@@ -2864,13 +3168,14 @@ impl RelayRttController {
             return None;
         }
 
+        self.inflated_probes = 0;
         if rtt <= min_rtt.saturating_add(15_000) {
             self.clean_probes = self.clean_probes.saturating_add(1);
-            if self.clean_probes >= 3
+            if self.clean_probes >= 2
                 && self.current_bps < self.cap_bps
-                && now.saturating_duration_since(self.last_adjust) >= RELAY_RTT_COOLDOWN
+                && now.saturating_duration_since(self.last_adjust) >= RELAY_RTT_RAMP_COOLDOWN
             {
-                let step = (self.current_bps / 5).max(2_000_000);
+                let step = (self.current_bps / 3).max(2_000_000);
                 let next = self.current_bps.saturating_add(step).min(self.cap_bps);
                 self.last_adjust = now;
                 self.clean_probes = 0;
@@ -3398,11 +3703,13 @@ fn dial_lan_direct_quic(
     }
 }
 
-/// 会话线程内部结束结果（携带是否适合上层自动重连恢复的 `recoverable` 标记）。
+/// 会话线程内部结束结果（携带是否适合上层自动重连恢复的 `recoverable` 标记及接管/忙状态）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionEnd {
     reason: String,
     recoverable: bool,
+    preempted: bool,
+    busy_controlled: bool,
 }
 
 impl SessionEnd {
@@ -3410,6 +3717,8 @@ impl SessionEnd {
         Self {
             reason: reason.into(),
             recoverable: false,
+            preempted: false,
+            busy_controlled: false,
         }
     }
 
@@ -3417,6 +3726,26 @@ impl SessionEnd {
         Self {
             reason: reason.into(),
             recoverable: true,
+            preempted: false,
+            busy_controlled: false,
+        }
+    }
+
+    fn preempted(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            recoverable: false,
+            preempted: true,
+            busy_controlled: false,
+        }
+    }
+
+    fn busy_controlled(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            recoverable: false,
+            preempted: false,
+            busy_controlled: true,
         }
     }
 }
@@ -3430,15 +3759,35 @@ fn effective_connection_mode(cfg: &UiSessionConfig) -> ConnectionMode {
     }
 }
 
-/// 判定一段错误/断开文案是否属于不可自动恢复的终态（用户主动断开、密码/鉴权拒绝、mTLS 证书校验失败、仅 P2P 模式拒绝回退、硬件解码持久失败）。
+fn is_busy_controlled_reason(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("hostbusycontrolled")
+        || lower.contains("host_busy_controlled")
+        || lower.contains("target_in_session")
+        || msg.contains("正在被控中")
+        || msg.contains("正在被控制")
+        || msg.contains("需要确认接管")
+}
+
+fn is_preempted_reason(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("preempted") || msg.contains("已被其他设备接管")
+}
+
+/// 判定一段错误/断开文案是否属于不可自动恢复的终态（用户主动断开、密码/鉴权拒绝、mTLS 证书校验失败、仅 P2P 模式拒绝回退、硬件解码持久失败、被接管或目标忙）。
 fn is_non_recoverable_error_reason(msg: &str) -> bool {
-    if is_mtls_cert_or_config_error(msg) {
+    if is_mtls_cert_or_config_error(msg)
+        || is_busy_controlled_reason(msg)
+        || is_preempted_reason(msg)
+    {
         return true;
     }
     let lower = msg.to_ascii_lowercase();
     msg.contains("用户主动断开")
         || msg.contains("已取消")
         || lower.contains("cancelled")
+        || lower.contains("hoststopped")
+        || lower.contains("host_stopped")
         || lower.contains("proxy_config_conflict")
         || msg.contains("代理配置冲突")
         || msg.contains("代理认证失败")
@@ -3504,17 +3853,26 @@ fn classify_stop_reason_end(stop: &rc_session::StopReason) -> SessionEnd {
         rc_session::StopReason::ByeReceived(ByeReason::SessionSwitching) => {
             SessionEnd::fatal(SESSION_SWITCHING_REASON)
         }
+        rc_session::StopReason::ByeReceived(ByeReason::Preempted) => {
+            SessionEnd::preempted("当前连接已被其他设备接管")
+        }
         rc_session::StopReason::ByeReceived(ByeReason::Normal)
         | rc_session::StopReason::Requested => SessionEnd::fatal(format!("对端已关闭 ({stop:?})")),
         rc_session::StopReason::ByeReceived(ByeReason::Refresh) => {
             SessionEnd::recoverable(format!("对端已关闭 ({stop:?})"))
         }
         rc_session::StopReason::Disconnected(msg) => {
-            let reason = format!("对端已关闭 ({stop:?})");
-            if is_non_recoverable_error_reason(msg) {
-                SessionEnd::fatal(reason)
+            if is_busy_controlled_reason(msg) {
+                SessionEnd::busy_controlled("目标设备正在被控中，需要确认接管")
+            } else if is_preempted_reason(msg) {
+                SessionEnd::preempted("当前连接已被其他设备接管")
             } else {
-                SessionEnd::recoverable(reason)
+                let reason = format!("对端已关闭 ({stop:?})");
+                if is_non_recoverable_error_reason(msg) {
+                    SessionEnd::fatal(reason)
+                } else {
+                    SessionEnd::recoverable(reason)
+                }
             }
         }
     }
@@ -3526,8 +3884,17 @@ fn classify_gave_up_end(closed_reason: Option<&rc_session::StopReason>) -> Sessi
         Some(rc_session::StopReason::ByeReceived(ByeReason::SessionSwitching)) => {
             SessionEnd::fatal(SESSION_SWITCHING_REASON)
         }
+        Some(rc_session::StopReason::ByeReceived(ByeReason::Preempted)) => {
+            SessionEnd::preempted("当前连接已被其他设备接管")
+        }
         Some(stop @ rc_session::StopReason::ByeReceived(ByeReason::Normal)) => {
             SessionEnd::fatal(format!("对端已关闭 ({stop:?})"))
+        }
+        Some(rc_session::StopReason::Disconnected(msg)) if is_busy_controlled_reason(msg) => {
+            SessionEnd::busy_controlled("目标设备正在被控中，需要确认接管")
+        }
+        Some(rc_session::StopReason::Disconnected(msg)) if is_preempted_reason(msg) => {
+            SessionEnd::preempted("当前连接已被其他设备接管")
         }
         _ => SessionEnd::recoverable("重连次数已耗尽"),
     }
@@ -3543,6 +3910,12 @@ fn classify_runtime_err_end(
         return SessionEnd::fatal("用户主动断开");
     }
     let raw = err.to_string();
+    if is_preempted_reason(&raw) {
+        return SessionEnd::preempted("当前连接已被其他设备接管");
+    }
+    if is_busy_controlled_reason(&raw) {
+        return SessionEnd::busy_controlled("目标设备正在被控中，需要确认接管");
+    }
     let reason = format!("{prefix}: {raw}");
     if is_non_recoverable_error_reason(&raw) {
         SessionEnd::fatal(reason)
@@ -3570,6 +3943,7 @@ fn run_session_thread(
     watch_only: Arc<AtomicBool>,
     tool_permissions: Arc<Mutex<ToolPermissions>>,
     still_refine_metrics: Arc<Mutex<crate::still_refine::StillRefineMetrics>>,
+    scroll_state: Arc<ScrollDispatchState>,
 ) -> Result<SessionEnd, SessionEnd> {
     let _relay_guard = RelayInterruptSlotGuard {
         slot: &relay_interrupt,
@@ -3594,6 +3968,35 @@ fn run_session_thread(
     let clock_reader = Arc::clone(&clock);
 
     let live_watch_only = Arc::clone(&watch_only);
+
+    let clamp_meta_field = |raw: &str| -> String {
+        let trimmed = raw.trim();
+        if trimmed.len() <= MAX_CONTROLLER_META_FIELD_BYTES {
+            return trimmed.to_string();
+        }
+        let mut end = MAX_CONTROLLER_META_FIELD_BYTES;
+        while !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        trimmed[..end].to_string()
+    };
+    let compute_controller_meta_mode = |wo: bool, tools: bool| -> u8 {
+        if tools {
+            CONTROLLER_MODE_TOOLS
+        } else if wo {
+            CONTROLLER_MODE_WATCH_ONLY
+        } else {
+            CONTROLLER_MODE_REMOTE_CONTROL
+        }
+    };
+    let mut last_sent_controller_mode =
+        compute_controller_meta_mode(live_watch_only.load(Ordering::Acquire), cfg.tools_only);
+    let initial_controller_meta = ControllerMeta {
+        device_id: clamp_meta_field(cfg.self_device_id.as_deref().unwrap_or("")),
+        device_name: clamp_meta_field(cfg.self_device_name.as_deref().unwrap_or("")),
+        os: clamp_meta_field(cfg.self_os.as_deref().unwrap_or(std::env::consts::OS)),
+        mode: last_sent_controller_mode,
+    };
 
     let resolution = Resolution::new(
         if cfg.width == 0 { 1920 } else { cfg.width },
@@ -3938,6 +4341,7 @@ fn run_session_thread(
                 }
             };
             client.set_pipeline_factory_for(make_pipeline_factory(backend_suffix));
+            client.set_controller_meta(Some(initial_controller_meta.clone()));
             if let Some(cb) = create_clipboard_backend(cfg.prefer_hardware) {
                 client.enable_clipboard(Box::new(ToggleableClipboardBackend::new(
                     cb,
@@ -3959,6 +4363,22 @@ fn run_session_thread(
                     let user_disc = disconnect_flag.load(Ordering::Acquire);
                     if user_disc {
                         return TierHandshakeResult::Abort(Ok(SessionEnd::fatal("用户主动断开")));
+                    }
+                    if client.handshake_busy_controlled()
+                        || is_busy_controlled_reason(&e.to_string())
+                    {
+                        return TierHandshakeResult::Abort(Err(SessionEnd::busy_controlled(
+                            "目标设备正在被控中，需要确认接管",
+                        )));
+                    }
+                    if matches!(
+                        client.closed_reason(),
+                        Some(rc_session::StopReason::ByeReceived(ByeReason::Preempted))
+                    ) || is_preempted_reason(&e.to_string())
+                    {
+                        return TierHandshakeResult::Abort(Err(SessionEnd::preempted(
+                            "当前连接已被其他设备接管",
+                        )));
                     }
                     if allow_fallback
                         && should_fallback_after_handshake_error(
@@ -4901,6 +5321,7 @@ fn run_session_thread(
 
         // ── 管线工厂：prefer_hardware 时优先 VT + 离屏 MetalRenderer，失败降级假后端；tools_only 走轻量占位管线 ──
         client.set_pipeline_factory_for(make_pipeline_factory(None));
+        client.set_controller_meta(Some(initial_controller_meta.clone()));
 
         // ── 连接 + 握手 ──
         let negotiated = match client.connect_and_handshake() {
@@ -4908,6 +5329,18 @@ fn run_session_thread(
             Err(e) => {
                 if disconnect_flag.load(Ordering::Acquire) {
                     return Ok(SessionEnd::fatal("用户主动断开"));
+                }
+                if client.handshake_busy_controlled() || is_busy_controlled_reason(&e.to_string()) {
+                    return Err(SessionEnd::busy_controlled(
+                        "目标设备正在被控中，需要确认接管",
+                    ));
+                }
+                if matches!(
+                    client.closed_reason(),
+                    Some(rc_session::StopReason::ByeReceived(ByeReason::Preempted))
+                ) || is_preempted_reason(&e.to_string())
+                {
+                    return Err(SessionEnd::preempted("当前连接已被其他设备接管"));
                 }
                 return Err(SessionEnd::fatal(format!("连接/握手失败: {e}")));
             }
@@ -4933,6 +5366,8 @@ fn run_session_thread(
         )
     };
     client.set_peer_idle_timeout_us(ClientSession::PEER_IDLE_TIMEOUT_US);
+    scroll_state.update_peer_capability(client.peer_supports_pixel_scroll());
+    input_rx.set_wake_handle(client.transport_wake_handle());
     streaming_started.store(true, Ordering::Release);
     let _activity =
         crate::platform::begin_latency_critical_activity("RabbitControl 远控会话", true);
@@ -5069,6 +5504,19 @@ fn run_session_thread(
     let mut last_local_tool_denied: [Option<Instant>; 8] = [None; 8];
 
     while client.state() != SessionState::Closed {
+        if client.state() == SessionState::Streaming {
+            let desired_mode = compute_controller_meta_mode(
+                live_watch_only.load(Ordering::Acquire),
+                client.is_media_paused(),
+            );
+            if desired_mode != last_sent_controller_mode {
+                last_sent_controller_mode = desired_mode;
+                let _ = client.send_controller_meta(ControllerMeta {
+                    mode: desired_mode,
+                    ..initial_controller_meta.clone()
+                });
+            }
+        }
         // 若上一拍因异步解码线程持锁争用未能清空静止无损叠加层，每拍开头非阻塞重试直至实际清除完成。
         if pending_still_clear {
             try_clear_still_overlay(
@@ -5829,13 +6277,22 @@ fn run_session_thread(
                 } else {
                     RUN_IDLE_POLL_BUDGET
                 };
-                let tick_report = client.tick(budget, Instant::now()).map_err(|e| {
-                    classify_runtime_err_end(
-                        "会话运行失败",
-                        &e,
-                        disconnect_flag.load(Ordering::Acquire),
-                    )
-                })?;
+                let tick_report = match client.tick(budget, Instant::now()) {
+                    Ok(rep) => rep,
+                    Err(e) => {
+                        if let Some(
+                            stop @ rc_session::StopReason::ByeReceived(ByeReason::Preempted),
+                        ) = client.closed_reason()
+                        {
+                            return Err(classify_stop_reason_end(stop));
+                        }
+                        return Err(classify_runtime_err_end(
+                            "会话运行失败",
+                            &e,
+                            disconnect_flag.load(Ordering::Acquire),
+                        ));
+                    }
+                };
                 if let Some(stop) = tick_report.closed {
                     end_state = classify_stop_reason_end(&stop);
                     break;
@@ -5861,9 +6318,11 @@ fn run_session_thread(
                 if let Some(ref mut ctrl) = relay_rtt_ctrl {
                     if client.state() == SessionState::Streaming {
                         let snap = client.probe_snapshot();
-                        if let Some(next_bps) =
-                            ctrl.on_probe(Instant::now(), snap.pongs_received, snap.rtt_us_median)
-                        {
+                        if let Some(next_bps) = ctrl.on_probe(
+                            Instant::now(),
+                            snap.pongs_received,
+                            client.latest_probe_rtt_us(),
+                        ) {
                             let mut buf = Vec::new();
                             ControlMessage::SetBitrate {
                                 bps: next_bps,
@@ -5943,8 +6402,25 @@ fn run_session_thread(
                                     supports_ext_codec_flags,
                                     codec_generation,
                                     still_stream_epoch,
+                                    supports_pixel_scroll,
+                                    supports_controller_meta,
                                     ..
                                 } => {
+                                    if *supports_pixel_scroll {
+                                        client.set_peer_supports_pixel_scroll(true);
+                                        scroll_state.update_peer_capability(true);
+                                    }
+                                    if *supports_controller_meta
+                                        && !client.peer_supports_controller_meta()
+                                    {
+                                        if let Err(e) =
+                                            client.enable_peer_supports_controller_meta()
+                                        {
+                                            eprintln!(
+                                                "[rc-client] send ControllerMeta after Capabilities failed: {e}"
+                                            );
+                                        }
+                                    }
                                     caps_ext_meta =
                                         Some((*supports_ext_codec_flags, *codec_generation));
                                     let target_w = if *current_width > 0 {
@@ -6520,7 +6996,7 @@ fn run_session_thread(
                     outcome @ (ReconnectOutcome::Resumed | ReconnectOutcome::Rebuilt) => {
                         in_reconnecting = false;
                         last_emitted_reconnect_attempt = 0;
-                        client.reset_clipboard_epoch();
+                        refresh_after_reconnect_outcome(&mut client, &input_rx, &scroll_state);
                         if matches!(outcome, ReconnectOutcome::Rebuilt) {
                             backend = backend_label
                                 .lock()
@@ -6693,7 +7169,12 @@ fn run_session_thread(
                     ReconnectOutcome::Connecting => {}
                 }
             }
-            _ => break,
+            _ => {
+                if let Some(stop) = client.closed_reason() {
+                    end_state = classify_stop_reason_end(stop);
+                }
+                break;
+            }
         }
 
         // 4) 纪元检测：T17 全新重建时重锚会话钟（同 rc-cli/src/cmd/client.rs）。
@@ -6769,6 +7250,22 @@ fn try_clear_still_overlay(
             }
         }
     }
+}
+
+/// 重连恢复（`Resumed`）或重建（`Rebuilt`）后刷新公共控制端会话状态。
+///
+/// `ClientSession::on_disconnected` 会丢弃旧传输且 `tick_reconnect` 必然新建传输连接，
+/// 因此无论 `Resumed` 还是 `Rebuilt` 都必须刷新 `BoundedInputQueue` 的传输唤醒句柄，
+/// 否则快速恢复后空闲 `poll()` 等待期间的新输入将失去即时唤醒能力。
+fn refresh_after_reconnect_outcome(
+    client: &mut ClientSession,
+    input_rx: &BoundedInputQueue,
+    scroll_state: &ScrollDispatchState,
+) {
+    scroll_state.update_peer_capability(client.peer_supports_pixel_scroll());
+    scroll_state.reset_accumulator();
+    client.reset_clipboard_epoch();
+    input_rx.set_wake_handle(client.transport_wake_handle());
 }
 
 /// 纯工具态原地热升级为桌面控屏的上下文（用于统一 `SetMediaPaused(false)` 与重连回 `Streaming` 补升级）。
@@ -6994,10 +7491,7 @@ fn try_hardware_controller_stack(
     .map_err(rc_types::Error::InvalidConfig)?;
     let shared: RendererHandle = Arc::new(Mutex::new(hw_rend.renderer));
     let pending_resize = Arc::new(AtomicU64::new(0));
-    let wrapper = SharedRenderer {
-        inner: Arc::clone(&shared),
-        pending_resize: Arc::clone(&pending_resize),
-    };
+    let wrapper = SharedRenderer::new(Arc::clone(&shared), Arc::clone(&pending_resize));
     let pipeline = ControllerPipeline::with_backends(hw_cfg, decoder, Box::new(wrapper))?;
     Ok(BuiltPipeline {
         pipeline,
@@ -7023,10 +7517,7 @@ fn fake_controller_stack(
     })?;
     let shared: RendererHandle = Arc::new(Mutex::new(Box::new(renderer)));
     let pending_resize = Arc::new(AtomicU64::new(0));
-    let wrapper = SharedRenderer {
-        inner: Arc::clone(&shared),
-        pending_resize: Arc::clone(&pending_resize),
-    };
+    let wrapper = SharedRenderer::new(Arc::clone(&shared), Arc::clone(&pending_resize));
     let mut fake_cfg = pcfg.clone();
     // 明确关闭假后端管线内部的 prefer_hardware，避免热切不同 codec 时误调硬件工厂报错锁死。
     fake_cfg.prefer_hardware = false;
@@ -7187,6 +7678,8 @@ fn handle_display_ctrl_msg(
             supports_ext_codec_flags: _,
             codec_generation: _,
             still_stream_epoch: _,
+            supports_pixel_scroll: _,
+            supports_controller_meta: _,
         } => {
             if current_width > 0 && current_height > 0 {
                 *hud_width = current_width;
@@ -8094,6 +8587,8 @@ mod tests {
                 supports_ext_codec_flags: false,
                 codec_generation: 0,
                 still_stream_epoch: 0,
+                supports_pixel_scroll: false,
+                supports_controller_meta: false,
             },
             &mut hud_w,
             &mut hud_h,
@@ -8139,6 +8634,8 @@ mod tests {
                 supports_ext_codec_flags: false,
                 codec_generation: 0,
                 still_stream_epoch: 0,
+                supports_pixel_scroll: false,
+                supports_controller_meta: false,
             },
             &mut hud_w,
             &mut hud_h,
@@ -8373,23 +8870,23 @@ mod tests {
             ctrl.on_probe(t0 + Duration::from_secs(1), 1, Some(22_000)),
             None
         );
-        // 2) RTT 膨胀至 95ms（> 22+45 且 > 44ms），冷却满足后触发 0.75 回退 → 10.5M
+        // 2) 单次孤立 RTT 尖峰不误降速；连续 2 次 RTT 膨胀至 95ms（> 22+45 且 > 44ms）才触发 0.75 回退 → 10.5M
         assert_eq!(
             ctrl.on_probe(t0 + Duration::from_secs(3), 2, Some(95_000)),
-            Some(10_500_000)
-        );
-        // 3) 连续 3 次正常 RTT（24ms <= 22+15ms）且冷却满足后逐步回升
-        assert_eq!(
-            ctrl.on_probe(t0 + Duration::from_secs(4), 3, Some(24_000)),
             None
         );
+        assert_eq!(
+            ctrl.on_probe(t0 + Duration::from_secs(4), 3, Some(95_000)),
+            Some(10_500_000)
+        );
+        // 3) 连续 2 次正常 RTT（24ms <= 22+15ms）且冷却（1s）满足后迅速回升（+1/3 = 14.0M）
         assert_eq!(
             ctrl.on_probe(t0 + Duration::from_secs(5), 4, Some(24_000)),
             None
         );
         assert_eq!(
             ctrl.on_probe(t0 + Duration::from_secs(6), 5, Some(23_000)),
-            Some(12_600_000)
+            Some(14_000_000)
         );
         // 4) 手动设定码率同步覆盖上限
         ctrl.on_manual_bitrate(8_000_000, t0 + Duration::from_secs(7));
@@ -8410,17 +8907,17 @@ mod tests {
             None
         );
 
-        // 2) 切换热点/路由后基线永久抬升至 75ms，窗口老化前持续回退至 2 Mbps
+        // 2) 切换热点/路由后基线永久抬升至 75ms，窗口老化（10s）前持续回退
         let mut pong = 1u64;
-        for sec in (3..=19).step_by(2) {
+        for sec in 2..=10 {
             pong += 1;
             let _ = ctrl.on_probe(t0 + Duration::from_secs(sec), pong, Some(75_000));
         }
-        assert_eq!(ctrl.current_bps, RELAY_RTT_MIN_BITRATE_BPS);
+        assert!(ctrl.current_bps < 14_000_000);
 
-        // 3) 达到 20s 窗口后 min_rtt_us 自动老化刷新为 75ms，后续 75ms 探测可正常爬坡恢复
+        // 3) 达到 10s 窗口后 min_rtt_us 自动老化刷新为 75ms，后续 75ms 探测可快速爬坡恢复满额
         let mut recovered = false;
-        for sec in 21..=60 {
+        for sec in 11..=30 {
             pong += 1;
             if let Some(next) = ctrl.on_probe(t0 + Duration::from_secs(sec), pong, Some(75_000)) {
                 if next > RELAY_RTT_MIN_BITRATE_BPS {
@@ -8473,7 +8970,12 @@ mod tests {
             None
         );
         assert_eq!(
-            ctrl.on_probe(t0 + Duration::from_secs(3), 2, Some(90_000)),
+            ctrl.on_probe(t0 + Duration::from_secs(2), 2, Some(90_000)),
+            None,
+            "单次 RTT 尖刺应经滞回防抖，不得立刻砍码率"
+        );
+        assert_eq!(
+            ctrl.on_probe(t0 + Duration::from_secs(3), 3, Some(90_000)),
             Some(9_000_000)
         );
 
@@ -8898,6 +9400,7 @@ mod tests {
             still_refine_metrics: Arc::new(Mutex::new(
                 crate::still_refine::StillRefineMetrics::default(),
             )),
+            scroll_state: Arc::new(ScrollDispatchState::new()),
             encrypt_connection: false,
             base_config: UiSessionConfig::default(),
             layer_lease: Arc::new(Mutex::new(None)),
@@ -8929,24 +9432,15 @@ mod tests {
         // 1) 信令会话在 Reconnecting 退出时按 transport_label 精确文案 + recoverable = true。
         assert_eq!(
             signaling_disconnect_end("UDP LAN"),
-            SessionEnd {
-                reason: "局域网连接已断开".to_string(),
-                recoverable: true,
-            }
+            SessionEnd::recoverable("局域网连接已断开")
         );
         assert_eq!(
             signaling_disconnect_end("UDP P2P"),
-            SessionEnd {
-                reason: "P2P 连接已断开".to_string(),
-                recoverable: true,
-            }
+            SessionEnd::recoverable("P2P 连接已断开")
         );
         assert_eq!(
             signaling_disconnect_end("TCP Relay"),
-            SessionEnd {
-                reason: "中继连接已断开".to_string(),
-                recoverable: true,
-            }
+            SessionEnd::recoverable("中继连接已断开")
         );
 
         // 2) 纯 IP 直连 GaveUp：非 SessionSwitching → recoverable = true；SessionSwitching / ByeNormal → false。
@@ -9361,10 +9855,7 @@ mod tests {
                         resizes: resizes_for_build,
                     })));
                 let pending_resize = Arc::new(AtomicU64::new(0));
-                let wrapper = SharedRenderer {
-                    inner: Arc::clone(&shared),
-                    pending_resize: Arc::clone(&pending_resize),
-                };
+                let wrapper = SharedRenderer::new(Arc::clone(&shared), Arc::clone(&pending_resize));
                 let pipeline = ControllerPipeline::with_backends(
                     pcfg.clone(),
                     Box::new(dec),
@@ -9461,6 +9952,7 @@ mod tests {
             still_refine_metrics: Arc::new(Mutex::new(
                 crate::still_refine::StillRefineMetrics::default(),
             )),
+            scroll_state: Arc::new(ScrollDispatchState::new()),
             encrypt_connection: false,
             base_config: UiSessionConfig::default(),
             layer_lease: Arc::new(Mutex::new(None)),
@@ -9521,6 +10013,7 @@ mod tests {
             still_refine_metrics: Arc::new(Mutex::new(
                 crate::still_refine::StillRefineMetrics::default(),
             )),
+            scroll_state: Arc::new(ScrollDispatchState::new()),
             encrypt_connection: false,
             base_config: UiSessionConfig::default(),
             layer_lease: Arc::new(Mutex::new(None)),
@@ -10927,10 +11420,8 @@ mod tests {
             ops: Arc::clone(&ops),
         })));
         let pending_resize = Arc::new(AtomicU64::new(0));
-        let mut shared_renderer = SharedRenderer {
-            inner: Arc::clone(&inner),
-            pending_resize: Arc::clone(&pending_resize),
-        };
+        let mut shared_renderer =
+            SharedRenderer::new(Arc::clone(&inner), Arc::clone(&pending_resize));
 
         // 1) While renderer mutex is held (simulating nextDrawable stall), apply_stage_rect_nonblocking
         //    must return immediately without blocking and store packed dimensions.
@@ -11597,5 +12088,672 @@ mod tests {
             elapsed < Duration::from_millis(600),
             "dead first LAN candidate must not block second candidate for 1500ms, took {elapsed:?}"
         );
+    }
+
+    /// `SessionHandle::send_ui_input` 根据 `ScrollDispatchState`（对端是否支持 `SUPPORTS_PIXEL_SCROLL`）
+    /// 与 `WheelAccumulator` 分发 `MouseWheelPixel` 或回退 `MouseWheel`（行）。
+    #[test]
+    fn session_scroll_dispatch_routes_pixel_vs_legacy_line_mode() {
+        let input_tx = Arc::new(BoundedInputQueue::new(INPUT_CHANNEL_CAP));
+        let scroll_state = Arc::new(ScrollDispatchState::new());
+        let running = Arc::new(AtomicBool::new(true));
+        let watch_only = Arc::new(AtomicBool::new(false));
+        let (fw, fh) = FileClientWorker::spawn(Arc::new(BoundedQueue::new(8)));
+        let handle = SessionHandle {
+            cmd_tx: Arc::new(BoundedQueue::new(8)),
+            display_ctrl_tx: Arc::new(BoundedQueue::new(8)),
+            input_tx: Arc::clone(&input_tx),
+            update_rx: Arc::new(BoundedUpdateQueue::new(8)),
+            file_event_rx: Arc::new(BoundedQueue::new(8)),
+            terminal_event_rx: Arc::new(BoundedQueue::new(8)),
+            portmap_latest: Arc::new(Mutex::new(None)),
+            tools_hub: Arc::new(Mutex::new(ToolClientHub::new())),
+            file_handle: fh,
+            disconnect_flag: Arc::new(AtomicBool::new(false)),
+            lock_on_disconnect: Arc::new(AtomicBool::new(false)),
+            relay_interrupt: Arc::new(Mutex::new(None)),
+            running,
+            watch_only,
+            tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
+            still_refine_metrics: Arc::new(Mutex::new(
+                crate::still_refine::StillRefineMetrics::default(),
+            )),
+            scroll_state: Arc::clone(&scroll_state),
+            encrypt_connection: false,
+            base_config: UiSessionConfig::default(),
+            layer_lease: Arc::new(Mutex::new(None)),
+            upgrade_surface: Arc::new(Mutex::new(None)),
+            thread: None,
+        };
+
+        // 1) 默认/旧端（supports_pixel_scroll = false）：8 次 2px 微滚动无损累积出 1 条 MouseWheel(-1)
+        assert!(!handle.peer_supports_pixel_scroll());
+        for _ in 0..8 {
+            handle.send_wheel(0.0, 2.0, 16.0, 0);
+        }
+        assert_eq!(
+            input_tx.drain_all(),
+            vec![InputEvent::MouseWheel {
+                delta: -1,
+                horizontal: false
+            }]
+        );
+
+        // 2) 新端（supports_pixel_scroll = true）：delta_mode=0 直接累积输出 MouseWheelPixel（轴向与 CGEvent 一致）
+        scroll_state.update_peer_capability(true);
+        assert!(handle.peer_supports_pixel_scroll());
+        handle.send_wheel(3.0, 5.0, 16.0, 0);
+        assert_eq!(
+            input_tx.drain_all(),
+            vec![InputEvent::MouseWheelPixel { dx: -3, dy: -5 }]
+        );
+
+        // 3) 新端收到 delta_mode=1（离散行滚轮）时仍走 MouseWheel 行单位
+        handle.send_wheel(0.0, -2.0, 16.0, 1);
+        assert_eq!(
+            input_tx.drain_all(),
+            vec![InputEvent::MouseWheel {
+                delta: 2,
+                horizontal: false
+            }]
+        );
+        drop(fw);
+    }
+
+    #[test]
+    fn shared_renderer_set_cursor_defers_nonblocking_under_contention() {
+        type RecordedCursors = Arc<Mutex<Vec<((i32, i32), bool)>>>;
+        struct CursorStubRenderer {
+            cursors: RecordedCursors,
+            presented: usize,
+        }
+        impl Renderer for CursorStubRenderer {
+            fn present(
+                &mut self,
+                _frame: rc_decode::DecodedFrame,
+            ) -> rc_types::Result<rc_types::Timestamp> {
+                self.presented += 1;
+                Ok(rc_types::Timestamp(self.presented as u32))
+            }
+            fn resize(&mut self, _size: (u32, u32)) -> rc_types::Result<()> {
+                Ok(())
+            }
+            fn set_vsync(&mut self, _on: bool) {}
+            fn set_cursor(&mut self, pos: (i32, i32), visible: bool) {
+                self.cursors.lock().unwrap().push((pos, visible));
+            }
+        }
+
+        let recorded_cursors = Arc::new(Mutex::new(Vec::new()));
+        let inner: RendererHandle = Arc::new(Mutex::new(Box::new(CursorStubRenderer {
+            cursors: Arc::clone(&recorded_cursors),
+            presented: 0,
+        })));
+        let pending_resize = Arc::new(AtomicU64::new(0));
+        let mut shared = SharedRenderer::new(Arc::clone(&inner), Arc::clone(&pending_resize));
+
+        // 模拟渲染线程正在持有 renderer mutex（等待 CAMetalLayer::nextDrawable）：
+        // set_cursor 绝不能阻塞，必须写入 pending_cursor 并立即返回。
+        let lock_guard = inner.lock().unwrap();
+        shared.set_cursor((100, 200), true);
+        shared.set_cursor((320, 480), false);
+        assert_eq!(
+            *shared.pending_cursor.lock().unwrap(),
+            Some((320, 480, false))
+        );
+        assert!(recorded_cursors.lock().unwrap().is_empty());
+        drop(lock_guard);
+
+        // 下一次 present 在持锁区间原子补刷最后一次挂起光标。
+        let dummy_frame = rc_decode::DecodedFrame {
+            decode_done_ts: rc_types::Timestamp(1),
+            width: 64,
+            height: 64,
+            texture: rc_capture::FrameTexture::Cpu(rc_types::CpuFrame {
+                width: 64,
+                height: 64,
+                format: rc_types::PixelFormat::Bgra8,
+                stride: 64 * 4,
+                data: vec![0u8; 64 * 64 * 4],
+            }),
+        };
+        shared.present(dummy_frame).unwrap();
+        assert_eq!(*shared.pending_cursor.lock().unwrap(), None);
+        assert_eq!(*recorded_cursors.lock().unwrap(), vec![((320, 480), false)]);
+
+        // 无锁竞争时 set_cursor 直达底层渲染器。
+        shared.set_cursor((10, 20), true);
+        assert_eq!(*shared.pending_cursor.lock().unwrap(), None);
+        assert_eq!(
+            *recorded_cursors.lock().unwrap(),
+            vec![((320, 480), false), ((10, 20), true)]
+        );
+    }
+
+    #[test]
+    fn session_input_handle_and_wake_hook_notify_on_empty_to_nonempty_and_skip_wheel_lock() {
+        let input_tx = Arc::new(BoundedInputQueue::new(INPUT_CHANNEL_CAP));
+        let wake_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_hits_cb = Arc::clone(&wake_hits);
+        input_tx.set_wake_handle(Some(Arc::new(move || {
+            wake_hits_cb.fetch_add(1, Ordering::Relaxed);
+        })));
+
+        let scroll_state = Arc::new(ScrollDispatchState::new());
+        let running = Arc::new(AtomicBool::new(true));
+        let watch_only = Arc::new(AtomicBool::new(false));
+        let (fw, fh) = FileClientWorker::spawn(Arc::new(BoundedQueue::new(8)));
+        let handle = SessionHandle {
+            cmd_tx: Arc::new(BoundedQueue::new(8)),
+            display_ctrl_tx: Arc::new(BoundedQueue::new(8)),
+            input_tx: Arc::clone(&input_tx),
+            update_rx: Arc::new(BoundedUpdateQueue::new(8)),
+            file_event_rx: Arc::new(BoundedQueue::new(8)),
+            terminal_event_rx: Arc::new(BoundedQueue::new(8)),
+            portmap_latest: Arc::new(Mutex::new(None)),
+            tools_hub: Arc::new(Mutex::new(ToolClientHub::new())),
+            file_handle: fh,
+            disconnect_flag: Arc::new(AtomicBool::new(false)),
+            lock_on_disconnect: Arc::new(AtomicBool::new(false)),
+            relay_interrupt: Arc::new(Mutex::new(None)),
+            running,
+            watch_only,
+            tool_permissions: Arc::new(Mutex::new(ToolPermissions::all_allowed())),
+            still_refine_metrics: Arc::new(Mutex::new(
+                crate::still_refine::StillRefineMetrics::default(),
+            )),
+            scroll_state: Arc::clone(&scroll_state),
+            encrypt_connection: false,
+            base_config: UiSessionConfig::default(),
+            layer_lease: Arc::new(Mutex::new(None)),
+            upgrade_surface: Arc::new(Mutex::new(None)),
+            thread: None,
+        };
+
+        let input_handle = handle.input_handle();
+        // 即使 wheel_accumulator 被其他线程/事件占用，非滚轮鼠标移动仍无阻塞投递并唤醒发送端。
+        let _wheel_guard = scroll_state.wheel_accumulator.lock().unwrap();
+        let unmapped = input_handle.send_ui_input(
+            &crate::input_bridge::UiInputEvent::MouseMove {
+                x: 100.0,
+                y: 100.0,
+                stage_w: 200.0,
+                stage_h: 200.0,
+            },
+            Some((1920, 1080)),
+        );
+        assert!(!unmapped);
+        assert_eq!(wake_hits.load(Ordering::Relaxed), 1);
+
+        // 队列非空时继续追加不会重复触发唤醒；排空后下一次由空转非空再次触发。
+        input_handle.send_input(InputEvent::MouseButton {
+            button: rc_input::MouseButton::Left,
+            pressed: true,
+        });
+        assert_eq!(wake_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(input_tx.drain_all().len(), 2);
+
+        input_handle.send_input(InputEvent::MouseButton {
+            button: rc_input::MouseButton::Left,
+            pressed: false,
+        });
+        assert_eq!(wake_hits.load(Ordering::Relaxed), 2);
+        drop(fw);
+    }
+
+    #[test]
+    fn reconnect_resumed_refreshes_input_queue_wake_handle() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct WakeStubTransport {
+            inbound: VecDeque<NetEvent>,
+            wake_hits: Arc<AtomicUsize>,
+        }
+
+        impl Transport for WakeStubTransport {
+            fn send_datagram(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+                Ok(())
+            }
+            fn send_reliable(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+                Ok(())
+            }
+            fn send_reliable_urgent(&mut self, _data: &[u8]) -> rc_types::Result<()> {
+                Ok(())
+            }
+            fn poll(&mut self, _timeout: Duration) -> rc_types::Result<Vec<NetEvent>> {
+                Ok(self.inbound.drain(..).collect())
+            }
+            fn stats(&self) -> NetStats {
+                NetStats::default()
+            }
+            fn wake_handle(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+                let hits = Arc::clone(&self.wake_hits);
+                Some(Arc::new(move || {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                }))
+            }
+        }
+
+        let params = SessionParams {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_bps: 8_000_000,
+        };
+        let mut initial_welcome = Vec::new();
+        ControlMessage::Welcome(rc_session::proto::Welcome {
+            session_id: 42,
+            granted: params,
+            auth_status: rc_session::proto::AuthStatus::Ok,
+            host_flags: rc_session::proto::HostFlags(0),
+        })
+        .encode(&mut initial_welcome);
+
+        let old_wake_hits = Arc::new(AtomicUsize::new(0));
+        let new_wake_hits = Arc::new(AtomicUsize::new(0));
+        let input_rx = Arc::new(BoundedInputQueue::new(INPUT_CHANNEL_CAP));
+        let scroll_state = ScrollDispatchState::new();
+
+        let mut ccfg = ClientSessionConfig::new(
+            "127.0.0.1:9901".parse().unwrap(),
+            params,
+            42,
+            Box::new(BridgeInputCapture {
+                queue: Arc::clone(&input_rx),
+                watch_only: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+        ccfg.pipeline.prefer_hardware = false;
+        let dec = rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
+            resolution: Resolution::new(64, 64),
+            ..rc_decode::FakeDecoderConfig::default()
+        })
+        .expect("fake decoder");
+        let rend = rc_render::FakeRenderer::new(rc_render::FakeRendererConfig {
+            size: (64, 64),
+            ..rc_render::FakeRendererConfig::default()
+        })
+        .expect("fake renderer");
+        let clock: SessionClock = Arc::new(|| 0);
+        let mut client = ClientSession::with_parts(
+            ccfg,
+            Box::new(WakeStubTransport {
+                inbound: VecDeque::from([NetEvent::Reliable(initial_welcome)]),
+                wake_hits: Arc::clone(&old_wake_hits),
+            }),
+            Box::new(dec),
+            Box::new(rend),
+            clock,
+        )
+        .expect("with_parts");
+        client.handshake().expect("initial handshake");
+        input_rx.set_wake_handle(client.transport_wake_handle());
+
+        // 空转非空入队触发旧传输的 wake_handle。
+        input_rx.push(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        assert_eq!(old_wake_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(input_rx.drain_all().len(), 1);
+
+        // 断线丢弃旧传输后，安装返回全新传输的 connect_factory 并走完快速 Resumed。
+        let factory_wake_hits = Arc::clone(&new_wake_hits);
+        client.set_connect_factory(Box::new(move || {
+            let mut resumed_welcome = Vec::new();
+            ControlMessage::Welcome(rc_session::proto::Welcome {
+                session_id: 42,
+                granted: params,
+                auth_status: rc_session::proto::AuthStatus::Ok,
+                host_flags: rc_session::proto::HostFlags(
+                    rc_session::proto::HostFlags::RESUME_ACCEPTED
+                        | rc_session::proto::HostFlags::SUPPORTS_PIXEL_SCROLL,
+                ),
+            })
+            .encode(&mut resumed_welcome);
+            Ok(Box::new(WakeStubTransport {
+                inbound: VecDeque::from([NetEvent::Reliable(resumed_welcome)]),
+                wake_hits: Arc::clone(&factory_wake_hits),
+            }))
+        }));
+
+        client.on_disconnected(0);
+        assert_eq!(client.state(), SessionState::Reconnecting);
+        let delay_us = client.reconnect_config().backoff_initial.as_micros() as u64;
+        assert!(matches!(
+            client.tick_reconnect(delay_us).expect("connect attempt"),
+            ReconnectOutcome::Connecting
+        ));
+        assert!(matches!(
+            client.tick_reconnect(delay_us).expect("resume welcome"),
+            ReconnectOutcome::Resumed
+        ));
+        assert_eq!(client.state(), SessionState::Streaming);
+
+        // run_session_thread 在 Resumed / Rebuilt 分支均调用此公共刷新入口。
+        refresh_after_reconnect_outcome(&mut client, &input_rx, &scroll_state);
+        assert!(scroll_state
+            .peer_supports_pixel_scroll
+            .load(Ordering::Acquire));
+
+        // 恢复后空闲期入队必须唤醒新传输的 wake_handle，不得再打到已丢弃的旧句柄。
+        input_rx.push(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        assert_eq!(old_wake_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(new_wake_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn classify_preempted_and_busy_controlled_disable_auto_reconnect() {
+        use crate::ui_error::ErrorPlatform;
+
+        let preempted =
+            classify_stop_reason_end(&rc_session::StopReason::ByeReceived(ByeReason::Preempted));
+        assert!(preempted.preempted);
+        assert!(!preempted.busy_controlled);
+        assert!(!preempted.recoverable);
+        assert_eq!(
+            crate::ui_error::classify_session_reason(&preempted.reason, ErrorPlatform::Macos).code,
+            "session.preempted"
+        );
+
+        let gave_up_preempted = classify_gave_up_end(Some(&rc_session::StopReason::ByeReceived(
+            ByeReason::Preempted,
+        )));
+        assert!(gave_up_preempted.preempted);
+        assert!(!gave_up_preempted.recoverable);
+
+        let busy_sig = classify_runtime_err_end(
+            "信令请求失败",
+            &rc_types::Error::Network("signal error target_in_session: device busy".to_string()),
+            false,
+        );
+        assert!(busy_sig.busy_controlled);
+        assert!(!busy_sig.preempted);
+        assert!(!busy_sig.recoverable);
+        assert_eq!(
+            crate::ui_error::classify_session_reason(&busy_sig.reason, ErrorPlatform::Macos).code,
+            "signal.target_in_session"
+        );
+
+        let busy_lan = classify_stop_reason_end(&rc_session::StopReason::Disconnected(
+            "HostBusyControlled: host already has an active controller".to_string(),
+        ));
+        assert!(busy_lan.busy_controlled);
+        assert!(!busy_lan.preempted);
+        assert!(!busy_lan.recoverable);
+        assert_eq!(
+            crate::ui_error::classify_session_reason(&busy_lan.reason, ErrorPlatform::Macos).code,
+            "signal.target_in_session"
+        );
+    }
+
+    #[test]
+    fn session_handle_lan_busy_controlled_and_preempted_emit_structured_disconnected() {
+        use rc_net::{NetConfig, NetEvent, Role};
+        use rc_session::dev_cert::{DEV_CERT_PEM, DEV_KEY_PEM};
+        use rc_session::proto::{AuthStatus, ByeReason, ControlMessage, HostFlags, Welcome};
+
+        fn drain_until_disconnected(t: &mut dyn rc_net::Transport, max_wait: Duration) {
+            let deadline = Instant::now() + max_wait;
+            while Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match t.poll(remaining.min(Duration::from_millis(50))) {
+                    Ok(events) => {
+                        if events
+                            .iter()
+                            .any(|e| matches!(e, NetEvent::Disconnected { .. }))
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let dev_id = Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM).expect("dev id");
+
+        // 1) 直连 LAN 握手返回 Welcome{Rejected, HostFlags::BUSY_CONTROLLED} -> 透出 busy_controlled=true 且禁自动重连
+        {
+            let ep = QuicEndpoint::new(
+                &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+                &dev_id,
+            )
+            .expect("busy lan ep");
+            let addr = ep.local_addr().expect("busy lan addr");
+            let jh = thread::spawn(move || {
+                let mut t = ep
+                    .accept_with_handshake_timeout(
+                        Duration::from_secs(5),
+                        Duration::from_secs(5),
+                        None,
+                    )
+                    .expect("accept busy");
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    for ev in t.poll(Duration::from_millis(20)).expect("poll") {
+                        if let NetEvent::Reliable(bytes) = ev {
+                            if let Ok(ControlMessage::Hello(h)) = ControlMessage::decode(&bytes) {
+                                let mut out = Vec::new();
+                                ControlMessage::Welcome(Welcome {
+                                    session_id: h.session_id,
+                                    granted: h.requested,
+                                    auth_status: AuthStatus::Rejected,
+                                    host_flags: HostFlags(HostFlags::BUSY_CONTROLLED),
+                                })
+                                .encode(&mut out);
+                                let _ = t.send_reliable(&out);
+                                drain_until_disconnected(&mut t, Duration::from_secs(2));
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+
+            let session = SessionHandle::spawn(UiSessionConfig {
+                connect_addr: addr,
+                width: 320,
+                height: 240,
+                fps: 30,
+                bitrate_bps: 1_000_000,
+                prefer_hardware: false,
+                clipboard_enabled: false,
+                audio_enabled: false,
+                ..UiSessionConfig::default()
+            });
+
+            let mut disc = None;
+            let mut ended = None;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                while let Some(upd) = session.try_recv_update() {
+                    match upd {
+                        SessionUpdate::Disconnected {
+                            preempted,
+                            busy_controlled,
+                            auto_reconnect_eligible,
+                            ui_error,
+                            ..
+                        } => {
+                            disc = Some((
+                                preempted,
+                                busy_controlled,
+                                auto_reconnect_eligible,
+                                ui_error,
+                            ));
+                        }
+                        SessionUpdate::Ended {
+                            recoverable,
+                            ui_error,
+                            ..
+                        } => {
+                            ended = Some((recoverable, ui_error));
+                        }
+                        _ => {}
+                    }
+                }
+                if disc.is_some() && ended.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            session.join();
+            jh.join().unwrap();
+
+            let (preempted, busy, auto_reconn, disc_err) =
+                disc.expect("must emit SessionUpdate::Disconnected");
+            assert!(!preempted);
+            assert!(busy);
+            assert!(!auto_reconn);
+            assert_eq!(
+                disc_err.as_ref().map(|e| e.code.as_str()),
+                Some("signal.target_in_session")
+            );
+            let (recoverable, end_err) = ended.expect("must emit SessionUpdate::Ended");
+            assert!(!recoverable);
+            assert_eq!(
+                end_err.as_ref().map(|e| e.code.as_str()),
+                Some("signal.target_in_session")
+            );
+        }
+
+        // 2) 流式阶段收到被控端 ByeReason::Preempted -> 透出 preempted=true 且禁自动重连
+        {
+            let ep = QuicEndpoint::new(
+                &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+                &dev_id,
+            )
+            .expect("preempt ep");
+            let addr = ep.local_addr().expect("preempt addr");
+            let jh = thread::spawn(move || {
+                let mut t = ep
+                    .accept_with_handshake_timeout(
+                        Duration::from_secs(5),
+                        Duration::from_secs(5),
+                        None,
+                    )
+                    .expect("accept preempt");
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    for ev in t.poll(Duration::from_millis(20)).expect("poll") {
+                        if let NetEvent::Reliable(bytes) = ev {
+                            if let Ok(ControlMessage::Hello(h)) = ControlMessage::decode(&bytes) {
+                                let mut w_out = Vec::new();
+                                ControlMessage::Welcome(Welcome {
+                                    session_id: h.session_id,
+                                    granted: h.requested,
+                                    auth_status: AuthStatus::Ok,
+                                    host_flags: HostFlags(0),
+                                })
+                                .encode(&mut w_out);
+                                let _ = t.send_reliable(&w_out);
+                                // 等待客户端完成 Welcome 消费并进入 Streaming，避免单次 poll 被上行控制帧提前唤醒。
+                                let settle_deadline = Instant::now() + Duration::from_millis(30);
+                                while Instant::now() < settle_deadline {
+                                    let rem =
+                                        settle_deadline.saturating_duration_since(Instant::now());
+                                    if rem.is_zero() {
+                                        break;
+                                    }
+                                    match t.poll(rem) {
+                                        Ok(evs)
+                                            if evs.iter().any(|e| {
+                                                matches!(e, NetEvent::Disconnected { .. })
+                                            }) =>
+                                        {
+                                            return;
+                                        }
+                                        Ok(_) => {}
+                                        Err(_) => return,
+                                    }
+                                }
+
+                                let mut bye_out = Vec::new();
+                                ControlMessage::Bye {
+                                    reason: ByeReason::Preempted,
+                                }
+                                .encode(&mut bye_out);
+                                let _ = t.send_reliable(&bye_out);
+                                drain_until_disconnected(&mut t, Duration::from_secs(2));
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+
+            let session = SessionHandle::spawn(UiSessionConfig {
+                connect_addr: addr,
+                width: 320,
+                height: 240,
+                fps: 30,
+                bitrate_bps: 1_000_000,
+                prefer_hardware: false,
+                clipboard_enabled: false,
+                audio_enabled: false,
+                ..UiSessionConfig::default()
+            });
+
+            let mut disc = None;
+            let mut ended = None;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                while let Some(upd) = session.try_recv_update() {
+                    match upd {
+                        SessionUpdate::Disconnected {
+                            preempted,
+                            busy_controlled,
+                            auto_reconnect_eligible,
+                            ui_error,
+                            ..
+                        } => {
+                            disc = Some((
+                                preempted,
+                                busy_controlled,
+                                auto_reconnect_eligible,
+                                ui_error,
+                            ));
+                        }
+                        SessionUpdate::Ended {
+                            recoverable,
+                            ui_error,
+                            ..
+                        } => {
+                            ended = Some((recoverable, ui_error));
+                        }
+                        _ => {}
+                    }
+                }
+                if disc.is_some() && ended.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            session.join();
+            jh.join().unwrap();
+
+            let (preempted, busy, auto_reconn, disc_err) =
+                disc.expect("must emit SessionUpdate::Disconnected on Preempted");
+            assert!(preempted);
+            assert!(!busy);
+            assert!(!auto_reconn);
+            assert_eq!(
+                disc_err.as_ref().map(|e| e.code.as_str()),
+                Some("session.preempted")
+            );
+            let (recoverable, end_err) = ended.expect("must emit SessionUpdate::Ended");
+            assert!(!recoverable);
+            assert_eq!(
+                end_err.as_ref().map(|e| e.code.as_str()),
+                Some("session.preempted")
+            );
+        }
     }
 }

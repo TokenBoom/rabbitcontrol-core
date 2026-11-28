@@ -1156,7 +1156,13 @@ impl ClientAuthenticator {
             }
             AuthStatus::Rejected => {
                 self.state = ClientState::Failed;
-                ClientAuthAction::Failed("authentication rejected by host".into())
+                if welcome.host_flags.busy_controlled() {
+                    ClientAuthAction::Failed(
+                        "HostBusyControlled: host already has an active controller".into(),
+                    )
+                } else {
+                    ClientAuthAction::Failed("authentication rejected by host".into())
+                }
             }
         }
     }
@@ -1709,6 +1715,16 @@ mod tests {
         match c3.on_welcome(&sample_welcome(AuthStatus::Rejected)) {
             ClientAuthAction::Failed(msg) => assert!(!msg.is_empty()),
             other => panic!("expected Failed, got {other:?}"),
+        }
+
+        let mut c4 = ClientAuthenticator::new(ClientAuthConfig::default());
+        let mut busy_welcome = sample_welcome(AuthStatus::Rejected);
+        busy_welcome.host_flags = crate::proto::HostFlags(crate::proto::HostFlags::BUSY_CONTROLLED);
+        match c4.on_welcome(&busy_welcome) {
+            ClientAuthAction::Failed(msg) => {
+                assert!(msg.contains("HostBusyControlled"), "got {msg}");
+            }
+            other => panic!("expected Failed(HostBusyControlled), got {other:?}"),
         }
     }
 

@@ -65,6 +65,18 @@ pub const TYPE_TOOL_CHANNEL: u8 = 0x10;
 pub const TYPE_AUDIO_FRAME: u8 = 0x11;
 /// 线格式类型字节：`OwnerAuthResponse`（client→host 自控免密挑战签名应答）。
 pub const TYPE_OWNER_AUTH_RESPONSE: u8 = 0x12;
+/// 线格式类型字节：`ControllerMeta`（client→host 上报控制端设备元数据与会话模式）。
+pub const TYPE_CONTROLLER_META: u8 = 0x16;
+
+/// 控制端元数据会话模式：`remote_control`（完全控制）。
+pub const CONTROLLER_MODE_REMOTE_CONTROL: u8 = 0;
+/// 控制端元数据会话模式：`watch_only`（仅观看）。
+pub const CONTROLLER_MODE_WATCH_ONLY: u8 = 1;
+/// 控制端元数据会话模式：`tools`（纯工具模式）。
+pub const CONTROLLER_MODE_TOOLS: u8 = 2;
+
+/// `ControllerMeta` 单个字符串字段（`device_id` / `device_name` / `os`）的最大 UTF-8 字节数。
+pub const MAX_CONTROLLER_META_FIELD_BYTES: usize = 256;
 
 /// 工具复用子通道号：文件传输（W2）。
 pub const TOOL_CHANNEL_FILE: u8 = 1;
@@ -238,7 +250,8 @@ pub enum BitrateReason {
 }
 
 /// Bye 的原因：0=正常关闭、1=u32 时间戳饱和刷新（T17：host 钟逼近
-/// 71.6 分钟守卫线时发 1，client 以 resume=false 全新重连）。
+/// 71.6 分钟守卫线时发 1，client 以 resume=false 全新重连）、
+/// 2=桌面会话切换（LoginWindow ↔ Aqua）、3=被其他设备接管抢占。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ByeReason {
@@ -248,6 +261,8 @@ pub enum ByeReason {
     Refresh = 1,
     /// 对端正在切换桌面会话（macOS LoginWindow ↔ Aqua），控制端可自动短延迟重连。
     SessionSwitching = 2,
+    /// 连接已被其他设备接管（收到时立即停机并禁用自动重连）。
+    Preempted = 3,
 }
 
 /// Welcome 的 host 能力位（newtype：位的语义只在访问器里展开）。
@@ -260,8 +275,20 @@ impl HostFlags {
     pub const RESUME_ACCEPTED: u8 = 0b0000_0001;
     /// bit1：时钟纪元已重置（饱和刷新后新会话）。
     pub const CLOCK_EPOCH_RESET: u8 = 0b0000_0010;
+    /// bit2：被控端支持像素级连续滚轮（`rc_input::InputEvent::MouseWheelPixel`）。
+    pub const SUPPORTS_PIXEL_SCROLL: u8 = 0b0000_0100;
+    /// bit3：被控端支持接收控制端元数据 `ControllerMeta`（`0x16`）。
+    pub const SUPPORTS_CONTROLLER_META: u8 = 0b0000_1000;
+    /// bit4：被控端当前已有活跃控制端且未声明接管，拒绝本次握手（`HostBusyControlled`）。
+    pub const BUSY_CONTROLLED: u8 = 0b0001_0000;
     /// 已定义位的掩码；decode 用它拒绝未知 bit。
-    pub const KNOWN_MASK: u8 = Self::RESUME_ACCEPTED | Self::CLOCK_EPOCH_RESET;
+    pub const KNOWN_MASK: u8 = Self::RESUME_ACCEPTED
+        | Self::CLOCK_EPOCH_RESET
+        | Self::SUPPORTS_PIXEL_SCROLL
+        | Self::SUPPORTS_CONTROLLER_META
+        | Self::BUSY_CONTROLLED;
+    /// [`Self::KNOWN_MASK`] 别名。
+    pub const KNOWN_BITS: u8 = Self::KNOWN_MASK;
 
     /// bit0 是否置位（ReconnectRequest.resume 被接受）。
     pub const fn resume_accepted(&self) -> bool {
@@ -271,6 +298,21 @@ impl HostFlags {
     /// bit1 是否置位（时钟纪元已重置）。
     pub const fn clock_epoch_reset(&self) -> bool {
         self.0 & Self::CLOCK_EPOCH_RESET != 0
+    }
+
+    /// bit2 是否置位（被控端支持像素级连续滚轮）。
+    pub const fn supports_pixel_scroll(&self) -> bool {
+        self.0 & Self::SUPPORTS_PIXEL_SCROLL != 0
+    }
+
+    /// bit3 是否置位（被控端支持接收控制端元数据 `ControllerMeta`）。
+    pub const fn supports_controller_meta(&self) -> bool {
+        self.0 & Self::SUPPORTS_CONTROLLER_META != 0
+    }
+
+    /// bit4 是否置位（被控端当前已有活跃控制端，拒绝非接管握手）。
+    pub const fn busy_controlled(&self) -> bool {
+        self.0 & Self::BUSY_CONTROLLED != 0
     }
 }
 
@@ -335,6 +377,54 @@ pub struct AudioFramePacket {
     pub codec: u8,
     /// 音频帧数据，字节数 ≤ [`MAX_AUDIO_FRAME_BYTES`]。
     pub data: Vec<u8>,
+}
+
+/// 0x16 ControllerMeta（client→host）：控制端上报自身设备元数据与会话模式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerMeta {
+    /// 控制端设备 ID（如 9 位设备码，UTF-8 字节数 ≤ [`MAX_CONTROLLER_META_FIELD_BYTES`]）。
+    pub device_id: String,
+    /// 控制端设备名称（UTF-8 字节数 ≤ [`MAX_CONTROLLER_META_FIELD_BYTES`]）。
+    pub device_name: String,
+    /// 控制端操作系统标识（UTF-8 字节数 ≤ [`MAX_CONTROLLER_META_FIELD_BYTES`]）。
+    pub os: String,
+    /// 会话模式：`0 = remote_control`，`1 = watch_only`，`2 = tools`。
+    pub mode: u8,
+}
+
+impl ControllerMeta {
+    /// 将线上 `mode` 字节转换为标准模式字符串。
+    pub const fn mode_str(&self) -> &'static str {
+        match self.mode {
+            CONTROLLER_MODE_REMOTE_CONTROL => "remote_control",
+            CONTROLLER_MODE_WATCH_ONLY => "watch_only",
+            CONTROLLER_MODE_TOOLS => "tools",
+            _ => "remote_control",
+        }
+    }
+
+    /// 校验控制端元数据各字段长度与模式枚举值是否合法。
+    pub fn validate(&self) -> Result<()> {
+        for (name, val) in [
+            ("device_id", self.device_id.as_str()),
+            ("device_name", self.device_name.as_str()),
+            ("os", self.os.as_str()),
+        ] {
+            if val.len() > MAX_CONTROLLER_META_FIELD_BYTES {
+                return Err(Error::InvalidConfig(format!(
+                    "controller_meta.{name} {} bytes exceeds MAX_CONTROLLER_META_FIELD_BYTES {MAX_CONTROLLER_META_FIELD_BYTES}",
+                    val.len()
+                )));
+            }
+        }
+        if self.mode > CONTROLLER_MODE_TOOLS {
+            return Err(Error::InvalidConfig(format!(
+                "controller_meta.mode must be 0..={CONTROLLER_MODE_TOOLS}, got {}",
+                self.mode
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// 一条控制消息。**通道约定**：除 [`ControlMessage::BwProbeData`] 走
@@ -476,6 +566,10 @@ pub enum ControlMessage {
         /// 对挑战 `(session_id, salt)` 的 PoP 签名（长度在 `1..=MAX_OWNER_SIGNATURE_LEN`）。
         signature: Vec<u8>,
     },
+    /// 0x16 ControllerMeta（client→host，控制端设备元数据与连接模式）。
+    /// 线格式：`[0x16][device_id_len: u16 LE][device_id][device_name_len: u16 LE][device_name][os_len: u16 LE][os][mode: u8]`。
+    /// 走 reliable 控制流（Stream A）。
+    ControllerMeta(ControllerMeta),
 }
 
 impl ControlMessage {
@@ -500,6 +594,13 @@ impl ControlMessage {
     pub fn tool_channel(channel: u8, payload: Vec<u8>) -> Result<Self> {
         validate_tool_message(channel, payload.len())?;
         Ok(ControlMessage::ToolChannel { channel, payload })
+    }
+
+    /// 校验并构造一条 `ControllerMeta` 消息（各字符串字段字节数须 ≤
+    /// [`MAX_CONTROLLER_META_FIELD_BYTES`]、`mode` 须在 `0..=2`）。
+    pub fn controller_meta(meta: ControllerMeta) -> Result<Self> {
+        meta.validate()?;
+        Ok(ControlMessage::ControllerMeta(meta))
     }
 
     /// 校验并构造一条 `AudioFrame` 消息（发送侧入口：`sample_rate` 须在
@@ -683,6 +784,20 @@ impl ControlMessage {
                 );
                 out.extend_from_slice(&len.to_le_bytes());
                 out.extend_from_slice(signature);
+            }
+            ControlMessage::ControllerMeta(meta) => {
+                out.push(TYPE_CONTROLLER_META);
+                debug_assert!(meta.validate().is_ok(), "controller_meta invalid: {meta:?}");
+                for field in [
+                    meta.device_id.as_str(),
+                    meta.device_name.as_str(),
+                    meta.os.as_str(),
+                ] {
+                    let len = u16::try_from(field.len()).unwrap_or(u16::MAX);
+                    out.extend_from_slice(&len.to_le_bytes());
+                    out.extend_from_slice(field.as_bytes());
+                }
+                out.push(meta.mode);
             }
         }
     }
@@ -940,6 +1055,29 @@ impl ControlMessage {
                 let signature = r.take(len, "owner_auth_response.signature")?.to_vec();
                 r.done("OwnerAuthResponse")?;
                 ControlMessage::OwnerAuthResponse { signature }
+            }
+            TYPE_CONTROLLER_META => {
+                let device_id = decode_controller_meta_str(&mut r, "controller_meta.device_id")?;
+                let device_name =
+                    decode_controller_meta_str(&mut r, "controller_meta.device_name")?;
+                let os = decode_controller_meta_str(&mut r, "controller_meta.os")?;
+                let mode_off = r.off;
+                let mode = r.u8("controller_meta.mode")?;
+                if mode > CONTROLLER_MODE_TOOLS {
+                    return Err(Error::Protocol {
+                        offset: mode_off,
+                        msg: format!(
+                            "controller_meta.mode must be 0(remote_control), 1(watch_only) or 2(tools), got {mode}"
+                        ),
+                    });
+                }
+                r.done("ControllerMeta")?;
+                ControlMessage::ControllerMeta(ControllerMeta {
+                    device_id,
+                    device_name,
+                    os,
+                    mode,
+                })
             }
             v => {
                 return Err(Error::Protocol {
@@ -1212,6 +1350,28 @@ fn decode_welcome(r: &mut Reader) -> Result<Welcome> {
     })
 }
 
+/// 解码 `ControllerMeta` 中的变长 UTF-8 字符串字段（长度前缀 u16 LE，上限 [`MAX_CONTROLLER_META_FIELD_BYTES`]）。
+fn decode_controller_meta_str(r: &mut Reader, field: &str) -> Result<String> {
+    let len_off = r.off;
+    let len = usize::from(r.u16(field)?);
+    if len > MAX_CONTROLLER_META_FIELD_BYTES {
+        return Err(Error::Protocol {
+            offset: len_off,
+            msg: format!(
+                "{field} length {len} exceeds MAX_CONTROLLER_META_FIELD_BYTES {MAX_CONTROLLER_META_FIELD_BYTES}"
+            ),
+        });
+    }
+    let str_off = r.off;
+    let raw = r.take(len, field)?;
+    std::str::from_utf8(raw)
+        .map(str::to_owned)
+        .map_err(|e| Error::Protocol {
+            offset: str_off + e.valid_up_to(),
+            msg: format!("{field} is not valid UTF-8: {e}"),
+        })
+}
+
 /// 严格解码布尔字节：只接受 0/1（对齐 rc-input 的 `decode_bool`）。
 fn decode_bool(v: u8, off: usize, field: &str) -> Result<bool> {
     match v {
@@ -1253,16 +1413,17 @@ fn decode_bitrate_reason(v: u8, off: usize) -> Result<BitrateReason> {
     }
 }
 
-/// 解码 ByeReason（严格 0..=2）。
+/// 解码 ByeReason（严格 0..=3）。
 fn decode_bye_reason(v: u8, off: usize) -> Result<ByeReason> {
     match v {
         0 => Ok(ByeReason::Normal),
         1 => Ok(ByeReason::Refresh),
         2 => Ok(ByeReason::SessionSwitching),
+        3 => Ok(ByeReason::Preempted),
         v => Err(Error::Protocol {
             offset: off,
             msg: format!(
-                "bye.reason must be 0(Normal), 1(Refresh) or 2(SessionSwitching), got {v}"
+                "bye.reason must be 0(Normal), 1(Refresh), 2(SessionSwitching) or 3(Preempted), got {v}"
             ),
         }),
     }
@@ -1698,15 +1859,33 @@ mod tests {
         let err = ControlMessage::decode(&wire).unwrap_err();
         assert!(err.to_string().contains("got 3"), "{err}");
 
-        // ByeReason=2（SessionSwitching 合法）& ByeReason=3（越界拒收）
+        // ByeReason=2（SessionSwitching 合法）、ByeReason=3（Preempted 合法）& ByeReason=4（越界拒收）
         assert_eq!(
             ControlMessage::decode(&[TYPE_BYE, 2]).unwrap(),
             ControlMessage::Bye {
                 reason: ByeReason::SessionSwitching
             }
         );
-        let err = ControlMessage::decode(&[TYPE_BYE, 3]).unwrap_err();
-        assert!(err.to_string().contains("got 3"), "{err}");
+        assert_eq!(
+            ControlMessage::decode(&[TYPE_BYE, 3]).unwrap(),
+            ControlMessage::Bye {
+                reason: ByeReason::Preempted
+            }
+        );
+        let mut bye_preempted_wire = Vec::new();
+        ControlMessage::Bye {
+            reason: ByeReason::Preempted,
+        }
+        .encode(&mut bye_preempted_wire);
+        assert_eq!(bye_preempted_wire, vec![TYPE_BYE, 3]);
+        assert_eq!(
+            ControlMessage::decode(&bye_preempted_wire).unwrap(),
+            ControlMessage::Bye {
+                reason: ByeReason::Preempted
+            }
+        );
+        let err = ControlMessage::decode(&[TYPE_BYE, 4]).unwrap_err();
+        assert!(err.to_string().contains("got 4"), "{err}");
 
         // resume=2（严格 0/1）
         let mut wire = vec![TYPE_RECONNECT_REQUEST];
@@ -1716,11 +1895,11 @@ mod tests {
         assert!(err.to_string().contains("must be 0 or 1"), "{err}");
     }
 
-    /// host_flags：0x00..=0x03（已定义位全集）可解且访问器正确；
-    /// 0x04/0x80/0xFF（未知 bit）拒收。
+    /// host_flags：0x00..=0x1F（已定义位全集）可解且访问器正确；
+    /// 0x20/0x80/0xFF（未知高位 bit）拒收。
     #[test]
     fn host_flags_reject_unknown_bits() {
-        for flags in [0x00u8, 0x01, 0x02, 0x03] {
+        for flags in 0x00u8..=HostFlags::KNOWN_MASK {
             let wire = welcome_wire_with_flags(flags);
             let decoded = ControlMessage::decode(&wire)
                 .unwrap_or_else(|e| panic!("host_flags=0x{flags:02X} 应可解: {e}"));
@@ -1738,8 +1917,24 @@ mod tests {
                 flags & HostFlags::CLOCK_EPOCH_RESET != 0,
                 "clock_epoch_reset(0x{flags:02X})"
             );
+            assert_eq!(
+                w.host_flags.supports_pixel_scroll(),
+                flags & HostFlags::SUPPORTS_PIXEL_SCROLL != 0,
+                "supports_pixel_scroll(0x{flags:02X})"
+            );
+            assert_eq!(
+                w.host_flags.supports_controller_meta(),
+                flags & HostFlags::SUPPORTS_CONTROLLER_META != 0,
+                "supports_controller_meta(0x{flags:02X})"
+            );
+            assert_eq!(
+                w.host_flags.busy_controlled(),
+                flags & HostFlags::BUSY_CONTROLLED != 0,
+                "busy_controlled(0x{flags:02X})"
+            );
         }
-        for flags in [0x04u8, 0x80, 0xFF] {
+        assert_eq!(HostFlags::KNOWN_BITS, HostFlags::KNOWN_MASK);
+        for flags in [0x20u8, 0x80, 0xFF] {
             let wire = welcome_wire_with_flags(flags);
             let err = ControlMessage::decode(&wire).expect_err("未知 bit 应拒收");
             let msg = err.to_string();
@@ -2476,5 +2671,130 @@ mod tests {
                 "len={bad_len} 应报 Protocol(offset=1)，实际: {err}"
             );
         }
+    }
+
+    /// ControllerMeta（0x16）：roundtrip、线格式字节布局、空字段/UTF-8/边界上限及超长/截断/非法 mode 拒绝。
+    #[test]
+    fn controller_meta_roundtrip_and_rejection() {
+        let cases = [
+            ControllerMeta {
+                device_id: "123456789".to_string(),
+                device_name: "办公 MacBook Pro".to_string(),
+                os: "macos".to_string(),
+                mode: CONTROLLER_MODE_REMOTE_CONTROL,
+            },
+            ControllerMeta {
+                device_id: "".to_string(),
+                device_name: "".to_string(),
+                os: "".to_string(),
+                mode: CONTROLLER_MODE_WATCH_ONLY,
+            },
+            ControllerMeta {
+                device_id: "d".repeat(MAX_CONTROLLER_META_FIELD_BYTES),
+                device_name: "n".repeat(MAX_CONTROLLER_META_FIELD_BYTES),
+                os: "o".repeat(MAX_CONTROLLER_META_FIELD_BYTES),
+                mode: CONTROLLER_MODE_TOOLS,
+            },
+        ];
+
+        for meta in cases {
+            let msg = ControlMessage::controller_meta(meta.clone()).expect("valid meta");
+            let mut wire = Vec::new();
+            msg.encode(&mut wire);
+
+            let mut expected = vec![TYPE_CONTROLLER_META];
+            for s in [&meta.device_id, &meta.device_name, &meta.os] {
+                expected.extend_from_slice(&(s.len() as u16).to_le_bytes());
+                expected.extend_from_slice(s.as_bytes());
+            }
+            expected.push(meta.mode);
+            assert_eq!(wire, expected);
+            assert_eq!(ControlMessage::decode(&wire).unwrap(), msg);
+
+            // 严格前缀截断拒收
+            for cut in 0..wire.len() {
+                assert!(
+                    matches!(
+                        ControlMessage::decode(&wire[..cut]),
+                        Err(Error::Protocol { .. })
+                    ),
+                    "ControllerMeta 截断到 {cut} 字节应报 Protocol"
+                );
+            }
+
+            // 尾字节拒收
+            let expected_len = wire.len();
+            wire.push(0x00);
+            let err = ControlMessage::decode(&wire).unwrap_err();
+            assert!(
+                matches!(err, Error::Protocol { offset, ref msg } if offset == expected_len && msg.contains("trailing")),
+                "尾字节应报 Protocol(offset={expected_len})，实际: {err}"
+            );
+        }
+
+        // 构造器拒收超长字段与非法 mode
+        let over_id = ControllerMeta {
+            device_id: "a".repeat(MAX_CONTROLLER_META_FIELD_BYTES + 1),
+            device_name: "mac".to_string(),
+            os: "macos".to_string(),
+            mode: CONTROLLER_MODE_REMOTE_CONTROL,
+        };
+        assert!(matches!(
+            ControlMessage::controller_meta(over_id),
+            Err(Error::InvalidConfig(_))
+        ));
+        let bad_mode_meta = ControllerMeta {
+            device_id: "123".to_string(),
+            device_name: "mac".to_string(),
+            os: "macos".to_string(),
+            mode: 3,
+        };
+        assert!(matches!(
+            ControlMessage::controller_meta(bad_mode_meta),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        // 线格式拒收超长字段（device_id / device_name / os）
+        for field_idx in 0..3 {
+            let mut wire = vec![TYPE_CONTROLLER_META];
+            for idx in 0..3 {
+                if idx == field_idx {
+                    let over = (MAX_CONTROLLER_META_FIELD_BYTES + 1) as u16;
+                    wire.extend_from_slice(&over.to_le_bytes());
+                    wire.extend(vec![b'x'; usize::from(over)]);
+                } else {
+                    wire.extend_from_slice(&1u16.to_le_bytes());
+                    wire.push(b'a');
+                }
+            }
+            wire.push(CONTROLLER_MODE_REMOTE_CONTROL);
+            assert!(
+                matches!(ControlMessage::decode(&wire), Err(Error::Protocol { .. })),
+                "超长字段 {field_idx} 应报 Protocol"
+            );
+        }
+
+        // 线格式拒收非法 UTF-8
+        let mut bad_utf8 = vec![TYPE_CONTROLLER_META];
+        bad_utf8.extend_from_slice(&2u16.to_le_bytes());
+        bad_utf8.extend_from_slice(&[0xFF, 0xFE]);
+        bad_utf8.extend_from_slice(&0u16.to_le_bytes());
+        bad_utf8.extend_from_slice(&0u16.to_le_bytes());
+        bad_utf8.push(0);
+        assert!(matches!(
+            ControlMessage::decode(&bad_utf8),
+            Err(Error::Protocol { .. })
+        ));
+
+        // 线格式拒收非法 mode >= 3
+        let mut bad_mode_wire = vec![TYPE_CONTROLLER_META];
+        bad_mode_wire.extend_from_slice(&0u16.to_le_bytes());
+        bad_mode_wire.extend_from_slice(&0u16.to_le_bytes());
+        bad_mode_wire.extend_from_slice(&0u16.to_le_bytes());
+        bad_mode_wire.push(3);
+        assert!(matches!(
+            ControlMessage::decode(&bad_mode_wire),
+            Err(Error::Protocol { .. })
+        ));
     }
 }

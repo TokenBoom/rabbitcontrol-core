@@ -139,6 +139,47 @@ const WOL_RELAY_RATE_WINDOW: Duration = Duration::from_secs(10);
 /// 本机代发 `wol_relay` 在滑动窗口内允许的最大次数（防异常或滥用刷包）。
 const WOL_RELAY_RATE_MAX: usize = 10;
 
+/// 单次 `control_state_report` 允许上报的最大活跃控制端数量（对齐服务端限制）。
+pub const MAX_ACTIVE_CONTROLLERS_REPORT: usize = 32;
+
+/// 当前连接到被控端的活跃控制端会话摘要（与服务端 `ActiveControllerSummary` 线格式对齐）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ActiveControllerSummary {
+    /// 控制端会话唯一标识（printable ASCII，≤ 64 B）。
+    pub session_id: String,
+    /// 控制端 9 位设备 ID（未知时为空字符串）。
+    #[serde(default)]
+    pub controller_device_id: String,
+    /// 控制端显示名称 / 主机名。
+    #[serde(default)]
+    pub controller_device_name: String,
+    /// 控制端操作系统标识。
+    #[serde(default)]
+    pub controller_os: String,
+    /// 是否为同账号本人自控（通过 `OwnerTicket` PoP 认证）。
+    #[serde(default)]
+    pub is_owner: bool,
+    /// 当前会话模式（`"remote_control"` / `"watch_only"` / `"tools"`）。
+    #[serde(default)]
+    pub mode: String,
+    /// 建立连接的 Unix 毫秒时间戳。
+    #[serde(default)]
+    pub connected_at_ms: u64,
+}
+
+/// 服务端下发的远程强制断开指令（本端作为被控端接收）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ForceDisconnectEvent {
+    /// 发起本次远程断开的同账号设备 ID。
+    pub requester_device_id: String,
+    /// 可选指定断开的控制端设备 ID（`None` 表示不按控制端设备过滤）。
+    #[serde(default)]
+    pub controller_device_id: Option<String>,
+    /// 可选指定断开的会话 ID（`None` 表示不按会话过滤；与 `controller_device_id` 均为 `None` 时断开全部）。
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 /// 服务端推送的入站中继会话请求（本端作为被控端 `host` 接收）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RelayIncoming {
@@ -150,6 +191,12 @@ pub struct RelayIncoming {
     pub relay_token: String,
     /// 发起连接的对端 9 位设备码。
     pub peer_id: String,
+    /// 可选对端设备名称（若信令服务端透传，用于被控端展示对端控制设备名称）。
+    pub peer_name: Option<String>,
+    /// 可选对端主机名（由服务端从同账号在线设备信息透传）。
+    pub peer_hostname: Option<String>,
+    /// 可选对端操作系统标识（由服务端透传）。
+    pub peer_os: Option<String>,
     /// 信令服务器观测到的对端公网 UDP 地址（空串归一化为 `None`）。
     pub peer_public_addr: Option<String>,
     /// 信令服务器观测到的对端双栈公网 UDP 地址列表（IPv6 + IPv4）。
@@ -182,6 +229,8 @@ pub struct RelayIncoming {
     pub owner_grant: Option<OwnerGrantPayload>,
     /// 本次连接是否为同一登录账号的自控连接。
     pub is_owner_connection: bool,
+    /// 是否由同账号控制端显式发起的接管连接（服务端仅在 `is_owner_connection == true` 时透传 `true`）。
+    pub takeover: bool,
     /// 是否为服务端显式 `relay_ready`（强制中继/切中继，而非 `punch_coord`）。
     pub is_relay_alloc: bool,
 }
@@ -259,6 +308,21 @@ pub struct DeviceStatusEvent {
     pub app_version: String,
     /// 设备 CPU 架构（旧服务端未推送时为空串）。
     pub arch: String,
+    /// 处理器型号（旧服务端未推送或为空时为空串）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cpu_model: String,
+    /// 主网卡 MAC 地址（旧服务端未推送或为空时为空串）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mac_address: String,
+    /// 系统总内存（MB，旧服务端未推送或为 0 时为 0）。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub total_memory_mb: u64,
+    /// 操作系统版本（旧服务端未推送或为空时为空串）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub os_version: String,
+    /// 显卡型号（旧服务端未推送或为空时为空串）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gpu_model: String,
     /// 是否允许他人远程协助。
     pub allow_remote_assist: bool,
     /// 是否允许被远程控制（含同账号本人自控；老服务端未推送时按操作系统推导）。
@@ -281,6 +345,31 @@ impl<'de> Deserialize<'de> for DeviceStatusEvent {
             app_version: String,
             #[serde(default)]
             arch: String,
+            #[serde(
+                default,
+                deserialize_with = "crate::platform::deserialize_null_default"
+            )]
+            cpu_model: String,
+            #[serde(
+                default,
+                deserialize_with = "crate::platform::deserialize_null_default"
+            )]
+            mac_address: String,
+            #[serde(
+                default,
+                deserialize_with = "crate::platform::deserialize_null_default"
+            )]
+            total_memory_mb: u64,
+            #[serde(
+                default,
+                deserialize_with = "crate::platform::deserialize_null_default"
+            )]
+            os_version: String,
+            #[serde(
+                default,
+                deserialize_with = "crate::platform::deserialize_null_default"
+            )]
+            gpu_model: String,
             allow_remote_assist: bool,
             #[serde(default)]
             allow_remote_control: Option<bool>,
@@ -298,6 +387,11 @@ impl<'de> Deserialize<'de> for DeviceStatusEvent {
             os: raw.os,
             app_version: raw.app_version,
             arch: raw.arch,
+            cpu_model: raw.cpu_model,
+            mac_address: raw.mac_address,
+            total_memory_mb: raw.total_memory_mb,
+            os_version: raw.os_version,
+            gpu_model: raw.gpu_model,
             allow_remote_assist: raw.allow_remote_assist,
             allow_remote_control,
         })
@@ -379,9 +473,18 @@ impl fmt::Debug for SignalClientOptions {
     }
 }
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_trimmed_empty_str(s: &str) -> bool {
+    s.trim().is_empty()
+}
+
 /// 客户端 -> 服务端信令帧（`type` 标签 `snake_case`）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 enum OutgoingSignalMsg {
     Register {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -393,6 +496,16 @@ enum OutgoingSignalMsg {
         app_version: String,
         #[serde(skip_serializing_if = "String::is_empty")]
         arch: String,
+        #[serde(skip_serializing_if = "is_trimmed_empty_str")]
+        cpu_model: String,
+        #[serde(skip_serializing_if = "is_trimmed_empty_str")]
+        mac_address: String,
+        #[serde(skip_serializing_if = "is_zero_u64")]
+        total_memory_mb: u64,
+        #[serde(skip_serializing_if = "is_trimmed_empty_str")]
+        os_version: String,
+        #[serde(skip_serializing_if = "is_trimmed_empty_str")]
+        gpu_model: String,
         device_group: String,
         lan_addrs: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -439,6 +552,26 @@ enum OutgoingSignalMsg {
         mac_addr: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         wol_enabled: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cpu_model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mac_address: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_memory_mb: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        os_version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        gpu_model: Option<String>,
+    },
+    ControlStateReport {
+        active_controllers: Vec<ActiveControllerSummary>,
+    },
+    ForceDisconnectRequest {
+        target_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        controller_device_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     ConnectRequest {
         target_id: String,
@@ -451,10 +584,12 @@ enum OutgoingSignalMsg {
         nat_port_delta: Option<i16>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nat_port_range: Option<[u16; 2]>,
+        takeover: bool,
     },
     RelayAlloc {
         target_id: String,
         session_id: String,
+        takeover: bool,
     },
     WolRequest {
         request_id: String,
@@ -496,6 +631,31 @@ enum IncomingSignalMsg {
         app_version: String,
         #[serde(default)]
         arch: String,
+        #[serde(
+            default,
+            deserialize_with = "crate::platform::deserialize_null_default"
+        )]
+        cpu_model: String,
+        #[serde(
+            default,
+            deserialize_with = "crate::platform::deserialize_null_default"
+        )]
+        mac_address: String,
+        #[serde(
+            default,
+            deserialize_with = "crate::platform::deserialize_null_default"
+        )]
+        total_memory_mb: u64,
+        #[serde(
+            default,
+            deserialize_with = "crate::platform::deserialize_null_default"
+        )]
+        os_version: String,
+        #[serde(
+            default,
+            deserialize_with = "crate::platform::deserialize_null_default"
+        )]
+        gpu_model: String,
         #[serde(default)]
         allow_remote_assist: bool,
         #[serde(default)]
@@ -503,11 +663,30 @@ enum IncomingSignalMsg {
         #[serde(default)]
         wol_capable: bool,
     },
+    DeviceControlStateChanged {
+        device_id: String,
+        #[serde(default)]
+        active_controllers: Vec<ActiveControllerSummary>,
+    },
+    ForceDisconnect {
+        #[serde(default)]
+        requester_device_id: String,
+        #[serde(default)]
+        controller_device_id: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     PunchCoord {
         session_id: String,
         #[serde(default)]
         role: String,
         peer_id: String,
+        #[serde(default)]
+        peer_name: Option<String>,
+        #[serde(default)]
+        peer_hostname: Option<String>,
+        #[serde(default)]
+        peer_os: Option<String>,
         #[serde(default, alias = "peer_public_addr")]
         peer_public_udp_addr: Option<String>,
         #[serde(default)]
@@ -537,12 +716,20 @@ enum IncomingSignalMsg {
         owner_grant: Option<OwnerGrantPayload>,
         #[serde(default)]
         is_owner_connection: bool,
+        #[serde(default)]
+        takeover: bool,
     },
     RelayReady {
         session_id: String,
         #[serde(default)]
         role: String,
         peer_id: String,
+        #[serde(default)]
+        peer_name: Option<String>,
+        #[serde(default)]
+        peer_hostname: Option<String>,
+        #[serde(default)]
+        peer_os: Option<String>,
         relay_token: String,
         #[serde(default)]
         relay_addr: String,
@@ -550,6 +737,8 @@ enum IncomingSignalMsg {
         owner_grant: Option<OwnerGrantPayload>,
         #[serde(default)]
         is_owner_connection: bool,
+        #[serde(default)]
+        takeover: bool,
     },
     PeerOffline {
         target_id: String,
@@ -692,6 +881,9 @@ struct SharedState {
     status_updates: Mutex<VecDeque<ServerStatusSnapshot>>,
     incoming: Mutex<VecDeque<RelayIncoming>>,
     device_status_events: Mutex<VecDeque<DeviceStatusEvent>>,
+    control_state_events: Mutex<VecDeque<(String, Vec<ActiveControllerSummary>)>>,
+    force_disconnect_requests: Mutex<VecDeque<ForceDisconnectEvent>>,
+    latest_control_state: Mutex<Vec<ActiveControllerSummary>>,
     kicked_reasons: Mutex<VecDeque<String>>,
     pending_connects: Mutex<HashMap<String, PendingConnect>>,
     active_writer: Mutex<Option<SignalWriter>>,
@@ -825,6 +1017,32 @@ impl SharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if q.len() >= DEVICE_STATUS_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(ev);
+    }
+
+    fn push_control_state_event(
+        &self,
+        device_id: String,
+        controllers: Vec<ActiveControllerSummary>,
+    ) {
+        let mut q = self
+            .control_state_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if q.len() >= DEVICE_STATUS_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back((device_id, controllers));
+    }
+
+    fn push_force_disconnect_request(&self, ev: ForceDisconnectEvent) {
+        let mut q = self
+            .force_disconnect_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if q.len() >= STATUS_QUEUE_CAP {
             q.pop_front();
         }
         q.push_back(ev);
@@ -1806,6 +2024,9 @@ impl SignalClientHandle {
             status_updates: Mutex::new(VecDeque::new()),
             incoming: Mutex::new(VecDeque::new()),
             device_status_events: Mutex::new(VecDeque::new()),
+            control_state_events: Mutex::new(VecDeque::new()),
+            force_disconnect_requests: Mutex::new(VecDeque::new()),
+            latest_control_state: Mutex::new(Vec::new()),
             kicked_reasons: Mutex::new(VecDeque::new()),
             pending_connects: Mutex::new(HashMap::new()),
             active_writer: Mutex::new(None),
@@ -1889,7 +2110,17 @@ impl SignalClientHandle {
         target_id: &str,
         timeout: Duration,
     ) -> Result<ConnectGrant, String> {
-        self.request_connect_inner(target_id, timeout, false)
+        self.request_connect_with_takeover(target_id, timeout, false)
+    }
+
+    /// 向服务器发起连接目标 9 位设备码的请求，并显式声明是否为同账号接管连接（`takeover`）。
+    pub fn request_connect_with_takeover(
+        &self,
+        target_id: &str,
+        timeout: Duration,
+        takeover: bool,
+    ) -> Result<ConnectGrant, String> {
+        self.request_connect_inner(target_id, timeout, false, takeover)
     }
 
     /// 向服务器发起纯中继通道分配请求（`relay_alloc`），跳过双方 LAN 宽限与 UDP P2P 打洞，
@@ -1899,7 +2130,17 @@ impl SignalClientHandle {
         target_id: &str,
         timeout: Duration,
     ) -> Result<ConnectGrant, String> {
-        self.request_connect_inner(target_id, timeout, true)
+        self.request_relay_with_takeover(target_id, timeout, false)
+    }
+
+    /// 向服务器发起纯中继通道分配请求（`relay_alloc`），并显式声明是否为同账号接管连接（`takeover`）。
+    pub fn request_relay_with_takeover(
+        &self,
+        target_id: &str,
+        timeout: Duration,
+        takeover: bool,
+    ) -> Result<ConnectGrant, String> {
+        self.request_connect_inner(target_id, timeout, true, takeover)
     }
 
     fn request_connect_inner(
@@ -1907,6 +2148,7 @@ impl SignalClientHandle {
         target_id: &str,
         timeout: Duration,
         force_relay: bool,
+        takeover: bool,
     ) -> Result<ConnectGrant, String> {
         if !self.shared.enabled {
             return Err("未启用信令服务器，请先在「设置 → 网络」中配置服务器".to_string());
@@ -1939,6 +2181,7 @@ impl SignalClientHandle {
             OutgoingSignalMsg::RelayAlloc {
                 target_id: normalized,
                 session_id: session_id.clone(),
+                takeover,
             }
         } else {
             self.shared.trigger_lightweight_probe_refresh();
@@ -1958,6 +2201,7 @@ impl SignalClientHandle {
                 nat_type,
                 nat_port_delta,
                 nat_port_range,
+                takeover,
             }
         };
 
@@ -2055,6 +2299,11 @@ impl SignalClientHandle {
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            cpu_model: None,
+            mac_address: None,
+            total_memory_mb: None,
+            os_version: None,
+            gpu_model: None,
         })
     }
 
@@ -2076,6 +2325,11 @@ impl SignalClientHandle {
             allow_remote_control: Some(allow),
             mac_addr: None,
             wol_enabled: None,
+            cpu_model: None,
+            mac_address: None,
+            total_memory_mb: None,
+            os_version: None,
+            gpu_model: None,
         })
     }
 
@@ -2103,6 +2357,11 @@ impl SignalClientHandle {
             allow_remote_control: None,
             mac_addr,
             wol_enabled: Some(enabled),
+            cpu_model: None,
+            mac_address: None,
+            total_memory_mb: None,
+            os_version: None,
+            gpu_model: None,
         })
     }
 
@@ -2136,6 +2395,36 @@ impl SignalClientHandle {
             allow_remote_control: None,
             mac_addr: Some(norm_mac),
             wol_enabled: self.shared.current_wol_enabled_opt(),
+            cpu_model: None,
+            mac_address: None,
+            total_memory_mb: None,
+            os_version: None,
+            gpu_model: None,
+        })
+    }
+
+    /// 增量同步本机硬件与系统版本元数据至服务端（自动清洗裁剪字段；全空时跳过发送空帧）。
+    pub fn update_hardware_info(
+        &self,
+        info: &crate::platform::DeviceHardwareInfo,
+    ) -> Result<(), String> {
+        let clean = info.sanitized();
+        if clean.is_empty() {
+            return Ok(());
+        }
+        if !self.shared.enabled {
+            return Err("未启用信令服务器".to_string());
+        }
+        self.shared.send_msg(&OutgoingSignalMsg::UpdateAssistState {
+            allow_remote_assist: None,
+            allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
+            cpu_model: (!clean.cpu_model.is_empty()).then_some(clean.cpu_model),
+            mac_address: (!clean.mac_address.is_empty()).then_some(clean.mac_address),
+            total_memory_mb: (clean.total_memory_mb > 0).then_some(clean.total_memory_mb),
+            os_version: (!clean.os_version.is_empty()).then_some(clean.os_version),
+            gpu_model: (!clean.gpu_model.is_empty()).then_some(clean.gpu_model),
         })
     }
 
@@ -2301,6 +2590,74 @@ impl SignalClientHandle {
             .pop_front()
     }
 
+    /// 向服务端上报本机当前活跃控制端列表（`control_state_report`），并缓存在重连后自动补发。
+    pub fn report_control_state(
+        &self,
+        controllers: Vec<ActiveControllerSummary>,
+    ) -> Result<(), String> {
+        let sanitized = sanitize_active_controllers_for_report(controllers);
+        *self
+            .shared
+            .latest_control_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = sanitized.clone();
+        if !self.shared.enabled {
+            return Err("未启用信令服务器".to_string());
+        }
+        self.shared
+            .send_msg(&OutgoingSignalMsg::ControlStateReport {
+                active_controllers: sanitized,
+            })
+    }
+
+    /// 请求同账号目标被控端远程断开指定控制端会话或全部活跃控制端会话（`force_disconnect_request`）。
+    pub fn force_disconnect_device(
+        &self,
+        target_device_id: &str,
+        controller_device_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<(), String> {
+        if !self.shared.enabled {
+            return Err("未启用信令服务器".to_string());
+        }
+        let target_id = parse_device_id_input(target_device_id)
+            .ok_or_else(|| "目标设备码格式无效，请输入 9 位数字设备码".to_string())?;
+        let controller_device_id = controller_device_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let session_id = session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        self.shared
+            .send_msg(&OutgoingSignalMsg::ForceDisconnectRequest {
+                target_id,
+                controller_device_id,
+                session_id,
+            })
+    }
+
+    /// 非阻塞排空同账号设备的控制状态变更通知 `(device_id, active_controllers)`。
+    pub fn drain_control_state_events(&self) -> Vec<(String, Vec<ActiveControllerSummary>)> {
+        self.shared
+            .control_state_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    /// 非阻塞排空服务端下发的远程强制断开请求列表。
+    pub fn drain_force_disconnect_requests(&self) -> Vec<ForceDisconnectEvent> {
+        self.shared
+            .force_disconnect_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
+    }
+
     /// 非阻塞拉取一条服务端强制踢线原始原因码（如 `account_disabled`、`device_unbound`、`cert_revoked` 等）。
     pub fn try_recv_kicked_reason(&self) -> Option<String> {
         self.shared
@@ -2400,20 +2757,7 @@ impl Drop for SignalClientHandle {
 
 /// 清洗上报的 `hostname`：去除控制字符与 `\0`，裁剪首尾空白并按 UTF-8 字符边界截断至 `<= 128` 字节。
 fn sanitize_hostname(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .filter(|&ch| !ch.is_control() && ch != '\0')
-        .collect();
-    let trimmed = cleaned.trim();
-    let mut end = 0usize;
-    for (idx, ch) in trimmed.char_indices() {
-        let next = idx + ch.len_utf8();
-        if next > MAX_HOSTNAME_BYTES {
-            break;
-        }
-        end = next;
-    }
-    trimmed[..end].to_string()
+    crate::platform::sanitize_text_field(raw, MAX_HOSTNAME_BYTES)
 }
 
 /// 清洗上报的 `lan_addrs`：仅保留 `1..=64` 字节且全部为 ASCII 可见图形字符的项，最多取 16 条。
@@ -3227,6 +3571,7 @@ fn run_single_connection(
     let (nat_type, nat_port_delta, nat_port_range) = shared.current_nat_wire_fields();
     // 初始注册时尚未绑定持久化 UDP 探测端口（local_udp_port == 0），必须上报空列表，
     // 绝不把未改写的 `:9901` 泄漏为 P2P 打洞目标；待 `Registered` 后由紧随的 Heartbeat 同步。
+    let hw = crate::platform::device_hardware_info();
     let reg_msg = OutgoingSignalMsg::Register {
         device_id: cached_device_id.clone(),
         device_key: cfg.device_key.clone(),
@@ -3234,6 +3579,11 @@ fn run_single_connection(
         os: std::env::consts::OS.to_string(),
         app_version: crate::platform::current_app_version(),
         arch: crate::platform::current_app_arch().to_string(),
+        cpu_model: hw.cpu_model,
+        mac_address: hw.mac_address,
+        total_memory_mb: hw.total_memory_mb,
+        os_version: hw.os_version,
+        gpu_model: hw.gpu_model,
         device_group: "default".to_string(),
         lan_addrs: Vec::new(),
         access_token,
@@ -3403,6 +3753,19 @@ fn run_single_connection(
 
     if shared.stop_flag.load(Ordering::Acquire) {
         return ConnectionOutcome::Stopped;
+    }
+
+    {
+        let cached = shared
+            .latest_control_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !cached.is_empty() {
+            let _ = shared.send_msg(&OutgoingSignalMsg::ControlStateReport {
+                active_controllers: cached,
+            });
+        }
     }
 
     let connected_at = Instant::now();
@@ -3753,6 +4116,11 @@ fn handle_incoming_message(
             os,
             app_version,
             arch,
+            cpu_model,
+            mac_address,
+            total_memory_mb,
+            os_version,
+            gpu_model,
             allow_remote_assist,
             allow_remote_control,
             wol_capable,
@@ -3797,8 +4165,34 @@ fn handle_incoming_message(
                 os,
                 app_version,
                 arch,
+                cpu_model,
+                mac_address,
+                total_memory_mb,
+                os_version,
+                gpu_model,
                 allow_remote_assist,
                 allow_remote_control,
+            });
+            IncomingAction::Continue
+        }
+        IncomingSignalMsg::DeviceControlStateChanged {
+            device_id,
+            active_controllers,
+        } => {
+            let norm_id =
+                parse_device_id_input(&device_id).unwrap_or_else(|| device_id.trim().to_string());
+            shared.push_control_state_event(norm_id, active_controllers);
+            IncomingAction::Continue
+        }
+        IncomingSignalMsg::ForceDisconnect {
+            requester_device_id,
+            controller_device_id,
+            session_id,
+        } => {
+            shared.push_force_disconnect_request(ForceDisconnectEvent {
+                requester_device_id: requester_device_id.trim().to_string(),
+                controller_device_id: normalize_optional_addr(controller_device_id),
+                session_id: normalize_optional_addr(session_id),
             });
             IncomingAction::Continue
         }
@@ -3806,6 +4200,9 @@ fn handle_incoming_message(
             session_id,
             role,
             peer_id,
+            peer_name,
+            peer_hostname,
+            peer_os,
             peer_public_udp_addr,
             peer_public_udp_addrs,
             self_public_udp_addr,
@@ -3821,6 +4218,7 @@ fn handle_incoming_message(
             relay_addr,
             owner_grant,
             is_owner_connection,
+            takeover,
         } => {
             shared.trigger_lightweight_probe_refresh();
             let eff_relay = pick_relay_addr(
@@ -3836,6 +4234,9 @@ fn handle_incoming_message(
                     session_id,
                     role,
                     peer_id,
+                    peer_name,
+                    peer_hostname,
+                    peer_os,
                     relay_addr: eff_relay,
                     relay_token,
                     peer_public_addr: peer_public_udp_addr,
@@ -3851,6 +4252,7 @@ fn handle_incoming_message(
                     relay_fallback_after_ms,
                     owner_grant,
                     is_owner_connection,
+                    takeover,
                     is_relay_alloc: false,
                 },
             );
@@ -3860,10 +4262,14 @@ fn handle_incoming_message(
             session_id,
             role,
             peer_id,
+            peer_name,
+            peer_hostname,
+            peer_os,
             relay_token,
             relay_addr,
             owner_grant,
             is_owner_connection,
+            takeover,
         } => {
             let eff_relay = pick_relay_addr(
                 &relay_addr,
@@ -3878,6 +4284,9 @@ fn handle_incoming_message(
                     session_id,
                     role,
                     peer_id,
+                    peer_name,
+                    peer_hostname,
+                    peer_os,
                     relay_addr: eff_relay,
                     relay_token,
                     peer_public_addr: None,
@@ -3893,6 +4302,7 @@ fn handle_incoming_message(
                     relay_fallback_after_ms: None,
                     owner_grant,
                     is_owner_connection,
+                    takeover,
                     is_relay_alloc: true,
                 },
             );
@@ -3997,6 +4407,9 @@ fn format_signal_error(code: &str, message: &str) -> String {
             "assist_disabled" => {
                 "服务器拒绝请求 (assist_disabled)：对方未开启允许他人远程协助".to_string()
             }
+            "target_in_session" => {
+                "服务器拒绝请求 (target_in_session)：目标设备正在被控制中，需要确认接管".to_string()
+            }
             _ => format!("服务器返回错误 ({code})"),
         }
     } else {
@@ -4004,11 +4417,56 @@ fn format_signal_error(code: &str, message: &str) -> String {
     }
 }
 
+fn clamp_utf8_bytes_clean(raw: &str, max_bytes: usize) -> String {
+    let filtered: String = raw.trim().chars().filter(|c| !c.is_control()).collect();
+    if filtered.len() <= max_bytes {
+        return filtered;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !filtered.is_char_boundary(end) {
+        end -= 1;
+    }
+    filtered[..end].to_string()
+}
+
+fn sanitize_active_controllers_for_report(
+    controllers: Vec<ActiveControllerSummary>,
+) -> Vec<ActiveControllerSummary> {
+    controllers
+        .into_iter()
+        .take(MAX_ACTIVE_CONTROLLERS_REPORT)
+        .filter_map(|c| {
+            let sid: String = c
+                .session_id
+                .trim()
+                .chars()
+                .filter(|ch| ch.is_ascii_graphic())
+                .collect();
+            let sid = clamp_utf8_bytes_clean(&sid, 64);
+            if sid.is_empty() {
+                return None;
+            }
+            Some(ActiveControllerSummary {
+                session_id: sid,
+                controller_device_id: clamp_utf8_bytes_clean(&c.controller_device_id, 64),
+                controller_device_name: clamp_utf8_bytes_clean(&c.controller_device_name, 128),
+                controller_os: clamp_utf8_bytes_clean(&c.controller_os, 128),
+                is_owner: c.is_owner,
+                mode: clamp_utf8_bytes_clean(&c.mode, 32),
+                connected_at_ms: c.connected_at_ms,
+            })
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct CoordPayload {
     session_id: String,
     role: String,
     peer_id: String,
+    peer_name: Option<String>,
+    peer_hostname: Option<String>,
+    peer_os: Option<String>,
     relay_addr: String,
     relay_token: String,
     peer_public_addr: Option<String>,
@@ -4024,6 +4482,7 @@ struct CoordPayload {
     relay_fallback_after_ms: Option<u16>,
     owner_grant: Option<OwnerGrantPayload>,
     is_owner_connection: bool,
+    takeover: bool,
     is_relay_alloc: bool,
 }
 
@@ -4047,6 +4506,9 @@ fn dispatch_coord(shared: &SharedState, coord: CoordPayload) {
         session_id,
         role,
         peer_id,
+        peer_name,
+        peer_hostname,
+        peer_os,
         relay_addr,
         relay_token,
         peer_public_addr,
@@ -4062,8 +4524,12 @@ fn dispatch_coord(shared: &SharedState, coord: CoordPayload) {
         relay_fallback_after_ms,
         owner_grant,
         is_owner_connection,
+        takeover,
         is_relay_alloc,
     } = coord;
+    let peer_name = normalize_optional_addr(peer_name);
+    let peer_hostname = normalize_optional_addr(peer_hostname);
+    let peer_os = normalize_optional_addr(peer_os);
     let peer_public_addr = normalize_optional_addr(peer_public_addr);
     let peer_public_addrs = normalize_addr_list(peer_public_addrs);
     let self_public_addr = normalize_optional_addr(self_public_addr)
@@ -4090,6 +4556,9 @@ fn dispatch_coord(shared: &SharedState, coord: CoordPayload) {
             relay_addr,
             relay_token,
             peer_id,
+            peer_name,
+            peer_hostname,
+            peer_os,
             peer_public_addr,
             peer_public_addrs,
             self_public_addr,
@@ -4106,6 +4575,7 @@ fn dispatch_coord(shared: &SharedState, coord: CoordPayload) {
             relay_fallback_after_ms,
             owner_grant,
             is_owner_connection,
+            takeover,
             is_relay_alloc,
         });
         return;
@@ -4688,6 +5158,10 @@ impl Transport for P2pHeldTransport {
         self.conn.send_datagram(data)
     }
 
+    fn send_datagrams_batch(&mut self, datagrams: &[Vec<u8>]) -> rc_types::Result<usize> {
+        self.conn.send_datagrams_batch(datagrams)
+    }
+
     fn send_reliable(&mut self, data: &[u8]) -> rc_types::Result<()> {
         self.conn.send_reliable(data)
     }
@@ -4714,6 +5188,18 @@ impl Transport for P2pHeldTransport {
 
     fn tx_dropped_datagrams(&self) -> u64 {
         self.conn.tx_dropped_datagrams()
+    }
+
+    fn reliable_tx_queued_len(&self) -> usize {
+        self.conn.reliable_tx_queued_len()
+    }
+
+    fn has_live_rtt(&self) -> bool {
+        self.conn.has_live_rtt()
+    }
+
+    fn wake_handle(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        self.conn.wake_handle()
     }
 }
 
@@ -6195,6 +6681,9 @@ mod tests {
             status_updates: Mutex::new(VecDeque::new()),
             incoming: Mutex::new(VecDeque::new()),
             device_status_events: Mutex::new(VecDeque::new()),
+            control_state_events: Mutex::new(VecDeque::new()),
+            force_disconnect_requests: Mutex::new(VecDeque::new()),
+            latest_control_state: Mutex::new(Vec::new()),
             kicked_reasons: Mutex::new(VecDeque::new()),
             pending_connects: Mutex::new(HashMap::new()),
             active_writer: Mutex::new(None),
@@ -6345,10 +6834,14 @@ mod tests {
                 session_id: "in-relay-ready".to_string(),
                 role: "host".to_string(),
                 peer_id: "111222333".to_string(),
+                peer_name: None,
+                peer_hostname: None,
+                peer_os: None,
                 relay_token: "tok-relay-alloc".to_string(),
                 relay_addr: "127.0.0.1:21117".to_string(),
                 owner_grant: None,
                 is_owner_connection: true,
+                takeover: false,
             },
             "127.0.0.1",
             21117,
@@ -6366,6 +6859,9 @@ mod tests {
                 session_id: "in-punch".to_string(),
                 role: "host".to_string(),
                 peer_id: "111222333".to_string(),
+                peer_name: Some("Alice Mac".to_string()),
+                peer_hostname: None,
+                peer_os: None,
                 peer_public_udp_addr: None,
                 peer_public_udp_addrs: Vec::new(),
                 self_public_udp_addr: None,
@@ -6381,6 +6877,7 @@ mod tests {
                 relay_addr: "127.0.0.1:21117".to_string(),
                 owner_grant: None,
                 is_owner_connection: true,
+                takeover: false,
             },
             "127.0.0.1",
             21117,
@@ -6390,6 +6887,7 @@ mod tests {
         let inc_punch = shared.incoming.lock().unwrap().pop_front().unwrap();
         assert!(!inc_punch.is_relay_alloc);
         assert_eq!(inc_punch.relay_token, "tok-punch");
+        assert_eq!(inc_punch.peer_name.as_deref(), Some("Alice Mac"));
     }
 
     #[test]
@@ -6648,6 +7146,9 @@ mod tests {
             status_updates: Mutex::new(VecDeque::new()),
             incoming: Mutex::new(VecDeque::new()),
             device_status_events: Mutex::new(VecDeque::new()),
+            control_state_events: Mutex::new(VecDeque::new()),
+            force_disconnect_requests: Mutex::new(VecDeque::new()),
+            latest_control_state: Mutex::new(Vec::new()),
             kicked_reasons: Mutex::new(VecDeque::new()),
             pending_connects: Mutex::new(HashMap::new()),
             active_writer: Mutex::new(Some(SignalWriter::Plain(stream))),
@@ -6864,6 +7365,9 @@ mod tests {
             status_updates: Mutex::new(VecDeque::new()),
             incoming: Mutex::new(VecDeque::new()),
             device_status_events: Mutex::new(VecDeque::new()),
+            control_state_events: Mutex::new(VecDeque::new()),
+            force_disconnect_requests: Mutex::new(VecDeque::new()),
+            latest_control_state: Mutex::new(Vec::new()),
             kicked_reasons: Mutex::new(VecDeque::new()),
             pending_connects: Mutex::new(HashMap::new()),
             active_writer: Mutex::new(None),
@@ -6995,6 +7499,9 @@ mod tests {
             status_updates: Mutex::new(VecDeque::new()),
             incoming: Mutex::new(VecDeque::new()),
             device_status_events: Mutex::new(VecDeque::new()),
+            control_state_events: Mutex::new(VecDeque::new()),
+            force_disconnect_requests: Mutex::new(VecDeque::new()),
+            latest_control_state: Mutex::new(Vec::new()),
             kicked_reasons: Mutex::new(VecDeque::new()),
             pending_connects: Mutex::new(HashMap::new()),
             active_writer: Mutex::new(None),
@@ -7659,6 +8166,11 @@ mod tests {
             os: "android".into(),
             app_version: String::new(),
             arch: String::new(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             device_group: "default".into(),
             lan_addrs: Vec::new(),
             access_token: None,
@@ -7686,6 +8198,11 @@ mod tests {
             os: "android".into(),
             app_version: String::new(),
             arch: String::new(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             device_group: "default".into(),
             lan_addrs: Vec::new(),
             access_token: None,
@@ -7708,6 +8225,11 @@ mod tests {
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            cpu_model: None,
+            mac_address: None,
+            total_memory_mb: None,
+            os_version: None,
+            gpu_model: None,
         })
         .unwrap();
         assert_eq!(upd_assist_only["allow_remote_assist"], true);
@@ -7718,6 +8240,11 @@ mod tests {
             allow_remote_control: Some(true),
             mac_addr: None,
             wol_enabled: None,
+            cpu_model: None,
+            mac_address: None,
+            total_memory_mb: None,
+            os_version: None,
+            gpu_model: None,
         })
         .unwrap();
         assert!(upd_ctrl_only.get("allow_remote_assist").is_none());
@@ -8636,6 +9163,9 @@ mod tests {
             status_updates: Mutex::new(VecDeque::new()),
             incoming: Mutex::new(VecDeque::new()),
             device_status_events: Mutex::new(VecDeque::new()),
+            control_state_events: Mutex::new(VecDeque::new()),
+            force_disconnect_requests: Mutex::new(VecDeque::new()),
+            latest_control_state: Mutex::new(Vec::new()),
             kicked_reasons: Mutex::new(VecDeque::new()),
             pending_connects: Mutex::new(HashMap::new()),
             active_writer: Mutex::new(None),
@@ -10636,5 +11166,468 @@ mod tests {
         assert_eq!(hook_calls.load(Ordering::Acquire), 2);
         assert!(!miss_guard.is_holding_local_slot());
         assert!(!miss_guard.is_holding());
+    }
+
+    #[test]
+    fn signal_register_attaches_device_hardware_info_and_skips_empty_fields() {
+        use crate::platform::{
+            lock_test_device_hardware_info, DeviceHardwareInfo, MAX_CPU_MODEL_BYTES,
+            MAX_GPU_MODEL_BYTES, MAX_MAC_ADDRESS_BYTES, MAX_OS_VERSION_BYTES, MAX_TOTAL_MEMORY_MB,
+        };
+
+        let hw_guard = lock_test_device_hardware_info();
+
+        // 1) 空硬件信息序列化时全部省略（向后兼容）
+        let reg_empty = serde_json::to_value(&OutgoingSignalMsg::Register {
+            device_id: None,
+            device_key: "k".repeat(64),
+            hostname: "host".into(),
+            os: "macos".into(),
+            app_version: String::new(),
+            arch: String::new(),
+            cpu_model: "   ".into(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
+            device_group: "default".into(),
+            lan_addrs: Vec::new(),
+            access_token: None,
+            device_pubkey: None,
+            allow_remote_assist: None,
+            allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
+            nat_port_range: None,
+            rcp2_v2: true,
+        })
+        .unwrap();
+        for key in [
+            "cpu_model",
+            "mac_address",
+            "total_memory_mb",
+            "os_version",
+            "gpu_model",
+        ] {
+            assert!(
+                reg_empty.get(key).is_none(),
+                "Register 空字段 {key} 不应被序列化"
+            );
+        }
+
+        // 2) 非空硬件信息完整序列化
+        let reg_full = serde_json::to_value(&OutgoingSignalMsg::Register {
+            device_id: None,
+            device_key: "k".repeat(64),
+            hostname: "host".into(),
+            os: "macos".into(),
+            app_version: "0.2.7".into(),
+            arch: "arm64".into(),
+            cpu_model: "Apple M3 Max".into(),
+            mac_address: "aa:bb:cc:dd:ee:ff".into(),
+            total_memory_mb: 32768,
+            os_version: "macOS 15.1".into(),
+            gpu_model: "Apple M3 Max".into(),
+            device_group: "default".into(),
+            lan_addrs: Vec::new(),
+            access_token: None,
+            device_pubkey: None,
+            allow_remote_assist: None,
+            allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
+            nat_port_range: None,
+            rcp2_v2: true,
+        })
+        .unwrap();
+        assert_eq!(reg_full["cpu_model"], "Apple M3 Max");
+        assert_eq!(reg_full["mac_address"], "aa:bb:cc:dd:ee:ff");
+        assert_eq!(reg_full["total_memory_mb"], 32768);
+        assert_eq!(reg_full["os_version"], "macOS 15.1");
+        assert_eq!(reg_full["gpu_model"], "Apple M3 Max");
+
+        // 3) IncomingSignalMsg::DeviceStatusChanged & DeviceStatusEvent 兼容携带硬件字段的新服务端广播
+        let status_json = serde_json::json!({
+            "type": "device_status_changed",
+            "device_id": "604928235",
+            "online": true,
+            "hostname": "m3-mac",
+            "alias": "",
+            "os": "macos",
+            "cpu_model": "Apple M3 Max",
+            "mac_address": "aa:bb:cc:dd:ee:ff",
+            "total_memory_mb": 32768,
+            "os_version": "macOS 15.1",
+            "gpu_model": "Apple M3 Max",
+            "allow_remote_assist": false,
+            "allow_remote_control": true,
+            "wol_capable": true
+        });
+        let status_msg: IncomingSignalMsg = serde_json::from_value(status_json.clone()).unwrap();
+        match status_msg {
+            IncomingSignalMsg::DeviceStatusChanged {
+                cpu_model,
+                mac_address,
+                total_memory_mb,
+                os_version,
+                gpu_model,
+                ..
+            } => {
+                assert_eq!(cpu_model, "Apple M3 Max");
+                assert_eq!(mac_address, "aa:bb:cc:dd:ee:ff");
+                assert_eq!(total_memory_mb, 32768);
+                assert_eq!(os_version, "macOS 15.1");
+                assert_eq!(gpu_model, "Apple M3 Max");
+            }
+            other => panic!("expected DeviceStatusChanged, got {other:?}"),
+        }
+        let status_ev: DeviceStatusEvent = serde_json::from_value(status_json).unwrap();
+        assert_eq!(status_ev.cpu_model, "Apple M3 Max");
+        assert_eq!(status_ev.mac_address, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(status_ev.total_memory_mb, 32768);
+        assert_eq!(status_ev.os_version, "macOS 15.1");
+        assert_eq!(status_ev.gpu_model, "Apple M3 Max");
+
+        let upd_hw = serde_json::to_value(&OutgoingSignalMsg::UpdateAssistState {
+            allow_remote_assist: None,
+            allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
+            cpu_model: Some("Apple M3 Max".into()),
+            mac_address: Some("aa:bb:cc:dd:ee:ff".into()),
+            total_memory_mb: Some(32768),
+            os_version: Some("macOS 15.1".into()),
+            gpu_model: Some("Apple M3 Max".into()),
+        })
+        .unwrap();
+        assert_eq!(upd_hw["cpu_model"], "Apple M3 Max");
+        assert_eq!(upd_hw["mac_address"], "aa:bb:cc:dd:ee:ff");
+        assert_eq!(upd_hw["total_memory_mb"], 32768);
+        assert_eq!(upd_hw["os_version"], "macOS 15.1");
+        assert_eq!(upd_hw["gpu_model"], "Apple M3 Max");
+
+        // 4) 端到端 mock 信令连接验证：run_single_connection 自动附带并清洗 platform::device_hardware_info()
+        hw_guard.set(Some(DeviceHardwareInfo {
+            cpu_model: format!("Apple M3 Max\r\n\0 {}", "c".repeat(200)),
+            mac_address: format!("aa:bb:cc:dd:ee:ff\n{}", "1".repeat(80)),
+            total_memory_mb: u64::MAX,
+            os_version: format!("macOS 15.2\t\0 {}", "v".repeat(200)),
+            gpu_model: format!("Apple M3 Max (40-core)\r\n {}", "g".repeat(200)),
+        }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let signal_addr = listener.local_addr().unwrap();
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_addr = udp_sock.local_addr().unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let reg = read_test_frame(&mut conn);
+            assert_eq!(reg["type"], "register");
+            let cpu = reg["cpu_model"].as_str().unwrap();
+            let mac = reg["mac_address"].as_str().unwrap();
+            let os_ver = reg["os_version"].as_str().unwrap();
+            let gpu = reg["gpu_model"].as_str().unwrap();
+            assert!(cpu.starts_with("Apple M3 Max "));
+            assert!(!cpu.chars().any(char::is_control) && !cpu.contains('\0'));
+            assert!(cpu.len() <= MAX_CPU_MODEL_BYTES);
+            assert!(mac.starts_with("aa:bb:cc:dd:ee:ff"));
+            assert!(!mac.chars().any(char::is_control) && !mac.contains('\0'));
+            assert!(mac.len() <= MAX_MAC_ADDRESS_BYTES);
+            assert_eq!(reg["total_memory_mb"], MAX_TOTAL_MEMORY_MB);
+            assert!(os_ver.starts_with("macOS 15.2 "));
+            assert!(!os_ver.chars().any(char::is_control) && !os_ver.contains('\0'));
+            assert!(os_ver.len() <= MAX_OS_VERSION_BYTES);
+            assert!(gpu.starts_with("Apple M3 Max (40-core) "));
+            assert!(!gpu.chars().any(char::is_control) && !gpu.contains('\0'));
+            assert!(gpu.len() <= MAX_GPU_MODEL_BYTES);
+
+            write_test_frame(
+                &mut conn,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "604928235",
+                    "formatted_id": "604 928 235",
+                    "udp_probe_addr": udp_addr.to_string(),
+                    "relay_addr": "127.0.0.1:21117",
+                }),
+            );
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: signal_addr.port(),
+            relay_port: 21117,
+            api_port: 21118,
+            use_https: false,
+            ..ServerConfig::default()
+        };
+        let mut client = SignalClientHandle::spawn(cfg, "hw-mac".to_string(), Vec::new());
+        let snap = wait_until_connected(&client, Duration::from_secs(3));
+        assert_eq!(snap.device_id.as_deref(), Some("604928235"));
+        let _ = done_tx.send(());
+        client.stop();
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn control_state_takeover_and_force_disconnect_roundtrip_and_handle_e2e() {
+        // 1) 线格式序列化与反序列化校验
+        let ctrl = ActiveControllerSummary {
+            session_id: "sess-1".to_string(),
+            controller_device_id: "111222333".to_string(),
+            controller_device_name: "Alice Mac".to_string(),
+            controller_os: "macos".to_string(),
+            is_owner: true,
+            mode: "remote_control".to_string(),
+            connected_at_ms: 1_763_800_000_000,
+        };
+        let report_val = serde_json::to_value(&OutgoingSignalMsg::ControlStateReport {
+            active_controllers: vec![ctrl.clone()],
+        })
+        .unwrap();
+        assert_eq!(report_val["type"], "control_state_report");
+        assert_eq!(report_val["active_controllers"][0]["session_id"], "sess-1");
+
+        let fd_req = serde_json::to_value(&OutgoingSignalMsg::ForceDisconnectRequest {
+            target_id: "987654321".to_string(),
+            controller_device_id: Some("111222333".to_string()),
+            session_id: Some("sess-1".to_string()),
+        })
+        .unwrap();
+        assert_eq!(fd_req["type"], "force_disconnect_request");
+        assert_eq!(fd_req["target_id"], "987654321");
+
+        let conn_req = serde_json::to_value(&OutgoingSignalMsg::ConnectRequest {
+            target_id: "987654321".to_string(),
+            session_id: "s-1".to_string(),
+            lan_addrs: vec![],
+            nonce: "abcd".to_string(),
+            nat_type: None,
+            nat_port_delta: None,
+            nat_port_range: None,
+            takeover: true,
+        })
+        .unwrap();
+        assert_eq!(conn_req["takeover"], true);
+
+        // 2) Mock 信令端到端测试：report_control_state、force_disconnect_device、request_connect_with_takeover、
+        //    DeviceControlStateChanged、ForceDisconnect 与 PunchCoord.takeover / peer_hostname / peer_os
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let signal_addr = listener.local_addr().unwrap();
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_addr = udp_sock.local_addr().unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let read_non_hb = |s: &mut TcpStream| -> serde_json::Value {
+                loop {
+                    let v = read_test_frame(s);
+                    if v["type"] != "heartbeat" {
+                        return v;
+                    }
+                }
+            };
+            let (mut conn, _) = listener.accept().unwrap();
+            let reg = read_non_hb(&mut conn);
+            assert_eq!(reg["type"], "register");
+            write_test_frame(
+                &mut conn,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "604928235",
+                    "formatted_id": "604 928 235",
+                    "udp_probe_addr": udp_addr.to_string(),
+                    "relay_addr": "127.0.0.1:21117",
+                }),
+            );
+
+            // 收到 control_state_report
+            let msg1 = read_non_hb(&mut conn);
+            assert_eq!(msg1["type"], "control_state_report");
+            assert_eq!(msg1["active_controllers"].as_array().unwrap().len(), 1);
+
+            // 收到 force_disconnect_request
+            let msg2 = read_non_hb(&mut conn);
+            assert_eq!(msg2["type"], "force_disconnect_request");
+            assert_eq!(msg2["target_id"], "987654321");
+            assert_eq!(msg2["controller_device_id"], "111222333");
+            assert_eq!(msg2["session_id"], "sess-1");
+
+            // 收到 request_connect(takeover=false) -> 返回 target_in_session error
+            let msg3 = read_non_hb(&mut conn);
+            assert_eq!(msg3["type"], "connect_request");
+            assert_eq!(msg3["takeover"], false);
+            write_test_frame(
+                &mut conn,
+                &serde_json::json!({
+                    "type": "error",
+                    "code": "target_in_session",
+                    "message": "目标设备正在被控制",
+                }),
+            );
+
+            // 收到 request_connect_with_takeover(takeover=true) -> 返回 punch_coord
+            let msg4 = read_non_hb(&mut conn);
+            assert_eq!(msg4["type"], "connect_request");
+            assert_eq!(msg4["takeover"], true);
+            let sid4 = msg4["session_id"].as_str().unwrap().to_string();
+            write_test_frame(
+                &mut conn,
+                &serde_json::json!({
+                    "type": "punch_coord",
+                    "session_id": sid4,
+                    "role": "client",
+                    "peer_id": "987654321",
+                    "relay_token": "tok-takeover",
+                    "relay_addr": "127.0.0.1:21117",
+                    "is_owner_connection": true,
+                    "takeover": true,
+                }),
+            );
+
+            // 下发 device_control_state_changed、force_disconnect 及 host 角色 punch_coord
+            write_test_frame(
+                &mut conn,
+                &serde_json::json!({
+                    "type": "device_control_state_changed",
+                    "device_id": "987 654 321",
+                    "active_controllers": [ctrl],
+                }),
+            );
+            write_test_frame(
+                &mut conn,
+                &serde_json::json!({
+                    "type": "force_disconnect",
+                    "requester_device_id": "111222333",
+                    "controller_device_id": "444555666",
+                    "session_id": "sess-9",
+                }),
+            );
+            write_test_frame(
+                &mut conn,
+                &serde_json::json!({
+                    "type": "punch_coord",
+                    "session_id": "host-in-1",
+                    "role": "host",
+                    "peer_id": "111222333",
+                    "peer_hostname": "Office MacBook",
+                    "peer_os": "macos",
+                    "relay_token": "tok-host",
+                    "relay_addr": "127.0.0.1:21117",
+                    "is_owner_connection": true,
+                    "takeover": true,
+                }),
+            );
+
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: signal_addr.port(),
+            relay_port: 21117,
+            api_port: 21118,
+            use_https: false,
+            ..ServerConfig::default()
+        };
+        let mut client = SignalClientHandle::spawn(cfg, "ctrl-key".to_string(), Vec::new());
+        wait_until_connected(&client, Duration::from_secs(3));
+
+        client
+            .report_control_state(vec![ActiveControllerSummary {
+                session_id: "sess-1".to_string(),
+                controller_device_id: "111222333".to_string(),
+                controller_device_name: "Alice Mac".to_string(),
+                controller_os: "macos".to_string(),
+                is_owner: true,
+                mode: "remote_control".to_string(),
+                connected_at_ms: 1_763_800_000_000,
+            }])
+            .expect("report_control_state");
+
+        client
+            .force_disconnect_device("987 654 321", Some("111222333"), Some("sess-1"))
+            .expect("force_disconnect_device");
+
+        let busy_err = client
+            .request_connect("987654321", Duration::from_secs(3))
+            .expect_err("takeover=false must receive target_in_session");
+        assert!(busy_err.contains("target_in_session"), "{busy_err}");
+
+        let grant = client
+            .request_connect_with_takeover("987654321", Duration::from_secs(3), true)
+            .expect("takeover=true grant");
+        assert_eq!(grant.relay_token, "tok-takeover");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got_cs = Vec::new();
+        let mut got_fd = Vec::new();
+        let mut got_inc = None;
+        while Instant::now() < deadline {
+            got_cs.extend(client.drain_control_state_events());
+            got_fd.extend(client.drain_force_disconnect_requests());
+            if got_inc.is_none() {
+                got_inc = client.try_recv_incoming();
+            }
+            if !got_cs.is_empty() && !got_fd.is_empty() && got_inc.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(got_cs.len(), 1);
+        assert_eq!(got_cs[0].0, "987654321");
+        assert_eq!(got_cs[0].1[0].session_id, "sess-1");
+
+        // 3) session_id 清洗与服务端 validate_ascii_token 对齐：剔除空格与非图形字符
+        let sanitized = sanitize_active_controllers_for_report(vec![
+            ActiveControllerSummary {
+                session_id: " sid with space\n".to_string(),
+                controller_device_id: "111222333".to_string(),
+                controller_device_name: "Test".to_string(),
+                controller_os: "macos".to_string(),
+                is_owner: true,
+                mode: "remote_control".to_string(),
+                connected_at_ms: 1,
+            },
+            ActiveControllerSummary {
+                session_id: "   \t\n".to_string(),
+                controller_device_id: "111222333".to_string(),
+                controller_device_name: "Dropped".to_string(),
+                controller_os: "macos".to_string(),
+                is_owner: true,
+                mode: "remote_control".to_string(),
+                connected_at_ms: 2,
+            },
+        ]);
+        assert_eq!(sanitized.len(), 1);
+        assert_eq!(sanitized[0].session_id, "sidwithspace");
+        assert!(sanitized[0]
+            .session_id
+            .bytes()
+            .all(|b| b.is_ascii_graphic()));
+
+        assert_eq!(got_fd.len(), 1);
+        assert_eq!(got_fd[0].requester_device_id, "111222333");
+        assert_eq!(got_fd[0].controller_device_id.as_deref(), Some("444555666"));
+        assert_eq!(got_fd[0].session_id.as_deref(), Some("sess-9"));
+
+        let inc = got_inc.expect("host RelayIncoming");
+        assert!(inc.takeover);
+        assert!(inc.is_owner_connection);
+        assert_eq!(inc.peer_hostname.as_deref(), Some("Office MacBook"));
+        assert_eq!(inc.peer_os.as_deref(), Some("macos"));
+
+        let _ = done_tx.send(());
+        client.stop();
+        server_thread.join().unwrap();
     }
 }

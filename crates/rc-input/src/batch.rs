@@ -207,6 +207,23 @@ impl InputBatcher {
                 });
                 self.critical = true;
             }
+            InputEvent::MouseWheelPixel { dx, dy } => {
+                if self.pending.is_empty()
+                    && self
+                        .last_emit
+                        .map_or(true, |t| now.saturating_duration_since(t) >= self.window)
+                {
+                    self.critical = true;
+                }
+                if let Some(InputEvent::MouseWheelPixel { dx: ldx, dy: ldy }) =
+                    self.pending.last_mut()
+                {
+                    *ldx = ldx.saturating_add(dx);
+                    *ldy = ldy.saturating_add(dy);
+                } else {
+                    self.pending.push(InputEvent::MouseWheelPixel { dx, dy });
+                }
+            }
             ev @ InputEvent::MouseButton { .. } | ev @ InputEvent::MouseWheel { .. } => {
                 self.pending.push(ev);
                 self.critical = true;
@@ -556,5 +573,96 @@ mod tests {
         );
         ms.release_all();
         assert_eq!(ms.bits(), 0);
+    }
+
+    /// `MouseWheelPixel`：空闲前沿 0ms 放行，4ms 窗口内连续事件使用 `saturating_add` 合并，
+    /// 遇到其他事件保持相对顺序不跨事件重排；既有 `MouseWheel` 保持关键不合并语义。
+    #[test]
+    fn pixel_wheel_leading_edge_coalesces_and_preserves_order() {
+        let mut b = InputBatcher::new(DEFAULT_WINDOW);
+        let t0 = Instant::now();
+
+        // 1. 首条空闲前沿 0ms 立即放行
+        b.push(InputEvent::MouseWheelPixel { dx: 1, dy: -3 }, t0);
+        assert_eq!(
+            b.poll(t0),
+            vec![InputEvent::MouseWheelPixel { dx: 1, dy: -3 }]
+        );
+
+        // 2. 4ms 窗口内连续进入：不抢跑，且以 saturating_add 合并（含极值饱和）
+        let t1 = t0 + Duration::from_millis(1);
+        b.push(
+            InputEvent::MouseWheelPixel {
+                dx: 2,
+                dy: i16::MIN,
+            },
+            t1,
+        );
+        b.push(InputEvent::MouseWheelPixel { dx: -5, dy: -10 }, t1);
+        assert!(b.poll(t1 + Duration::from_millis(2)).is_empty());
+        let t2 = t1 + DEFAULT_WINDOW;
+        assert_eq!(
+            b.poll(t2),
+            vec![InputEvent::MouseWheelPixel {
+                dx: -3,
+                dy: i16::MIN,
+            }]
+        );
+
+        // 3. 遇 MouseMove / MouseButton / Key 保持相对顺序不跨事件重排
+        let t3 = t2 + Duration::from_millis(1);
+        b.push(InputEvent::MouseWheelPixel { dx: 0, dy: -2 }, t3);
+        b.push(InputEvent::MouseWheelPixel { dx: 0, dy: -4 }, t3);
+        b.push(InputEvent::MouseMove { x: 100, y: 200 }, t3);
+        b.push(InputEvent::MouseWheelPixel { dx: 1, dy: -5 }, t3);
+        b.push(
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true,
+            },
+            t3,
+        );
+        assert_eq!(
+            b.poll(t3),
+            vec![
+                InputEvent::MouseWheelPixel { dx: 0, dy: -6 },
+                InputEvent::MouseMove { x: 100, y: 200 },
+                InputEvent::MouseWheelPixel { dx: 1, dy: -5 },
+                InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    pressed: true,
+                },
+            ]
+        );
+
+        // 4. 既有离散 MouseWheel 保持关键不合并与 0ms 立即放行
+        let t4 = t3 + Duration::from_millis(1);
+        b.push(
+            InputEvent::MouseWheel {
+                delta: 1,
+                horizontal: false,
+            },
+            t4,
+        );
+        b.push(
+            InputEvent::MouseWheel {
+                delta: 2,
+                horizontal: false,
+            },
+            t4,
+        );
+        assert_eq!(
+            b.poll(t4),
+            vec![
+                InputEvent::MouseWheel {
+                    delta: 1,
+                    horizontal: false,
+                },
+                InputEvent::MouseWheel {
+                    delta: 2,
+                    horizontal: false,
+                },
+            ]
+        );
     }
 }

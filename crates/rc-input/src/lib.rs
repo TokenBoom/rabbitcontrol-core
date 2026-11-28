@@ -30,11 +30,12 @@
 //!
 //!
 //! ```text
-//! type 0x01 MouseMove:    x(u16 LE) y(u16 LE)              = 5 字节
-//! type 0x02 MouseButton:  button(u8) pressed(u8)           = 3 字节
-//! type 0x03 MouseWheel:   delta(i16 LE) horizontal(u8)     = 4 字节
-//! type 0x04 Key:          scancode(u16 LE) pressed(u8) mods(u8) = 5 字节
-//! type 0x05 Sync:         —                                = 1 字节
+//! type 0x01 MouseMove:       x(u16 LE) y(u16 LE)                = 5 字节
+//! type 0x02 MouseButton:     button(u8) pressed(u8)             = 3 字节
+//! type 0x03 MouseWheel:      delta(i16 LE) horizontal(u8)       = 4 字节
+//! type 0x04 Key:             scancode(u16 LE) pressed(u8) mods(u8) = 5 字节
+//! type 0x05 Sync:            —                                  = 1 字节
+//! type 0x06 MouseWheelPixel: dx(i16 LE) dy(i16 LE)              = 5 字节
 //! ```
 //!
 //! 解码器对脏数据一律返回 [`rc_types::Error::Protocol`]（带偏移），
@@ -111,6 +112,19 @@ pub enum InputEvent {
         /// `true` = 水平滚动，`false` = 垂直滚动。
         horizontal: bool,
     },
+    /// 像素级平滑滚轮（触控板连续像素增量，须经协商 `HostFlags::SUPPORTS_PIXEL_SCROLL` 后发送）。
+    ///
+    /// **坐标系约定（与 macOS `CGEventCreateScrollWheelEvent2` `PIXEL` 单位一致）**：
+    /// - `dy > 0` 表示向上滚（远离用户），`dy < 0` 表示向下滚；
+    /// - `dx > 0` 表示向左滚，`dx < 0` 表示向右滚。
+    ///
+    /// 线格式类型 `0x06`（因 `0x05` 已被 `Sync` 占用），定长 5 字节：`[0x06][dx: i16 LE][dy: i16 LE]`。
+    MouseWheelPixel {
+        /// 水平像素滚动增量（向左为正，单位：点/像素）。
+        dx: i16,
+        /// 垂直像素滚动增量（向上为正，单位：点/像素）。
+        dy: i16,
+    },
     /// 按下 / 抬起键盘键。**关键事件**：立即 flush。扫描码而非虚拟键码
     /// （I5，跨布局不乱）：**Set 1 make code**，E0 前缀键编码为
     /// `0xE0 << 8 | code`（如右 Ctrl = `0xE01D`，左 Win = `0xE05B`）。
@@ -141,6 +155,8 @@ const TYPE_WHEEL: u8 = 0x03;
 const TYPE_KEY: u8 = 0x04;
 /// 线格式类型字节：`Sync`。
 const TYPE_SYNC: u8 = 0x05;
+/// 线格式类型字节：`MouseWheelPixel`（`0x05` 已被 `Sync` 占用）。
+const TYPE_WHEEL_PIXEL: u8 = 0x06;
 
 /// 把一批事件编码成一个 stream 消息，追加到 `out`。
 ///
@@ -186,6 +202,11 @@ fn encode_one(ev: &InputEvent, out: &mut Vec<u8>) {
             out.extend_from_slice(&delta.to_le_bytes());
             out.push(u8::from(*horizontal));
         }
+        InputEvent::MouseWheelPixel { dx, dy } => {
+            out.push(TYPE_WHEEL_PIXEL);
+            out.extend_from_slice(&dx.to_le_bytes());
+            out.extend_from_slice(&dy.to_le_bytes());
+        }
         InputEvent::Key {
             scancode,
             pressed,
@@ -209,6 +230,7 @@ pub(crate) fn event_wire_size(ev: &InputEvent) -> usize {
         InputEvent::MouseMove { .. } => 5,
         InputEvent::MouseButton { .. } => 3,
         InputEvent::MouseWheel { .. } => 4,
+        InputEvent::MouseWheelPixel { .. } => 5,
         InputEvent::Key { .. } => 5,
         InputEvent::Sync => 1,
     }
@@ -300,6 +322,12 @@ fn decode_one(body: &[u8], off: usize) -> Result<(InputEvent, usize)> {
             let delta = i16::from_le_bytes([body[off + 1], body[off + 2]]);
             let horizontal = decode_bool(body[off + 3], off, "horizontal")?;
             Ok((InputEvent::MouseWheel { delta, horizontal }, 4))
+        }
+        TYPE_WHEEL_PIXEL => {
+            need(5)?;
+            let dx = i16::from_le_bytes([body[off + 1], body[off + 2]]);
+            let dy = i16::from_le_bytes([body[off + 3], body[off + 4]]);
+            Ok((InputEvent::MouseWheelPixel { dx, dy }, 5))
         }
         TYPE_KEY => {
             need(5)?;
@@ -406,6 +434,7 @@ mod tests {
                 delta: -120,
                 horizontal: true,
             },
+            InputEvent::MouseWheelPixel { dx: -24, dy: 64 },
             InputEvent::Key {
                 scancode: 0xE05B,
                 pressed: false,
@@ -415,9 +444,9 @@ mod tests {
         ];
         let mut buf = Vec::new();
         encode_events(&events, &mut buf);
-        // 2 前缀 + 5 + 3 + 4 + 5 + 1 = 20
-        assert_eq!(buf.len(), 20, "线格式字节数与任务卡表格不符: {buf:02X?}");
-        assert_eq!(&buf[0..2], &18u16.to_le_bytes(), "长度前缀 = 事件段字节数");
+        // 2 前缀 + 5 + 3 + 4 + 5 + 5 + 1 = 25
+        assert_eq!(buf.len(), 25, "线格式字节数与任务卡表格不符: {buf:02X?}");
+        assert_eq!(&buf[0..2], &23u16.to_le_bytes(), "长度前缀 = 事件段字节数");
         let decoded = decode_events(&buf).expect("roundtrip must decode");
         assert_eq!(decoded, events);
 
@@ -529,6 +558,7 @@ mod tests {
                 delta: 120,
                 horizontal: false,
             },
+            InputEvent::MouseWheelPixel { dx: -7, dy: 12 },
             InputEvent::Key {
                 scancode: 0x1E,
                 pressed: true,
@@ -590,5 +620,45 @@ mod tests {
         // 失败后状态不被破坏：继续调用仍返回错误，依旧不 panic
         assert!(inj.inject(&[]).is_err());
         inj.set_screen_size(1920, 1080); // 不 panic
+    }
+
+    /// `MouseWheelPixel` 编解码 roundtrip、定长 5 字节及截断/超长拒绝。
+    #[test]
+    fn mouse_wheel_pixel_wire_roundtrip_and_validation() {
+        let samples = [
+            InputEvent::MouseWheelPixel { dx: 0, dy: 0 },
+            InputEvent::MouseWheelPixel { dx: 12, dy: -34 },
+            InputEvent::MouseWheelPixel {
+                dx: i16::MIN,
+                dy: i16::MAX,
+            },
+        ];
+        for ev in samples {
+            let mut buf = Vec::new();
+            encode_events(&[ev], &mut buf);
+            assert_eq!(buf.len(), 2 + 5);
+            assert_eq!(&buf[0..2], &5u16.to_le_bytes());
+            assert_eq!(buf[2], TYPE_WHEEL_PIXEL);
+            assert_eq!(decode_events(&buf).unwrap(), vec![ev]);
+        }
+
+        // 截断：事件段 1..=4 字节均报 truncated
+        for n in 1..=4u16 {
+            let mut buf = Vec::from(n.to_le_bytes());
+            buf.push(TYPE_WHEEL_PIXEL);
+            buf.extend(std::iter::repeat_n(0u8, usize::from(n - 1)));
+            let err = decode_events(&buf).unwrap_err();
+            assert!(
+                err.to_string().contains("truncated"),
+                "len={n} 应报截断: {err}"
+            );
+        }
+
+        // 超长（尾部多出字节）报 trailing bytes
+        let mut extra = Vec::new();
+        encode_events(&[InputEvent::MouseWheelPixel { dx: 1, dy: -1 }], &mut extra);
+        extra.push(0x00);
+        let err = decode_events(&extra).unwrap_err();
+        assert!(err.to_string().contains("trailing bytes"), "{err}");
     }
 }

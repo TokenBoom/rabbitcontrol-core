@@ -707,7 +707,10 @@ pub struct SwitchableTransport {
     next_switch_id: u64,
     buffered_events: VecDeque<NetEvent>,
     pacing_rate_bps: u64,
+    active_wake: WakeHandleSlot,
 }
+
+type WakeHandleSlot = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandEventOutcome {
@@ -781,6 +784,7 @@ impl SwitchableTransport {
         } else {
             0x8000_0000_0000_0001
         };
+        let active_wake = Arc::new(Mutex::new(initial.wake_handle()));
         let mut me = Self {
             role,
             active: initial,
@@ -801,6 +805,7 @@ impl SwitchableTransport {
             next_switch_id: switch_base,
             buffered_events: VecDeque::new(),
             pacing_rate_bps: 0,
+            active_wake,
         };
         me.maybe_send_cap_probe(Instant::now());
         (me, handle)
@@ -925,7 +930,9 @@ impl SwitchableTransport {
         if self.pacing_rate_bps > 0 {
             new_transport.set_pacing_rate(self.pacing_rate_bps);
         }
+        let next_wake = new_transport.wake_handle();
         let old_transport = std::mem::replace(&mut self.active, new_transport);
+        *self.active_wake.lock().unwrap_or_else(|e| e.into_inner()) = next_wake;
         self.draining_old = Some((old_transport, Instant::now() + DEFAULT_OLD_DRAIN_GRACE));
         self.active_kind = candidate_kind;
         *self
@@ -1603,6 +1610,10 @@ impl Transport for SwitchableTransport {
         self.active.send_datagram(data)
     }
 
+    fn send_datagrams_batch(&mut self, datagrams: &[Vec<u8>]) -> Result<usize> {
+        self.active.send_datagrams_batch(datagrams)
+    }
+
     fn send_reliable(&mut self, data: &[u8]) -> Result<()> {
         self.send_reliable_wire(false, data)
     }
@@ -1671,6 +1682,27 @@ impl Transport for SwitchableTransport {
 
     fn tx_dropped_datagrams(&self) -> u64 {
         self.active.tx_dropped_datagrams()
+    }
+
+    fn reliable_tx_queued_len(&self) -> usize {
+        self.active.reliable_tx_queued_len()
+    }
+
+    fn has_live_rtt(&self) -> bool {
+        self.active.has_live_rtt()
+    }
+
+    fn wake_handle(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let active_wake = Arc::clone(&self.active_wake);
+        Some(Arc::new(move || {
+            let cb = active_wake
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(wake) = cb {
+                wake();
+            }
+        }))
     }
 }
 

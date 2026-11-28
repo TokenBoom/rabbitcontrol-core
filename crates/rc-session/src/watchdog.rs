@@ -48,12 +48,18 @@ const PARTIAL_STALE_US: u32 = 500_000;
 /// 闭环无意义。
 const COMPLETED_HISTORY: usize = 8;
 
-/// 帧等待超时基数（微秒）：ack 已到、等对应 IDR 帧完整到达的窗口 =
-/// `rtt + ack_margin + 本值`。取值对齐看门狗节拍（500ms）：IDR 数据报
-/// 被丢时反正 500ms 后看门狗会再触发一轮恢复，比它更短的帧超时只会把
-/// 重发频率抬到高于看门狗节拍（持续丢包演练的请求上界约束），比它长
-/// 则拖慢恢复（演练断言丢包窗结束后 ≤700ms 恢复上屏）。
-const FRAME_WAIT_BASE_US: u32 = 500_000;
+/// 帧等待超时基数（微秒）：ack 已到、等对应 IDR 帧完整到达的首轮基数 =
+/// `rtt + ack_margin + 本值`。首轮用 120ms 快速从单包丢 IDR 恢复（~170ms 内重试），
+/// 连续失败后按 attempt 指数退避（120ms → 300ms → 600ms），兼顾单次丢包恢复速度与持续丢包去抖上界。
+const FRAME_WAIT_BASE_US: u32 = 120_000;
+
+fn await_frame_base_us(attempt: u8) -> u32 {
+    match attempt {
+        0 | 1 => FRAME_WAIT_BASE_US,
+        2 => 300_000,
+        _ => 600_000,
+    }
+}
 
 // ── 完整帧跟踪 ──────────────────────────────────────────────
 
@@ -526,10 +532,10 @@ impl IdrController {
                 attempt,
             } => {
                 // ack 到了但对应 IDR 帧超时未到（IDR 数据报被丢）：
-                // 窗口 = rtt + margin + 帧等待基数；地板以距上次发送计。
+                // 窗口 = rtt + margin + 按 attempt 退避的帧等待基数；地板以距上次发送计。
                 let frame_timeout = rtt_us
                     .saturating_add(self.cfg.ack_margin_us)
-                    .saturating_add(FRAME_WAIT_BASE_US);
+                    .saturating_add(await_frame_base_us(attempt));
                 let since_elapsed = now_us.wrapping_sub(since);
                 let sent_elapsed = now_us.wrapping_sub(sent_at);
                 if since_elapsed > frame_timeout && sent_elapsed >= self.cfg.min_retry_interval_us {
@@ -925,12 +931,12 @@ mod tests {
         c.on_ack(FrameSeq(3), 20_000); // → AwaitFrame(3)
         assert_eq!(c.stats().acks_received, 1);
 
-        // 帧等待窗口 = rtt(0) + margin(50ms) + 500ms = 550ms（自 since）。
+        // 首轮帧等待窗口 = rtt(0) + margin(50ms) + 120ms = 170ms（自 since=20ms → 190ms）。
         assert!(
-            c.poll(569_000, 0).is_none(),
+            c.poll(189_000, 0).is_none(),
             "帧等待窗口内不重发（ack 已确认请求到达）"
         );
-        let r2 = c.poll(570_001, 0).expect("帧超时必须重发");
+        let r2 = c.poll(190_001, 0).expect("帧超时必须重发");
         assert_eq!(r2.attempt, 2);
         assert_eq!(c.stats().retries, 1);
 

@@ -240,8 +240,100 @@ pub struct AuthUserInfo {
     pub token_version: i64,
 }
 
+fn is_none_or_empty_str(opt: &Option<String>) -> bool {
+    opt.as_deref().map(str::trim).map_or(true, str::is_empty)
+}
+
+fn is_none_or_zero_u64(opt: &Option<u64>) -> bool {
+    opt.map_or(true, |v| v == 0)
+}
+
+fn sanitize_opt_text(opt: Option<String>, max_bytes: usize) -> Option<String> {
+    opt.and_then(|s| {
+        let cleaned = crate::platform::sanitize_text_field(&s, max_bytes);
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    })
+}
+
+fn non_empty_opt(s: String) -> Option<String> {
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn non_zero_opt(v: u64) -> Option<u64> {
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct HardwareWireFields {
+    #[serde(skip_serializing_if = "is_none_or_empty_str")]
+    cpu_model: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty_str")]
+    mac_address: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_zero_u64")]
+    total_memory_mb: Option<u64>,
+    #[serde(skip_serializing_if = "is_none_or_empty_str")]
+    os_version: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty_str")]
+    gpu_model: Option<String>,
+}
+
+impl HardwareWireFields {
+    fn from_platform() -> Self {
+        let hw = crate::platform::device_hardware_info();
+        Self {
+            cpu_model: non_empty_opt(hw.cpu_model),
+            mac_address: non_empty_opt(hw.mac_address),
+            total_memory_mb: non_zero_opt(hw.total_memory_mb),
+            os_version: non_empty_opt(hw.os_version),
+            gpu_model: non_empty_opt(hw.gpu_model),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RequestWithHardware<'a, T> {
+    #[serde(flatten)]
+    base: &'a T,
+    #[serde(flatten)]
+    hardware: HardwareWireFields,
+}
+
+fn fill_hardware_fields_from_platform(
+    cpu_model: &mut Option<String>,
+    mac_address: &mut Option<String>,
+    total_memory_mb: &mut Option<u64>,
+    os_version: &mut Option<String>,
+    gpu_model: &mut Option<String>,
+) {
+    let hw = crate::platform::device_hardware_info();
+    *cpu_model = sanitize_opt_text(cpu_model.take(), crate::platform::MAX_CPU_MODEL_BYTES)
+        .or_else(|| non_empty_opt(hw.cpu_model));
+    *mac_address = sanitize_opt_text(mac_address.take(), crate::platform::MAX_MAC_ADDRESS_BYTES)
+        .or_else(|| non_empty_opt(hw.mac_address));
+    *total_memory_mb = total_memory_mb
+        .map(|v| v.min(crate::platform::MAX_TOTAL_MEMORY_MB))
+        .filter(|&v| v > 0)
+        .or_else(|| non_zero_opt(hw.total_memory_mb));
+    *os_version = sanitize_opt_text(os_version.take(), crate::platform::MAX_OS_VERSION_BYTES)
+        .or_else(|| non_empty_opt(hw.os_version));
+    *gpu_model = sanitize_opt_text(gpu_model.take(), crate::platform::MAX_GPU_MODEL_BYTES)
+        .or_else(|| non_empty_opt(hw.gpu_model));
+}
+
 /// 注册请求参数。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterRequest {
     /// 登录邮箱。
     pub email: String,
@@ -271,7 +363,7 @@ pub struct RegisterRequest {
 }
 
 /// 登录请求参数。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoginRequest {
     /// 登录邮箱。
     pub email: String,
@@ -298,7 +390,7 @@ pub struct LoginRequest {
 }
 
 /// 绑定设备请求参数。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindDeviceRequest {
     /// 设备稳定密钥（64 位 hex）。
     pub device_key: String,
@@ -325,6 +417,119 @@ pub struct BindDeviceRequest {
     pub allow_remote_assist: Option<bool>,
 }
 
+/// 公共设备注册请求参数（`POST /api/v1/devices/register`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRegisterRequest {
+    /// 设备稳定密钥（64 位 hex）。
+    pub device_key: String,
+    /// 可选主机名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// 可选操作系统名称。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// 可选应用版本号。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    /// 可选 CPU 架构。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    /// 可选 CPU 型号。
+    #[serde(default, skip_serializing_if = "is_none_or_empty_str")]
+    pub cpu_model: Option<String>,
+    /// 可选硬件 MAC 地址。
+    #[serde(default, skip_serializing_if = "is_none_or_empty_str")]
+    pub mac_address: Option<String>,
+    /// 可选物理内存总容量（MB）。
+    #[serde(default, skip_serializing_if = "is_none_or_zero_u64")]
+    pub total_memory_mb: Option<u64>,
+    /// 可选操作系统版本描述。
+    #[serde(default, skip_serializing_if = "is_none_or_empty_str")]
+    pub os_version: Option<String>,
+    /// 可选 GPU 型号。
+    #[serde(default, skip_serializing_if = "is_none_or_empty_str")]
+    pub gpu_model: Option<String>,
+    /// 可选设备分组。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_group: Option<String>,
+}
+
+/// 服务端 `/api/v1/devices/register` 响应。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRegisterResponse {
+    /// 9 位纯数字设备码。
+    pub device_id: String,
+    /// 格式化设备码（如 `"123 456 789"`）。
+    #[serde(default)]
+    pub formatted_id: String,
+    /// 设备稳定密钥。
+    #[serde(default)]
+    pub device_key: String,
+    /// 主机名。
+    #[serde(default)]
+    pub hostname: String,
+    /// 操作系统。
+    #[serde(default)]
+    pub os: String,
+    /// 应用版本号。
+    #[serde(default)]
+    pub app_version: String,
+    /// CPU 架构。
+    #[serde(default)]
+    pub arch: String,
+    /// CPU 型号（旧服务端未返回时为空串）。
+    #[serde(
+        default,
+        deserialize_with = "crate::platform::deserialize_null_default"
+    )]
+    pub cpu_model: String,
+    /// 硬件 MAC 地址（旧服务端未返回时为空串）。
+    #[serde(
+        default,
+        deserialize_with = "crate::platform::deserialize_null_default"
+    )]
+    pub mac_address: String,
+    /// 物理内存总容量（MB，旧服务端未返回时为 `0`）。
+    #[serde(
+        default,
+        deserialize_with = "crate::platform::deserialize_null_default"
+    )]
+    pub total_memory_mb: u64,
+    /// 操作系统版本描述（旧服务端未返回时为空串）。
+    #[serde(
+        default,
+        deserialize_with = "crate::platform::deserialize_null_default"
+    )]
+    pub os_version: String,
+    /// GPU 型号（旧服务端未返回时为空串）。
+    #[serde(
+        default,
+        deserialize_with = "crate::platform::deserialize_null_default"
+    )]
+    pub gpu_model: String,
+    /// 设备分组。
+    #[serde(default)]
+    pub device_group: String,
+    /// 信令 TCP 地址。
+    #[serde(default)]
+    pub signal_tcp_addr: String,
+    /// UDP 探测主地址。
+    #[serde(default)]
+    pub udp_probe_addr: String,
+    /// 可选 UDP 探测备用端口地址。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_probe_alt_addr: Option<String>,
+    /// 可选 UDP 探测备用 IP 地址。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_probe_alt_ip_addr: Option<String>,
+    /// TCP 中继地址。
+    #[serde(default)]
+    pub tcp_relay_addr: String,
+    /// 中继地址。
+    #[serde(default)]
+    pub relay_addr: String,
+}
+
 /// 更新已绑定设备属性的请求参数（`PATCH /api/v1/me/devices/{id}`）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateDeviceRequest {
@@ -340,7 +545,7 @@ pub struct UpdateDeviceRequest {
 }
 
 /// 服务端返回的当前用户设备信息。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct MyDeviceInfo {
     /// 9 位纯数字设备码。
     pub device_id: String,
@@ -354,6 +559,16 @@ pub struct MyDeviceInfo {
     pub app_version: String,
     /// CPU 架构（旧服务端未返回时为空串）。
     pub arch: String,
+    /// CPU 型号（旧服务端未返回时为空串）。
+    pub cpu_model: String,
+    /// 硬件 MAC 地址（旧服务端未返回时为空串）。
+    pub mac_address: String,
+    /// 物理内存总容量（MB，旧服务端未返回时为 `0`）。
+    pub total_memory_mb: u64,
+    /// 操作系统版本描述（旧服务端未返回时为空串）。
+    pub os_version: String,
+    /// GPU 型号（旧服务端未返回时为空串）。
+    pub gpu_model: String,
     /// 用户自定义设备别名。
     pub alias: String,
     /// 设备 Ed25519 公钥 hex。
@@ -368,6 +583,8 @@ pub struct MyDeviceInfo {
     pub online: bool,
     /// 是否处于会话中。
     pub in_session: bool,
+    /// 当前活跃控制端会话列表（老服务端未返回时为空）。
+    pub active_controllers: Vec<crate::signal_client::ActiveControllerSummary>,
     /// 是否支持通过 Wake-on-LAN 远程开机（旧服务端未返回时为 `false`）。
     pub wol_capable: bool,
     /// 绑定时间。
@@ -394,6 +611,31 @@ impl<'de> Deserialize<'de> for MyDeviceInfo {
             app_version: String,
             #[serde(default)]
             arch: String,
+            #[serde(
+                default,
+                deserialize_with = "crate::platform::deserialize_null_default"
+            )]
+            cpu_model: String,
+            #[serde(
+                default,
+                deserialize_with = "crate::platform::deserialize_null_default"
+            )]
+            mac_address: String,
+            #[serde(
+                default,
+                deserialize_with = "crate::platform::deserialize_null_default"
+            )]
+            total_memory_mb: u64,
+            #[serde(
+                default,
+                deserialize_with = "crate::platform::deserialize_null_default"
+            )]
+            os_version: String,
+            #[serde(
+                default,
+                deserialize_with = "crate::platform::deserialize_null_default"
+            )]
+            gpu_model: String,
             #[serde(default)]
             alias: String,
             #[serde(default)]
@@ -408,6 +650,11 @@ impl<'de> Deserialize<'de> for MyDeviceInfo {
             online: bool,
             #[serde(default)]
             in_session: bool,
+            #[serde(
+                default,
+                deserialize_with = "crate::platform::deserialize_null_default"
+            )]
+            active_controllers: Vec<crate::signal_client::ActiveControllerSummary>,
             #[serde(default)]
             wol_capable: bool,
             #[serde(default)]
@@ -427,6 +674,11 @@ impl<'de> Deserialize<'de> for MyDeviceInfo {
             os: raw.os,
             app_version: raw.app_version,
             arch: raw.arch,
+            cpu_model: raw.cpu_model,
+            mac_address: raw.mac_address,
+            total_memory_mb: raw.total_memory_mb,
+            os_version: raw.os_version,
+            gpu_model: raw.gpu_model,
             alias: raw.alias,
             device_pubkey: raw.device_pubkey,
             allow_remote_assist: raw.allow_remote_assist,
@@ -434,6 +686,7 @@ impl<'de> Deserialize<'de> for MyDeviceInfo {
             disabled: raw.disabled,
             online: raw.online,
             in_session: raw.in_session,
+            active_controllers: raw.active_controllers,
             wol_capable: raw.wol_capable,
             bound_at: raw.bound_at,
             last_seen_at: raw.last_seen_at,
@@ -733,13 +986,57 @@ impl AuthHttpClient {
     }
 
     /// 注册新用户（`POST /api/v1/auth/register`）。
+    ///
+    /// 当请求携带 `device_key` 时，自动在请求体附带 [`crate::platform::device_hardware_info`] 硬件字段。
     pub fn register(&self, req: &RegisterRequest) -> Result<AuthTokenResponse, AuthClientError> {
-        self.post_json("/api/v1/auth/register", None, req)
+        if req
+            .device_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty())
+        {
+            let payload = RequestWithHardware {
+                base: req,
+                hardware: HardwareWireFields::from_platform(),
+            };
+            self.post_json("/api/v1/auth/register", None, &payload)
+        } else {
+            self.post_json("/api/v1/auth/register", None, req)
+        }
     }
 
     /// 邮箱密码登录（`POST /api/v1/auth/login`）。
+    ///
+    /// 当请求携带 `device_key` 时，自动在请求体附带 [`crate::platform::device_hardware_info`] 硬件字段。
     pub fn login(&self, req: &LoginRequest) -> Result<AuthTokenResponse, AuthClientError> {
-        self.post_json("/api/v1/auth/login", None, req)
+        if req
+            .device_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty())
+        {
+            let payload = RequestWithHardware {
+                base: req,
+                hardware: HardwareWireFields::from_platform(),
+            };
+            self.post_json("/api/v1/auth/login", None, &payload)
+        } else {
+            self.post_json("/api/v1/auth/login", None, req)
+        }
+    }
+
+    /// 公共设备注册（`POST /api/v1/devices/register`），自动附带宿主硬件信息。
+    pub fn register_device(
+        &self,
+        req: &DeviceRegisterRequest,
+    ) -> Result<DeviceRegisterResponse, AuthClientError> {
+        let mut payload = req.clone();
+        fill_hardware_fields_from_platform(
+            &mut payload.cpu_model,
+            &mut payload.mac_address,
+            &mut payload.total_memory_mb,
+            &mut payload.os_version,
+            &mut payload.gpu_model,
+        );
+        self.post_json("/api/v1/devices/register", None, &payload)
     }
 
     /// 原子轮换 Refresh Token（`POST /api/v1/auth/refresh`）。
@@ -831,7 +1128,7 @@ impl AuthHttpClient {
         })
     }
 
-    /// 将设备绑定到当前登录账号（`POST /api/v1/me/devices/bind`）。
+    /// 将设备绑定到当前登录账号（`POST /api/v1/me/devices/bind`），自动附带宿主硬件信息。
     pub fn bind_device(
         &self,
         access_token: &str,
@@ -843,8 +1140,12 @@ impl AuthHttpClient {
             Wrapped { device: MyDeviceInfo },
             Flat(MyDeviceInfo),
         }
+        let payload = RequestWithHardware {
+            base: req,
+            hardware: HardwareWireFields::from_platform(),
+        };
         let parsed: BindPayload =
-            self.post_json("/api/v1/me/devices/bind", Some(access_token), req)?;
+            self.post_json("/api/v1/me/devices/bind", Some(access_token), &payload)?;
         Ok(match parsed {
             BindPayload::Wrapped { device } => device,
             BindPayload::Flat(device) => device,
@@ -4185,5 +4486,478 @@ mod tests {
         assert_eq!(updated.os, "android");
         assert!(updated.allow_remote_control);
         assert!(!updated.allow_remote_assist);
+    }
+
+    #[test]
+    fn hardware_info_wire_compat_in_requests_and_my_devices() {
+        use crate::platform::{
+            lock_test_device_hardware_info, DeviceHardwareInfo, MAX_CPU_MODEL_BYTES,
+            MAX_GPU_MODEL_BYTES, MAX_MAC_ADDRESS_BYTES, MAX_OS_VERSION_BYTES, MAX_TOTAL_MEMORY_MB,
+        };
+
+        let hw_guard = lock_test_device_hardware_info();
+        let hw_keys = [
+            "cpu_model",
+            "mac_address",
+            "total_memory_mb",
+            "os_version",
+            "gpu_model",
+        ];
+
+        // 1. 请求结构体与 Wire 包装空值/0 值通过 skip_serializing_if 自动省略（保持旧服务端兼容性）
+        let empty_wire = serde_json::to_value(&RequestWithHardware {
+            base: &LoginRequest {
+                email: "a@b.com".into(),
+                password: "pw".into(),
+                ..LoginRequest::default()
+            },
+            hardware: HardwareWireFields {
+                cpu_model: Some("   ".into()),
+                mac_address: Some(String::new()),
+                total_memory_mb: Some(0),
+                os_version: None,
+                gpu_model: Some(String::new()),
+            },
+        })
+        .unwrap();
+        for key in hw_keys {
+            assert!(
+                empty_wire.get(key).is_none(),
+                "RequestWithHardware 空字段 {key} 不应被序列化"
+            );
+        }
+
+        let empty_dev_reg = serde_json::to_value(&DeviceRegisterRequest {
+            device_key: "k".repeat(64),
+            total_memory_mb: Some(0),
+            ..DeviceRegisterRequest::default()
+        })
+        .unwrap();
+        for key in hw_keys {
+            assert!(
+                empty_dev_reg.get(key).is_none(),
+                "DeviceRegisterRequest 空字段 {key} 不应被序列化"
+            );
+        }
+
+        // 2. MyDeviceInfo & DeviceRegisterResponse 解析新字段（含 Default、完整值、缺省字段与 null 容错）
+        assert_eq!(MyDeviceInfo::default().total_memory_mb, 0);
+        assert_eq!(DeviceRegisterResponse::default().total_memory_mb, 0);
+
+        let legacy_dev: MyDeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": "604928235",
+            "hostname": "old-mac",
+            "os": "macos",
+            "allow_remote_assist": false
+        }))
+        .unwrap();
+        assert_eq!(legacy_dev.cpu_model, "");
+        assert_eq!(legacy_dev.mac_address, "");
+        assert_eq!(legacy_dev.total_memory_mb, 0);
+        assert_eq!(legacy_dev.os_version, "");
+        assert_eq!(legacy_dev.gpu_model, "");
+
+        let null_hw_dev: MyDeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": "604928236",
+            "hostname": "null-mac",
+            "os": "macos",
+            "cpu_model": null,
+            "mac_address": null,
+            "total_memory_mb": null,
+            "os_version": null,
+            "gpu_model": null
+        }))
+        .unwrap();
+        assert_eq!(null_hw_dev.cpu_model, "");
+        assert_eq!(null_hw_dev.total_memory_mb, 0);
+
+        let full_hw_dev: MyDeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": "604928237",
+            "hostname": "m3-mac",
+            "os": "macos",
+            "cpu_model": "Apple M3 Max",
+            "mac_address": "aa:bb:cc:dd:ee:ff",
+            "total_memory_mb": 32768,
+            "os_version": "macOS 15.1",
+            "gpu_model": "Apple M3 Max"
+        }))
+        .unwrap();
+        assert_eq!(full_hw_dev.cpu_model, "Apple M3 Max");
+        assert_eq!(full_hw_dev.mac_address, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(full_hw_dev.total_memory_mb, 32768);
+        assert_eq!(full_hw_dev.os_version, "macOS 15.1");
+        assert_eq!(full_hw_dev.gpu_model, "Apple M3 Max");
+
+        let legacy_dev_reg: DeviceRegisterResponse = serde_json::from_value(serde_json::json!({
+            "device_id": "604928238",
+            "hostname": "old-dev-reg",
+            "os": "linux"
+        }))
+        .unwrap();
+        assert_eq!(legacy_dev_reg.cpu_model, "");
+        assert_eq!(legacy_dev_reg.mac_address, "");
+        assert_eq!(legacy_dev_reg.total_memory_mb, 0);
+        assert_eq!(legacy_dev_reg.os_version, "");
+        assert_eq!(legacy_dev_reg.gpu_model, "");
+
+        let null_dev_reg: DeviceRegisterResponse = serde_json::from_value(serde_json::json!({
+            "device_id": "604928239",
+            "cpu_model": null,
+            "mac_address": null,
+            "total_memory_mb": null,
+            "os_version": null,
+            "gpu_model": null
+        }))
+        .unwrap();
+        assert_eq!(null_dev_reg.cpu_model, "");
+        assert_eq!(null_dev_reg.mac_address, "");
+        assert_eq!(null_dev_reg.total_memory_mb, 0);
+        assert_eq!(null_dev_reg.os_version, "");
+        assert_eq!(null_dev_reg.gpu_model, "");
+
+        // 3. 登录、注册、绑定设备、/api/v1/devices/register 与 AuthSessionManager::{login, register}
+        //    自动附带 platform::device_hardware_info()，并在空值或无 device_key 时省略，脏值自动清洗截断
+        let recorded = Arc::new(Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+        let recorded_srv = Arc::clone(&recorded);
+
+        let server = spawn_mock_server(None, move |method, path, _headers, body| {
+            let req_json: serde_json::Value = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body).unwrap()
+            };
+            recorded_srv
+                .lock()
+                .unwrap()
+                .push((format!("{method} {path}"), req_json.clone()));
+            match (method, path) {
+                ("POST", "/api/v1/auth/register") | ("POST", "/api/v1/auth/login") => (
+                    200,
+                    false,
+                    serde_json::to_vec(&serde_json::json!({
+                        "access_token": "acc-hw",
+                        "refresh_token": "ref-hw",
+                        "expires_in_sec": 900,
+                        "user": {
+                            "id": "u-hw",
+                            "email": "alice@example.com",
+                            "display_name": "Alice",
+                            "role": "user",
+                            "status": "active"
+                        },
+                        "device": {
+                            "device_id": "604928237",
+                            "hostname": "m3-mac",
+                            "os": "macos",
+                            "cpu_model": "Apple M3 Max",
+                            "mac_address": "aa:bb:cc:dd:ee:ff",
+                            "total_memory_mb": 65536,
+                            "os_version": "macOS 15.2",
+                            "gpu_model": "Apple M3 Max (40-core)"
+                        }
+                    }))
+                    .unwrap(),
+                ),
+                ("POST", "/api/v1/me/devices/bind") => (
+                    200,
+                    false,
+                    serde_json::to_vec(&serde_json::json!({
+                        "device": {
+                            "device_id": "604928237",
+                            "hostname": "m3-mac",
+                            "os": "macos",
+                            "cpu_model": "Apple M3 Max",
+                            "mac_address": "aa:bb:cc:dd:ee:ff",
+                            "total_memory_mb": 65536,
+                            "os_version": "macOS 15.2",
+                            "gpu_model": "Apple M3 Max (40-core)"
+                        }
+                    }))
+                    .unwrap(),
+                ),
+                ("POST", "/api/v1/devices/register") => (
+                    200,
+                    false,
+                    serde_json::to_vec(&serde_json::json!({
+                        "device_id": "604928237",
+                        "formatted_id": "604 928 237",
+                        "device_key": req_json["device_key"],
+                        "hostname": "m3-mac",
+                        "os": "macos",
+                        "cpu_model": "Apple M3 Max",
+                        "mac_address": "aa:bb:cc:dd:ee:ff",
+                        "total_memory_mb": 65536,
+                        "os_version": "macOS 15.2",
+                        "gpu_model": "Apple M3 Max (40-core)"
+                    }))
+                    .unwrap(),
+                ),
+                ("GET", "/api/v1/me/devices") => (
+                    200,
+                    false,
+                    serde_json::to_vec(&serde_json::json!({
+                        "devices": [{
+                            "device_id": "604928237",
+                            "formatted_id": "604 928 237",
+                            "hostname": "m3-mac",
+                            "os": "macos",
+                            "cpu_model": "Apple M3 Max",
+                            "mac_address": "aa:bb:cc:dd:ee:ff",
+                            "total_memory_mb": 65536,
+                            "os_version": "macOS 15.2",
+                            "gpu_model": "Apple M3 Max (40-core)",
+                            "allow_remote_assist": false
+                        }]
+                    }))
+                    .unwrap(),
+                ),
+                _ => (404, false, b"{}".to_vec()),
+            }
+        });
+
+        let hw = DeviceHardwareInfo {
+            cpu_model: "Apple M3 Max".into(),
+            mac_address: "aa:bb:cc:dd:ee:ff".into(),
+            total_memory_mb: 65536,
+            os_version: "macOS 15.2".into(),
+            gpu_model: "Apple M3 Max (40-core)".into(),
+        };
+        hw_guard.set(Some(hw));
+
+        let client = AuthHttpClient::new("127.0.0.1", server.port, false, None).unwrap();
+        let reg_resp = client
+            .register(&RegisterRequest {
+                email: "alice@example.com".into(),
+                password: "pw".into(),
+                device_key: Some("k".repeat(64)),
+                ..RegisterRequest::default()
+            })
+            .unwrap();
+        assert_eq!(reg_resp.device.as_ref().unwrap().cpu_model, "Apple M3 Max");
+
+        let login_resp = client
+            .login(&LoginRequest {
+                email: "alice@example.com".into(),
+                password: "pw".into(),
+                device_key: Some("k".repeat(64)),
+                ..LoginRequest::default()
+            })
+            .unwrap();
+        assert_eq!(
+            login_resp.device.as_ref().unwrap().cpu_model,
+            "Apple M3 Max"
+        );
+
+        let bound = client
+            .bind_device(
+                "acc-hw",
+                &BindDeviceRequest {
+                    device_key: "k".repeat(64),
+                    hostname: Some("m3-mac".into()),
+                    os: Some("macos".into()),
+                    ..BindDeviceRequest::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(bound.total_memory_mb, 65536);
+
+        let dev_reg = client
+            .register_device(&DeviceRegisterRequest {
+                device_key: "k".repeat(64),
+                hostname: Some("m3-mac".into()),
+                os: Some("macos".into()),
+                ..DeviceRegisterRequest::default()
+            })
+            .unwrap();
+        assert_eq!(dev_reg.os_version, "macOS 15.2");
+        assert_eq!(dev_reg.gpu_model, "Apple M3 Max (40-core)");
+
+        let devices = client.list_my_devices("acc-hw").unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].cpu_model, "Apple M3 Max");
+        assert_eq!(devices[0].mac_address, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(devices[0].total_memory_mb, 65536);
+        assert_eq!(devices[0].os_version, "macOS 15.2");
+        assert_eq!(devices[0].gpu_model, "Apple M3 Max (40-core)");
+
+        // AuthSessionManager::{register, login} 自动附带硬件信息
+        let dir = temp_test_dir("auth_mgr_hw");
+        let cert_mgr = Arc::new(CertManager::load_or_init(dir.join("certs")).unwrap());
+        let cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".into(),
+            api_port: server.port,
+            use_https: false,
+            device_key: "d".repeat(64),
+            ..ServerConfig::default()
+        };
+        let mgr = AuthSessionManager::new(cfg, dir.join("auth.json"), cert_mgr);
+        mgr.register(
+            "alice@example.com",
+            "pw",
+            Some("Alice"),
+            Some("m3-mac"),
+            Some("macos"),
+        )
+        .unwrap();
+        mgr.login("alice@example.com", "pw", Some("m3-mac"), Some("macos"))
+            .unwrap();
+
+        {
+            let reqs = recorded.lock().unwrap();
+            let hw_requests: Vec<&serde_json::Value> = reqs
+                .iter()
+                .filter(|(op, _)| op.starts_with("POST "))
+                .map(|(_, body)| body)
+                .collect();
+            assert_eq!(hw_requests.len(), 6);
+            for body in hw_requests {
+                assert_eq!(body["cpu_model"], "Apple M3 Max");
+                assert_eq!(body["mac_address"], "aa:bb:cc:dd:ee:ff");
+                assert_eq!(body["total_memory_mb"], 65536);
+                assert_eq!(body["os_version"], "macOS 15.2");
+                assert_eq!(body["gpu_model"], "Apple M3 Max (40-core)");
+            }
+        }
+
+        // 3b. 无 device_key 的登录/注册不附带硬件字段；空硬件信息不发送空字段
+        recorded.lock().unwrap().clear();
+        client
+            .register(&RegisterRequest {
+                email: "alice@example.com".into(),
+                password: "pw".into(),
+                device_key: None,
+                ..RegisterRequest::default()
+            })
+            .unwrap();
+        client
+            .login(&LoginRequest {
+                email: "alice@example.com".into(),
+                password: "pw".into(),
+                device_key: None,
+                ..LoginRequest::default()
+            })
+            .unwrap();
+        hw_guard.set(None);
+        client
+            .login(&LoginRequest {
+                email: "alice@example.com".into(),
+                password: "pw".into(),
+                device_key: Some("k".repeat(64)),
+                ..LoginRequest::default()
+            })
+            .unwrap();
+        client
+            .bind_device(
+                "acc-hw",
+                &BindDeviceRequest {
+                    device_key: "k".repeat(64),
+                    ..BindDeviceRequest::default()
+                },
+            )
+            .unwrap();
+        client
+            .register_device(&DeviceRegisterRequest {
+                device_key: "k".repeat(64),
+                ..DeviceRegisterRequest::default()
+            })
+            .unwrap();
+        {
+            let reqs = recorded.lock().unwrap();
+            assert_eq!(reqs.len(), 5);
+            for (op, body) in reqs.iter() {
+                for key in hw_keys {
+                    assert!(
+                        body.get(key).is_none(),
+                        "{op} 在无 device_key 或空硬件信息时不应携带 {key}"
+                    );
+                }
+            }
+        }
+
+        // 3c. 脏硬件元数据（控制字符/NUL/超长 UTF-8/u64::MAX）在平台钩子与 DeviceRegisterRequest 侧均被清洗与钳制
+        recorded.lock().unwrap().clear();
+        hw_guard.set(Some(DeviceHardwareInfo {
+            cpu_model: format!("CPU\0\r\n {}", "中".repeat(50)),
+            mac_address: format!("aa:bb:cc\n{}", "1".repeat(80)),
+            total_memory_mb: u64::MAX,
+            os_version: format!("OS\t\0 {}", "v".repeat(200)),
+            gpu_model: format!("GPU\r\n {}", "g".repeat(200)),
+        }));
+        client
+            .login(&LoginRequest {
+                email: "alice@example.com".into(),
+                password: "pw".into(),
+                device_key: Some("k".repeat(64)),
+                ..LoginRequest::default()
+            })
+            .unwrap();
+        client
+            .register_device(&DeviceRegisterRequest {
+                device_key: "k".repeat(64),
+                cpu_model: Some(format!("Direct\0\n {}", "x".repeat(200))),
+                mac_address: Some(format!("00:11\r\n{}", "z".repeat(80))),
+                total_memory_mb: Some(u64::MAX),
+                os_version: Some(format!("DirectOS\n {}", "o".repeat(200))),
+                gpu_model: Some(format!("DirectGPU\0 {}", "u".repeat(200))),
+                ..DeviceRegisterRequest::default()
+            })
+            .unwrap();
+        {
+            let reqs = recorded.lock().unwrap();
+            assert_eq!(reqs.len(), 2);
+            for (_, body) in reqs.iter() {
+                let cpu = body["cpu_model"].as_str().unwrap();
+                let mac = body["mac_address"].as_str().unwrap();
+                let os_ver = body["os_version"].as_str().unwrap();
+                let gpu = body["gpu_model"].as_str().unwrap();
+                let mem = body["total_memory_mb"].as_u64().unwrap();
+                assert!(!cpu.chars().any(char::is_control) && !cpu.contains('\0'));
+                assert!(cpu.len() <= MAX_CPU_MODEL_BYTES);
+                assert!(!mac.chars().any(char::is_control) && !mac.contains('\0'));
+                assert!(mac.len() <= MAX_MAC_ADDRESS_BYTES);
+                assert!(!os_ver.chars().any(char::is_control) && !os_ver.contains('\0'));
+                assert!(os_ver.len() <= MAX_OS_VERSION_BYTES);
+                assert!(!gpu.chars().any(char::is_control) && !gpu.contains('\0'));
+                assert!(gpu.len() <= MAX_GPU_MODEL_BYTES);
+                assert_eq!(mem, MAX_TOTAL_MEMORY_MB);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn my_device_info_deserializes_active_controllers_with_legacy_fallback() {
+        let with_ctrls: MyDeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": "123456789",
+            "in_session": true,
+            "active_controllers": [{
+                "session_id": "s-1",
+                "controller_device_id": "111222333",
+                "controller_device_name": "Alice Mac",
+                "controller_os": "macos",
+                "is_owner": true,
+                "mode": "remote_control",
+                "connected_at_ms": 1763800000000u64
+            }]
+        }))
+        .expect("deserialize with active_controllers");
+        assert!(with_ctrls.in_session);
+        assert_eq!(with_ctrls.active_controllers.len(), 1);
+        assert_eq!(with_ctrls.active_controllers[0].session_id, "s-1");
+        assert!(with_ctrls.active_controllers[0].is_owner);
+
+        let legacy_null: MyDeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": "123456789",
+            "active_controllers": null
+        }))
+        .expect("deserialize with null active_controllers");
+        assert!(legacy_null.active_controllers.is_empty());
+
+        let legacy_missing: MyDeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": "123456789"
+        }))
+        .expect("deserialize without active_controllers");
+        assert!(legacy_missing.active_controllers.is_empty());
     }
 }

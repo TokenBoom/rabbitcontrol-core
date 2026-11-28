@@ -42,7 +42,8 @@ use crate::clipboard::{
     ClipboardAction, ClipboardBackend, ClipboardChannel, ClipboardConfig, ClipboardStats,
 };
 use crate::proto::{
-    self, AudioFramePacket, AuthStatus, ByeReason, ControlMessage, Hello, IdrReason, SessionParams,
+    self, AudioFramePacket, AuthStatus, ByeReason, ControlMessage, ControllerMeta, Hello,
+    IdrReason, SessionParams,
 };
 use crate::reconnect::{Backoff, ReconnectConfig, ReconnectStats};
 use crate::watchdog::{
@@ -169,6 +170,12 @@ pub struct ClientSession {
     clock: SessionClock,
     state: SessionState,
     negotiated: Option<SessionParams>,
+    /// 对端在 `Welcome.host_flags` 中通告是否支持像素级连续滚轮（`HostFlags::SUPPORTS_PIXEL_SCROLL`）。
+    peer_supports_pixel_scroll: bool,
+    /// 对端在 `Welcome.host_flags` 中通告是否支持接收 `ControllerMeta`（`HostFlags::SUPPORTS_CONTROLLER_META`）。
+    peer_supports_controller_meta: bool,
+    /// 待上报或最近一次设定的本端控制端元数据（仅当对端支持 `SUPPORTS_CONTROLLER_META` 时发送）。
+    controller_meta: Option<ControllerMeta>,
     bye_sent: bool,
     closed_reason: Option<StopReason>,
     /// S4：Streaming 之前 / 方向错误到达的事件丢弃计数。
@@ -265,6 +272,8 @@ pub struct ClientSession {
     /// 上层三阶路由回退据此区分「`Welcome` 前底层断连（尚未触发审批/鉴权）」与
     /// 「已进入密码挑战或机主审批交互后的失败」，防止误回退导致被控端连弹多个审批窗。
     handshake_entered_auth: bool,
+    /// 最近一次握手是否被对端以 `HostFlags::BUSY_CONTROLLED` 拒收（目标已被其他控制端控制）。
+    handshake_busy_controlled: bool,
     // ── T20：剪贴板 UTF-8 纯文本双向同步（默认禁用，显式 enable_clipboard 开启）──
     /// 剪贴板同步状态：`Some((channel, backend))` 表示已启用，`None` 表示禁用（CB1）。
     clipboard: Option<(ClipboardChannel, Box<dyn ClipboardBackend>)>,
@@ -310,8 +319,8 @@ enum AuthPhase {
 enum ClientHandshakeStep {
     /// 鉴权进行中（已收到过程 Welcome 或已发出 AuthResponse，继续等待终局）。
     Authenticating,
-    /// 终局成功（收到 `Welcome{Ok}`，携带裁定参数）。
-    Done(SessionParams),
+    /// 终局成功（收到 `Welcome{Ok}`，携带裁定参数与像素滚轮/控制端元数据能力位）。
+    Done(SessionParams, bool, bool),
 }
 
 /// connect 工厂类型（[`ClientSession::set_connect_factory`] 的注入件）。
@@ -388,6 +397,9 @@ impl ClientSession {
             clock,
             state: SessionState::Init,
             negotiated: None,
+            peer_supports_pixel_scroll: false,
+            peer_supports_controller_meta: false,
+            controller_meta: None,
             bye_sent: false,
             closed_reason: None,
             early_events_dropped: 0,
@@ -436,6 +448,7 @@ impl ClientSession {
             refresh_pending: false,
             auth_phase: AuthPhase::Idle,
             handshake_entered_auth: false,
+            handshake_busy_controlled: false,
             clipboard: None,
             clipboard_received_while_disabled: 0,
             tool_rx: VecDeque::new(),
@@ -477,6 +490,9 @@ impl ClientSession {
             clock,
             state: SessionState::Connected,
             negotiated: None,
+            peer_supports_pixel_scroll: false,
+            peer_supports_controller_meta: false,
+            controller_meta: None,
             bye_sent: false,
             closed_reason: None,
             early_events_dropped: 0,
@@ -525,6 +541,7 @@ impl ClientSession {
             refresh_pending: false,
             auth_phase: AuthPhase::Idle,
             handshake_entered_auth: false,
+            handshake_busy_controlled: false,
             clipboard: None,
             clipboard_received_while_disabled: 0,
             tool_rx: VecDeque::new(),
@@ -644,6 +661,7 @@ impl ClientSession {
         }
         // T19（A1/A2）：构造全新 ClientAuthenticator，鉴权位来自 hello_auth()（密码绝不进 Hello）。
         self.handshake_entered_auth = false;
+        self.handshake_busy_controlled = false;
         let mut auth =
             ClientAuthenticator::with_session_id(self.cfg.auth.clone(), self.session_id_current);
         let (auth_method, auth_payload) = auth.hello_auth();
@@ -695,9 +713,17 @@ impl ClientSession {
                 match ev {
                     NetEvent::Reliable(msg) => {
                         match self.handle_handshake_reliable(&msg) {
-                            Ok(ClientHandshakeStep::Done(granted)) => {
+                            Ok(ClientHandshakeStep::Done(
+                                granted,
+                                supports_pixel_scroll,
+                                supports_controller_meta,
+                            )) => {
                                 self.auth_phase = AuthPhase::Idle;
-                                if let Err(e) = self.finalize_handshake(granted) {
+                                if let Err(e) = self.finalize_handshake(
+                                    granted,
+                                    supports_pixel_scroll,
+                                    supports_controller_meta,
+                                ) {
                                     return Err(self.handshake_fail(e));
                                 }
                                 // 同批中 Welcome 之后紧随到达的控制帧（例如初始 DisplayConfig ToolChannel）
@@ -756,6 +782,11 @@ impl ClientSession {
         self.handshake_entered_auth
     }
 
+    /// 最近一次 [`Self::handshake`] 是否因对端已有活跃控制端而被拒收（`HostFlags::BUSY_CONTROLLED`）。
+    pub fn handshake_busy_controlled(&self) -> bool {
+        self.handshake_busy_controlled
+    }
+
     /// 会话停机原因（未停机前为 `None`）。
     pub fn closed_reason(&self) -> Option<&StopReason> {
         self.closed_reason.as_ref()
@@ -769,6 +800,73 @@ impl ClientSession {
     /// 握手裁定的流参数（Streaming 前 None）。
     pub fn negotiated(&self) -> Option<SessionParams> {
         self.negotiated
+    }
+
+    /// 对端（被控端）在 `Welcome` 中是否通告支持像素级连续滚轮（`HostFlags::SUPPORTS_PIXEL_SCROLL`）。
+    ///
+    /// 未完成握手或连接旧版被控端时返回 `false`，控制端应回落到行单位 `InputEvent::MouseWheel`。
+    pub fn peer_supports_pixel_scroll(&self) -> bool {
+        self.peer_supports_pixel_scroll
+    }
+
+    /// 对端（被控端）在 `Welcome` 中是否通告支持接收 `ControllerMeta`（`HostFlags::SUPPORTS_CONTROLLER_META`）。
+    pub fn peer_supports_controller_meta(&self) -> bool {
+        self.peer_supports_controller_meta
+    }
+
+    /// 运行期经带内能力协商（如 `DisplayControlMsg::Capabilities`）确认对端支持像素级滚轮时启用。
+    pub fn set_peer_supports_pixel_scroll(&mut self, supported: bool) {
+        self.peer_supports_pixel_scroll = supported;
+    }
+
+    /// 运行期经带内能力协商确认对端支持 `ControllerMeta`（`0x16`）时启用，并立即补发已配置的元数据。
+    pub fn enable_peer_supports_controller_meta(&mut self) -> Result<()> {
+        let was_supported = self.peer_supports_controller_meta;
+        self.peer_supports_controller_meta = true;
+        if !was_supported && self.state == SessionState::Streaming {
+            self.maybe_send_controller_meta()?;
+        }
+        Ok(())
+    }
+
+    /// 设定本端控制端元数据（在握手或重连完成且对端支持 `SUPPORTS_CONTROLLER_META` 时自动上报）。
+    pub fn set_controller_meta(&mut self, meta: Option<ControllerMeta>) {
+        self.controller_meta = meta;
+    }
+
+    /// 更新并发送本端控制端元数据。
+    ///
+    /// **兼容纪律**：仅当对端在 `Welcome.host_flags` 中宣告 `SUPPORTS_CONTROLLER_META` 且当前处于
+    /// `Streaming` 时才实际发送 `0x16 ControllerMeta`；对不支持的旧端静默跳过，绝不发未知消息导致旧端断链。
+    pub fn send_controller_meta(&mut self, meta: ControllerMeta) -> Result<()> {
+        let msg = ControlMessage::controller_meta(meta.clone())?;
+        self.controller_meta = Some(meta);
+        if self.state != SessionState::Streaming || !self.peer_supports_controller_meta {
+            return Ok(());
+        }
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        self.transport
+            .as_mut()
+            .expect("Streaming implies transport")
+            .send_reliable(&buf)
+    }
+
+    /// 内部辅助：仅当 `peer_supports_controller_meta == true` 且存在已配置 `controller_meta` 时发送。
+    fn maybe_send_controller_meta(&mut self) -> Result<()> {
+        if !self.peer_supports_controller_meta {
+            return Ok(());
+        }
+        let Some(meta) = self.controller_meta.clone() else {
+            return Ok(());
+        };
+        let msg = ControlMessage::controller_meta(meta)?;
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        self.transport
+            .as_mut()
+            .expect("Streaming implies transport")
+            .send_reliable(&buf)
     }
 
     /// 一拍：
@@ -1027,16 +1125,19 @@ impl ClientSession {
                 if self.watchdog.poll(now) {
                     self.idr.request(IdrReason::WatchdogStall, now);
                 }
-                // 优先注入 T15 ProbePong 的实时中位数 RTT（捕获 TCP Relay 真实排队延迟）；
-                // 尚未采集到有效实时探针样本时，回落至传输层 NetStats::rtt_us。
-                let transport_rtt_us = self
+                // QUIC 等具备传输层逐包实时 RTT 的路径优先使用实时 `transport.stats().rtt_us`；
+                // TCP Relay 等不具备实时 RTT 的路径取最新探测 RTT 与传输 RTT 的较大值，避免 8 秒中位数滞后。
+                let transport = self
                     .transport
                     .as_ref()
-                    .expect("Streaming implies transport")
-                    .stats()
-                    .rtt_us;
-                let rtt_us =
-                    effective_idr_rtt_us(self.probe_snapshot().rtt_us_median, transport_rtt_us);
+                    .expect("Streaming implies transport");
+                let transport_rtt_us = transport.stats().rtt_us;
+                let has_live_rtt = transport.has_live_rtt();
+                let rtt_us = effective_idr_rtt_us(
+                    self.probe.latest_rtt_us(),
+                    transport_rtt_us,
+                    has_live_rtt,
+                );
                 if let Some(req) = self.idr.poll(now, rtt_us) {
                     // T17：尽力而为——连接将死时的发送失败由 poll 的断线信号
                     // 接管（重连成功后去抖已清，恢复路径会重新请求）。
@@ -1497,6 +1598,16 @@ impl ClientSession {
     /// u32 零扩展无损（B9：70 分钟守卫内两钟同源同纪元）。
     pub fn host_to_local_us(&self, host_us: u32) -> Option<u64> {
         self.probe.to_local_us(u64::from(host_us))
+    }
+
+    /// 最近一次成功 ProbePong 的瞬时 RTT（微秒；供控制端 Relay 拥塞控制器快速响应 RTT 波动与恢复）。
+    pub fn latest_probe_rtt_us(&self) -> Option<u64> {
+        self.probe.latest_rtt_us()
+    }
+
+    /// 获取底层传输的空闲唤醒回调（若支持），供控制端输入队列在空闲态立刻唤醒 `poll`。
+    pub fn transport_wake_handle(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        self.transport.as_ref().and_then(|t| t.wake_handle())
     }
 
     /// 探测快照（T18 嵌入 client 会话报告 JSON 的 session 段）。
@@ -2130,16 +2241,22 @@ impl ClientSession {
         match (decoded, self.reconnect_phase) {
             (ControlMessage::Welcome(w), ReconnectPhase::AwaitingVerdict) => {
                 // 修复卡 B-1：Welcome 校验失败（对端可触发——session_id 不
-                // 回显 / auth 拒绝）不再 `?` 裸上抛——先按红线完整停机
+                // 回显 / auth 拒绝 / HostBusyControlled）不再 `?` 裸上抛——先按红线完整停机
                 //（S6/S8）再返回 Err，不得把会话晾在 Reconnecting。
                 if let Err(e) = self.validate_welcome(&w) {
-                    let stop = StopReason::Disconnected(format!(
-                        "welcome rejected while reconnecting: {e}"
-                    ));
+                    let stop = if self.handshake_busy_controlled {
+                        StopReason::Disconnected(format!("HostBusyControlled: {e}"))
+                    } else {
+                        StopReason::Disconnected(format!(
+                            "welcome rejected while reconnecting: {e}"
+                        ))
+                    };
                     self.stop_with(stop, None);
                     return Err(e);
                 }
                 if w.host_flags.resume_accepted() {
+                    self.peer_supports_pixel_scroll = w.host_flags.supports_pixel_scroll();
+                    self.peer_supports_controller_meta = w.host_flags.supports_controller_meta();
                     // resume 命中：管线复用（FrameSeq 延续），立即强制 IDR
                     //（R4 client 侧半边），清 T16 在途去抖（坑 6：旧连接的
                     // IdrAck 永远不会来）、重置看门狗基准；时钟/RTT/偏移
@@ -2178,6 +2295,13 @@ impl ClientSession {
                     self.audio_ctrl_rx = None;
                     self.audio_rx.clear();
                     self.note_peer_rx(now_us);
+                    if let Err(e) = self.maybe_send_controller_meta() {
+                        let stop = StopReason::Disconnected(format!(
+                            "send ControllerMeta after resume failed: {e}"
+                        ));
+                        self.stop_with(stop, None);
+                        return Err(e);
+                    }
                     Ok(Some(ReconnectOutcome::Resumed))
                 } else {
                     // bit0=0 → 同连接降级：换新 session_id 补发全新 Hello
@@ -2230,12 +2354,18 @@ impl ClientSession {
                         eprintln!(
                             "[rc-session/auth] client authentication failed during reconnect: {reason}"
                         );
+                        if w.auth_status == AuthStatus::Rejected && w.host_flags.busy_controlled() {
+                            self.handshake_busy_controlled = true;
+                        }
                         let e = Error::Protocol {
                             offset: 0,
                             msg: reason,
                         };
-                        let stop =
-                            StopReason::Disconnected(format!("auth failed while rebuilding: {e}"));
+                        let stop = if self.handshake_busy_controlled {
+                            StopReason::Disconnected(format!("HostBusyControlled: {e}"))
+                        } else {
+                            StopReason::Disconnected(format!("auth failed while rebuilding: {e}"))
+                        };
                         self.stop_with(stop, None);
                         Err(e)
                     }
@@ -2286,6 +2416,9 @@ impl ClientSession {
                         }
                         self.pipeline = Some(pipeline);
                         self.negotiated = Some(granted);
+                        self.peer_supports_pixel_scroll = w.host_flags.supports_pixel_scroll();
+                        self.peer_supports_controller_meta =
+                            w.host_flags.supports_controller_meta();
                         self.state = SessionState::Streaming;
                         self.reconnect_phase = ReconnectPhase::Idle;
                         self.pipeline_generation += 1;
@@ -2315,6 +2448,13 @@ impl ClientSession {
                         self.tool_rx_overflow_dropped = 0;
                         self.audio_rx.clear();
                         self.note_peer_rx(now_us);
+                        if let Err(e) = self.maybe_send_controller_meta() {
+                            let stop = StopReason::Disconnected(format!(
+                                "send ControllerMeta after rebuild failed: {e}"
+                            ));
+                            self.stop_with(stop, None);
+                            return Err(e);
+                        }
                         Ok(Some(ReconnectOutcome::Rebuilt))
                     }
                 }
@@ -2423,6 +2563,7 @@ impl ClientSession {
 
     /// 发送 ReconnectRequest{当前会话号, resume=1}（reliable 流）。
     fn send_reconnect_request(&mut self) -> Result<()> {
+        self.handshake_busy_controlled = false;
         let msg = ControlMessage::ReconnectRequest {
             session_id: self.session_id_current,
             resume: true,
@@ -2441,6 +2582,7 @@ impl ClientSession {
     /// T19（A1/A2）：构造全新 [`ClientAuthenticator`]，鉴权位来自 `hello_auth()`
     /// （密码绝不进 Hello），并记录 `on_hello_sent(now_us)` 启动超时窗口。
     fn send_fresh_hello(&mut self, now_us: u64) -> Result<()> {
+        self.handshake_busy_controlled = false;
         let mut auth =
             ClientAuthenticator::with_session_id(self.cfg.auth.clone(), self.session_id_current);
         let (auth_method, auth_payload) = auth.hello_auth();
@@ -2548,13 +2690,22 @@ impl ClientSession {
                     ),
                 };
                 match action {
-                    ClientAuthAction::Done => Ok(ClientHandshakeStep::Done(welcome.granted)),
+                    ClientAuthAction::Done => Ok(ClientHandshakeStep::Done(
+                        welcome.granted,
+                        welcome.host_flags.supports_pixel_scroll(),
+                        welcome.host_flags.supports_controller_meta(),
+                    )),
                     ClientAuthAction::Waiting => {
                         // 过程 Welcome{ChallengeRequired}：显式忽略 granted（坑 5），
                         // 不建管线（A6），保持 Authenticating 子态。
                         Ok(ClientHandshakeStep::Authenticating)
                     }
                     ClientAuthAction::Failed(reason) => {
+                        if welcome.auth_status == AuthStatus::Rejected
+                            && welcome.host_flags.busy_controlled()
+                        {
+                            self.handshake_busy_controlled = true;
+                        }
                         eprintln!("[rc-session/auth] client authentication failed: {reason}");
                         Err(Error::Protocol {
                             offset: 0,
@@ -2568,6 +2719,12 @@ impl ClientSession {
                         })
                     }
                 }
+            }
+            ControlMessage::Bye { reason } => {
+                self.stop_with(StopReason::ByeReceived(reason), None);
+                Err(Error::Network(format!(
+                    "host sent Bye({reason:?}) during handshake"
+                )))
             }
             ControlMessage::AuthChallenge(ch) => {
                 self.handshake_entered_auth = true;
@@ -2620,12 +2777,19 @@ impl ClientSession {
     }
 
     /// 鉴权终局通过后建管线并迁移到 Streaming（A6：管线只在此处启动）。
-    fn finalize_handshake(&mut self, granted: SessionParams) -> Result<()> {
+    fn finalize_handshake(
+        &mut self,
+        granted: SessionParams,
+        supports_pixel_scroll: bool,
+        supports_controller_meta: bool,
+    ) -> Result<()> {
         let mut pipeline = self.build_controller_pipeline(granted)?;
         pipeline.set_clock(Arc::clone(&self.clock));
 
         self.pipeline = Some(pipeline);
         self.negotiated = Some(granted);
+        self.peer_supports_pixel_scroll = supports_pixel_scroll;
+        self.peer_supports_controller_meta = supports_controller_meta;
         self.state = SessionState::Streaming;
         // T17：首建管线代数 +1（与重建同口径）。
         self.pipeline_generation += 1;
@@ -2637,12 +2801,14 @@ impl ClientSession {
         self.tool_rx_overflow_dropped = 0;
         self.audio_rx.clear();
         self.note_peer_rx(u64::from((self.clock)()));
+        self.maybe_send_controller_meta()?;
         Ok(())
     }
 
     /// Welcome 校验（S3）：session_id 必须回显当前会话号、auth_status
-    /// 必须为 Ok。返回裁定参数。T17 重连路径共用（重建后回显新号）。
-    fn validate_welcome(&self, welcome: &proto::Welcome) -> Result<SessionParams> {
+    /// 必须为 Ok；若收到 `Rejected` + `BUSY_CONTROLLED`，标记 `handshake_busy_controlled`
+    /// 并返回带 `HostBusyControlled` 的错误以终止重连退避。T17 重连路径共用（重建后回显新号）。
+    fn validate_welcome(&mut self, welcome: &proto::Welcome) -> Result<SessionParams> {
         // S3：session_id 不回显即断。
         if welcome.session_id != self.session_id_current {
             return Err(Error::Protocol {
@@ -2651,6 +2817,13 @@ impl ClientSession {
                     "welcome session_id {} does not echo local {} (refusing)",
                     welcome.session_id, self.session_id_current
                 ),
+            });
+        }
+        if welcome.auth_status == AuthStatus::Rejected && welcome.host_flags.busy_controlled() {
+            self.handshake_busy_controlled = true;
+            return Err(Error::Protocol {
+                offset: 0,
+                msg: "HostBusyControlled: host already has an active controller".into(),
             });
         }
         // S3：auth_status ≠ 0 即断（本卡只认通过；挑战路径是 T19）。
@@ -2706,7 +2879,12 @@ impl ClientSession {
         self.clear_peer_liveness();
         if self.state != SessionState::Closed {
             self.state = SessionState::Closed;
-            self.closed_reason = Some(StopReason::Disconnected(format!("handshake failed: {e}")));
+            let msg = if self.handshake_busy_controlled {
+                format!("HostBusyControlled: {e}")
+            } else {
+                format!("handshake failed: {e}")
+            };
+            self.closed_reason = Some(StopReason::Disconnected(msg));
             self.transport = None;
         }
         e
@@ -2949,6 +3127,7 @@ fn ignore_tag_client(m: &ControlMessage) -> &'static str {
         ControlMessage::ClipboardNotify { .. } => "ClipboardNotify(非 Streaming 态到达，忽略)",
         ControlMessage::ToolChannel { .. } => "ToolChannel(非 Streaming 态到达，忽略)",
         ControlMessage::AudioFrame { .. } => "AudioFrame(非 Streaming 态到达，忽略)",
+        ControlMessage::ControllerMeta(_) => "ControllerMeta(方向错误：client 是发送侧)",
         _ => "未知方向消息",
     }
 }
@@ -3016,12 +3195,21 @@ pub struct ClientRunSummary {
 // 测试：全部离线确定性（mock transport + 假后端，无网络、无 sleep）
 // ─────────────────────────────────────────────────────────────────
 
-/// 优先使用实时 `ProbeSnapshot::rtt_us_median`（>0），无有效样本时回落至 `transport.stats().rtt_us`。
-fn effective_idr_rtt_us(probe_rtt_median_us: Option<u64>, transport_rtt_us: u32) -> u32 {
-    probe_rtt_median_us
+/// 具备传输层逐包实时 RTT（QUIC）时优先使用 `transport_rtt_us`；
+/// 非实时传输（Relay）时取最新 `ProbePong` RTT 与 `transport_rtt_us` 的较大值。
+fn effective_idr_rtt_us(
+    probe_latest_rtt_us: Option<u64>,
+    transport_rtt_us: u32,
+    transport_has_live_rtt: bool,
+) -> u32 {
+    if transport_has_live_rtt && transport_rtt_us > 0 {
+        return transport_rtt_us;
+    }
+    let probe_u32 = probe_latest_rtt_us
         .filter(|&rtt| rtt > 0)
         .map(|rtt| u32::try_from(rtt).unwrap_or(u32::MAX))
-        .unwrap_or(transport_rtt_us)
+        .unwrap_or(0);
+    probe_u32.max(transport_rtt_us)
 }
 
 #[cfg(test)]
@@ -5531,10 +5719,17 @@ mod tests {
     fn client_feeds_live_probe_rtt_to_idr_controller_and_falls_back_to_transport_stats() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
-        assert_eq!(effective_idr_rtt_us(None, 12_000), 12_000);
-        assert_eq!(effective_idr_rtt_us(Some(0), 12_000), 12_000);
-        assert_eq!(effective_idr_rtt_us(Some(180_000), 12_000), 180_000);
-        assert_eq!(effective_idr_rtt_us(Some(u64::MAX), 12_000), u32::MAX);
+        assert_eq!(effective_idr_rtt_us(None, 12_000, false), 12_000);
+        assert_eq!(effective_idr_rtt_us(Some(0), 12_000, false), 12_000);
+        assert_eq!(effective_idr_rtt_us(Some(180_000), 12_000, false), 180_000);
+        assert_eq!(effective_idr_rtt_us(Some(20_000), 180_000, false), 180_000);
+        assert_eq!(
+            effective_idr_rtt_us(Some(u64::MAX), 12_000, false),
+            u32::MAX
+        );
+        // Live transport RTT (QUIC) must prefer fresh transport_rtt_us over stale probe RTT.
+        assert_eq!(effective_idr_rtt_us(Some(180_000), 15_000, true), 15_000);
+        assert_eq!(effective_idr_rtt_us(Some(180_000), 0, true), 180_000);
 
         struct RttMockTransport {
             inner: MockTransport,
@@ -5653,5 +5848,288 @@ mod tests {
             .expect("b t1450_001");
         assert_eq!(client_b.idr_requests_sent(), sent_at_1200ms + 1);
         client_b.close(ByeReason::Normal).expect("close b");
+    }
+
+    /// `ClientSession::peer_supports_pixel_scroll` 严格按 `Welcome.host_flags` bit2 判定：
+    /// 旧被控端（`HostFlags(0)`）为 `false`，新被控端（`SUPPORTS_PIXEL_SCROLL`）为 `true`。
+    #[test]
+    fn client_tracks_peer_supports_pixel_scroll_from_welcome() {
+        let mut mock_legacy = MockTransport::new();
+        mock_legacy.deliver_reliable(&welcome_msg(7, req(), proto::AuthStatus::Ok)); // HostFlags(0)
+        let mut client_legacy = ClientSession::with_parts(
+            cfg(Vec::new()),
+            Box::new(mock_legacy),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts legacy");
+        assert!(!client_legacy.peer_supports_pixel_scroll());
+        client_legacy.handshake().expect("handshake legacy");
+        assert!(
+            !client_legacy.peer_supports_pixel_scroll(),
+            "旧端 Welcome 未置 bit2 时必须为 false"
+        );
+        client_legacy.close(ByeReason::Normal).expect("close");
+
+        let mut mock_pixel = MockTransport::new();
+        mock_pixel.deliver_reliable(&ControlMessage::Welcome(proto::Welcome {
+            session_id: 7,
+            granted: req(),
+            auth_status: proto::AuthStatus::Ok,
+            host_flags: HostFlags(HostFlags::SUPPORTS_PIXEL_SCROLL),
+        }));
+        let mut client_pixel = ClientSession::with_parts(
+            cfg(Vec::new()),
+            Box::new(mock_pixel),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts pixel");
+        client_pixel.handshake().expect("handshake pixel");
+        assert!(
+            client_pixel.peer_supports_pixel_scroll(),
+            "新端 Welcome 置 SUPPORTS_PIXEL_SCROLL 时必须为 true"
+        );
+        client_pixel.close(ByeReason::Normal).expect("close");
+    }
+
+    /// 兼容纪律：仅当 `Welcome.host_flags.supports_controller_meta()` 为 `true` 时，
+    /// `ClientSession` 才发送 `ControllerMeta`；连接不支持该标志的旧被控端时绝不发送。
+    #[test]
+    fn client_sends_controller_meta_only_when_host_supports_it() {
+        let meta = proto::ControllerMeta {
+            device_id: "987654321".to_string(),
+            device_name: "Controller Mini".to_string(),
+            os: "macos".to_string(),
+            mode: proto::CONTROLLER_MODE_WATCH_ONLY,
+        };
+
+        // 1) 旧被控端（仅 SUPPORTS_PIXEL_SCROLL，未置 SUPPORTS_CONTROLLER_META）：绝不发送 ControllerMeta。
+        let mut mock_legacy = MockTransport::new();
+        mock_legacy.deliver_reliable(&ControlMessage::Welcome(proto::Welcome {
+            session_id: 7,
+            granted: req(),
+            auth_status: proto::AuthStatus::Ok,
+            host_flags: HostFlags(HostFlags::SUPPORTS_PIXEL_SCROLL),
+        }));
+        let handle_legacy = mock_legacy.clone();
+        let mut client_legacy = ClientSession::with_parts(
+            cfg(Vec::new()),
+            Box::new(mock_legacy),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts legacy");
+        client_legacy.set_controller_meta(Some(meta.clone()));
+        client_legacy.handshake().expect("handshake legacy");
+        assert!(!client_legacy.peer_supports_controller_meta());
+        client_legacy
+            .send_controller_meta(meta.clone())
+            .expect("send_controller_meta on legacy must be no-op");
+        assert!(
+            handle_legacy
+                .reliable_decoded()
+                .iter()
+                .all(|m| !matches!(m, ControlMessage::ControllerMeta(_))),
+            "旧端未宣告 SUPPORTS_CONTROLLER_META 时不得发送 ControllerMeta"
+        );
+        client_legacy.close(ByeReason::Normal).expect("close");
+
+        // 2) 新被控端（置 SUPPORTS_CONTROLLER_META）：握手后自动发送，且 mid-session 更新也会发送。
+        let mut mock_new = MockTransport::new();
+        mock_new.deliver_reliable(&ControlMessage::Welcome(proto::Welcome {
+            session_id: 7,
+            granted: req(),
+            auth_status: proto::AuthStatus::Ok,
+            host_flags: HostFlags(
+                HostFlags::SUPPORTS_PIXEL_SCROLL | HostFlags::SUPPORTS_CONTROLLER_META,
+            ),
+        }));
+        let handle_new = mock_new.clone();
+        let mut client_new = ClientSession::with_parts(
+            cfg(Vec::new()),
+            Box::new(mock_new),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts new");
+        client_new.set_controller_meta(Some(meta.clone()));
+        client_new.handshake().expect("handshake new");
+        assert!(client_new.peer_supports_controller_meta());
+
+        let updated_meta = proto::ControllerMeta {
+            mode: proto::CONTROLLER_MODE_REMOTE_CONTROL,
+            ..meta.clone()
+        };
+        client_new
+            .send_controller_meta(updated_meta.clone())
+            .expect("send updated ControllerMeta");
+
+        let sent_metas: Vec<proto::ControllerMeta> = handle_new
+            .reliable_decoded()
+            .into_iter()
+            .filter_map(|m| match m {
+                ControlMessage::ControllerMeta(cm) => Some(cm),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent_metas, vec![meta, updated_meta]);
+        client_new.close(ByeReason::Normal).expect("close");
+    }
+
+    #[test]
+    fn bye_preempted_stops_immediately_without_entering_reconnecting() {
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&ControlMessage::Welcome(proto::Welcome {
+            session_id: 7,
+            granted: req(),
+            auth_status: proto::AuthStatus::Ok,
+            host_flags: HostFlags(0),
+        }));
+        let mut handle = mock.clone();
+        let mut client = ClientSession::with_parts(
+            cfg(Vec::new()),
+            Box::new(mock),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+        client.handshake().expect("handshake");
+        assert_eq!(client.state(), SessionState::Streaming);
+
+        // 同批下发 Bye(Preempted) 与 Disconnected，必须直接进入 Closed 且绝不进入 Reconnecting。
+        handle.deliver_reliable(&ControlMessage::Bye {
+            reason: ByeReason::Preempted,
+        });
+        handle.deliver(NetEvent::Disconnected {
+            reason: "peer closed after preempt".into(),
+        });
+
+        let report = client.tick(Duration::ZERO, Instant::now()).expect("tick");
+        assert_eq!(
+            report.closed,
+            Some(StopReason::ByeReceived(ByeReason::Preempted))
+        );
+        assert_eq!(client.state(), SessionState::Closed);
+        assert_eq!(
+            client.closed_reason(),
+            Some(&StopReason::ByeReceived(ByeReason::Preempted))
+        );
+    }
+
+    #[test]
+    fn welcome_busy_controlled_sets_flag_and_rejects_handshake() {
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&ControlMessage::Welcome(proto::Welcome {
+            session_id: 7,
+            granted: req(),
+            auth_status: proto::AuthStatus::Rejected,
+            host_flags: HostFlags(HostFlags::BUSY_CONTROLLED),
+        }));
+        let mut client = ClientSession::with_parts(
+            cfg(Vec::new()),
+            Box::new(mock),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+        let err = client
+            .handshake()
+            .expect_err("HostBusyControlled Welcome must fail handshake");
+        assert!(
+            err.to_string().contains("HostBusyControlled"),
+            "err should expose HostBusyControlled: {err}"
+        );
+        assert!(client.handshake_busy_controlled());
+        assert_eq!(client.state(), SessionState::Closed);
+        assert!(matches!(
+            client.closed_reason(),
+            Some(StopReason::Disconnected(s)) if s.contains("HostBusyControlled")
+        ));
+    }
+
+    #[test]
+    fn reconnect_welcome_busy_controlled_sets_flag_and_stops_immediately() {
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&ControlMessage::Welcome(proto::Welcome {
+            session_id: 7,
+            granted: req(),
+            auth_status: proto::AuthStatus::Ok,
+            host_flags: HostFlags(0),
+        }));
+        let mut handle = mock.clone();
+        let mut client = ClientSession::with_parts(
+            cfg(Vec::new()),
+            Box::new(mock),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+        client.handshake().expect("handshake");
+
+        // 安装重连传输工厂：新连接收到 ReconnectRequest 后直接回 Welcome{Rejected, BUSY_CONTROLLED}。
+        let mut reconn_mock = MockTransport::new();
+        reconn_mock.deliver_reliable(&ControlMessage::Welcome(proto::Welcome {
+            session_id: 7,
+            granted: req(),
+            auth_status: proto::AuthStatus::Rejected,
+            host_flags: HostFlags(HostFlags::BUSY_CONTROLLED),
+        }));
+        let reconn_handle = reconn_mock.clone();
+        let slot = Arc::new(std::sync::Mutex::new(Some(
+            Box::new(reconn_mock) as Box<dyn Transport>
+        )));
+        client.set_connect_factory(Box::new(move || {
+            slot.lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| Error::Network("no second reconnect transport".into()))
+        }));
+        client.set_pipeline_factory(Box::new(|| {
+            rc_pipeline::ControllerPipeline::with_backends(
+                PipelineConfig::default(),
+                fake_decoder(0),
+                fake_renderer(),
+            )
+        }));
+
+        handle.deliver(NetEvent::Disconnected {
+            reason: "transient drop".into(),
+        });
+        let tick_rep = client.tick(Duration::ZERO, Instant::now()).expect("tick");
+        assert!(tick_rep.closed.is_none());
+        assert_eq!(client.state(), SessionState::Reconnecting);
+
+        // 第 1 拍重连：发送 ReconnectRequest；第 2 拍收到 Welcome{Rejected, BUSY_CONTROLLED} 即刻停机。
+        let out1 = client.tick_reconnect(500_000).expect("connect attempt");
+        assert_eq!(out1, ReconnectOutcome::Connecting);
+        assert!(matches!(
+            reconn_handle.reliable_decoded().as_slice(),
+            [ControlMessage::ReconnectRequest {
+                session_id: 7,
+                resume: true
+            }]
+        ));
+        let err = client
+            .tick_reconnect(500_000)
+            .expect_err("HostBusyControlled during reconnect must fail immediately");
+        assert!(
+            err.to_string().contains("HostBusyControlled"),
+            "err should expose HostBusyControlled: {err}"
+        );
+        assert!(client.handshake_busy_controlled());
+        assert_eq!(client.state(), SessionState::Closed);
+        assert!(matches!(
+            client.closed_reason(),
+            Some(StopReason::Disconnected(s)) if s.contains("HostBusyControlled")
+        ));
+        assert_eq!(client.reconnect_stats().reconnect_attempts, 1);
     }
 }

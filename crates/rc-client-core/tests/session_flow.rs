@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rc_client_core::input_bridge::UiInputEvent;
 use rc_client_core::session_bridge::{
     ConnectPhase, SessionCommand, SessionHandle, SessionUpdate, UiSessionConfig,
 };
@@ -82,6 +83,10 @@ fn spawn_inprocess_host(
         clock,
     )
     .expect("construct in-process host session");
+
+    // 显式开启像素级滚轮（默认 HostSession 为兼容 v0.2.7 客户端仅置 HostFlags 0x00..=0x03，
+    // 完整桥接由 HostHandle 经 DisplayControlMsg::Capabilities 协商；此处裸 HostSession 直连显式开启）。
+    host.set_supports_pixel_scroll(true);
 
     let factory_origin = Arc::clone(&origin);
     host.set_pipeline_factory_for(Box::new(move |pcfg| {
@@ -373,6 +378,19 @@ fn input_events_reach_injector_normalized() {
         delta: 3,
         horizontal: false,
     });
+    assert!(
+        session.peer_supports_pixel_scroll(),
+        "新版 HostSession 握手后应宣告 SUPPORTS_PIXEL_SCROLL"
+    );
+    assert!(!session.send_ui_input(
+        &UiInputEvent::MouseWheel {
+            delta_y_px: 5.0,
+            line_height_px: 16.0,
+            delta_x_px: 2.0,
+            delta_mode: 0,
+        },
+        None,
+    ));
 
     thread::sleep(Duration::from_millis(250));
     session.send(SessionCommand::Disconnect);
@@ -409,6 +427,12 @@ fn input_events_reach_injector_normalized() {
             }
         )),
         "应收到 MouseWheel(delta=3, horizontal=false)，实际：{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, InputEvent::MouseWheelPixel { dx: -2, dy: -5 })),
+        "应收到 MouseWheelPixel(dx=-2, dy=-5)，实际：{events:?}"
     );
 }
 

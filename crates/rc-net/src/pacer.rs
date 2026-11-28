@@ -21,6 +21,9 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use rc_proto::MediaHeader;
+use rc_types::FrameSeq;
+
 /// 平滑发送队列。
 ///
 /// # 并发
@@ -36,6 +39,12 @@ pub struct Pacer {
     queued_bytes: usize,
     /// 下一个包的最早放行时刻。`None` 表示队列空闲过，下一个包可立即发。
     next_release: Option<Instant>,
+    /// 单调递增入队序号（用于 `pacer_worker` 检测持锁外发送期间的并发入队，防止丢失唤醒）。
+    enqueue_seq: u64,
+    /// 因队列满而淘汰/丢弃的包计数（供 `Transport::tx_dropped_datagrams` 上报）。
+    dropped_packets: u64,
+    /// 最近在溢出淘汰中被整帧放弃的 `frame_seq`，用于拒收同一残帧的后续尾片。
+    abandoned_frame_seq: Option<FrameSeq>,
 }
 
 /// pacer 排队包数上限，避免带宽骤降时排队延迟无界膨胀（按 MTU≈1200B 约 ≤2.4 MiB）。
@@ -49,21 +58,75 @@ impl Pacer {
             queue: VecDeque::new(),
             queued_bytes: 0,
             next_release: None,
+            enqueue_seq: 0,
+            dropped_packets: 0,
+            abandoned_frame_seq: None,
         }
     }
 
     /// 入队一个待发送的包。
     ///
     /// 入队不判速率——速率只影响 [`Self::poll`] 的放行节奏。
-    /// 当队列达到 [`MAX_PACER_QUEUE_PACKETS`] 时淘汰队头最旧包，防止拥塞下排队延迟无限堆积。
+    /// 当队列达到 [`MAX_PACER_QUEUE_PACKETS`] 时优先按 `frame_seq` 整帧原子淘汰最旧非 IDR 帧，
+    /// 保护在途 IDR 并避免只弹出单包留下必废残帧尾片。
     pub fn enqueue(&mut self, data: Vec<u8>) {
+        let parsed = MediaHeader::parse(&data).ok();
+        let incoming_seq = parsed.map(|h| h.frame_seq);
+        let incoming_is_idr = parsed.is_some_and(|h| h.flags.is_idr());
+
+        if incoming_seq.is_some() && self.abandoned_frame_seq == incoming_seq {
+            self.dropped_packets = self.dropped_packets.saturating_add(1);
+            return;
+        }
+        if incoming_seq.is_some() && self.abandoned_frame_seq != incoming_seq {
+            self.abandoned_frame_seq = None;
+        }
+
         while self.queue.len() >= MAX_PACER_QUEUE_PACKETS {
-            if let Some(old) = self.queue.pop_front() {
-                self.queued_bytes = self.queued_bytes.saturating_sub(old.len());
+            let evict_idx = self
+                .queue
+                .iter()
+                .position(|pkt| !MediaHeader::parse(pkt).is_ok_and(|h| h.flags.is_idr()));
+            let idx = match evict_idx {
+                Some(i) => i,
+                None if !incoming_is_idr && incoming_seq.is_some() => {
+                    // 队列中仅剩 IDR 分片时，直接放弃入站 P 帧并拒收后续尾片，保护在途 IDR。
+                    self.abandoned_frame_seq = incoming_seq;
+                    self.dropped_packets = self.dropped_packets.saturating_add(1);
+                    return;
+                }
+                None => 0,
+            };
+            let Some(victim) = self.queue.remove(idx) else {
+                break;
+            };
+            self.queued_bytes = self.queued_bytes.saturating_sub(victim.len());
+            self.dropped_packets = self.dropped_packets.saturating_add(1);
+            if let Ok(vh) = MediaHeader::parse(&victim) {
+                let victim_seq = vh.frame_seq;
+                let mut extra_bytes = 0usize;
+                let mut extra_removed = 0u64;
+                self.queue.retain(|pkt| {
+                    if MediaHeader::parse(pkt).is_ok_and(|h| h.frame_seq == victim_seq) {
+                        extra_bytes = extra_bytes.saturating_add(pkt.len());
+                        extra_removed += 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                self.queued_bytes = self.queued_bytes.saturating_sub(extra_bytes);
+                self.dropped_packets = self.dropped_packets.saturating_add(extra_removed);
+                if Some(victim_seq) == incoming_seq {
+                    self.abandoned_frame_seq = Some(victim_seq);
+                    self.dropped_packets = self.dropped_packets.saturating_add(1);
+                    return;
+                }
             }
         }
         self.queued_bytes += data.len();
         self.queue.push_back(data);
+        self.enqueue_seq = self.enqueue_seq.wrapping_add(1);
     }
 
     /// 取出当前时刻允许发送的包（可能 0 个或多个）。
@@ -128,6 +191,21 @@ impl Pacer {
     /// 队列积压字节数。
     pub fn queued_bytes(&self) -> usize {
         self.queued_bytes
+    }
+
+    /// 队列是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// 累计因溢出被淘汰/丢弃的包数。
+    pub fn dropped_packets(&self) -> u64 {
+        self.dropped_packets
+    }
+
+    /// 单调入队序号。
+    pub(crate) fn enqueue_seq(&self) -> u64 {
+        self.enqueue_seq
     }
 
     /// 当前速率（bps）。
@@ -301,5 +379,149 @@ mod tests {
         let slow_batch = slow.poll_coalesced(t0, horizon);
         assert_eq!(slow_batch.len(), 1);
         assert_eq!(slow.next_release_at(), Some(t0 + ONE_MS));
+    }
+
+    fn make_media_pkt(seq: u64, pkt_idx: u16, pkt_count: u16, is_idr: bool) -> Vec<u8> {
+        use rc_proto::{HeaderFlags, MediaHeader};
+        use rc_types::Timestamp;
+
+        let mut flags = HeaderFlags::empty();
+        if is_idr {
+            flags.set(HeaderFlags::IDR);
+        }
+        let h = MediaHeader {
+            frame_seq: FrameSeq(seq),
+            capture_ts: Timestamp(1_000),
+            encode_done_ts: Timestamp(1_000),
+            packet_idx: pkt_idx,
+            packet_cnt: pkt_count,
+            fec_group: 0,
+            flags,
+            layer_id: 0,
+            payload_len: 16,
+        };
+        let mut buf = Vec::with_capacity(rc_proto::HEADER_LEN + 16);
+        let mut hdr = [0u8; rc_proto::HEADER_LEN];
+        h.write(&mut hdr);
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(&[0x5Au8; 16]);
+        buf
+    }
+
+    #[test]
+    fn pacer_overflow_evicts_oldest_p_frame_atomically_and_protects_idr() {
+        let mut p = Pacer::new(10_000_000);
+        // Enqueue 4-packet IDR (seq=1) + enough 4-packet P-frames to fill MAX_PACER_QUEUE_PACKETS (2048).
+        for idx in 0..4u16 {
+            p.enqueue(make_media_pkt(1, idx, 4, true));
+        }
+        // 511 P-frames * 4 packets = 2044 packets -> total 2048 packets.
+        for seq in 2..=512u64 {
+            for idx in 0..4u16 {
+                p.enqueue(make_media_pkt(seq, idx, 4, false));
+            }
+        }
+        assert_eq!(p.queue.len(), MAX_PACER_QUEUE_PACKETS);
+        let before_seq = p.enqueue_seq();
+
+        // Enqueue 1 packet of P-frame 513 -> must atomically evict all 4 packets of oldest P-frame 2,
+        // keeping IDR (seq=1) intact and leaving zero orphan fragments of frame 2.
+        p.enqueue(make_media_pkt(513, 0, 4, false));
+        assert!(p.enqueue_seq() > before_seq);
+        assert_eq!(p.dropped_packets(), 4);
+        assert_eq!(p.queue.len(), MAX_PACER_QUEUE_PACKETS - 3);
+        let has_idr1 = p
+            .queue
+            .iter()
+            .filter(|pkt| MediaHeader::parse(pkt).is_ok_and(|h| h.frame_seq == FrameSeq(1)))
+            .count();
+        assert_eq!(has_idr1, 4, "in-flight IDR frame 1 must stay intact");
+        let has_p2 = p
+            .queue
+            .iter()
+            .any(|pkt| MediaHeader::parse(pkt).is_ok_and(|h| h.frame_seq == FrameSeq(2)));
+        assert!(
+            !has_p2,
+            "evicted P-frame 2 must leave zero orphan fragments"
+        );
+
+        // When queue contains only IDR packets at capacity, incoming P-frame fragments are dropped whole.
+        let mut idr_only = Pacer::new(10_000_000);
+        for idx in 0..MAX_PACER_QUEUE_PACKETS as u16 {
+            idr_only.enqueue(make_media_pkt(
+                10,
+                idx,
+                MAX_PACER_QUEUE_PACKETS as u16,
+                true,
+            ));
+        }
+        idr_only.enqueue(make_media_pkt(11, 0, 2, false));
+        idr_only.enqueue(make_media_pkt(11, 1, 2, false));
+        assert_eq!(idr_only.dropped_packets(), 2);
+        assert!(idr_only
+            .queue
+            .iter()
+            .all(|pkt| MediaHeader::parse(pkt).is_ok_and(|h| h.frame_seq == FrameSeq(10))));
+    }
+
+    #[test]
+    fn pacer_overflow_self_eviction_counts_incoming_packet_in_dropped_packets() {
+        // Case 1: P-frame reaches MAX_PACER_QUEUE_PACKETS and self-evicts on its next fragment.
+        let mut p = Pacer::new(10_000_000);
+        for idx in 0..MAX_PACER_QUEUE_PACKETS as u16 {
+            p.enqueue(make_media_pkt(
+                42,
+                idx,
+                (MAX_PACER_QUEUE_PACKETS + 2) as u16,
+                false,
+            ));
+        }
+        assert_eq!(p.queue.len(), MAX_PACER_QUEUE_PACKETS);
+        assert_eq!(p.dropped_packets(), 0);
+
+        // Next fragment of frame 42 triggers self-eviction of all 2048 queued packets AND drops itself.
+        p.enqueue(make_media_pkt(
+            42,
+            MAX_PACER_QUEUE_PACKETS as u16,
+            (MAX_PACER_QUEUE_PACKETS + 2) as u16,
+            false,
+        ));
+        assert!(p.is_empty());
+        assert_eq!(p.queued_bytes(), 0);
+        assert_eq!(
+            p.dropped_packets(),
+            (MAX_PACER_QUEUE_PACKETS + 1) as u64,
+            "self-eviction must count all queued packets plus the dropped incoming packet"
+        );
+
+        // Subsequent fragment of the abandoned frame 42 is also dropped and counted.
+        p.enqueue(make_media_pkt(
+            42,
+            (MAX_PACER_QUEUE_PACKETS + 1) as u16,
+            (MAX_PACER_QUEUE_PACKETS + 2) as u16,
+            false,
+        ));
+        assert!(p.is_empty());
+        assert_eq!(p.dropped_packets(), (MAX_PACER_QUEUE_PACKETS + 2) as u64);
+
+        // Case 2: IDR frame reaches MAX_PACER_QUEUE_PACKETS and self-evicts on its next fragment.
+        let mut idr = Pacer::new(10_000_000);
+        for idx in 0..MAX_PACER_QUEUE_PACKETS as u16 {
+            idr.enqueue(make_media_pkt(
+                99,
+                idx,
+                (MAX_PACER_QUEUE_PACKETS + 1) as u16,
+                true,
+            ));
+        }
+        idr.enqueue(make_media_pkt(
+            99,
+            MAX_PACER_QUEUE_PACKETS as u16,
+            (MAX_PACER_QUEUE_PACKETS + 1) as u16,
+            true,
+        ));
+        assert!(idr.is_empty());
+        assert_eq!(idr.queued_bytes(), 0);
+        assert_eq!(idr.dropped_packets(), (MAX_PACER_QUEUE_PACKETS + 1) as u64);
     }
 }

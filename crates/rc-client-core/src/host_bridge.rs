@@ -23,7 +23,7 @@ use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -57,7 +57,8 @@ pub use crate::relay_transport::SessionMtlsBundle;
 use crate::relay_transport::{
     E2eeRelayTransport, RelayE2eeMode, RelayRole, RelayShutdownHandle, TcpRelayTransport,
 };
-use crate::signal_client::RelayIncoming;
+use crate::server_config::parse_device_id_input;
+use crate::signal_client::{ActiveControllerSummary, ForceDisconnectEvent, RelayIncoming};
 use crate::switchable_transport::{
     CandidateTransport, SwitchControlMsg, SwitchHandle, SwitchableTransport, TransportPathKind,
 };
@@ -241,6 +242,59 @@ pub struct HostApprovalPrompt {
     pub password_verified: bool,
 }
 
+/// 当前连接到本机的活跃控制端会话摘要（供「本机被控中」状态感知与管理）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ActiveControllerSession {
+    /// 控制端会话唯一标识。
+    pub session_id: String,
+    /// 控制端设备 ID（如 9 位设备码；未知时为空）。
+    pub controller_device_id: String,
+    /// 控制端显示名称（优先 `ControllerMeta.device_name`，其次 `RelayIncoming.peer_name`，
+    /// 再退化为 `caller_device_id` 或 `remote_addr`）。
+    pub controller_device_name: String,
+    /// 控制端操作系统标识（来自 `ControllerMeta.os`，未知时为空字符串）。
+    pub controller_os: String,
+    /// 是否为同账号本人自控（通过 `OwnerTicket` PoP 认证）。
+    pub is_owner: bool,
+    /// 当前会话模式：`"remote_control"` / `"watch_only"` / `"tools"`。
+    pub mode: String,
+    /// 建立连接的 Unix 毫秒时间戳。
+    pub connected_at_ms: u64,
+}
+
+impl From<&ActiveControllerSession> for ActiveControllerSummary {
+    fn from(s: &ActiveControllerSession) -> Self {
+        Self {
+            session_id: s.session_id.clone(),
+            controller_device_id: s.controller_device_id.clone(),
+            controller_device_name: s.controller_device_name.clone(),
+            controller_os: s.controller_os.clone(),
+            is_owner: s.is_owner,
+            mode: s.mode.clone(),
+            connected_at_ms: s.connected_at_ms,
+        }
+    }
+}
+
+impl From<ActiveControllerSession> for ActiveControllerSummary {
+    fn from(s: ActiveControllerSession) -> Self {
+        Self::from(&s)
+    }
+}
+
+/// UI → 被控端工作线程的低频控制命令。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostCommand {
+    /// 主动断开指定或全部活跃控制端远控连接。
+    DisconnectController {
+        /// 目标会话 ID；`None` 表示断开当前所有（活跃）远控连接，
+        /// `Some(sid)` 表示仅当与当前活跃会话 `session_id` 匹配时断开。
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+}
+
 /// 被控端工作线程 → UI 的状态更新（经 Tauri event 转发到前端）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -277,6 +331,11 @@ pub enum HostUpdate {
     ClientDisconnected {
         /// 人类可读的断开原因。
         reason: String,
+    },
+    /// 当前活跃控制端列表变更（进入 `Streaming`、`ControllerMeta` 更新或会话结束时推送）。
+    ActiveControllersChanged {
+        /// 当前活跃控制端会话列表（无连接时为 `vec![]`）。
+        controllers: Vec<ActiveControllerSession>,
     },
     /// 会话结束后工作线程已原子轮换临时验证码（零窗口防止下一次连入复用旧码）。
     PasswordRotated {
@@ -359,10 +418,15 @@ impl BoundedRelayIncomingQueue {
         if !item.peer_id.is_empty() {
             q.retain(|(_, existing)| existing.peer_id != item.peer_id);
         }
+        let is_priority_takeover = item.takeover && item.is_owner_connection;
         while q.len() >= self.cap {
             q.pop_front();
         }
-        q.push_back((Instant::now(), item));
+        if is_priority_takeover {
+            q.push_front((Instant::now(), item));
+        } else {
+            q.push_back((Instant::now(), item));
+        }
     }
 
     fn pop_ready(&self, ttl: Duration, lan_grace: Duration) -> Option<RelayIncoming> {
@@ -374,7 +438,12 @@ impl BoundedRelayIncomingQueue {
             if elapsed > ttl {
                 continue;
             }
-            if !item.is_relay_alloc && !item.peer_lan_addrs.is_empty() && elapsed < lan_grace {
+            let is_priority_takeover = item.takeover && item.is_owner_connection;
+            if !item.is_relay_alloc
+                && !is_priority_takeover
+                && !item.peer_lan_addrs.is_empty()
+                && elapsed < lan_grace
+            {
                 deferred.push_back((enqueued_at, item));
                 continue;
             }
@@ -439,12 +508,23 @@ impl BoundedRelayIncomingQueue {
         });
     }
 
+    fn has_pending_takeover_or_same_peer(&self, peer_did: Option<&str>, ttl: Duration) -> bool {
+        let q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        q.iter()
+            .filter(|(enqueued_at, _)| enqueued_at.elapsed() <= ttl)
+            .any(|(_, item)| {
+                (item.takeover && item.is_owner_connection)
+                    || peer_did.is_some_and(|d| !d.is_empty() && item.peer_id == d)
+            })
+    }
+
     /// 只读检查入站队列中是否存在可立即抢占当前旧会话的新连接候选：
-    /// 1. 同设备重连（`active_peer_id` 非空且与 `item.peer_id` 相同）；
-    /// 2. 同账号自控失活抢占（`item.is_owner_connection` 且 `is_detached || active_idle_us >= 3s`）；
-    /// 3. 旧会话已失活（`is_detached || active_idle_us >= 4s`）。
+    /// 1. 同账号显式接管（`item.takeover && item.is_owner_connection`）：无视活跃阈值立即抢占，并回传 `PreemptDecision::TakeoverOwner`；
+    /// 2. 同设备重连（`active_peer_id` 非空且与 `item.peer_id` 相同）；
+    /// 3. 同账号自控失活抢占（`item.is_owner_connection` 且 `is_detached || active_idle_us >= 3s`）；
+    /// 4. 旧会话已失活（`is_detached || active_idle_us >= 4s`）。
     ///
-    /// 若旧会话活跃（`!is_detached && active_idle_us < 3s`）且到达的是不同设备，返回 `false` 保护当前活跃用户。
+    /// 若旧会话活跃（`!is_detached && active_idle_us < 3s`）且到达的是不同设备的非接管请求，返回 `false` 保护当前活跃用户。
     #[cfg(test)]
     fn has_preempt_candidate(
         &self,
@@ -456,6 +536,7 @@ impl BoundedRelayIncomingQueue {
         self.has_preempt_candidate_filtered(ttl, active_peer_id, active_idle_us, is_detached, None)
     }
 
+    #[cfg(test)]
     fn has_preempt_candidate_filtered(
         &self,
         ttl: Duration,
@@ -464,7 +545,25 @@ impl BoundedRelayIncomingQueue {
         is_detached: bool,
         ignore_same_peer_lan_before: Option<Instant>,
     ) -> bool {
-        self.has_preempt_candidate_with_switch(
+        self.check_preempt_candidate_with_switch(
+            ttl,
+            active_peer_id,
+            active_idle_us,
+            is_detached,
+            ignore_same_peer_lan_before,
+            false,
+        ) != PreemptDecision::None
+    }
+
+    fn check_preempt_candidate_filtered(
+        &self,
+        ttl: Duration,
+        active_peer_id: Option<&str>,
+        active_idle_us: u64,
+        is_detached: bool,
+        ignore_same_peer_lan_before: Option<Instant>,
+    ) -> PreemptDecision {
+        self.check_preempt_candidate_with_switch(
             ttl,
             active_peer_id,
             active_idle_us,
@@ -474,7 +573,7 @@ impl BoundedRelayIncomingQueue {
         )
     }
 
-    fn has_preempt_candidate_with_switch(
+    fn check_preempt_candidate_with_switch(
         &self,
         ttl: Duration,
         active_peer_id: Option<&str>,
@@ -482,39 +581,55 @@ impl BoundedRelayIncomingQueue {
         is_detached: bool,
         ignore_same_peer_lan_before: Option<Instant>,
         switch_capable: bool,
-    ) -> bool {
+    ) -> PreemptDecision {
         let q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        q.iter()
+        let mut decision = PreemptDecision::None;
+        for (enqueued_at, item) in q
+            .iter()
             .filter(|(enqueued_at, _)| enqueued_at.elapsed() <= ttl)
-            .any(|(enqueued_at, item)| {
-                let same_peer =
-                    active_peer_id.is_some_and(|cur| !cur.is_empty() && cur == item.peer_id);
-                // 若当前会话启用运行期热切，给同对端刚到达的 `is_relay_alloc == true` 令牌留出 2s 窗口
-                // 供 `SwitchControlMsg::RelayAllocReady` 认领，避免运行期 `P2P -> Relay` 切换误触发抢占断流。
-                if switch_capable
-                    && !is_detached
-                    && same_peer
-                    && item.is_relay_alloc
-                    && enqueued_at.elapsed() < Duration::from_secs(2)
-                {
-                    return false;
-                }
-                // LAN / mTLS LAN 初始宽限期内到达的同对端普通 PunchCoord（!is_relay_alloc）
-                // 一律视为本次 LAN 建连同源迟到的旧信令：无论 peer_lan_addrs 是否为空、
-                // 无论是否满 3s/4s、无论当前处于 Streaming 还是 Detached，绝不触发误抢占。
-                if same_peer
-                    && !item.is_relay_alloc
-                    && ignore_same_peer_lan_before.is_some_and(|cutoff| *enqueued_at <= cutoff)
-                {
-                    return false;
-                }
-                same_peer
-                    || (item.is_owner_connection
-                        && (is_detached || active_idle_us >= PREEMPT_OWNER_IDLE_THRESHOLD_US))
-                    || is_detached
-                    || active_idle_us >= PREEMPT_ANY_IDLE_THRESHOLD_US
-            })
+        {
+            if item.takeover && item.is_owner_connection {
+                return PreemptDecision::TakeoverOwner;
+            }
+            let same_peer =
+                active_peer_id.is_some_and(|cur| !cur.is_empty() && cur == item.peer_id);
+            // 若当前会话启用运行期热切，给同对端刚到达的 `is_relay_alloc == true` 令牌留出 2s 窗口
+            // 供 `SwitchControlMsg::RelayAllocReady` 认领，避免运行期 `P2P -> Relay` 切换误触发抢占断流。
+            if switch_capable
+                && !is_detached
+                && same_peer
+                && item.is_relay_alloc
+                && enqueued_at.elapsed() < Duration::from_secs(2)
+            {
+                continue;
+            }
+            // LAN / mTLS LAN 初始宽限期内到达的同对端普通 PunchCoord（!is_relay_alloc）
+            // 一律视为本次 LAN 建连同源迟到的旧信令：无论 peer_lan_addrs 是否为空、
+            // 无论是否满 3s/4s、无论当前处于 Streaming 还是 Detached，绝不触发误抢占。
+            if same_peer
+                && !item.is_relay_alloc
+                && ignore_same_peer_lan_before.is_some_and(|cutoff| *enqueued_at <= cutoff)
+            {
+                continue;
+            }
+            if same_peer
+                || (item.is_owner_connection
+                    && (is_detached || active_idle_us >= PREEMPT_OWNER_IDLE_THRESHOLD_US))
+                || is_detached
+                || active_idle_us >= PREEMPT_ANY_IDLE_THRESHOLD_US
+            {
+                decision = PreemptDecision::SamePeerOrIdle;
+            }
+        }
+        decision
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreemptDecision {
+    None,
+    SamePeerOrIdle,
+    TakeoverOwner,
 }
 
 /// LAN 建连后容忍广域网信令迟到推送的旧 `PunchCoord` 清理宽限（3s）。
@@ -558,6 +673,450 @@ fn emit_peer_connected(host: &HostSession, remote_addr: &str, updates: &BoundedH
         updates.push(HostUpdate::ClientConnected {
             remote_addr: remote_addr.to_string(),
         });
+    }
+}
+
+type SharedActiveControllers = Arc<Mutex<Vec<ActiveControllerSession>>>;
+
+#[derive(Clone, Default)]
+struct ActiveControllerPeerHints {
+    session_id_hint: Option<String>,
+    relay_peer_id: Option<String>,
+    relay_peer_name: Option<String>,
+    relay_peer_hostname: Option<String>,
+    relay_peer_os: Option<String>,
+    mtls_peer_did: Option<String>,
+    remote_addr: String,
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn build_active_controller_session(
+    host: &HostSession,
+    hints: &ActiveControllerPeerHints,
+    connected_at_ms: u64,
+) -> ActiveControllerSession {
+    let meta = host.controller_meta();
+    let session_id = hints
+        .session_id_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| host.session_id().map(|id| id.to_string()))
+        .unwrap_or_else(|| "0".to_string());
+    let caller_did = host
+        .authenticated_owner()
+        .map(|o| o.caller_device_id.as_str())
+        .or(hints.relay_peer_id.as_deref())
+        .or(hints.mtls_peer_did.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let controller_device_id = meta
+        .map(|m| m.device_id.trim())
+        .filter(|s| !s.is_empty())
+        .or(caller_did)
+        .unwrap_or("")
+        .to_string();
+    let controller_device_name = meta
+        .map(|m| m.device_name.trim())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            hints
+                .relay_peer_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            hints
+                .relay_peer_hostname
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .or(caller_did)
+        .or_else(|| {
+            let r = hints.remote_addr.trim();
+            (!r.is_empty()).then_some(r)
+        })
+        .unwrap_or("")
+        .to_string();
+    let controller_os = meta
+        .map(|m| m.os.trim())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            hints
+                .relay_peer_os
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("")
+        .to_string();
+    let mode = meta.map(|m| m.mode_str().to_string()).unwrap_or_else(|| {
+        if host.is_media_paused() {
+            "tools".to_string()
+        } else {
+            "remote_control".to_string()
+        }
+    });
+    ActiveControllerSession {
+        session_id,
+        controller_device_id,
+        controller_device_name,
+        controller_os,
+        is_owner: host.authenticated_owner().is_some(),
+        mode,
+        connected_at_ms,
+    }
+}
+
+fn report_control_state_to_signal(
+    signal_client: Option<&SharedSignalClient>,
+    controllers: &[ActiveControllerSession],
+) {
+    let Some(shared_sig) = signal_client else {
+        return;
+    };
+    let sig_opt = shared_sig.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(sig) = sig_opt {
+        let summaries: Vec<ActiveControllerSummary> = controllers
+            .iter()
+            .map(ActiveControllerSummary::from)
+            .collect();
+        let _ = sig.report_control_state(summaries);
+    }
+}
+
+fn publish_active_controller(
+    slot: &SharedActiveControllers,
+    updates: &BoundedHostUpdateQueue,
+    signal_client: Option<&SharedSignalClient>,
+    session: ActiveControllerSession,
+) {
+    let list = vec![session];
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = list.clone();
+    report_control_state_to_signal(signal_client, &list);
+    updates.push(HostUpdate::ActiveControllersChanged { controllers: list });
+}
+
+fn clear_active_controllers(
+    slot: &SharedActiveControllers,
+    updates: &BoundedHostUpdateQueue,
+    signal_client: Option<&SharedSignalClient>,
+) {
+    let had_any = {
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let had = !guard.is_empty();
+        guard.clear();
+        had
+    };
+    if had_any {
+        report_control_state_to_signal(signal_client, &[]);
+        updates.push(HostUpdate::ActiveControllersChanged {
+            controllers: Vec::new(),
+        });
+    }
+}
+
+fn force_disconnect_matches_controller(
+    req: &ForceDisconnectEvent,
+    active: Option<&ActiveControllerSession>,
+    fallback_peer_id: Option<&str>,
+    fallback_session_id: Option<&str>,
+) -> bool {
+    let req_cid = req
+        .controller_device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let req_sid = req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if req_cid.is_none() && req_sid.is_none() {
+        return true;
+    }
+    if let Some(target_sid) = req_sid {
+        let cur_sid = active
+            .map(|c| c.session_id.as_str())
+            .or(fallback_session_id)
+            .unwrap_or("")
+            .trim();
+        if cur_sid != target_sid {
+            return false;
+        }
+    }
+    if let Some(target_cid) = req_cid {
+        let cur_cid = active
+            .map(|c| c.controller_device_id.as_str())
+            .or(fallback_peer_id)
+            .unwrap_or("")
+            .trim();
+        let norm_target =
+            parse_device_id_input(target_cid).unwrap_or_else(|| target_cid.to_string());
+        let norm_cur = parse_device_id_input(cur_cid).unwrap_or_else(|| cur_cid.to_string());
+        if norm_cur.is_empty() || norm_cur != norm_target {
+            return false;
+        }
+    }
+    true
+}
+
+fn drain_matching_force_disconnect(
+    signal_client: Option<&SharedSignalClient>,
+    active_controllers: Option<&SharedActiveControllers>,
+    fallback_peer_id: Option<&str>,
+    fallback_session_id: Option<&str>,
+) -> bool {
+    let Some(shared_sig) = signal_client else {
+        return false;
+    };
+    let sig_opt = shared_sig.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(sig) = sig_opt else {
+        return false;
+    };
+    let reqs = sig.drain_force_disconnect_requests();
+    if reqs.is_empty() {
+        return false;
+    }
+    let active = active_controllers.and_then(|slot| {
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .first()
+            .cloned()
+    });
+    reqs.iter().any(|req| {
+        force_disconnect_matches_controller(
+            req,
+            active.as_ref(),
+            fallback_peer_id,
+            fallback_session_id,
+        )
+    })
+}
+
+fn reject_busy_lan_endpoint_once_with_cancel(
+    ep: &QuicEndpoint,
+    caps: SessionParams,
+    active_controllers: Option<&SharedActiveControllers>,
+    incoming_relay: Option<&Arc<BoundedRelayIncomingQueue>>,
+    cancel: &AtomicBool,
+) {
+    if cancel.load(Ordering::Acquire) {
+        return;
+    }
+    let active_peer_did = active_controllers.and_then(|slot| {
+        let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_empty() {
+            return None;
+        }
+        Some(
+            guard
+                .first()
+                .map(|c| c.controller_device_id.clone())
+                .filter(|s| !s.is_empty()),
+        )
+    });
+    let Some(active_peer_did) = active_peer_did else {
+        return;
+    };
+    // 若入站信令队列已有同账号接管或同设备重连候选，则保留在 QUIC accept 队列中交由外层监听循环承接。
+    if incoming_relay.is_some_and(|q| {
+        q.has_pending_takeover_or_same_peer(active_peer_did.as_deref(), RELAY_INCOMING_TTL)
+    }) {
+        return;
+    }
+    let mut busy_transport =
+        match ep.try_accept_nonblocking(Duration::from_millis(200), Some(cancel)) {
+            Ok(Some(t)) => t,
+            Ok(None) | Err(_) => return,
+        };
+    let mtls_peer_did = busy_transport
+        .peer_mtls_identity()
+        .map(|id| id.device_id.clone());
+    let latest_active_peer_did = active_controllers.and_then(|slot| {
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .first()
+            .map(|c| c.controller_device_id.clone())
+            .filter(|s| !s.is_empty())
+    });
+    let same_active_peer = mtls_peer_did
+        .as_deref()
+        .is_some_and(|did| latest_active_peer_did.as_deref() == Some(did));
+    let pending_takeover_or_same = incoming_relay.is_some_and(|q| {
+        q.has_pending_takeover_or_same_peer(mtls_peer_did.as_deref(), RELAY_INCOMING_TTL)
+    });
+    if same_active_peer || pending_takeover_or_same {
+        // 已完成 QUIC accept 时不得静默 drop 连接，显式回发 Bye(Refresh) 避免对端误判为密码拒绝或传输异常。
+        let _ = rc_session::send_bye_and_drain(&mut busy_transport, ByeReason::Refresh);
+        return;
+    }
+    let _ = rc_session::reject_transport_busy_controlled_cancelable(
+        &mut busy_transport,
+        caps,
+        Duration::from_millis(200),
+        Some(cancel),
+    );
+}
+
+struct BusyLanRejectShared {
+    active: AtomicBool,
+    stop: AtomicBool,
+    accept_cancel: AtomicBool,
+    poll_lock: Mutex<()>,
+    wake_lock: Mutex<()>,
+    wake_cv: Condvar,
+}
+
+impl BusyLanRejectShared {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            accept_cancel: AtomicBool::new(true),
+            poll_lock: Mutex::new(()),
+            wake_lock: Mutex::new(()),
+            wake_cv: Condvar::new(),
+        }
+    }
+}
+
+/// 异步后台辅助线程：在活跃 `Streaming` 期非阻塞轮询 LAN `QuicEndpoint` 并拒收额外直连请求，
+/// 避免同步 `try_accept_nonblocking(200ms)` + `reject_transport_busy_controlled(200ms+50ms)` 卡顿媒体热路径。
+struct BusyLanRejectWorker {
+    shared: Arc<BusyLanRejectShared>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl BusyLanRejectWorker {
+    fn spawn(
+        ep: QuicEndpoint,
+        caps: SessionParams,
+        active_controllers: Option<SharedActiveControllers>,
+        incoming_relay: Option<Arc<BoundedRelayIncomingQueue>>,
+    ) -> Self {
+        let shared = Arc::new(BusyLanRejectShared::new());
+        let worker_shared = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name("rc-busy-lan-reject".to_string())
+            .spawn(move || {
+                while !worker_shared.stop.load(Ordering::Acquire) {
+                    if !worker_shared.active.load(Ordering::Acquire) {
+                        let guard = worker_shared
+                            .wake_lock
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if !worker_shared.active.load(Ordering::Acquire)
+                            && !worker_shared.stop.load(Ordering::Acquire)
+                        {
+                            drop(worker_shared.wake_cv.wait(guard));
+                        }
+                        continue;
+                    }
+
+                    {
+                        let _poll_guard = worker_shared
+                            .poll_lock
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if worker_shared.active.load(Ordering::Acquire)
+                            && !worker_shared.stop.load(Ordering::Acquire)
+                        {
+                            reject_busy_lan_endpoint_once_with_cancel(
+                                &ep,
+                                caps,
+                                active_controllers.as_ref(),
+                                incoming_relay.as_ref(),
+                                &worker_shared.accept_cancel,
+                            );
+                        }
+                    }
+
+                    if worker_shared.stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let guard = worker_shared
+                        .wake_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if worker_shared.active.load(Ordering::Acquire)
+                        && !worker_shared.stop.load(Ordering::Acquire)
+                    {
+                        drop(
+                            worker_shared
+                                .wake_cv
+                                .wait_timeout(guard, PREEMPT_CHECK_INTERVAL),
+                        );
+                    }
+                }
+            })
+            .ok();
+        Self { shared, handle }
+    }
+
+    fn set_active(&self) {
+        if !self.shared.active.load(Ordering::Acquire) {
+            self.shared.accept_cancel.store(false, Ordering::Release);
+            self.shared.active.store(true, Ordering::Release);
+            let _guard = self
+                .shared
+                .wake_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.shared.wake_cv.notify_all();
+        }
+    }
+
+    fn pause_and_sync(&self) {
+        if self.shared.active.swap(false, Ordering::AcqRel) {
+            self.shared.accept_cancel.store(true, Ordering::Release);
+            if let Some(h) = self.handle.as_ref() {
+                h.thread().unpark();
+            }
+            let _guard = self
+                .shared
+                .wake_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.shared.wake_cv.notify_all();
+            drop(_guard);
+            let _poll_guard = self
+                .shared
+                .poll_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+impl Drop for BusyLanRejectWorker {
+    fn drop(&mut self) {
+        self.shared.active.store(false, Ordering::Release);
+        self.shared.stop.store(true, Ordering::Release);
+        self.shared.accept_cancel.store(true, Ordering::Release);
+        if let Some(h) = self.handle.as_ref() {
+            h.thread().unpark();
+        }
+        {
+            let _guard = self
+                .shared
+                .wake_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.shared.wake_cv.notify_all();
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -1243,132 +1802,6 @@ fn host_hardware_display_backing(prefer_hardware: bool) -> Option<Resolution> {
     crate::platform::main_display_backing_resolution()
 }
 
-/// HiDPI/Retina 宿主在 HEVC 会话下的默认清晰度上限（2560×1600，兼顾文本锐利度与 144fps 高刷甜点 600M px/s）。
-const DEFAULT_HIDPI_STREAM_MAX_WIDTH: u32 = 2560;
-const DEFAULT_HIDPI_STREAM_MAX_HEIGHT: u32 = 1600;
-
-/// 计算 Retina/HiDPI 宿主在双端确认使用 HEVC 后的清晰度甜点分辨率：
-/// - 严格保持 `logical` 宽高比、偶数对齐，且不超过物理 `backing` 与 `(2560×1600)`；
-/// - 当 `fps >= HIGH_REFRESH_FPS_THRESHOLD (90)` 时同步受 `HEVC_HIGH_REFRESH_MAX_PIXEL_RATE (600M px/s)` 约束，
-///   确保默认 `144fps` 下不会触发「超出高刷甜点」告警（例如 14" MBP `1512×982` → `2464×1600`，`567.7M px/s <= 600M`）；
-/// - 退化输入（`< 2px`）或非 HiDPI 屏严格沿用 `logical.to_even()`。
-fn compute_hevc_hidpi_target(
-    logical: Resolution,
-    backing: Option<Resolution>,
-    fps: u32,
-) -> Resolution {
-    let logical_even = logical.to_even();
-    let Some(backing_even) = backing.map(|b| b.to_even()) else {
-        return logical_even;
-    };
-    if logical_even.width < 2
-        || logical_even.height < 2
-        || backing_even.width <= logical_even.width
-        || backing_even.height <= logical_even.height
-    {
-        return logical_even;
-    }
-    let mut cap_w = backing_even
-        .width
-        .min(DEFAULT_HIDPI_STREAM_MAX_WIDTH)
-        .max(logical_even.width);
-    let mut cap_h = backing_even
-        .height
-        .min(DEFAULT_HIDPI_STREAM_MAX_HEIGHT)
-        .max(logical_even.height);
-    if fps >= display_ctrl::HIGH_REFRESH_FPS_THRESHOLD {
-        let max_pixels = display_ctrl::HEVC_HIGH_REFRESH_MAX_PIXEL_RATE / u64::from(fps.max(1));
-        let logical_pixels =
-            u64::from(logical_even.width).saturating_mul(u64::from(logical_even.height));
-        if max_pixels <= logical_pixels {
-            return logical_even;
-        }
-        let scale = (max_pixels as f64 / logical_pixels as f64).sqrt();
-        let budget_w = ((f64::from(logical_even.width) * scale).floor() as u32) & !1;
-        let budget_h = ((f64::from(logical_even.height) * scale).floor() as u32) & !1;
-        cap_w = cap_w.min(budget_w.max(logical_even.width));
-        cap_h = cap_h.min(budget_h.max(logical_even.height));
-    }
-    let (w, h) =
-        display_ctrl::fit_within_cap(cap_w, cap_h, logical_even.width, logical_even.height);
-    Resolution::new(w.max(logical_even.width), h.max(logical_even.height)).to_even()
-}
-
-/// 为主屏未手动固定分辨率的会话计算编解码器/帧率切换后的目标 `(width, height, next_auto_hidpi_active)`：
-/// - `Codec::Hevc`：当此前已处于自动 HiDPI 或当前分辨率与原生逻辑分辨率一致（`<= 2px`）时，
-///   按新 `eff_fps` 计算不超 HEVC 600M px/s 高刷预算的 2K 锐利甜点（不误放大显式较低分辨率）；
-/// - `Codec::H264`：当此前处于自动 HiDPI 或当前分辨率高于原生逻辑分辨率时回退至原生逻辑分辨率。
-fn resolve_auto_hidpi_resolution(
-    cur_width: u32,
-    cur_height: u32,
-    native_res: Resolution,
-    max_res: Resolution,
-    eff_fps: u32,
-    eff_codec: rc_encode::Codec,
-    auto_hidpi_active: bool,
-) -> (u32, u32, bool) {
-    match eff_codec {
-        rc_encode::Codec::Hevc
-            if auto_hidpi_active
-                || (cur_width.abs_diff(native_res.width) <= 2
-                    && cur_height.abs_diff(native_res.height) <= 2) =>
-        {
-            let hi = compute_hevc_hidpi_target(native_res, Some(max_res), eff_fps);
-            let upgraded = hi.width > native_res.width || hi.height > native_res.height;
-            (hi.width, hi.height, upgraded)
-        }
-        rc_encode::Codec::H264
-            if auto_hidpi_active
-                || cur_width > native_res.width
-                || cur_height > native_res.height =>
-        {
-            (native_res.width, native_res.height, false)
-        }
-        _ => (cur_width, cur_height, auto_hidpi_active),
-    }
-}
-
-/// 若给定 `native/max/fps` 在 HEVC 下存在高于原生的 2K 锐利甜点档位，将其并入预设列表（去重且降序），
-/// 确保菜单中高亮当前分辨率并允许用户切回 2K 锐利档。
-fn ensure_hevc_hidpi_preset(
-    presets: &mut Vec<DisplayPreset>,
-    native_res: Resolution,
-    max_res: Resolution,
-    fps: u32,
-    hevc_available: bool,
-) {
-    if !hevc_available {
-        return;
-    }
-    let hi = compute_hevc_hidpi_target(native_res, Some(max_res), fps);
-    if hi.width <= native_res.width.saturating_add(2)
-        || hi.height <= native_res.height.saturating_add(2)
-    {
-        return;
-    }
-    if presets.is_empty() {
-        *presets = display_ctrl::build_resolution_presets(
-            native_res.width,
-            native_res.height,
-            max_res.width,
-            max_res.height,
-        );
-    }
-    let already_present = presets
-        .iter()
-        .any(|p| p.width.abs_diff(hi.width) <= 2 && p.height.abs_diff(hi.height) <= 2);
-    if !already_present {
-        presets.push(DisplayPreset {
-            width: hi.width,
-            height: hi.height,
-            label: format!("{} × {} (HiDPI)", hi.width, hi.height),
-            is_native: false,
-            is_hidpi: true,
-        });
-        presets.sort_by(|a, b| b.width.cmp(&a.width).then_with(|| b.height.cmp(&a.height)));
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn default_host_session_config(
     listen_addr: SocketAddr,
@@ -1576,6 +2009,10 @@ impl Transport for CancellableHostTransport {
         self.inner.send_datagram(data)
     }
 
+    fn send_datagrams_batch(&mut self, datagrams: &[Vec<u8>]) -> rc_types::Result<usize> {
+        self.inner.send_datagrams_batch(datagrams)
+    }
+
     fn send_reliable(&mut self, data: &[u8]) -> rc_types::Result<()> {
         self.inner.send_reliable(data)
     }
@@ -1610,6 +2047,18 @@ impl Transport for CancellableHostTransport {
 
     fn tx_dropped_datagrams(&self) -> u64 {
         self.inner.tx_dropped_datagrams()
+    }
+
+    fn reliable_tx_queued_len(&self) -> usize {
+        self.inner.reliable_tx_queued_len()
+    }
+
+    fn has_live_rtt(&self) -> bool {
+        self.inner.has_live_rtt()
+    }
+
+    fn wake_handle(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        self.inner.wake_handle()
     }
 }
 
@@ -2328,6 +2777,7 @@ pub struct HostHandle {
     config_version: Arc<AtomicU64>,
     relay_incoming: Arc<BoundedRelayIncomingQueue>,
     active_relay_interrupt: Arc<Mutex<Option<ActiveRelayInterrupt>>>,
+    active_controllers: SharedActiveControllers,
     disconnect_flag: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     close_reason: Arc<AtomicU8>,
@@ -2386,6 +2836,7 @@ impl HostHandle {
         let relay_incoming = Arc::new(BoundedRelayIncomingQueue::new(RELAY_INCOMING_QUEUE_CAP));
         let active_relay_interrupt: Arc<Mutex<Option<ActiveRelayInterrupt>>> =
             Arc::new(Mutex::new(None));
+        let active_controllers: SharedActiveControllers = Arc::new(Mutex::new(Vec::new()));
         let disconnect_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let close_reason = Arc::new(AtomicU8::new(ByeReason::Normal as u8));
@@ -2534,12 +2985,14 @@ impl HostHandle {
         let t_cfg_ver = Arc::clone(&config_version);
         let t_relay_incoming = Arc::clone(&relay_incoming);
         let t_active_relay_interrupt = Arc::clone(&active_relay_interrupt);
+        let t_active_controllers = Arc::clone(&active_controllers);
         let t_disconnect = Arc::clone(&disconnect_flag);
         let t_stop = Arc::clone(&stop_flag);
         let t_close_reason = Arc::clone(&close_reason);
         let t_running = Arc::clone(&running);
         let t_lock_screen_count = Arc::clone(&lock_screen_count);
         let t_file_transfer_dir = Arc::clone(&file_transfer_dir);
+        let t_signal_client = Arc::clone(&shared_signal_client);
 
         let listen_addr_shared = Arc::new(Mutex::new(actual_addr));
         let t_listen_addr = Arc::clone(&listen_addr_shared);
@@ -2563,6 +3016,7 @@ impl HostHandle {
                         t_cfg_ver,
                         t_relay_incoming,
                         t_active_relay_interrupt,
+                        Arc::clone(&t_active_controllers),
                         t_disconnect,
                         t_stop,
                         t_close_reason,
@@ -2573,6 +3027,7 @@ impl HostHandle {
                 if res.is_err() {
                     t_updates.push(HostUpdate::error("被控端工作线程异常退出"));
                 }
+                clear_active_controllers(&t_active_controllers, &t_updates, Some(&t_signal_client));
                 // M8：先清除 running 标记再推送 Stopped，消除轮询器读到 Stopped 时 is_running 仍为 true 的竞态。
                 t_running.store(false, Ordering::Release);
                 t_updates.push(HostUpdate::Stopped);
@@ -2589,6 +3044,7 @@ impl HostHandle {
             config_version,
             relay_incoming,
             active_relay_interrupt,
+            active_controllers,
             disconnect_flag,
             stop_flag,
             close_reason,
@@ -2723,11 +3179,22 @@ impl HostHandle {
         &self,
         signal_client: Option<Arc<crate::signal_client::SignalClientHandle>>,
     ) {
-        let mut guard = self
-            .signal_client
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        *guard = signal_client;
+        let sync_handle = signal_client.clone();
+        {
+            let mut guard = self
+                .signal_client
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = signal_client;
+        }
+        if let Some(sig) = sync_handle {
+            let summaries: Vec<ActiveControllerSummary> = self
+                .active_controllers()
+                .iter()
+                .map(ActiveControllerSummary::from)
+                .collect();
+            let _ = sig.report_control_state(summaries);
+        }
     }
 
     /// 运行期热更新「他人远程协助时是否允许文件传输」（即时对当前活跃非 Owner 会话及后续会话生效，不中断会话）。
@@ -2741,6 +3208,53 @@ impl HostHandle {
     /// 查询当前「他人远程协助时是否允许文件传输」配置开关。
     pub fn allow_assist_file_transfer(&self) -> bool {
         self.allow_assist_file_transfer.load(Ordering::Acquire)
+    }
+
+    /// 查询当前正在接入本机的活跃控制端会话快照列表。
+    pub fn active_controllers(&self) -> Vec<ActiveControllerSession> {
+        self.active_controllers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 发送被控端控制命令（幂等）。
+    pub fn send(&self, cmd: HostCommand) {
+        match cmd {
+            HostCommand::DisconnectController { session_id } => {
+                let _ = self.disconnect_controller(session_id);
+            }
+        }
+    }
+
+    /// 主动断开指定或当前全部活跃控制端远控连接。
+    ///
+    /// - `None`：断开当前所有（活跃）远控连接；
+    /// - `Some(sid)`：仅当与当前活跃控制端会话 `session_id` 匹配时断开。
+    ///
+    /// 返回 `true` 表示命中并已触发断开，`false` 表示无活跃连接或 `session_id` 不匹配。
+    pub fn disconnect_controller(&self, session_id: Option<String>) -> bool {
+        let should_disconnect = {
+            let guard = self
+                .active_controllers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match session_id.as_deref() {
+                None => {
+                    !guard.is_empty()
+                        || self
+                            .active_relay_interrupt
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some()
+                }
+                Some(target) => guard.iter().any(|c| c.session_id == target),
+            }
+        };
+        if should_disconnect {
+            self.disconnect_client();
+        }
+        should_disconnect
     }
 
     /// 主动断开当前已连接的控制端会话（触发优雅 `Bye` / 中继即时断流，被控端继续等待新连接）。
@@ -3333,6 +3847,18 @@ fn build_hardware_display_presets(
             is_hidpi: m.is_hidpi,
         });
     }
+    if let Some(nat) = native_res {
+        if nat.width >= 2 && nat.height >= 2 && !presets.iter().any(|p| p.is_native) {
+            presets.push(DisplayPreset {
+                width: nat.width,
+                height: nat.height,
+                label: format!("{} × {}", nat.width, nat.height),
+                is_native: true,
+                is_hidpi: false,
+            });
+            presets.sort_by(|a, b| b.width.cmp(&a.width).then_with(|| b.height.cmp(&a.height)));
+        }
+    }
     presets
 }
 
@@ -3362,7 +3888,7 @@ fn encode_host_display_caps(
     host: &HostSession,
     native_res: Resolution,
     max_res: Resolution,
-    mut presets: Vec<DisplayPreset>,
+    presets: Vec<DisplayPreset>,
     hevc_available: bool,
     negotiator: &HostCodecNegotiator,
     hardware_media_active: bool,
@@ -3373,7 +3899,6 @@ fn encode_host_display_caps(
     let max_fps = host.caps().fps.max(1);
     let current_codec = Some(host.active_codec().as_str().to_string());
     let supported_codecs = host_supported_codecs(negotiator, tier, hevc_available);
-    ensure_hevc_hidpi_preset(&mut presets, native_res, max_res, cur.fps, hevc_available);
     let encode_caps = negotiator.host_encode_caps().to_vec();
     let decode_caps = codec_selector::cached_or_platform_decode_caps(hardware_media_active);
     let refinement_caps = Some(codec_selector::cached_or_platform_refinement_caps(
@@ -3397,6 +3922,8 @@ fn encode_host_display_caps(
         supports_ext_codec_flags: true,
         codec_generation: negotiator.codec_generation(),
         still_stream_epoch,
+        supports_pixel_scroll: true,
+        supports_controller_meta: true,
     })
 }
 
@@ -3644,11 +4171,13 @@ fn drive_ui_host_session(
 }
 
 const RELAY_MIN_BITRATE_BPS: u32 = 2_000_000;
-const RELAY_QUEUE_HIGH_BYTES: usize = 192 * 1024;
-const RELAY_QUEUE_LOW_BYTES: usize = 32 * 1024;
-const RELAY_HIGH_QUEUE_HOLD: Duration = Duration::from_millis(150);
+const RELAY_QUEUE_HIGH_BYTES: usize = 256 * 1024;
+const RELAY_QUEUE_LOW_BYTES: usize = 48 * 1024;
+const RELAY_HIGH_QUEUE_HOLD: Duration = Duration::from_millis(200);
 const RELAY_BACKOFF_COOLDOWN: Duration = Duration::from_millis(500);
-const RELAY_RAMP_INTERVAL: Duration = Duration::from_secs(2);
+const RELAY_RAMP_INTERVAL: Duration = Duration::from_secs(1);
+/// 单拍至少累计淘汰 12 个数据报（整帧级淘汰）或连续 2 拍有淘汰才触发降速，避免孤立单帧溢出误杀码率。
+const RELAY_DROP_BURST_THRESHOLD: u64 = 12;
 
 /// 被控端 TCP Relay 连续码率控制器：将手动上限、`local_bps`（发送队列/淘汰 AIMD）与
 /// 对端控制端 RTT 限速上限（`remote_probe_cap_bps`）解耦，恒取三者最小值以避免双端抢权互盖。
@@ -3657,6 +4186,7 @@ struct RelayBitrateController {
     local_bps: u32,
     remote_probe_cap_bps: Option<u32>,
     last_dropped: u64,
+    drop_streak: u32,
     high_queue_since: Option<Instant>,
     last_adjust: Instant,
     clean_since: Instant,
@@ -3672,6 +4202,7 @@ impl RelayBitrateController {
             local_bps: cap,
             remote_probe_cap_bps: None,
             last_dropped: 0,
+            drop_streak: 0,
             high_queue_since: None,
             last_adjust: now,
             clean_since: now,
@@ -3701,6 +4232,7 @@ impl RelayBitrateController {
                 self.local_bps = self.manual_cap_bps;
                 self.remote_probe_cap_bps = None;
                 self.last_remote_probe_seen = remote_probe_bps;
+                self.drop_streak = 0;
                 self.high_queue_since = None;
                 self.last_adjust = now;
                 self.clean_since = now;
@@ -3716,8 +4248,14 @@ impl RelayBitrateController {
 
     fn poll(&mut self, now: Instant, queued_bytes: usize, dropped_total: u64) -> Option<u32> {
         let prev_eff = self.effective_bps();
-        let has_new_drops = dropped_total > self.last_dropped;
+        let drop_delta = dropped_total.saturating_sub(self.last_dropped);
         self.last_dropped = dropped_total;
+        if drop_delta > 0 {
+            self.drop_streak = self.drop_streak.saturating_add(1);
+        } else {
+            self.drop_streak = 0;
+        }
+        let sustained_drops = drop_delta >= RELAY_DROP_BURST_THRESHOLD || self.drop_streak >= 2;
 
         if queued_bytes >= RELAY_QUEUE_HIGH_BYTES {
             self.high_queue_since.get_or_insert(now);
@@ -3728,7 +4266,7 @@ impl RelayBitrateController {
             .high_queue_since
             .is_some_and(|since| now.saturating_duration_since(since) >= RELAY_HIGH_QUEUE_HOLD);
 
-        if has_new_drops || sustained_high_queue {
+        if sustained_drops || sustained_high_queue {
             self.clean_since = now;
             if now.saturating_duration_since(self.last_adjust) >= RELAY_BACKOFF_COOLDOWN {
                 let floor = RELAY_MIN_BITRATE_BPS.min(self.manual_cap_bps).max(1);
@@ -3736,6 +4274,7 @@ impl RelayBitrateController {
                     (((self.local_bps as f64) * 0.75) as u32).clamp(floor, self.manual_cap_bps);
                 self.last_adjust = now;
                 self.high_queue_since = None;
+                self.drop_streak = 0;
                 self.local_bps = next;
                 let next_eff = self.effective_bps();
                 if next_eff != prev_eff {
@@ -3750,7 +4289,7 @@ impl RelayBitrateController {
                 && now.saturating_duration_since(self.clean_since) >= RELAY_RAMP_INTERVAL
                 && now.saturating_duration_since(self.last_adjust) >= RELAY_RAMP_INTERVAL
             {
-                let step = (self.local_bps / 7).max(2_000_000);
+                let step = (self.local_bps / 4).max(2_000_000);
                 let next = self.local_bps.saturating_add(step).min(self.manual_cap_bps);
                 self.last_adjust = now;
                 self.clean_since = now;
@@ -3820,6 +4359,7 @@ fn rebuild_host_p2p_mtls(
         .ok()
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn drive_ui_host_session_inner(
     host: &mut HostSession,
@@ -3876,6 +4416,13 @@ fn drive_ui_host_session_inner(
     )
 }
 
+struct HostControllerTracking {
+    active_controllers: SharedActiveControllers,
+    peer_hints: ActiveControllerPeerHints,
+    signal_client: SharedSignalClient,
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn drive_ui_host_session_with_switch(
     host: &mut HostSession,
@@ -3904,9 +4451,70 @@ fn drive_ui_host_session_with_switch(
     session_started_at: Instant,
     switch_rt: Option<HostSwitchRuntime>,
 ) -> DriveSessionOutcome {
+    drive_ui_host_session_with_switch_and_tracking(
+        host,
+        clock,
+        clock_anchor,
+        updates,
+        password_version,
+        observed_pw_ver,
+        config_version,
+        observed_cfg_ver,
+        disconnect_flag,
+        stop_flag,
+        close_reason,
+        transport_kind,
+        prefer_hardware,
+        audio_enabled,
+        hardware_video_active,
+        lock_screen_count,
+        auth_state,
+        owner_terminals,
+        wake_guard,
+        file_transfer_dir,
+        allow_assist_file_transfer,
+        incoming_relay,
+        active_peer_id,
+        session_started_at,
+        switch_rt,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_ui_host_session_with_switch_and_tracking(
+    host: &mut HostSession,
+    clock: &SessionClock,
+    clock_anchor: Option<&HostClockAnchor>,
+    updates: &BoundedHostUpdateQueue,
+    password_version: &AtomicU64,
+    observed_pw_ver: u64,
+    config_version: &AtomicU64,
+    observed_cfg_ver: u64,
+    disconnect_flag: &AtomicBool,
+    stop_flag: &AtomicBool,
+    close_reason: &AtomicU8,
+    transport_kind: HostTransportKind,
+    prefer_hardware: bool,
+    audio_enabled: bool,
+    hardware_video_active: bool,
+    lock_screen_count: &AtomicU64,
+    auth_state: Option<&Mutex<AuthRuntimeState>>,
+    owner_terminals: &mut PersistentOwnerTerminals,
+    wake_guard: SharedWakeGuard,
+    file_transfer_dir: SharedFileTransferDir,
+    allow_assist_file_transfer: &AtomicBool,
+    incoming_relay: Option<&Arc<BoundedRelayIncomingQueue>>,
+    active_peer_id: Option<&str>,
+    session_started_at: Instant,
+    switch_rt: Option<HostSwitchRuntime>,
+    controller_tracking: Option<HostControllerTracking>,
+    busy_lan_endpoint: Option<&QuicEndpoint>,
+) -> DriveSessionOutcome {
     let audio_mgr =
         HostAudioManager::new(audio_enabled && prefer_hardware && hardware_video_active);
-    drive_ui_host_session_with_audio(
+    drive_ui_host_session_core(
         host,
         clock,
         clock_anchor,
@@ -3932,11 +4540,73 @@ fn drive_ui_host_session_with_switch(
         session_started_at,
         audio_mgr,
         switch_rt,
+        controller_tracking,
+        busy_lan_endpoint,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn drive_ui_host_session_with_audio(
+    host: &mut HostSession,
+    clock: &SessionClock,
+    clock_anchor: Option<&HostClockAnchor>,
+    updates: &BoundedHostUpdateQueue,
+    password_version: &AtomicU64,
+    observed_pw_ver: u64,
+    config_version: &AtomicU64,
+    observed_cfg_ver: u64,
+    disconnect_flag: &AtomicBool,
+    stop_flag: &AtomicBool,
+    close_reason: &AtomicU8,
+    transport_kind: HostTransportKind,
+    prefer_hardware: bool,
+    hardware_video_active: bool,
+    lock_screen_count: &AtomicU64,
+    auth_state: Option<&Mutex<AuthRuntimeState>>,
+    owner_terminals: &mut PersistentOwnerTerminals,
+    wake_guard: SharedWakeGuard,
+    file_transfer_dir: SharedFileTransferDir,
+    allow_assist_file_transfer: &AtomicBool,
+    incoming_relay: Option<&Arc<BoundedRelayIncomingQueue>>,
+    active_peer_id: Option<&str>,
+    session_started_at: Instant,
+    audio_mgr: HostAudioManager,
+    switch_rt: Option<HostSwitchRuntime>,
+) -> DriveSessionOutcome {
+    drive_ui_host_session_core(
+        host,
+        clock,
+        clock_anchor,
+        updates,
+        password_version,
+        observed_pw_ver,
+        config_version,
+        observed_cfg_ver,
+        disconnect_flag,
+        stop_flag,
+        close_reason,
+        transport_kind,
+        prefer_hardware,
+        hardware_video_active,
+        lock_screen_count,
+        auth_state,
+        owner_terminals,
+        wake_guard,
+        file_transfer_dir,
+        allow_assist_file_transfer,
+        incoming_relay,
+        active_peer_id,
+        session_started_at,
+        audio_mgr,
+        switch_rt,
+        None,
+        None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drive_ui_host_session_with_audio(
+fn drive_ui_host_session_core(
     host: &mut HostSession,
     clock: &SessionClock,
     clock_anchor: Option<&HostClockAnchor>,
@@ -3962,6 +4632,8 @@ fn drive_ui_host_session_with_audio(
     mut session_started_at: Instant,
     mut audio_mgr: HostAudioManager,
     switch_rt: Option<HostSwitchRuntime>,
+    mut controller_tracking: Option<HostControllerTracking>,
+    busy_lan_endpoint: Option<&QuicEndpoint>,
 ) -> DriveSessionOutcome {
     // 启用 8s 应用层客户端失活看门狗（控制端在静屏与纯工具模式下每 1s 发送 ProbePing 心跳）。
     host.set_client_idle_timeout_us(HostSession::CLIENT_IDLE_TIMEOUT_US);
@@ -3974,14 +4646,14 @@ fn drive_ui_host_session_with_audio(
     let mut hw_cleanup = HostHardwareCleanupGuard::new(prefer_hardware);
     let mut active_display_id: Option<u32> = None;
     let mut shows_cursor = false;
-    let mut user_pinned_resolution = false;
-    let mut auto_hidpi_active = false;
     let mut active_peer_id: Option<String> = active_peer_id.map(str::to_string);
 
     let mut detached_reason: Option<String> = None;
     let mut drive_err: Option<String> = None;
     let mut pending_lock_on_exit = false;
     let mut preempted_by_incoming = false;
+    let mut preempted_by_takeover = false;
+    let mut force_disconnected = false;
     let mut last_preempt_check = Instant::now();
     let mut epoch_reanchored_in_detached = false;
 
@@ -4050,6 +4722,23 @@ fn drive_ui_host_session_with_audio(
     let mut last_reported_screen_state: Option<(bool, bool)> = None;
     let mut last_screen_state_check = Instant::now();
     let mut mid_session_wake = MidSessionWakeDriver::new();
+    let mut last_controller_meta_gen = host.controller_meta_gen();
+    let mut active_controller_connected_at_ms = unix_now_ms();
+    if let Some(ref tr) = controller_tracking {
+        if host.state() == SessionState::Streaming {
+            let initial_ctrl = build_active_controller_session(
+                host,
+                &tr.peer_hints,
+                active_controller_connected_at_ms,
+            );
+            publish_active_controller(
+                &tr.active_controllers,
+                updates,
+                Some(&tr.signal_client),
+                initial_ctrl,
+            );
+        }
+    }
     let initial_screen_locked = crate::platform::is_screen_locked();
     let mut terminal_lock_gate = TerminalLockGate::new(initial_screen_locked);
     let mut terminal_verify_driver = TerminalVerifyDriver::new();
@@ -4122,6 +4811,16 @@ fn drive_ui_host_session_with_audio(
     let mut relay_bitrate_ctrl = (transport_kind == HostTransportKind::Relay)
         .then(|| RelayBitrateController::new(host.current_bitrate_bps().max(1), Instant::now()));
     let mut last_relay_bwe_at = Instant::now();
+    let busy_lan_worker = busy_lan_endpoint.or_else(|| host.endpoint()).map(|ep| {
+        BusyLanRejectWorker::spawn(
+            ep.clone(),
+            host.negotiated().unwrap_or_else(|| host.caps()),
+            controller_tracking
+                .as_ref()
+                .map(|tr| Arc::clone(&tr.active_controllers)),
+            incoming_relay.cloned(),
+        )
+    });
 
     while !stop_flag.load(Ordering::Acquire)
         && !disconnect_flag.load(Ordering::Acquire)
@@ -4129,6 +4828,9 @@ fn drive_ui_host_session_with_audio(
     {
         match host.state() {
             SessionState::Streaming => {
+                if let Some(worker) = busy_lan_worker.as_ref() {
+                    worker.set_active();
+                }
                 // 运行期工具通道权限热更新（不中断会话；撤销文件传输权限时立即中止在途传输并丢弃待投递帧）。
                 let desired_tool_perms = compute_effective_tool_permissions(
                     host.authenticated_owner().is_some(),
@@ -4177,6 +4879,33 @@ fn drive_ui_host_session_with_audio(
                         }
                         if host.state() != SessionState::Streaming {
                             continue;
+                        }
+
+                        // 若对端上报或更新了 ControllerMeta，立即刷新 ActiveControllerSession 并推送更新。
+                        let cur_meta_gen = host.controller_meta_gen();
+                        if cur_meta_gen != last_controller_meta_gen {
+                            last_controller_meta_gen = cur_meta_gen;
+                            if let Some(ref tr) = controller_tracking {
+                                let updated_ctrl = build_active_controller_session(
+                                    host,
+                                    &tr.peer_hints,
+                                    active_controller_connected_at_ms,
+                                );
+                                let prev_ctrl = tr
+                                    .active_controllers
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .first()
+                                    .cloned();
+                                if prev_ctrl.as_ref() != Some(&updated_ctrl) {
+                                    publish_active_controller(
+                                        &tr.active_controllers,
+                                        updates,
+                                        Some(&tr.signal_client),
+                                        updated_ctrl,
+                                    );
+                                }
+                            }
                         }
 
                         // 修正 #5：收到任意输入事件或产出新动态帧时，毫秒级立即抢占清空待发静止补帧并推进状态机。
@@ -4239,21 +4968,10 @@ fn drive_ui_host_session_with_audio(
                                 if failed_codec == rc_encode::Codec::Hevc {
                                     hevc_runtime_failed = true;
                                 }
-                                let (tw, th) = if fb_plan.codec == rc_encode::Codec::H264
-                                    && !user_pinned_resolution
-                                    && active_display_id.is_none()
-                                    && (cur.width > session_native_res.width
-                                        || cur.height > session_native_res.height)
-                                {
-                                    auto_hidpi_active = false;
-                                    (session_native_res.width, session_native_res.height)
-                                } else {
-                                    (cur.width, cur.height)
-                                };
                                 let prev_codec = host.active_codec();
                                 let _ = host.reconfigure_stream_with_codec(
-                                    tw,
-                                    th,
+                                    cur.width,
+                                    cur.height,
                                     Some(cur.fps),
                                     Some(session_max_res),
                                     Some(fb_plan.codec),
@@ -4511,8 +5229,6 @@ fn drive_ui_host_session_with_audio(
                                                         audio_mgr.reset_backoff_for_display_change(
                                                             Instant::now(),
                                                         );
-                                                        user_pinned_resolution = true;
-                                                        auto_hidpi_active = false;
                                                         host.set_injector_screen_size(
                                                             switched_res.width,
                                                             switched_res.height,
@@ -4560,10 +5276,7 @@ fn drive_ui_host_session_with_audio(
                                                             Some(session_max_res),
                                                             requested_codec,
                                                         ) {
-                                                            Ok(_) => {
-                                                                user_pinned_resolution = true;
-                                                                auto_hidpi_active = false;
-                                                            }
+                                                            Ok(_) => {}
                                                             Err(err) => {
                                                                 eprintln!(
                                                         "[rc-ui-host] 热切换流参数 ({target_w}x{target_h}@{fps}fps, {requested_codec:?}) 失败: {err}"
@@ -4572,49 +5285,19 @@ fn drive_ui_host_session_with_audio(
                                                         }
                                                     }
                                                 } else {
-                                                    let eff_codec = attempted_codec;
-                                                    let eff_fps = target_fps
-                                                        .unwrap_or(cur.fps)
-                                                        .clamp(1, host.caps().fps.max(1));
-                                                    let (target_w, target_h, next_auto_hidpi) =
-                                                        if !user_pinned_resolution
-                                                            && active_display_id.is_none()
-                                                            && prefer_hardware
-                                                            && hardware_video_active
-                                                        {
-                                                            resolve_auto_hidpi_resolution(
-                                                                cur.width,
-                                                                cur.height,
-                                                                session_native_res,
-                                                                session_max_res,
-                                                                eff_fps,
-                                                                eff_codec,
-                                                                auto_hidpi_active,
-                                                            )
-                                                        } else {
-                                                            (
-                                                                cur.width,
-                                                                cur.height,
-                                                                auto_hidpi_active,
-                                                            )
-                                                        };
-                                                    match host.reconfigure_stream_with_codec(
-                                                        target_w,
-                                                        target_h,
-                                                        target_fps,
-                                                        Some(session_max_res),
-                                                        requested_codec,
-                                                    ) {
-                                                        Ok(_) => {
-                                                            auto_hidpi_active = next_auto_hidpi
-                                                                && host.active_codec()
-                                                                    == rc_encode::Codec::Hevc;
-                                                        }
-                                                        Err(err) => {
-                                                            eprintln!(
-                                                                "[rc-ui-host] 热切换流参数 ({target_w}x{target_h}@{fps}fps, {requested_codec:?}) 失败: {err}"
-                                                            );
-                                                        }
+                                                    if let Err(err) = host
+                                                        .reconfigure_stream_with_codec(
+                                                            cur.width,
+                                                            cur.height,
+                                                            target_fps,
+                                                            Some(session_max_res),
+                                                            requested_codec,
+                                                        )
+                                                    {
+                                                        eprintln!(
+                                                            "[rc-ui-host] 热切换流参数 ({}x{}@{fps}fps, {requested_codec:?}) 失败: {err}",
+                                                            cur.width, cur.height
+                                                        );
                                                     }
                                                 }
                                                 if attempted_codec != rc_encode::Codec::H264
@@ -4634,24 +5317,6 @@ fn drive_ui_host_session_with_audio(
                                                     );
                                                     if attempted_codec == rc_encode::Codec::Hevc {
                                                         hevc_runtime_failed = true;
-                                                    }
-                                                    auto_hidpi_active = false;
-                                                    if host.active_codec() == rc_encode::Codec::H264
-                                                        && !user_pinned_resolution
-                                                        && active_display_id.is_none()
-                                                        && host.negotiated().is_some_and(|n| {
-                                                            n.width > session_native_res.width
-                                                                || n.height
-                                                                    > session_native_res.height
-                                                        })
-                                                    {
-                                                        let _ = host.reconfigure_stream_with_codec(
-                                                            session_native_res.width,
-                                                            session_native_res.height,
-                                                            target_fps.or(Some(cur.fps)),
-                                                            Some(session_max_res),
-                                                            Some(rc_encode::Codec::H264),
-                                                        );
                                                     }
                                                 }
                                                 if host.active_codec() != prev_codec {
@@ -4723,46 +5388,19 @@ fn drive_ui_host_session_with_audio(
                                                     current_net_hint(host),
                                                 );
                                                 if plan.codec != prev_codec {
-                                                    let (target_w, target_h, next_auto_hidpi) =
-                                                        if !user_pinned_resolution
-                                                            && active_display_id.is_none()
-                                                            && prefer_hardware
-                                                            && hardware_video_active
-                                                        {
-                                                            resolve_auto_hidpi_resolution(
-                                                                cur.width,
-                                                                cur.height,
-                                                                session_native_res,
-                                                                session_max_res,
-                                                                cur.fps,
-                                                                plan.codec,
-                                                                auto_hidpi_active,
-                                                            )
-                                                        } else {
-                                                            (
-                                                                cur.width,
-                                                                cur.height,
-                                                                auto_hidpi_active,
-                                                            )
-                                                        };
-                                                    match host.reconfigure_stream_with_codec(
-                                                        target_w,
-                                                        target_h,
-                                                        Some(cur.fps),
-                                                        Some(session_max_res),
-                                                        Some(plan.codec),
-                                                    ) {
-                                                        Ok(_) => {
-                                                            auto_hidpi_active = next_auto_hidpi
-                                                                && host.active_codec()
-                                                                    == rc_encode::Codec::Hevc;
-                                                        }
-                                                        Err(err) => {
-                                                            eprintln!(
-                                                                "[rc-ui-host] ClientMediaCaps 自动选型切换 ({:?}) 失败: {err}",
-                                                                plan.codec
-                                                            );
-                                                        }
+                                                    if let Err(err) = host
+                                                        .reconfigure_stream_with_codec(
+                                                            cur.width,
+                                                            cur.height,
+                                                            Some(cur.fps),
+                                                            Some(session_max_res),
+                                                            Some(plan.codec),
+                                                        )
+                                                    {
+                                                        eprintln!(
+                                                            "[rc-ui-host] ClientMediaCaps 自动选型切换 ({:?}) 失败: {err}",
+                                                            plan.codec
+                                                        );
                                                     }
                                                     if host.active_codec() != plan.codec {
                                                         let _ = codec_negotiator.on_encode_failure(
@@ -4855,31 +5493,15 @@ fn drive_ui_host_session_with_audio(
                                                     if failed_codec == rc_encode::Codec::Hevc {
                                                         hevc_runtime_failed = true;
                                                     }
-                                                    let (tw, th) = if fallback_plan.codec
-                                                        == rc_encode::Codec::H264
-                                                        && !user_pinned_resolution
-                                                        && active_display_id.is_none()
-                                                        && (cur.width > session_native_res.width
-                                                            || cur.height
-                                                                > session_native_res.height)
-                                                    {
-                                                        auto_hidpi_active = false;
-                                                        (
-                                                            session_native_res.width,
-                                                            session_native_res.height,
-                                                        )
-                                                    } else {
-                                                        (cur.width, cur.height)
-                                                    };
                                                     let _ = host.reconfigure_stream_with_codec(
-                                                        tw,
-                                                        th,
+                                                        cur.width,
+                                                        cur.height,
                                                         Some(cur.fps),
                                                         Some(session_max_res),
                                                         Some(fallback_plan.codec),
                                                     );
                                                     // 若降级目标（如 HEVC）在编码侧同样构造失败并被 HostSession 内部顺延 H.264，
-                                                    // 同步记录熔断、更新 hevc_runtime_failed 并按需回退自动 HiDPI 分辨率。
+                                                    // 同步记录熔断与 hevc_runtime_failed。
                                                     if fallback_plan.codec != rc_encode::Codec::H264
                                                         && host.active_codec()
                                                             != fallback_plan.codec
@@ -4895,26 +5517,6 @@ fn drive_ui_host_session_with_audio(
                                                             == rc_encode::Codec::Hevc
                                                         {
                                                             hevc_runtime_failed = true;
-                                                        }
-                                                        auto_hidpi_active = false;
-                                                        if host.active_codec()
-                                                            == rc_encode::Codec::H264
-                                                            && !user_pinned_resolution
-                                                            && active_display_id.is_none()
-                                                            && host.negotiated().is_some_and(|n| {
-                                                                n.width > session_native_res.width
-                                                                    || n.height
-                                                                        > session_native_res.height
-                                                            })
-                                                        {
-                                                            let _ = host
-                                                                .reconfigure_stream_with_codec(
-                                                                    session_native_res.width,
-                                                                    session_native_res.height,
-                                                                    Some(cur.fps),
-                                                                    Some(session_max_res),
-                                                                    Some(rc_encode::Codec::H264),
-                                                                );
                                                         }
                                                     }
                                                     if host.active_codec() != prev_codec {
@@ -5007,44 +5609,18 @@ fn drive_ui_host_session_with_audio(
                                             {
                                                 codec_negotiator.set_manual_pref(c);
                                                 let prev_codec = host.active_codec();
-                                                // 双端协商切入 HEVC 且用户尚未手动固定分辨率时，在同一次管线重建中一步升级到
-                                                // Retina HiDPI 2K 甜点（满足当前 fps 的 HEVC 高刷预算）；切回 H.264 时若此前自动升过级，
-                                                // 同步回退到原生逻辑分辨率，避免非 HEVC/H.264 掉帧。
-                                                let (target_w, target_h, next_auto_hidpi) =
-                                                    if !user_pinned_resolution
-                                                        && active_display_id.is_none()
-                                                        && prefer_hardware
-                                                        && hardware_video_active
-                                                    {
-                                                        resolve_auto_hidpi_resolution(
-                                                            cur.width,
-                                                            cur.height,
-                                                            session_native_res,
-                                                            session_max_res,
-                                                            cur.fps,
-                                                            c,
-                                                            auto_hidpi_active,
-                                                        )
-                                                    } else {
-                                                        (cur.width, cur.height, auto_hidpi_active)
-                                                    };
-                                                match host.reconfigure_stream_with_codec(
-                                                    target_w,
-                                                    target_h,
-                                                    Some(cur.fps),
-                                                    Some(session_max_res),
-                                                    Some(c),
-                                                ) {
-                                                    Ok(_) => {
-                                                        auto_hidpi_active = next_auto_hidpi
-                                                            && host.active_codec()
-                                                                == rc_encode::Codec::Hevc;
-                                                    }
-                                                    Err(err) => {
-                                                        eprintln!(
-                                                            "[rc-ui-host] 热切换编解码器 ({c:?}) 失败（保持当前管线）: {err}"
-                                                        );
-                                                    }
+                                                if let Err(err) = host
+                                                    .reconfigure_stream_with_codec(
+                                                        cur.width,
+                                                        cur.height,
+                                                        Some(cur.fps),
+                                                        Some(session_max_res),
+                                                        Some(c),
+                                                    )
+                                                {
+                                                    eprintln!(
+                                                        "[rc-ui-host] 热切换编解码器 ({c:?}) 失败（保持当前管线）: {err}"
+                                                    );
                                                 }
                                                 if c != rc_encode::Codec::H264
                                                     && host.active_codec() != c
@@ -5063,25 +5639,6 @@ fn drive_ui_host_session_with_audio(
                                                     );
                                                     if c == rc_encode::Codec::Hevc {
                                                         hevc_runtime_failed = true;
-                                                    }
-                                                    auto_hidpi_active = false;
-                                                    // 若 HEVC/AV1 启动失败且管线回退为 H.264 但分辨率已被升至 2K，立即回退到原生逻辑分辨率。
-                                                    if host.active_codec() == rc_encode::Codec::H264
-                                                        && !user_pinned_resolution
-                                                        && active_display_id.is_none()
-                                                        && host.negotiated().is_some_and(|n| {
-                                                            n.width > session_native_res.width
-                                                                || n.height
-                                                                    > session_native_res.height
-                                                        })
-                                                    {
-                                                        let _ = host.reconfigure_stream_with_codec(
-                                                            session_native_res.width,
-                                                            session_native_res.height,
-                                                            Some(cur.fps),
-                                                            Some(session_max_res),
-                                                            Some(rc_encode::Codec::H264),
-                                                        );
                                                     }
                                                 }
                                                 if host.active_codec() != prev_codec {
@@ -5167,33 +5724,7 @@ fn drive_ui_host_session_with_audio(
                                                                     != rc_encode::Codec::Hevc
                                                             {
                                                                 hevc_runtime_failed = true;
-                                                                auto_hidpi_active = false;
                                                                 hevc_fell_back = true;
-                                                                if !user_pinned_resolution
-                                                                    && active_display_id.is_none()
-                                                                    && host.negotiated().is_some_and(
-                                                                        |n| {
-                                                                            n.width
-                                                                                > session_native_res
-                                                                                    .width
-                                                                                || n.height
-                                                                                    > session_native_res
-                                                                                        .height
-                                                                        },
-                                                                    )
-                                                                {
-                                                                    let _ = host
-                                                                        .reconfigure_stream_with_codec(
-                                                                            session_native_res.width,
-                                                                            session_native_res
-                                                                                .height,
-                                                                            Some(cur.fps),
-                                                                            Some(session_max_res),
-                                                                            Some(
-                                                                                rc_encode::Codec::H264,
-                                                                            ),
-                                                                        );
-                                                                }
                                                             }
                                                         }
                                                     }
@@ -5237,37 +5768,7 @@ fn drive_ui_host_session_with_audio(
                                                                         != rc_encode::Codec::Hevc
                                                                 {
                                                                     hevc_runtime_failed = true;
-                                                                    auto_hidpi_active = false;
                                                                     hevc_fell_back = true;
-                                                                    if !user_pinned_resolution
-                                                                        && active_display_id
-                                                                            .is_none()
-                                                                        && host
-                                                                            .negotiated()
-                                                                            .is_some_and(|n| {
-                                                                                n.width
-                                                                                    > session_native_res
-                                                                                        .width
-                                                                                    || n.height
-                                                                                        > session_native_res
-                                                                                            .height
-                                                                            })
-                                                                    {
-                                                                        let _ = host
-                                                                            .reconfigure_stream_with_codec(
-                                                                                session_native_res
-                                                                                    .width,
-                                                                                session_native_res
-                                                                                    .height,
-                                                                                Some(cur.fps),
-                                                                                Some(
-                                                                                    session_max_res,
-                                                                                ),
-                                                                                Some(
-                                                                                    rc_encode::Codec::H264,
-                                                                                ),
-                                                                            );
-                                                                    }
                                                                 }
                                                             }
                                                             (norm_mode, eff_preset, true)
@@ -5403,25 +5904,7 @@ fn drive_ui_host_session_with_audio(
                                                             != rc_encode::Codec::Hevc
                                                     {
                                                         hevc_runtime_failed = true;
-                                                        auto_hidpi_active = false;
                                                         hevc_fell_back = true;
-                                                        if !user_pinned_resolution
-                                                            && active_display_id.is_none()
-                                                            && host.negotiated().is_some_and(|n| {
-                                                                n.width > session_native_res.width
-                                                                    || n.height
-                                                                        > session_native_res.height
-                                                            })
-                                                        {
-                                                            let _ = host
-                                                                .reconfigure_stream_with_codec(
-                                                                    session_native_res.width,
-                                                                    session_native_res.height,
-                                                                    Some(cur.fps),
-                                                                    Some(session_max_res),
-                                                                    Some(rc_encode::Codec::H264),
-                                                                );
-                                                        }
                                                     }
                                                 }
                                             }
@@ -5530,44 +6013,18 @@ fn drive_ui_host_session_with_audio(
                                                     );
                                                     let wanted_hevc = host.active_codec()
                                                         == rc_encode::Codec::Hevc;
-                                                    let cur_fps = host.negotiated().map(|c| c.fps);
-                                                    let (reconfig_ok, next_auto_hidpi) =
+                                                    let reconfig_ok =
                                                         if let Some(cur) = host.negotiated() {
-                                                            let (tw, th, is_hi) = if target.is_main
-                                                                && wanted_hevc
-                                                            {
-                                                                let hi = compute_hevc_hidpi_target(
-                                                                    disp_res,
-                                                                    Some(next_max),
-                                                                    cur.fps,
-                                                                );
-                                                                (
-                                                                    hi.width,
-                                                                    hi.height,
-                                                                    hi.width > disp_res.width
-                                                                        || hi.height
-                                                                            > disp_res.height,
-                                                                )
-                                                            } else {
-                                                                (
-                                                                    disp_res.width,
-                                                                    disp_res.height,
-                                                                    false,
-                                                                )
-                                                            };
-                                                            (
-                                                                host.force_reconfigure_stream(
-                                                                    tw,
-                                                                    th,
-                                                                    Some(cur.fps),
-                                                                    Some(next_max),
-                                                                    None,
-                                                                )
-                                                                .is_ok(),
-                                                                is_hi,
+                                                            host.force_reconfigure_stream(
+                                                                disp_res.width,
+                                                                disp_res.height,
+                                                                Some(cur.fps),
+                                                                Some(next_max),
+                                                                None,
                                                             )
+                                                            .is_ok()
                                                         } else {
-                                                            (true, false)
+                                                            true
                                                         };
                                                     if reconfig_ok {
                                                         audio_mgr.reset_backoff_for_display_change(
@@ -5576,39 +6033,11 @@ fn drive_ui_host_session_with_audio(
                                                         active_display_id = next_active;
                                                         session_native_res = disp_res;
                                                         session_max_res = next_max;
-                                                        user_pinned_resolution = false;
-                                                        auto_hidpi_active = next_auto_hidpi
-                                                            && host.active_codec()
-                                                                == rc_encode::Codec::Hevc;
                                                         if wanted_hevc
                                                             && host.active_codec()
                                                                 != rc_encode::Codec::Hevc
                                                         {
                                                             hevc_runtime_failed = true;
-                                                            auto_hidpi_active = false;
-                                                            if target.is_main
-                                                                && host.negotiated().is_some_and(
-                                                                    |n| {
-                                                                        n.width
-                                                                            > session_native_res
-                                                                                .width
-                                                                            || n.height
-                                                                                > session_native_res
-                                                                                    .height
-                                                                    },
-                                                                )
-                                                            {
-                                                                let _ = host
-                                                                    .reconfigure_stream_with_codec(
-                                                                        session_native_res.width,
-                                                                        session_native_res.height,
-                                                                        cur_fps,
-                                                                        Some(session_max_res),
-                                                                        Some(
-                                                                            rc_encode::Codec::H264,
-                                                                        ),
-                                                                    );
-                                                            }
                                                         }
                                                         host.set_injector_screen_bounds(
                                                             target.origin_x,
@@ -5783,8 +6212,6 @@ fn drive_ui_host_session_with_audio(
                                                                     Some(resolved.id);
                                                                 session_native_res = vres;
                                                                 session_max_res = next_max;
-                                                                user_pinned_resolution = false;
-                                                                auto_hidpi_active = false;
                                                                 if wanted_hevc
                                                                     && host.active_codec()
                                                                         != rc_encode::Codec::Hevc
@@ -5902,8 +6329,6 @@ fn drive_ui_host_session_with_audio(
                                                     original_native_res.unwrap_or(main_native);
                                                 session_native_res = main_native;
                                                 session_max_res = main_max;
-                                                user_pinned_resolution = false;
-                                                auto_hidpi_active = false;
                                                 let main_origin = crate::platform::list_displays()
                                                     .into_iter()
                                                     .find(|d| d.is_main)
@@ -5918,59 +6343,18 @@ fn drive_ui_host_session_with_audio(
                                                 if let Some(cur) = host.negotiated() {
                                                     let wanted_hevc = host.active_codec()
                                                         == rc_encode::Codec::Hevc;
-                                                    let (tw, th, is_hi) = if wanted_hevc {
-                                                        let hi = compute_hevc_hidpi_target(
-                                                            main_native,
-                                                            Some(session_max_res),
-                                                            cur.fps,
-                                                        );
-                                                        (
-                                                            hi.width,
-                                                            hi.height,
-                                                            hi.width > main_native.width
-                                                                || hi.height > main_native.height,
-                                                        )
-                                                    } else {
-                                                        (
-                                                            main_native.width,
-                                                            main_native.height,
-                                                            false,
-                                                        )
-                                                    };
-                                                    if host
-                                                        .force_reconfigure_stream(
-                                                            tw,
-                                                            th,
-                                                            Some(cur.fps),
-                                                            Some(session_max_res),
-                                                            None,
-                                                        )
-                                                        .is_ok()
-                                                    {
-                                                        auto_hidpi_active = is_hi
-                                                            && host.active_codec()
-                                                                == rc_encode::Codec::Hevc;
-                                                    }
+                                                    let _ = host.force_reconfigure_stream(
+                                                        main_native.width,
+                                                        main_native.height,
+                                                        Some(cur.fps),
+                                                        Some(session_max_res),
+                                                        None,
+                                                    );
                                                     if wanted_hevc
                                                         && host.active_codec()
                                                             != rc_encode::Codec::Hevc
                                                     {
                                                         hevc_runtime_failed = true;
-                                                        auto_hidpi_active = false;
-                                                        if host.negotiated().is_some_and(|n| {
-                                                            n.width > session_native_res.width
-                                                                || n.height
-                                                                    > session_native_res.height
-                                                        }) {
-                                                            let _ = host
-                                                                .reconfigure_stream_with_codec(
-                                                                    session_native_res.width,
-                                                                    session_native_res.height,
-                                                                    Some(cur.fps),
-                                                                    Some(session_max_res),
-                                                                    Some(rc_encode::Codec::H264),
-                                                                );
-                                                        }
                                                     }
                                                 }
                                                 let presets = build_hardware_display_presets(
@@ -6001,6 +6385,7 @@ fn drive_ui_host_session_with_audio(
                                             }
                                         }
                                         Some(DisplayControlMsg::SetMediaPaused { paused }) => {
+                                            let was_paused = host.is_media_paused();
                                             if paused {
                                                 still_refine.on_input_event();
                                                 host.pause_media();
@@ -6020,7 +6405,6 @@ fn drive_ui_host_session_with_audio(
                                                                 != rc_encode::Codec::Hevc
                                                         {
                                                             hevc_runtime_failed = true;
-                                                            auto_hidpi_active = false;
                                                         }
                                                         let (caps_native, presets) =
                                                             if active_display_id.is_some() {
@@ -6117,6 +6501,24 @@ fn drive_ui_host_session_with_audio(
                                                             pending_display_tx.push_transient(mp);
                                                         }
                                                     }
+                                                }
+                                            }
+                                            if host.controller_meta().is_none()
+                                                && host.is_media_paused() != was_paused
+                                            {
+                                                if let Some(ref tr) = controller_tracking {
+                                                    let updated_ctrl =
+                                                        build_active_controller_session(
+                                                            host,
+                                                            &tr.peer_hints,
+                                                            active_controller_connected_at_ms,
+                                                        );
+                                                    publish_active_controller(
+                                                        &tr.active_controllers,
+                                                        updates,
+                                                        Some(&tr.signal_client),
+                                                        updated_ctrl,
+                                                    );
                                                 }
                                             }
                                         }
@@ -6304,15 +6706,17 @@ fn drive_ui_host_session_with_audio(
                         }
 
                         // 4) 系统音频采集 → IMA-ADPCM 编码 → AudioFramePacket 发送。
-                        //    M9：当文件/端口映射/更新中转通道存在背压待重试帧时，本拍跳过发送音频帧避免加剧 Stream A 拥塞。
+                        //    M9：当文件/端口映射/更新中转通道存在背压待重试帧或 Stream A 发送队列深度达高水位时，提前让渡跳过音频与静态补帧避免加剧 Stream A 拥塞。
                         let stream_a_congested = !pending_file_tx.is_empty()
                             || !pending_portmap_tx.is_empty()
-                            || !pending_update_tx.is_empty();
-                        // 3.5) 静止无损 Tile 补帧低优先级限速发送（仅当控制面空闲且无 Stream A 拥塞时最多发送 1 片，
+                            || !pending_update_tx.is_empty()
+                            || host.transport_reliable_tx_queued_len() >= 16;
+                        // 3.5) 静止无损 Tile 补帧低优先级限速发送（仅当控制面空闲、无 Stream A 拥塞且媒体发送队列无积压时最多发送 1 片，
                         //      保证控制消息、输入与动态视频流零阻塞，且输入/新帧抢占可瞬间清空未发队列）。
                         if !host.is_media_paused()
                             && pending_display_tx.is_empty()
                             && !stream_a_congested
+                            && host.transport_tx_queued_bytes() < 64 * 1024
                             && still_refine.is_active()
                         {
                             let now_ms = u64::try_from(session_started_at.elapsed().as_millis())
@@ -6454,9 +6858,22 @@ fn drive_ui_host_session_with_audio(
                             }
                         }
 
-                        if let Some(relay_q) = incoming_relay {
-                            if last_preempt_check.elapsed() >= PREEMPT_CHECK_INTERVAL {
-                                last_preempt_check = Instant::now();
+                        if last_preempt_check.elapsed() >= PREEMPT_CHECK_INTERVAL {
+                            last_preempt_check = Instant::now();
+                            let active_sid_str = host.session_id().map(|id| id.to_string());
+                            if drain_matching_force_disconnect(
+                                controller_tracking.as_ref().map(|tr| &tr.signal_client),
+                                controller_tracking
+                                    .as_ref()
+                                    .map(|tr| &tr.active_controllers),
+                                active_peer_id.as_deref(),
+                                active_sid_str.as_deref(),
+                            ) {
+                                force_disconnected = true;
+                                disconnect_flag.store(true, Ordering::Release);
+                                break;
+                            }
+                            if let Some(relay_q) = incoming_relay {
                                 let idle_us = host.idle_since_last_client_rx_us(u64::from(clock()));
                                 let ignore_lan_before = matches!(
                                     transport_kind,
@@ -6475,7 +6892,7 @@ fn drive_ui_host_session_with_audio(
                                 let sw_capable = switch_rt
                                     .as_ref()
                                     .is_some_and(|s| s.handle.is_switch_capable());
-                                if relay_q.has_preempt_candidate_with_switch(
+                                match relay_q.check_preempt_candidate_with_switch(
                                     RELAY_INCOMING_TTL,
                                     active_peer_id.as_deref(),
                                     idle_us,
@@ -6483,30 +6900,38 @@ fn drive_ui_host_session_with_audio(
                                     ignore_lan_before,
                                     sw_capable,
                                 ) {
-                                    preempted_by_incoming = true;
-                                    break;
+                                    PreemptDecision::TakeoverOwner => {
+                                        preempted_by_incoming = true;
+                                        preempted_by_takeover = true;
+                                        break;
+                                    }
+                                    PreemptDecision::SamePeerOrIdle => {
+                                        preempted_by_incoming = true;
+                                        break;
+                                    }
+                                    PreemptDecision::None => {}
                                 }
                             }
                         }
 
                         last_busy = r.busy || tools_busy || audio_busy;
                         if !last_busy && host.state() == SessionState::Streaming {
-                            let wait_ms = if pending_file_in.is_empty()
+                            let wait_budget = if pending_file_in.is_empty()
                                 && pending_display_tx.is_empty()
                                 && pending_update_tx.is_empty()
                             {
                                 if host.is_media_paused() {
-                                    3
+                                    Duration::from_millis(3)
                                 } else {
-                                    2
+                                    Duration::from_micros(500)
                                 }
                             } else {
-                                1
+                                Duration::from_micros(500)
                             };
                             if host.has_pipeline() {
-                                host.pipeline().wait_event(Duration::from_millis(wait_ms));
+                                host.pipeline().wait_event(wait_budget);
                             } else if host.is_media_paused() {
-                                thread::sleep(Duration::from_millis(wait_ms));
+                                thread::sleep(wait_budget);
                             }
                         }
                     }
@@ -6517,6 +6942,9 @@ fn drive_ui_host_session_with_audio(
                 }
             }
             SessionState::Detached => {
+                if let Some(worker) = busy_lan_worker.as_ref() {
+                    worker.pause_and_sync();
+                }
                 match transport_kind {
                     HostTransportKind::P2p => {
                         detached_reason = Some("P2P 连接已断开".to_string());
@@ -6545,9 +6973,22 @@ fn drive_ui_host_session_with_audio(
                     detached_reason = Some("鉴权配置已变更，重置监听".to_string());
                     break;
                 }
-                if let Some(relay_q) = incoming_relay {
-                    if last_preempt_check.elapsed() >= PREEMPT_CHECK_INTERVAL {
-                        last_preempt_check = Instant::now();
+                if last_preempt_check.elapsed() >= PREEMPT_CHECK_INTERVAL {
+                    last_preempt_check = Instant::now();
+                    let active_sid_str = host.session_id().map(|id| id.to_string());
+                    if drain_matching_force_disconnect(
+                        controller_tracking.as_ref().map(|tr| &tr.signal_client),
+                        controller_tracking
+                            .as_ref()
+                            .map(|tr| &tr.active_controllers),
+                        active_peer_id.as_deref(),
+                        active_sid_str.as_deref(),
+                    ) {
+                        force_disconnected = true;
+                        disconnect_flag.store(true, Ordering::Release);
+                        break;
+                    }
+                    if let Some(relay_q) = incoming_relay {
                         let idle_us = host.idle_since_last_client_rx_us(u64::from(clock()));
                         let ignore_lan_before = matches!(
                             transport_kind,
@@ -6561,15 +7002,23 @@ fn drive_ui_host_session_with_audio(
                                 RELAY_INCOMING_TTL,
                             );
                         }
-                        if relay_q.has_preempt_candidate_filtered(
+                        match relay_q.check_preempt_candidate_filtered(
                             RELAY_INCOMING_TTL,
                             active_peer_id.as_deref(),
                             idle_us,
                             true,
                             ignore_lan_before,
                         ) {
-                            preempted_by_incoming = true;
-                            break;
+                            PreemptDecision::TakeoverOwner => {
+                                preempted_by_incoming = true;
+                                preempted_by_takeover = true;
+                                break;
+                            }
+                            PreemptDecision::SamePeerOrIdle => {
+                                preempted_by_incoming = true;
+                                break;
+                            }
+                            PreemptDecision::None => {}
                         }
                     }
                 }
@@ -6740,8 +7189,6 @@ fn drive_ui_host_session_with_audio(
                         still_window_dropped_dgrams = 0;
                         still_last_dropped_total = host.transport_tx_dropped_datagrams();
                         still_loss_window_at = Instant::now();
-                        user_pinned_resolution = false;
-                        auto_hidpi_active = false;
                         last_busy = true;
                         host.reset_clipboard_epoch();
                         audio_muted = false;
@@ -6855,6 +7302,32 @@ fn drive_ui_host_session_with_audio(
                         }
                         portmap_host = PortMapHostEngine::new();
                         emit_peer_connected(host, &host.peer_addr().to_string(), updates);
+                        active_controller_connected_at_ms = unix_now_ms();
+                        last_controller_meta_gen = host.controller_meta_gen();
+                        if let Some(ref mut tr) = controller_tracking {
+                            tr.peer_hints = ActiveControllerPeerHints {
+                                session_id_hint: None,
+                                relay_peer_id: host
+                                    .authenticated_owner()
+                                    .map(|o| o.caller_device_id.clone()),
+                                relay_peer_name: None,
+                                relay_peer_hostname: None,
+                                relay_peer_os: None,
+                                mtls_peer_did: None,
+                                remote_addr: host.peer_addr().to_string(),
+                            };
+                            let replaced_ctrl = build_active_controller_session(
+                                host,
+                                &tr.peer_hints,
+                                active_controller_connected_at_ms,
+                            );
+                            publish_active_controller(
+                                &tr.active_controllers,
+                                updates,
+                                Some(&tr.signal_client),
+                                replaced_ctrl,
+                            );
+                        }
                     }
                     Ok(DetachOutcome::Waiting) => {
                         owner_terminals.sync_auth_and_poll(auth_state);
@@ -6891,7 +7364,9 @@ fn drive_ui_host_session_with_audio(
     }
 
     let user_disconnected = disconnect_flag.load(Ordering::Acquire);
-    let bye_reason = if stop_flag.load(Ordering::Acquire) {
+    let bye_reason = if preempted_by_takeover {
+        ByeReason::Preempted
+    } else if stop_flag.load(Ordering::Acquire) {
         match close_reason.load(Ordering::Acquire) {
             1 => ByeReason::Refresh,
             2 => ByeReason::SessionSwitching,
@@ -6901,7 +7376,14 @@ fn drive_ui_host_session_with_audio(
         ByeReason::Normal
     };
     let close_res = host.close(bye_reason);
-    let reason = if preempted_by_incoming {
+    if let Some(ref tr) = controller_tracking {
+        clear_active_controllers(&tr.active_controllers, updates, Some(&tr.signal_client));
+    }
+    let reason = if preempted_by_takeover {
+        "连接已被其他设备接管".to_string()
+    } else if force_disconnected {
+        "已被同账号设备远程断开".to_string()
+    } else if preempted_by_incoming {
         "收到新的远控连接，已切换会话".to_string()
     } else if user_disconnected {
         "本机主动断开".to_string()
@@ -7434,12 +7916,14 @@ fn serve_relay_incoming(
     auth_state: &Mutex<AuthRuntimeState>,
     config_version: &AtomicU64,
     active_relay_interrupt: &Mutex<Option<ActiveRelayInterrupt>>,
+    active_controllers: &SharedActiveControllers,
     disconnect_flag: &Arc<AtomicBool>,
     stop_flag: &Arc<AtomicBool>,
     close_reason: &Arc<AtomicU8>,
     lock_screen_count: &AtomicU64,
     owner_terminals: &mut PersistentOwnerTerminals,
     file_transfer_dir: &SharedFileTransferDir,
+    busy_lan_endpoint: Option<&QuicEndpoint>,
 ) {
     if stop_flag.load(Ordering::Acquire) {
         return;
@@ -7683,6 +8167,16 @@ fn serve_relay_incoming(
         && !disconnect_flag.load(Ordering::Acquire)
         && !session_cancel.load(Ordering::Acquire)
     {
+        if drain_matching_force_disconnect(
+            Some(&opts.signal_client),
+            None,
+            Some(incoming.peer_id.as_str()),
+            Some(incoming.session_id.as_str()),
+        ) {
+            session_cancel.store(true, Ordering::Release);
+            disconnect_flag.store(true, Ordering::Release);
+            break;
+        }
         if relay_rx.is_none()
             && has_relay
             && !relay_done
@@ -7948,7 +8442,7 @@ fn serve_relay_incoming(
         signal_client: Arc::clone(&opts.signal_client),
     });
 
-    let outcome = drive_ui_host_session_with_switch(
+    let outcome = drive_ui_host_session_with_switch_and_tracking(
         &mut host,
         &clock,
         Some(&clock_anchor),
@@ -7974,6 +8468,22 @@ fn serve_relay_incoming(
         Some(incoming.peer_id.as_str()),
         Instant::now(),
         switch_runtime,
+        Some(HostControllerTracking {
+            active_controllers: Arc::clone(active_controllers),
+            peer_hints: ActiveControllerPeerHints {
+                session_id_hint: (!incoming.session_id.trim().is_empty())
+                    .then(|| incoming.session_id.clone()),
+                relay_peer_id: (!incoming.peer_id.trim().is_empty())
+                    .then(|| incoming.peer_id.clone()),
+                relay_peer_name: incoming.peer_name.clone(),
+                relay_peer_hostname: incoming.peer_hostname.clone(),
+                relay_peer_os: incoming.peer_os.clone(),
+                mtls_peer_did: None,
+                remote_addr: peer_label,
+            },
+            signal_client: Arc::clone(&opts.signal_client),
+        }),
+        busy_lan_endpoint,
     );
     bg_cancel.store(true, Ordering::Release);
     let reason = outcome.reason;
@@ -8036,6 +8546,7 @@ fn run_host_worker(
     config_version: Arc<AtomicU64>,
     incoming_relay: Arc<BoundedRelayIncomingQueue>,
     active_relay_interrupt: Arc<Mutex<Option<ActiveRelayInterrupt>>>,
+    active_controllers: SharedActiveControllers,
     disconnect_flag: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     close_reason: Arc<AtomicU8>,
@@ -8277,6 +8788,12 @@ fn run_host_worker(
                         break false;
                     }
                     owner_terminals.sync_auth_and_poll(Some(auth_state.as_ref()));
+                    let _ = drain_matching_force_disconnect(
+                        Some(&opts.signal_client),
+                        None,
+                        None,
+                        None,
+                    );
                     if let Some(incoming) =
                         incoming_relay.pop_ready(RELAY_INCOMING_TTL, Duration::from_millis(180))
                     {
@@ -8293,12 +8810,14 @@ fn run_host_worker(
                             &auth_state,
                             &config_version,
                             &active_relay_interrupt,
+                            &active_controllers,
                             &disconnect_flag,
                             &stop_flag,
                             &close_reason,
                             &lock_screen_count,
                             &mut owner_terminals,
                             &file_transfer_dir,
+                            host.endpoint(),
                         );
                         // M6：中继会话结束后清理过期入站令牌，并重建空闲 LAN HostSession 清除期间积压的过期 QUIC 连接。
                         incoming_relay.purge_expired(RELAY_INCOMING_TTL);
@@ -8364,7 +8883,7 @@ fn run_host_worker(
                     .map(|o| o.caller_device_id.clone());
                 emit_peer_connected(&host, &remote_addr, &updates);
 
-                let outcome = drive_ui_host_session_inner(
+                let outcome = drive_ui_host_session_with_switch_and_tracking(
                     &mut host,
                     &clock,
                     Some(&clock_anchor),
@@ -8389,6 +8908,21 @@ fn run_host_worker(
                     Some(&incoming_relay),
                     initial_lan_peer_did.as_deref(),
                     session_started_at,
+                    None,
+                    Some(HostControllerTracking {
+                        active_controllers: Arc::clone(&active_controllers),
+                        peer_hints: ActiveControllerPeerHints {
+                            session_id_hint: None,
+                            relay_peer_id: initial_lan_peer_did.clone(),
+                            relay_peer_name: None,
+                            relay_peer_hostname: None,
+                            relay_peer_os: None,
+                            mtls_peer_did: None,
+                            remote_addr: remote_addr.clone(),
+                        },
+                        signal_client: Arc::clone(&opts.signal_client),
+                    }),
+                    None,
                 );
                 let reason = outcome.reason;
                 let lan_peer_did = host
@@ -8430,6 +8964,12 @@ fn run_host_worker(
             HostListener::AwaitingMtlsCert => {
                 while !stop_flag.load(Ordering::Acquire) {
                     owner_terminals.sync_auth_and_poll(Some(auth_state.as_ref()));
+                    let _ = drain_matching_force_disconnect(
+                        Some(&opts.signal_client),
+                        None,
+                        None,
+                        None,
+                    );
                     if let Some(incoming) =
                         incoming_relay.pop_ready(RELAY_INCOMING_TTL, Duration::from_millis(180))
                     {
@@ -8453,6 +8993,12 @@ fn run_host_worker(
                 let mut consecutive_accept_errors: u32 = 0;
                 while !stop_flag.load(Ordering::Acquire) {
                     owner_terminals.sync_auth_and_poll(Some(auth_state.as_ref()));
+                    let _ = drain_matching_force_disconnect(
+                        Some(&opts.signal_client),
+                        None,
+                        None,
+                        None,
+                    );
                     if let Some(incoming) =
                         incoming_relay.pop_ready(RELAY_INCOMING_TTL, Duration::from_millis(180))
                     {
@@ -8469,12 +9015,14 @@ fn run_host_worker(
                             &auth_state,
                             &config_version,
                             &active_relay_interrupt,
+                            &active_controllers,
                             &disconnect_flag,
                             &stop_flag,
                             &close_reason,
                             &lock_screen_count,
                             &mut owner_terminals,
                             &file_transfer_dir,
+                            Some(&endpoint),
                         );
                         incoming_relay.purge_expired(RELAY_INCOMING_TTL);
                         continue;
@@ -8536,7 +9084,7 @@ fn run_host_worker(
                                     } = *built;
                                     streaming_started.store(true, Ordering::Release);
                                     emit_peer_connected(&host, &peer_label, &updates);
-                                    let outcome = drive_ui_host_session_inner(
+                                    let outcome = drive_ui_host_session_with_switch_and_tracking(
                                         &mut host,
                                         &clock,
                                         Some(&clock_anchor),
@@ -8561,6 +9109,21 @@ fn run_host_worker(
                                         Some(&incoming_relay),
                                         mtls_peer_did.as_deref(),
                                         session_started_at,
+                                        None,
+                                        Some(HostControllerTracking {
+                                            active_controllers: Arc::clone(&active_controllers),
+                                            peer_hints: ActiveControllerPeerHints {
+                                                session_id_hint: None,
+                                                relay_peer_id: None,
+                                                relay_peer_name: None,
+                                                relay_peer_hostname: None,
+                                                relay_peer_os: None,
+                                                mtls_peer_did: mtls_peer_did.clone(),
+                                                remote_addr: peer_label,
+                                            },
+                                            signal_client: Arc::clone(&opts.signal_client),
+                                        }),
+                                        Some(&endpoint),
                                     );
                                     let reason = outcome.reason;
                                     let last_backend = backend_label
@@ -9249,28 +9812,32 @@ mod tests {
         let t0 = Instant::now();
         let mut ctrl = RelayBitrateController::new(14_000_000, t0);
 
-        // 1) 持续高排队 150ms + 冷却 500ms 后触发回退（×0.75 = 10.5 Mbps）
+        // 1) 持续高排队 200ms + 冷却 500ms 后触发回退（×0.75 = 10.5 Mbps）
         assert_eq!(
-            ctrl.poll(t0 + Duration::from_millis(50), 200 * 1024, 0),
+            ctrl.poll(t0 + Duration::from_millis(50), 260 * 1024, 0),
             None
         );
         assert_eq!(
-            ctrl.poll(t0 + Duration::from_millis(520), 200 * 1024, 0),
+            ctrl.poll(t0 + Duration::from_millis(520), 260 * 1024, 0),
             Some(10_500_000)
         );
 
-        // 2) 丢包淘汰同样触发回退（冷却期外）：10.5M * 0.75 = 7.875M
+        // 2) 孤立 1-3 包瞬态淘汰不立即误杀码率；连续两拍或整帧级 (>=12 包) 淘汰才回退：10.5M * 0.75 = 7.875M
         assert_eq!(
             ctrl.poll(t0 + Duration::from_millis(1_100), 16 * 1024, 3),
+            None
+        );
+        assert_eq!(
+            ctrl.poll(t0 + Duration::from_millis(1_200), 16 * 1024, 5),
             Some(7_875_000)
         );
 
-        // 3) 排队清空并维持低水位 >= 2s 后逐步爬坡恢复
+        // 3) 排队清空并维持低水位 >= 1s 后对称逐步爬坡恢复（+1/4）
         assert_eq!(
-            ctrl.poll(t0 + Duration::from_millis(2_000), 8 * 1024, 3),
+            ctrl.poll(t0 + Duration::from_millis(2_000), 8 * 1024, 5),
             None
         );
-        let ramped = ctrl.poll(t0 + Duration::from_millis(3_200), 8 * 1024, 3);
+        let ramped = ctrl.poll(t0 + Duration::from_millis(2_300), 8 * 1024, 5);
         assert_eq!(ramped, Some(9_875_000));
 
         // 4) 用户手动下调码率后，上限同步刷新且不再超过新上限
@@ -9279,35 +9846,35 @@ mod tests {
                 Some((1, 8_000_000)),
                 None,
                 8_000_000,
-                t0 + Duration::from_millis(3_300),
+                t0 + Duration::from_millis(2_400),
             ),
             None
         );
-        assert_eq!(ctrl.poll(t0 + Duration::from_millis(6_000), 0, 3), None);
+        assert_eq!(ctrl.poll(t0 + Duration::from_millis(5_000), 0, 5), None);
 
         // 5) 控制端 RTT 探针要求降至 4M，且本机排队清空时不得覆盖抬高；
-        //    随后即使控制端试图用 Probe 拉高至 7.5M，但宿主自身排队回退至 6M 时必须立刻钳制回 6M。
+        //    随后即使控制端试图用 Probe 拉高至 7.5M，但宿主自身突发整帧淘汰回退至 6M 时必须立刻钳制回 6M。
         assert_eq!(
             ctrl.sync_external_caps(
                 Some((1, 8_000_000)),
                 Some(4_000_000),
                 4_000_000,
-                t0 + Duration::from_millis(6_100),
+                t0 + Duration::from_millis(5_100),
             ),
             None
         );
-        assert_eq!(ctrl.poll(t0 + Duration::from_millis(9_000), 0, 3), None);
+        assert_eq!(ctrl.poll(t0 + Duration::from_millis(8_000), 0, 5), None);
         assert_eq!(
             ctrl.sync_external_caps(
                 Some((1, 8_000_000)),
                 Some(7_000_000),
                 7_000_000,
-                t0 + Duration::from_millis(9_100),
+                t0 + Duration::from_millis(8_100),
             ),
             None
         );
         assert_eq!(
-            ctrl.poll(t0 + Duration::from_millis(9_600), 0, 4),
+            ctrl.poll(t0 + Duration::from_millis(8_600), 0, 17),
             Some(6_000_000)
         );
         assert_eq!(
@@ -9315,7 +9882,7 @@ mod tests {
                 Some((1, 8_000_000)),
                 Some(7_500_000),
                 7_500_000,
-                t0 + Duration::from_millis(9_700),
+                t0 + Duration::from_millis(8_700),
             ),
             Some(6_000_000)
         );
@@ -9327,7 +9894,7 @@ mod tests {
                 Some((2, 8_000_000)),
                 None,
                 8_000_000,
-                t0 + Duration::from_millis(9_800),
+                t0 + Duration::from_millis(8_800),
             ),
             None
         );
@@ -9488,178 +10055,183 @@ mod tests {
     }
 
     #[test]
-    fn compute_hevc_hidpi_target_respects_fps_pixel_budget_and_edge_cases() {
-        // 14" MBP Retina (1512x982 logical, 3024x1964 backing) @ 144fps -> 2464x1600 (567.7M px/s <= 600M!)
-        let mbp14_144 = compute_hevc_hidpi_target(
-            Resolution::new(1512, 982),
-            Some(Resolution::new(3024, 1964)),
-            144,
-        );
-        assert_eq!(mbp14_144, Resolution::new(2464, 1600));
-        assert!(display_ctrl::is_within_high_refresh_sweet_spot(
-            mbp14_144.width,
-            mbp14_144.height,
-            144,
-            display_ctrl::StreamCodec::Hevc,
-        ));
+    fn client_media_caps_and_fps_change_preserve_host_current_resolution() {
+        use rc_session::{ClientSession, ClientSessionConfig};
 
-        // 16" MBP Retina @ 144fps stays within 600M px/s budget
-        let mbp16_144 = compute_hevc_hidpi_target(
-            Resolution::new(1728, 1117),
-            Some(Resolution::new(3456, 2234)),
-            144,
-        );
-        assert!(display_ctrl::is_within_high_refresh_sweet_spot(
-            mbp16_144.width,
-            mbp16_144.height,
-            144,
-            display_ctrl::StreamCodec::Hevc,
-        ));
-        assert!(mbp16_144.width > 2400);
+        struct EmptyInput;
+        impl rc_input::InputCapture for EmptyInput {
+            fn next_events(
+                &mut self,
+                _timeout: Duration,
+            ) -> rc_types::Result<Vec<rc_input::InputEvent>> {
+                Ok(Vec::new())
+            }
+        }
 
-        // 14" MBP @ 240fps scales cleanly to stay within 600M px/s budget
-        let mbp14_240 = compute_hevc_hidpi_target(
-            Resolution::new(1512, 982),
-            Some(Resolution::new(3024, 1964)),
-            240,
-        );
-        assert!(display_ctrl::is_within_high_refresh_sweet_spot(
-            mbp14_240.width,
-            mbp14_240.height,
-            240,
-            display_ctrl::StreamCodec::Hevc,
-        ));
-
-        // 4K scaled to 1080p logical (1920x1080 logical, 3840x2160 backing) @ 144fps -> 2560x1440
-        let hidpi_16_9 = compute_hevc_hidpi_target(
-            Resolution::new(1920, 1080),
-            Some(Resolution::new(3840, 2160)),
-            144,
-        );
-        assert_eq!(hidpi_16_9, Resolution::new(2560, 1440));
-        assert!(display_ctrl::is_within_high_refresh_sweet_spot(
-            hidpi_16_9.width,
-            hidpi_16_9.height,
-            144,
-            display_ctrl::StreamCodec::Hevc,
-        ));
-
-        // 5K Studio Display (2560x1440 logical, 5120x2880 backing) -> stays 2560x1440
-        assert_eq!(
-            compute_hevc_hidpi_target(
-                Resolution::new(2560, 1440),
-                Some(Resolution::new(5120, 2880)),
-                144,
-            ),
-            Resolution::new(2560, 1440)
-        );
-
-        // Non-Retina 1080p & degenerate <2px logical stay unchanged
-        assert_eq!(
-            compute_hevc_hidpi_target(
-                Resolution::new(1920, 1080),
-                Some(Resolution::new(1920, 1080)),
-                144,
-            ),
-            Resolution::new(1920, 1080)
-        );
-        assert_eq!(
-            compute_hevc_hidpi_target(
-                Resolution::new(0, 0),
-                Some(Resolution::new(3024, 1964)),
-                144,
-            ),
-            Resolution::new(0, 0)
-        );
-
-        // ensure_hevc_hidpi_preset adds 2464x1600 to hardware presets so menu highlights & allows re-selection
-        let mut presets = vec![
-            DisplayPreset {
-                width: 3024,
-                height: 1964,
-                label: "3024 × 1964".to_string(),
-                is_native: false,
-                is_hidpi: false,
-            },
-            DisplayPreset {
-                width: 1512,
-                height: 982,
-                label: "1512 × 982 (HiDPI)".to_string(),
-                is_native: true,
-                is_hidpi: true,
-            },
-        ];
-        ensure_hevc_hidpi_preset(
-            &mut presets,
-            Resolution::new(1512, 982),
-            Resolution::new(3024, 1964),
-            144,
-            true,
-        );
-        assert!(presets.iter().any(|p| p.width == 2464 && p.height == 1600));
-
-        // resolve_auto_hidpi_resolution tracks FPS changes (144->240->144) and H.264 revert cleanly
-        let native = Resolution::new(1512, 982);
-        let max_res = Resolution::new(3024, 1964);
-        let (w1, h1, hi1) = resolve_auto_hidpi_resolution(
-            1512,
-            982,
-            native,
-            max_res,
-            144,
-            rc_encode::Codec::Hevc,
+        let updates = Arc::new(BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP));
+        let owner_replay = Arc::new(Mutex::new(rc_session::OwnerReplayCache::new()));
+        let BuiltUiHost {
+            mut host,
+            clock,
+            clock_anchor,
+            ..
+        } = build_host_session(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            None,
+            rc_session::auth::DEFAULT_AUTH_TIMEOUT_US,
             false,
-        );
-        assert_eq!((w1, h1, hi1), (2464, 1600, true));
-        let (w2, h2, hi2) = resolve_auto_hidpi_resolution(
-            w1,
-            h1,
-            native,
-            max_res,
-            240,
-            rc_encode::Codec::Hevc,
-            hi1,
-        );
-        assert!(hi2 && w2 < w1);
-        assert!(display_ctrl::is_within_high_refresh_sweet_spot(
-            w2,
-            h2,
-            240,
-            display_ctrl::StreamCodec::Hevc,
-        ));
-        let (w3, h3, hi3) = resolve_auto_hidpi_resolution(
-            w2,
-            h2,
-            native,
-            max_res,
-            144,
-            rc_encode::Codec::Hevc,
-            hi2,
-        );
-        assert_eq!((w3, h3, hi3), (2464, 1600, true));
-        let (w4, h4, hi4) = resolve_auto_hidpi_resolution(
-            w3,
-            h3,
-            native,
-            max_res,
-            144,
-            rc_encode::Codec::H264,
-            hi3,
-        );
-        assert_eq!((w4, h4, hi4), (1512, 982, false));
-        // Does NOT inflate an explicit lower Hello resolution (e.g. 1280x720)
-        assert_eq!(
-            resolve_auto_hidpi_resolution(
-                1280,
-                720,
-                native,
-                max_res,
-                144,
-                rc_encode::Codec::Hevc,
+            false,
+            true,
+            true,
+            None,
+            owner_replay,
+            Box::new(AutoApprover),
+            Arc::clone(&updates),
+        )
+        .expect("build_host_session");
+        // 模拟被控端系统当前逻辑分辨率 1512×982（如 14" MacBook Pro 默认缩放）
+        host.update_caps_resolution(1512, 982);
+        let addr = host.local_addr().expect("local_addr");
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop_flag);
+        let t_updates = Arc::clone(&updates);
+        let t_anchor = clock_anchor.clone();
+        let host_thread = thread::spawn(move || {
+            t_anchor.reset_pending();
+            host.accept_and_handshake(Duration::from_secs(5))
+                .expect("accept_and_handshake");
+            drive_ui_host_session_inner(
+                &mut host,
+                &clock,
+                Some(&t_anchor),
+                &t_updates,
+                &AtomicU64::new(0),
+                0,
+                &AtomicU64::new(0),
+                0,
+                &AtomicBool::new(false),
+                &t_stop,
+                &AtomicU8::new(ByeReason::Normal as u8),
+                HostTransportKind::Lan,
                 false,
-            ),
-            (1280, 720, false)
+                false,
+                false,
+                &AtomicU64::new(0),
+                None,
+                &mut PersistentOwnerTerminals::new(),
+                Arc::new(Mutex::new(None)),
+                Arc::new(RwLock::new(None)),
+                &AtomicBool::new(true),
+                None,
+                None,
+                Instant::now(),
+            )
+        });
+
+        let mut ccfg = ClientSessionConfig::new(
+            addr,
+            SessionParams {
+                width: 0,
+                height: 0,
+                fps: 60,
+                bitrate_bps: 14_000_000,
+            },
+            7789,
+            Box::new(EmptyInput),
         );
+        ccfg.handshake_timeout = Duration::from_secs(3);
+        ccfg.connect_timeout = Duration::from_secs(3);
+        ccfg.auth = rc_session::auth::ClientAuthConfig::default();
+        let cclock: SessionClock = Arc::new(|| 0);
+        let mut client = ClientSession::new(
+            ccfg,
+            DEV_CERT_PEM,
+            DEV_KEY_PEM,
+            DEV_CERT_PEM,
+            "rabbitcontrol",
+            Arc::clone(&cclock),
+        )
+        .expect("client new");
+        let negotiated = client.connect_and_handshake().expect("client handshake");
+        assert_eq!((negotiated.width, negotiated.height), (1512, 982));
+
+        // 1) 上报控制端支持 HEVC 的 ClientMediaCaps 后，被控端不得把 1512×982 自动放大到 2K。
+        let caps_msg = display_ctrl::encode_display_ctrl(&DisplayControlMsg::ClientMediaCaps {
+            decode_caps: rc_pipeline::default_codec_capabilities(true),
+            refinement_caps: None,
+            pref: crate::codec_selector::CodecSelectionPref::OfficeClear,
+            supports_ext_codec_flags: true,
+        })
+        .expect("encode ClientMediaCaps");
+        client
+            .send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, caps_msg)
+            .expect("send ClientMediaCaps");
+
+        let mut saw_initial_caps = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let _ = client.tick(Duration::from_millis(10), Instant::now());
+            for (ch, payload) in client.drain_tool_messages() {
+                if ch == TOOL_CHANNEL_DISPLAY_CTRL {
+                    if let Some(DisplayControlMsg::Capabilities {
+                        current_width,
+                        current_height,
+                        native_width,
+                        native_height,
+                        ..
+                    }) = display_ctrl::decode_display_ctrl(&payload)
+                    {
+                        assert_eq!((current_width, current_height), (1512, 982));
+                        assert_eq!((native_width, native_height), (1512, 982));
+                        saw_initial_caps = true;
+                    }
+                }
+            }
+            if saw_initial_caps {
+                break;
+            }
+        }
+        assert!(saw_initial_caps, "应收到保持 1512×982 的 Capabilities");
+
+        // 2) 仅切帧率（width=0, height=0, fps=120）同样保持被控端当前系统分辨率 1512×982。
+        let set_fps = display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetStream {
+            width: 0,
+            height: 0,
+            fps: 120,
+            codec: None,
+        })
+        .expect("encode SetStream");
+        client
+            .send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, set_fps)
+            .expect("send SetStream");
+
+        let mut saw_120_caps = false;
+        let deadline2 = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline2 && !saw_120_caps {
+            let _ = client.tick(Duration::from_millis(10), Instant::now());
+            for (ch, payload) in client.drain_tool_messages() {
+                if ch == TOOL_CHANNEL_DISPLAY_CTRL {
+                    if let Some(DisplayControlMsg::Capabilities {
+                        current_width,
+                        current_height,
+                        current_fps,
+                        ..
+                    }) = display_ctrl::decode_display_ctrl(&payload)
+                    {
+                        assert_eq!((current_width, current_height), (1512, 982));
+                        if current_fps == 120 {
+                            saw_120_caps = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_120_caps, "仅切帧率 120fps 后仍应保持 1512×982");
+
+        let _ = client.close(ByeReason::Normal);
+        stop_flag.store(true, Ordering::Release);
+        let _ = host_thread.join();
     }
 
     #[test]
@@ -12626,5 +13198,1327 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    #[test]
+    fn active_controller_session_name_fallback_priority_and_serde() {
+        let mut mock = rc_session::MockTransport::new();
+        let params = SessionParams {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_bps: 1_000_000,
+        };
+        mock.deliver_reliable(&rc_session::proto::ControlMessage::Hello(
+            rc_session::proto::Hello {
+                version: rc_session::proto::PROTOCOL_VERSION,
+                session_id: 42,
+                requested: params,
+                auth_method: rc_session::AuthMethod::None,
+                auth_payload: Vec::new(),
+            },
+        ));
+        let mut handle = mock.clone();
+        let capture = rc_capture::FakeBackend::new(rc_capture::FakeBackendConfig {
+            display: rc_capture::DisplayInfo {
+                id: rc_types::DisplayId(0),
+                resolution: Resolution::new(64, 64),
+                scale: 1.0,
+                hdr: false,
+            },
+            fps: 30,
+            content: rc_capture::FakeContent::Static,
+            dirty_rect: None,
+        })
+        .unwrap();
+        let encoder = rc_encode::FakeEncoder::new(rc_encode::EncoderConfig {
+            resolution: Resolution::new(64, 64),
+            fps: 30,
+            bitrate_bps: 1_000_000,
+            ..rc_encode::EncoderConfig::default()
+        })
+        .unwrap();
+        let mut host = HostSession::with_parts(
+            HostSessionConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                params,
+                Box::new(RecordingInjector::new()),
+            ),
+            Box::new(mock),
+            Box::new(capture),
+            Box::new(encoder),
+            Arc::new(|| 0),
+        )
+        .unwrap();
+        host.handshake().unwrap();
+
+        // 4th fallback: remote_addr
+        let hints_addr = ActiveControllerPeerHints {
+            remote_addr: "192.168.1.50:55555".to_string(),
+            ..Default::default()
+        };
+        let s4 = build_active_controller_session(&host, &hints_addr, 1_700_000_000_000);
+        assert_eq!(s4.session_id, "42");
+        assert_eq!(s4.controller_device_name, "192.168.1.50:55555");
+        assert_eq!(s4.mode, "remote_control");
+
+        // 3rd fallback: caller_device_id / relay_peer_id
+        let hints_did = ActiveControllerPeerHints {
+            relay_peer_id: Some("111222333".to_string()),
+            remote_addr: "192.168.1.50:55555".to_string(),
+            ..Default::default()
+        };
+        let s3 = build_active_controller_session(&host, &hints_did, 1_700_000_000_000);
+        assert_eq!(s3.controller_device_name, "111222333");
+        assert_eq!(s3.controller_device_id, "111222333");
+
+        // 2nd fallback: RelayIncoming.peer_name
+        let hints_relay_name = ActiveControllerPeerHints {
+            relay_peer_id: Some("111222333".to_string()),
+            relay_peer_name: Some("Office iMac".to_string()),
+            remote_addr: "192.168.1.50:55555".to_string(),
+            ..Default::default()
+        };
+        let s2 = build_active_controller_session(&host, &hints_relay_name, 1_700_000_000_000);
+        assert_eq!(s2.controller_device_name, "Office iMac");
+
+        // 1st priority: ControllerMeta.device_name
+        let meta = rc_session::ControllerMeta {
+            device_id: "999888777".to_string(),
+            device_name: "Meta MacBook".to_string(),
+            os: "macos".to_string(),
+            mode: rc_session::CONTROLLER_MODE_WATCH_ONLY,
+        };
+        handle.deliver_reliable(&rc_session::proto::ControlMessage::controller_meta(meta).unwrap());
+        host.tick(Duration::ZERO).unwrap();
+        let s1 = build_active_controller_session(&host, &hints_relay_name, 1_700_000_000_000);
+        assert_eq!(s1.controller_device_id, "999888777");
+        assert_eq!(s1.controller_device_name, "Meta MacBook");
+        assert_eq!(s1.controller_os, "macos");
+        assert_eq!(s1.mode, "watch_only");
+
+        let s_json = serde_json::to_string(&s1).unwrap();
+        let s_de: ActiveControllerSession = serde_json::from_str(&s_json).unwrap();
+        assert_eq!(s_de, s1);
+        let cmd_json = serde_json::to_string(&HostCommand::DisconnectController {
+            session_id: Some("sess-1".to_string()),
+        })
+        .unwrap();
+        let cmd_de: HostCommand = serde_json::from_str(&cmd_json).unwrap();
+        assert_eq!(
+            cmd_de,
+            HostCommand::DisconnectController {
+                session_id: Some("sess-1".to_string()),
+            }
+        );
+        host.close(ByeReason::Normal).unwrap();
+    }
+
+    #[test]
+    fn host_bridge_tracks_controller_meta_mode_changes_and_disconnect_controller() {
+        use crate::session_bridge::{SessionHandle, SessionUpdate, UiSessionConfig};
+
+        let mut host = HostHandle::spawn(UiHostConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            prefer_hardware: false,
+            require_approval: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            ..UiHostConfig::default()
+        })
+        .expect("spawn HostHandle");
+        let addr = host.listen_addr();
+
+        // 1) 首次连接：watch_only = true + 完整 ControllerMeta
+        let session = SessionHandle::spawn(UiSessionConfig {
+            connect_addr: addr,
+            watch_only: true,
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_bps: 1_000_000,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            self_device_id: Some("222333444".to_string()),
+            self_device_name: Some("Alice MacBook".to_string()),
+            self_os: Some("macos".to_string()),
+            ..UiSessionConfig::default()
+        });
+
+        let mut observed_meta: Option<ActiveControllerSession> = None;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            while let Some(upd) = host.try_recv_update() {
+                if let HostUpdate::ActiveControllersChanged { controllers } = upd {
+                    if let Some(first) = controllers.into_iter().next() {
+                        if first.controller_device_name == "Alice MacBook" {
+                            observed_meta = Some(first);
+                        }
+                    }
+                }
+            }
+            if observed_meta.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let ctrl = observed_meta.expect("host must observe ControllerMeta update");
+        assert_eq!(ctrl.controller_device_id, "222333444");
+        assert_eq!(ctrl.controller_device_name, "Alice MacBook");
+        assert_eq!(ctrl.controller_os, "macos");
+        assert_eq!(ctrl.mode, "watch_only");
+        assert!(!ctrl.is_owner);
+        assert!(ctrl.connected_at_ms > 0);
+        assert_eq!(host.active_controllers(), vec![ctrl.clone()]);
+
+        // 2) 运行期切换 watch_only -> remote_control，被控端应再次推送更新
+        session.set_watch_only(false);
+        let mut updated_mode = String::new();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            while let Some(upd) = host.try_recv_update() {
+                if let HostUpdate::ActiveControllersChanged { controllers } = upd {
+                    if let Some(first) = controllers.into_iter().next() {
+                        if first.mode == "remote_control" {
+                            updated_mode = first.mode;
+                        }
+                    }
+                }
+            }
+            if updated_mode == "remote_control" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(updated_mode, "remote_control");
+
+        // 3) 不匹配的 session_id 不得断开；匹配的 session_id 必须立即断开并推送空列表
+        assert!(!host.disconnect_controller(Some("wrong-session-id".to_string())));
+        assert!(!host.active_controllers().is_empty());
+
+        assert!(host.disconnect_controller(Some(ctrl.session_id.clone())));
+
+        let mut saw_empty = false;
+        let mut saw_listening = false;
+        let mut client_ended = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            while let Some(upd) = host.try_recv_update() {
+                match upd {
+                    HostUpdate::ActiveControllersChanged { controllers }
+                        if controllers.is_empty() =>
+                    {
+                        saw_empty = true;
+                    }
+                    HostUpdate::Listening { .. } if saw_empty => {
+                        saw_listening = true;
+                    }
+                    _ => {}
+                }
+            }
+            while let Some(su) = session.try_recv_update() {
+                if matches!(su, SessionUpdate::Ended { .. }) {
+                    client_ended = true;
+                }
+            }
+            if saw_empty && saw_listening && client_ended {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_empty,
+            "disconnect_controller must emit empty ActiveControllersChanged"
+        );
+        assert!(
+            saw_listening,
+            "host must re-enter Listening after disconnect"
+        );
+        assert!(client_ended, "controller session must end");
+        assert!(host.active_controllers().is_empty());
+        session.join();
+
+        // 4) 第二轮：tools_only + HostCommand::DisconnectController { session_id: None } 全断
+        let addr2 = host.listen_addr();
+        let session2 = SessionHandle::spawn(UiSessionConfig {
+            connect_addr: addr2,
+            tools_only: true,
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_bps: 1_000_000,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            self_device_id: Some("555666777".to_string()),
+            self_device_name: Some("Tools Client".to_string()),
+            self_os: Some("linux".to_string()),
+            ..UiSessionConfig::default()
+        });
+
+        let mut saw_tools = false;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            while let Some(upd) = host.try_recv_update() {
+                if let HostUpdate::ActiveControllersChanged { controllers } = upd {
+                    if controllers.first().is_some_and(|c| {
+                        c.controller_device_name == "Tools Client" && c.mode == "tools"
+                    }) {
+                        saw_tools = true;
+                    }
+                }
+            }
+            if saw_tools {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_tools,
+            "host must report mode='tools' for tools_only session"
+        );
+
+        host.send(HostCommand::DisconnectController { session_id: None });
+
+        let mut saw_empty2 = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            while let Some(upd) = host.try_recv_update() {
+                if let HostUpdate::ActiveControllersChanged { controllers } = upd {
+                    if controllers.is_empty() {
+                        saw_empty2 = true;
+                    }
+                }
+            }
+            if saw_empty2 && !session2.is_running() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_empty2,
+            "DisconnectController(None) must disconnect and emit empty list"
+        );
+        session2.join();
+        host.stop();
+    }
+
+    #[test]
+    fn host_bridge_legacy_client_without_controller_meta_still_streams_with_fallback_session() {
+        use rc_session::{ClientSession, ClientSessionConfig};
+
+        let mut host = HostHandle::spawn(UiHostConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            prefer_hardware: false,
+            require_approval: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            ..UiHostConfig::default()
+        })
+        .expect("spawn HostHandle");
+        let addr = host.listen_addr();
+
+        let cap =
+            Box::new(rc_session::testkit::ScriptedCapture::from_timeline(Vec::new()).unwrap());
+        let mut ccfg = ClientSessionConfig::new(
+            addr,
+            SessionParams {
+                width: 64,
+                height: 64,
+                fps: 30,
+                bitrate_bps: 1_000_000,
+            },
+            777,
+            cap,
+        );
+        ccfg.pipeline = PipelineConfig {
+            resolution: Resolution::new(64, 64),
+            fps: 30,
+            bitrate_bps: 1_000_000,
+            prefer_hardware: false,
+            ..PipelineConfig::default()
+        };
+        let mut client = ClientSession::new(
+            ccfg,
+            DEV_CERT_PEM,
+            DEV_KEY_PEM,
+            rc_session::dev_cert::dev_server_cert_pem(),
+            rc_session::dev_cert::DEV_SERVER_NAME,
+            Arc::new(|| 0),
+        )
+        .expect("ClientSession::new");
+        // 旧客户端未设置 controller_meta，握手后绝不发送 0x16 ControllerMeta。
+        client.connect_and_handshake().expect("legacy handshake");
+        assert_eq!(client.state(), SessionState::Streaming);
+
+        let mut observed: Option<ActiveControllerSession> = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let _ = client.tick(Duration::from_millis(5), Instant::now());
+            while let Some(upd) = host.try_recv_update() {
+                if let HostUpdate::ActiveControllersChanged { controllers } = upd {
+                    if let Some(first) = controllers.into_iter().next() {
+                        observed = Some(first);
+                    }
+                }
+            }
+            if observed.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let ctrl = observed.expect("host must emit fallback ActiveControllerSession");
+        assert_eq!(ctrl.session_id, "777");
+        assert!(!ctrl.controller_device_name.is_empty());
+        assert_eq!(ctrl.controller_os, "");
+        assert_eq!(ctrl.mode, "remote_control");
+        assert!(!ctrl.is_owner);
+
+        client
+            .close(ByeReason::Normal)
+            .expect("close legacy client");
+        host.stop();
+    }
+
+    fn make_test_relay_incoming(
+        session_id: &str,
+        peer_id: &str,
+        is_owner_connection: bool,
+        takeover: bool,
+    ) -> RelayIncoming {
+        RelayIncoming {
+            session_id: session_id.to_string(),
+            relay_addr: "127.0.0.1:21117".to_string(),
+            relay_token: "tok-test".to_string(),
+            peer_id: peer_id.to_string(),
+            peer_name: Some(format!("Device {peer_id}")),
+            peer_hostname: Some(format!("host-{peer_id}")),
+            peer_os: Some("macos".to_string()),
+            peer_public_addr: None,
+            peer_public_addrs: Vec::new(),
+            self_public_addr: None,
+            self_nat_type: crate::nat::NatType::Unknown,
+            self_nat_port_delta: None,
+            self_nat_port_range: None,
+            peer_nat_type: crate::nat::NatType::Unknown,
+            peer_nat_port_delta: None,
+            peer_nat_port_range: None,
+            punch_secret: None,
+            start_after_ms: None,
+            relay_fallback_after_ms: None,
+            peer_lan_addrs: vec!["127.0.0.1:21115".to_string()],
+            local_udp_port: None,
+            owner_grant: None,
+            is_owner_connection,
+            takeover,
+            is_relay_alloc: false,
+        }
+    }
+
+    #[test]
+    fn bounded_relay_incoming_takeover_preempts_active_and_protects_non_takeover() {
+        let q = BoundedRelayIncomingQueue::new(4);
+
+        // 1) 非接管请求：活跃期间（idle_us=0, !detached）不得抢占不同设备
+        q.push(make_test_relay_incoming("s-normal", "peer-b", true, false));
+        assert_eq!(
+            q.check_preempt_candidate_with_switch(
+                Duration::from_secs(20),
+                Some("peer-a"),
+                0,
+                false,
+                None,
+                false,
+            ),
+            PreemptDecision::None
+        );
+        // 有 lan_addrs 且刚入队，非接管请求需等待 lan_grace
+        assert!(q
+            .pop_ready(Duration::from_secs(20), Duration::from_secs(5))
+            .is_none());
+        assert!(!q.has_pending_takeover_or_same_peer(Some("peer-other"), Duration::from_secs(20)));
+        assert!(q.has_pending_takeover_or_same_peer(Some("peer-b"), Duration::from_secs(20)));
+
+        // 2) 未经 Owner 身份校验的伪造 takeover=true（is_owner_connection=false）不得触发接管
+        let q_unverified = BoundedRelayIncomingQueue::new(4);
+        q_unverified.push(make_test_relay_incoming("s-spoof", "peer-c", false, true));
+        assert_eq!(
+            q_unverified.check_preempt_candidate_with_switch(
+                Duration::from_secs(20),
+                Some("peer-a"),
+                0,
+                false,
+                None,
+                false,
+            ),
+            PreemptDecision::None
+        );
+        assert!(!q_unverified
+            .has_pending_takeover_or_same_peer(Some("peer-other"), Duration::from_secs(20)));
+
+        // 3) 合法同账号 takeover=true && is_owner_connection=true：
+        //    无视 0us 活跃期立即返回 TakeoverOwner，插队排在普通请求前且跳过 lan_grace
+        q.push(make_test_relay_incoming(
+            "s-takeover",
+            "peer-owner-2",
+            true,
+            true,
+        ));
+        assert_eq!(
+            q.check_preempt_candidate_with_switch(
+                Duration::from_secs(20),
+                Some("peer-a"),
+                0,
+                false,
+                None,
+                false,
+            ),
+            PreemptDecision::TakeoverOwner
+        );
+        assert!(q.has_pending_takeover_or_same_peer(Some("peer-other"), Duration::from_secs(20)));
+        let popped = q
+            .pop_ready(Duration::from_secs(20), Duration::from_secs(5))
+            .expect("owner takeover must bypass lan_grace and jump to front");
+        assert_eq!(popped.session_id, "s-takeover");
+    }
+
+    fn read_mock_signal_frame(stream: &mut std::net::TcpStream) -> serde_json::Value {
+        use std::io::Read;
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).expect("read frame len");
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).expect("read frame body");
+        serde_json::from_slice(&body).expect("parse signal json")
+    }
+
+    fn write_mock_signal_frame(stream: &mut std::net::TcpStream, val: &serde_json::Value) {
+        use std::io::Write;
+        let body = serde_json::to_vec(val).unwrap();
+        let mut frame = Vec::with_capacity(4 + body.len());
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+        stream.write_all(&frame).expect("write signal frame");
+        stream.flush().expect("flush signal frame");
+    }
+
+    #[test]
+    fn host_bridge_force_disconnect_and_busy_lan_rejection_e2e() {
+        use crate::server_config::{ServerConfig, ServerConnectionState};
+        use crate::session_bridge::{SessionHandle, SessionUpdate, UiSessionConfig};
+        use rc_session::{ClientSession, ClientSessionConfig};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind signal");
+        let signal_addr = listener.local_addr().expect("signal addr");
+        let (report_tx, report_rx) = mpsc::channel::<Vec<ActiveControllerSummary>>();
+        let (send_fd_tx, send_fd_rx) = mpsc::channel::<(Option<String>, Option<String>)>();
+        let (stop_sig_tx, stop_sig_rx) = mpsc::channel::<()>();
+
+        let srv_jh = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept signal");
+            conn.set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("set read timeout");
+            let reg = read_mock_signal_frame(&mut conn);
+            assert_eq!(reg["type"], "register");
+            write_mock_signal_frame(
+                &mut conn,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "900100200",
+                    "formatted_id": "900 100 200",
+                    "udp_probe_addr": "",
+                    "relay_addr": "127.0.0.1:21117",
+                }),
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if stop_sig_rx.try_recv().is_ok() {
+                    break;
+                }
+                while let Ok((cdid, sid)) = send_fd_rx.try_recv() {
+                    write_mock_signal_frame(
+                        &mut conn,
+                        &serde_json::json!({
+                            "type": "force_disconnect",
+                            "requester_device_id": "111222333",
+                            "controller_device_id": cdid,
+                            "session_id": sid,
+                        }),
+                    );
+                }
+                let mut len_buf = [0u8; 4];
+                match std::io::Read::read(&mut conn, &mut len_buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut rem = n;
+                        while rem < 4 {
+                            let k = std::io::Read::read(&mut conn, &mut len_buf[rem..])
+                                .expect("finish frame len");
+                            assert!(k > 0);
+                            rem += k;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut body = vec![0u8; len];
+                        std::io::Read::read_exact(&mut conn, &mut body).expect("read body");
+                        let val: serde_json::Value =
+                            serde_json::from_slice(&body).expect("json body");
+                        if val["type"] == "control_state_report" {
+                            let ctrls: Vec<ActiveControllerSummary> =
+                                serde_json::from_value(val["active_controllers"].clone())
+                                    .expect("active_controllers json");
+                            let _ = report_tx.send(ctrls);
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let sig_cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: signal_addr.port(),
+            relay_port: 21117,
+            api_port: 21118,
+            use_https: false,
+            ..ServerConfig::default()
+        };
+        let sig = crate::signal_client::SignalClientHandle::spawn(
+            sig_cfg,
+            "host-sig-key".to_string(),
+            Vec::new(),
+        );
+        let sig_arc = Arc::new(sig);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if sig_arc.status().state == ServerConnectionState::Connected {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut host = HostHandle::spawn(UiHostConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            prefer_hardware: false,
+            require_approval: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            ..UiHostConfig::default()
+        })
+        .expect("spawn HostHandle");
+        host.set_signal_client(Some(Arc::clone(&sig_arc)));
+        let host_addr = host.listen_addr();
+
+        // 1) 控制端 1 正常直连，信令服务端必须收到 active_controllers.len() == 1 的同步报告
+        let session1 = SessionHandle::spawn(UiSessionConfig {
+            connect_addr: host_addr,
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_bps: 1_000_000,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            self_device_id: Some("111222333".to_string()),
+            self_device_name: Some("Controller One".to_string()),
+            self_os: Some("macos".to_string()),
+            ..UiSessionConfig::default()
+        });
+
+        let mut active_ctrl = None;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            while let Ok(ctrls) = report_rx.try_recv() {
+                if let Some(first) = ctrls.into_iter().next() {
+                    active_ctrl = Some(first);
+                }
+            }
+            if active_ctrl.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let ctrl = active_ctrl.expect("signal server must receive control_state_report(1)");
+        assert_eq!(ctrl.controller_device_id, "111222333");
+        assert_eq!(ctrl.controller_device_name, "Controller One");
+
+        // 2) 未声明接管的新直连控制端在被控端繁忙时必须被明确拒收为 HostBusyControlled，
+        //    同时原控制端 1 保持活跃不断线
+        let cap2 =
+            Box::new(rc_session::testkit::ScriptedCapture::from_timeline(Vec::new()).unwrap());
+        let mut ccfg2 = ClientSessionConfig::new(
+            host_addr,
+            SessionParams {
+                width: 64,
+                height: 64,
+                fps: 30,
+                bitrate_bps: 1_000_000,
+            },
+            9901,
+            cap2,
+        );
+        ccfg2.pipeline = PipelineConfig {
+            resolution: Resolution::new(64, 64),
+            fps: 30,
+            bitrate_bps: 1_000_000,
+            prefer_hardware: false,
+            ..PipelineConfig::default()
+        };
+        let mut client2 = ClientSession::new(
+            ccfg2,
+            DEV_CERT_PEM,
+            DEV_KEY_PEM,
+            rc_session::dev_cert::dev_server_cert_pem(),
+            rc_session::dev_cert::DEV_SERVER_NAME,
+            Arc::new(|| 0),
+        )
+        .expect("client2");
+        let err2 = client2
+            .connect_and_handshake()
+            .expect_err("extra LAN client must be rejected when host busy");
+        assert!(
+            err2.to_string().contains("HostBusyControlled"),
+            "unexpected error: {err2}"
+        );
+        assert!(client2.handshake_busy_controlled());
+        assert_eq!(host.active_controllers().len(), 1);
+
+        // 3) 不匹配的 force_disconnect 不得断开；匹配的 force_disconnect 立即踢断并上报空列表
+        send_fd_tx
+            .send((Some("other-did".to_string()), Some("other-sid".to_string())))
+            .unwrap();
+        thread::sleep(Duration::from_millis(120));
+        assert_eq!(host.active_controllers().len(), 1);
+
+        send_fd_tx
+            .send((Some("111222333".to_string()), Some(ctrl.session_id.clone())))
+            .unwrap();
+
+        let mut reported_empty = false;
+        let mut session1_ended_non_recoverable = false;
+        let mut session1_disc_non_recoverable = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            while let Ok(ctrls) = report_rx.try_recv() {
+                if ctrls.is_empty() {
+                    reported_empty = true;
+                }
+            }
+            while let Some(su) = session1.try_recv_update() {
+                match su {
+                    SessionUpdate::Disconnected {
+                        preempted,
+                        busy_controlled,
+                        auto_reconnect_eligible,
+                        ..
+                    } => {
+                        assert!(
+                            !auto_reconnect_eligible && !preempted && !busy_controlled,
+                            "ForceDisconnect must emit non-recoverable Disconnected (got preempted={preempted}, busy={busy_controlled}, auto={auto_reconnect_eligible})"
+                        );
+                        session1_disc_non_recoverable = true;
+                    }
+                    SessionUpdate::Ended { recoverable, .. } => {
+                        assert!(
+                            !recoverable,
+                            "ForceDisconnect must emit Ended with recoverable=false"
+                        );
+                        session1_ended_non_recoverable = true;
+                    }
+                    _ => {}
+                }
+            }
+            if reported_empty && session1_ended_non_recoverable && session1_disc_non_recoverable {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            reported_empty,
+            "must report empty control_state after ForceDisconnect"
+        );
+        assert!(
+            session1_disc_non_recoverable,
+            "controller 1 must receive Disconnected with auto_reconnect_eligible=false"
+        );
+        assert!(
+            session1_ended_non_recoverable,
+            "controller 1 must receive Ended with recoverable=false"
+        );
+        assert!(host.active_controllers().is_empty());
+
+        session1.join();
+        host.stop();
+        drop(sig_arc);
+        let _ = stop_sig_tx.send(());
+        srv_jh.join().unwrap();
+    }
+
+    #[test]
+    fn host_bridge_owner_takeover_preempts_active_controller_under_1500ms() {
+        use crate::session_bridge::{SessionHandle, SessionUpdate, UiSessionConfig};
+
+        let mut host = HostHandle::spawn(UiHostConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            prefer_hardware: false,
+            require_approval: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            ..UiHostConfig::default()
+        })
+        .expect("spawn HostHandle");
+        let host_addr = host.listen_addr();
+
+        let session1 = SessionHandle::spawn(UiSessionConfig {
+            connect_addr: host_addr,
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_bps: 1_000_000,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            self_device_id: Some("111222333".to_string()),
+            self_device_name: Some("Old Controller".to_string()),
+            self_os: Some("macos".to_string()),
+            ..UiSessionConfig::default()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline && host.active_controllers().is_empty() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(host.active_controllers().len(), 1);
+
+        // 绑定不可达本地端口仅用于触发接管切流：验证旧控制端 <= 1.5s 收到 ByeReason::Preempted 且禁用重连
+        let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+
+        let started = Instant::now();
+        let mut inc = make_test_relay_incoming("takeover-sid-2", "222333444", true, true);
+        inc.relay_addr = dead_addr.to_string();
+        host.offer_relay_incoming(inc);
+
+        let mut saw_preempted_disc = false;
+        let mut saw_non_recoverable_end = false;
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            while let Some(su) = session1.try_recv_update() {
+                match su {
+                    SessionUpdate::Disconnected {
+                        preempted,
+                        busy_controlled,
+                        auto_reconnect_eligible,
+                        ui_error,
+                        ..
+                    } => {
+                        if preempted && !busy_controlled && !auto_reconnect_eligible {
+                            assert_eq!(
+                                ui_error.as_ref().map(|e| e.code.as_str()),
+                                Some("session.preempted")
+                            );
+                            saw_preempted_disc = true;
+                        }
+                    }
+                    SessionUpdate::Ended { recoverable, .. } if !recoverable => {
+                        saw_non_recoverable_end = true;
+                    }
+                    _ => {}
+                }
+            }
+            if saw_preempted_disc && saw_non_recoverable_end {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_preempted_disc && saw_non_recoverable_end,
+            "takeover must preempt active controller with ByeReason::Preempted in <=1.5s (elapsed={:?})",
+            started.elapsed()
+        );
+
+        session1.join();
+        host.stop();
+    }
+
+    #[test]
+    fn host_bridge_legacy_set_media_paused_refreshes_active_controllers_and_signal() {
+        use crate::server_config::{ServerConfig, ServerConnectionState};
+        use rc_session::{ClientSession, ClientSessionConfig};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind signal");
+        let signal_addr = listener.local_addr().expect("signal addr");
+        let (report_tx, report_rx) = mpsc::channel::<Vec<ActiveControllerSummary>>();
+        let (stop_sig_tx, stop_sig_rx) = mpsc::channel::<()>();
+
+        let srv_jh = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept signal");
+            conn.set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("set read timeout");
+            let reg = read_mock_signal_frame(&mut conn);
+            assert_eq!(reg["type"], "register");
+            write_mock_signal_frame(
+                &mut conn,
+                &serde_json::json!({
+                    "type": "registered",
+                    "device_id": "900100201",
+                    "formatted_id": "900 100 201",
+                    "udp_probe_addr": "",
+                    "relay_addr": "127.0.0.1:21117",
+                }),
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if stop_sig_rx.try_recv().is_ok() {
+                    break;
+                }
+                let mut len_buf = [0u8; 4];
+                match std::io::Read::read(&mut conn, &mut len_buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut full = Vec::from(&len_buf[..n]);
+                        while full.len() < 4 {
+                            let mut more = [0u8; 4];
+                            let k = std::io::Read::read(&mut conn, &mut more[..4 - full.len()])
+                                .expect("read rest len");
+                            if k == 0 {
+                                break;
+                            }
+                            full.extend_from_slice(&more[..k]);
+                        }
+                        if full.len() < 4 {
+                            break;
+                        }
+                        let len = u32::from_be_bytes([full[0], full[1], full[2], full[3]]) as usize;
+                        let mut body = vec![0u8; len];
+                        std::io::Read::read_exact(&mut conn, &mut body).expect("read body");
+                        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+                        if v["type"] == "control_state_report" {
+                            let ctrls: Vec<ActiveControllerSummary> =
+                                serde_json::from_value(v["active_controllers"].clone())
+                                    .expect("active_controllers json");
+                            let _ = report_tx.send(ctrls);
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let sig_cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: signal_addr.port(),
+            relay_port: 21117,
+            api_port: 21118,
+            use_https: false,
+            ..ServerConfig::default()
+        };
+        let sig_arc = Arc::new(crate::signal_client::SignalClientHandle::spawn(
+            sig_cfg,
+            "host-sig-legacy".to_string(),
+            Vec::new(),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if sig_arc.status().state == ServerConnectionState::Connected {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut host = HostHandle::spawn(UiHostConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            prefer_hardware: false,
+            require_approval: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            ..UiHostConfig::default()
+        })
+        .expect("spawn HostHandle");
+        host.set_signal_client(Some(Arc::clone(&sig_arc)));
+        let host_addr = host.listen_addr();
+
+        let mut ccfg = ClientSessionConfig::new(
+            host_addr,
+            SessionParams {
+                width: 64,
+                height: 64,
+                fps: 30,
+                bitrate_bps: 1_000_000,
+            },
+            6601,
+            Box::new(rc_session::testkit::ScriptedCapture::from_timeline(Vec::new()).unwrap()),
+        );
+        ccfg.pipeline = PipelineConfig {
+            resolution: Resolution::new(64, 64),
+            fps: 30,
+            bitrate_bps: 1_000_000,
+            prefer_hardware: false,
+            ..PipelineConfig::default()
+        };
+        let mut client = ClientSession::new(
+            ccfg,
+            DEV_CERT_PEM,
+            DEV_KEY_PEM,
+            rc_session::dev_cert::dev_server_cert_pem(),
+            rc_session::dev_cert::DEV_SERVER_NAME,
+            Arc::new(|| 0),
+        )
+        .expect("client");
+        client
+            .connect_and_handshake()
+            .expect("connect_and_handshake");
+        // 默认 Welcome.host_flags 绝不置位超出 v0.2.7 KNOWN_MASK(0x03) 的位。
+        assert!(!client.peer_supports_pixel_scroll());
+        assert!(!client.peer_supports_controller_meta());
+
+        let wait_mode = |client: &mut ClientSession, expected_mode: &str| {
+            let dl = Instant::now() + Duration::from_secs(4);
+            let mut saw_local = false;
+            let mut saw_signal = false;
+            while Instant::now() < dl {
+                let _ = client.tick(Duration::from_millis(5), Instant::now());
+                if host
+                    .active_controllers()
+                    .first()
+                    .is_some_and(|c| c.mode == expected_mode)
+                {
+                    saw_local = true;
+                }
+                while let Ok(ctrls) = report_rx.try_recv() {
+                    if ctrls.first().is_some_and(|c| c.mode == expected_mode) {
+                        saw_signal = true;
+                    }
+                }
+                if saw_local && saw_signal {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "timed out waiting for mode={expected_mode} (saw_local={saw_local}, saw_signal={saw_signal})"
+            );
+        };
+
+        // 1) 初始无 ControllerMeta 时模式为 "remote_control"
+        wait_mode(&mut client, "remote_control");
+
+        // 2) 旧客户端发送 SetMediaPaused(true) -> active_controllers 与信令上报必须切为 "tools"
+        let pause_payload =
+            display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetMediaPaused { paused: true })
+                .unwrap();
+        client
+            .send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, pause_payload)
+            .expect("send SetMediaPaused(true)");
+        wait_mode(&mut client, "tools");
+
+        // 3) 旧客户端发送 SetMediaPaused(false) -> 恢复为 "remote_control"
+        let resume_payload =
+            display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetMediaPaused { paused: false })
+                .unwrap();
+        client
+            .send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, resume_payload)
+            .expect("send SetMediaPaused(false)");
+        wait_mode(&mut client, "remote_control");
+
+        client.close(ByeReason::Normal).expect("close client");
+        host.stop();
+        drop(sig_arc);
+        let _ = stop_sig_tx.send(());
+        srv_jh.join().unwrap();
+    }
+
+    #[test]
+    fn host_bridge_reconnecting_lan_client_receives_busy_controlled_when_replaced() {
+        use crate::session_bridge::{SessionHandle, SessionUpdate, UiSessionConfig};
+        use rc_net::quic::{Identity, QuicEndpoint};
+        use rc_net::{NetConfig, Role};
+        use rc_session::{ClientSession, ClientSessionConfig};
+
+        let mut host = HostHandle::spawn(UiHostConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            prefer_hardware: false,
+            require_approval: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            ..UiHostConfig::default()
+        })
+        .expect("spawn HostHandle");
+        let host_addr = host.listen_addr();
+
+        // 先由控制端 2 占住被控端活跃会话。
+        let session2 = SessionHandle::spawn(UiSessionConfig {
+            connect_addr: host_addr,
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_bps: 1_000_000,
+            prefer_hardware: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            self_device_id: Some("222333444".to_string()),
+            self_device_name: Some("Active Controller".to_string()),
+            self_os: Some("macos".to_string()),
+            ..UiSessionConfig::default()
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline && host.active_controllers().is_empty() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(host.active_controllers().len(), 1);
+        assert!(
+            session2.peer_supports_pixel_scroll(),
+            "HostHandle <-> SessionHandle must negotiate pixel_scroll via DisplayControlMsg::Capabilities"
+        );
+
+        // 模拟原直连 LAN 客户端处于 Reconnecting 期（发 ReconnectRequest），
+        // 向已被占用的 HostHandle 重连：必须立即收到 HostBusyControlled 且不耗尽 5 次退避。
+        let mut old_mock = rc_session::MockTransport::new();
+        old_mock.deliver_reliable(&rc_session::proto::ControlMessage::Welcome(
+            rc_session::proto::Welcome {
+                session_id: 5501,
+                granted: SessionParams {
+                    width: 64,
+                    height: 64,
+                    fps: 30,
+                    bitrate_bps: 1_000_000,
+                },
+                auth_status: rc_session::proto::AuthStatus::Ok,
+                host_flags: rc_session::proto::HostFlags(0),
+            },
+        ));
+        let mut old_handle = old_mock.clone();
+        let mut old_ccfg = ClientSessionConfig::new(
+            host_addr,
+            SessionParams {
+                width: 64,
+                height: 64,
+                fps: 30,
+                bitrate_bps: 1_000_000,
+            },
+            5501,
+            Box::new(rc_session::testkit::ScriptedCapture::from_timeline(Vec::new()).unwrap()),
+        );
+        old_ccfg.pipeline = PipelineConfig {
+            resolution: Resolution::new(64, 64),
+            fps: 30,
+            bitrate_bps: 1_000_000,
+            prefer_hardware: false,
+            ..PipelineConfig::default()
+        };
+        let mut old_client = ClientSession::with_parts(
+            old_ccfg,
+            Box::new(old_mock),
+            Box::new(rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig::default()).unwrap()),
+            Box::new(
+                rc_render::FakeRenderer::new(rc_render::FakeRendererConfig::default()).unwrap(),
+            ),
+            Arc::new(|| 0),
+        )
+        .expect("old_client");
+        old_client.handshake().expect("initial handshake");
+        old_client.set_connect_factory(Box::new(move || {
+            let identity = Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM)?;
+            let net = NetConfig {
+                role: Role::Controller,
+                local_addr: "0.0.0.0:0".parse().unwrap(),
+                peer_addr: Some(host_addr),
+                mtu: rc_session::DEFAULT_SESSION_MTU,
+            };
+            let ep = QuicEndpoint::new(&net, &identity)?;
+            let certs = Identity::certs_from_pem(rc_session::dev_cert::dev_server_cert_pem())?;
+            let t = ep.connect(
+                host_addr,
+                &certs,
+                rc_session::dev_cert::DEV_SERVER_NAME,
+                Duration::from_secs(5),
+            )?;
+            Ok(Box::new(t))
+        }));
+        old_client.set_pipeline_factory(Box::new(|| {
+            rc_pipeline::ControllerPipeline::with_backends(
+                PipelineConfig {
+                    resolution: Resolution::new(64, 64),
+                    fps: 30,
+                    bitrate_bps: 1_000_000,
+                    prefer_hardware: false,
+                    ..PipelineConfig::default()
+                },
+                Box::new(
+                    rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig::default()).unwrap(),
+                ),
+                Box::new(
+                    rc_render::FakeRenderer::new(rc_render::FakeRendererConfig::default()).unwrap(),
+                ),
+            )
+        }));
+        old_handle.deliver(NetEvent::Disconnected {
+            reason: "lan drop".into(),
+        });
+        old_client
+            .tick(Duration::ZERO, Instant::now())
+            .expect("enter reconnecting");
+        assert_eq!(old_client.state(), SessionState::Reconnecting);
+
+        // 第 1 拍建连并发送 ReconnectRequest，随后轮询等待 HostHandle 繁忙拒收返回。
+        let first_out = old_client
+            .tick_reconnect(500_000)
+            .expect("first reconnect connect");
+        assert_eq!(first_out, rc_session::ReconnectOutcome::Connecting);
+
+        let mut got_err = None;
+        let dl = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < dl {
+            match old_client.tick_reconnect(500_000) {
+                Ok(_) => thread::sleep(Duration::from_millis(10)),
+                Err(e) => {
+                    got_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err =
+            got_err.expect("reconnecting LAN client must be rejected with HostBusyControlled");
+        assert!(
+            err.to_string().contains("HostBusyControlled"),
+            "unexpected error: {err}"
+        );
+        assert!(old_client.handshake_busy_controlled());
+        assert_eq!(old_client.state(), SessionState::Closed);
+        assert_eq!(old_client.reconnect_stats().reconnect_attempts, 1);
+
+        // 确认原活跃控制端 session2 仍保持活跃。
+        assert!(
+            session2
+                .try_recv_update()
+                .is_none_or(|u| !matches!(u, SessionUpdate::Ended { .. })),
+            "active controller must stay connected"
+        );
+        assert_eq!(host.active_controllers().len(), 1);
+
+        session2.send(crate::session_bridge::SessionCommand::Disconnect);
+        session2.join();
+        host.stop();
+    }
+
+    #[test]
+    fn busy_lan_reject_sends_bye_refresh_for_same_active_peer_and_worker_is_nonblocking() {
+        use crate::relay_transport::tests::mtls_test_certs::TestCa;
+
+        let mut ca = TestCa::new("BusyLanSamePeerCA");
+        let (host_cert, host_key) = ca.issue_device("user-1", "200000001");
+        let (same_cert, same_key) = ca.issue_device("user-1", "100000001");
+
+        let host_bundle = SessionMtlsBundle {
+            ca_cert_pem: ca.ca_pem.clone(),
+            cert_pem: host_cert,
+            key_pem: host_key,
+            local_user_id: "user-1".to_string(),
+            expected_peer_device_id: None,
+            expected_peer_user_id: None,
+        };
+        let same_bundle = SessionMtlsBundle {
+            ca_cert_pem: ca.ca_pem.clone(),
+            cert_pem: same_cert,
+            key_pem: same_key,
+            local_user_id: "user-1".to_string(),
+            expected_peer_device_id: Some("200000001".to_string()),
+            expected_peer_user_id: Some("user-1".to_string()),
+        };
+
+        let host_ep =
+            bind_mtls_lan_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), &host_bundle)
+                .expect("bind mtls host endpoint");
+        let host_addr = host_ep.local_addr().expect("host addr");
+
+        let active_controllers: SharedActiveControllers =
+            Arc::new(Mutex::new(vec![ActiveControllerSession {
+                session_id: "active-sid".to_string(),
+                controller_device_id: "100000001".to_string(),
+                controller_device_name: "Same Controller".to_string(),
+                controller_os: "macos".to_string(),
+                is_owner: true,
+                mode: "remote_control".to_string(),
+                connected_at_ms: 1,
+            }]));
+
+        let caps = SessionParams {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_bps: 1_000_000,
+        };
+        let t0 = Instant::now();
+        let worker = BusyLanRejectWorker::spawn(
+            host_ep.clone(),
+            caps,
+            Some(Arc::clone(&active_controllers)),
+            None,
+        );
+        worker.set_active();
+        assert!(
+            t0.elapsed() < Duration::from_millis(50),
+            "spawning/activating BusyLanRejectWorker must never block caller"
+        );
+
+        let dev_id = rc_net::quic::Identity::from_pem(DEV_CERT_PEM, DEV_KEY_PEM).expect("dev id");
+        let client_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Controller, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            &dev_id,
+        )
+        .expect("client ep");
+        let same_mtls = same_bundle.to_quic_mtls_config().expect("same mtls");
+        let mut client_t = client_ep
+            .connect_mtls(host_addr, &same_mtls, "", Duration::from_secs(3))
+            .expect("connect_mtls");
+
+        // 同设备重连/并发连入时不得静默 drop，必须收到显式 Bye(Refresh)。
+        let mut got_bye_refresh = false;
+        let dl = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < dl && !got_bye_refresh {
+            match client_t.poll(Duration::from_millis(20)) {
+                Ok(events) => {
+                    for ev in events {
+                        if let NetEvent::Reliable(bytes) = ev {
+                            if let Ok(rc_session::ControlMessage::Bye {
+                                reason: ByeReason::Refresh,
+                            }) = rc_session::ControlMessage::decode(&bytes)
+                            {
+                                got_bye_refresh = true;
+                            }
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            got_bye_refresh,
+            "same_active_peer arriving on busy LAN endpoint must receive explicit Bye(Refresh)"
+        );
+
+        let drop_started = Instant::now();
+        drop(worker);
+        assert!(
+            drop_started.elapsed() < Duration::from_millis(200),
+            "dropping BusyLanRejectWorker must wake and join promptly"
+        );
     }
 }

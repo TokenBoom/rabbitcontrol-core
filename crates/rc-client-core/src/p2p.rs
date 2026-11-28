@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -306,6 +306,10 @@ impl Transport for P2pQuicConnection {
         self.transport.send_datagram(data)
     }
 
+    fn send_datagrams_batch(&mut self, datagrams: &[Vec<u8>]) -> rc_types::Result<usize> {
+        self.transport.send_datagrams_batch(datagrams)
+    }
+
     fn send_reliable(&mut self, data: &[u8]) -> rc_types::Result<()> {
         self.transport.send_reliable(data)
     }
@@ -332,6 +336,18 @@ impl Transport for P2pQuicConnection {
 
     fn tx_dropped_datagrams(&self) -> u64 {
         self.transport.tx_dropped_datagrams()
+    }
+
+    fn reliable_tx_queued_len(&self) -> usize {
+        self.transport.reliable_tx_queued_len()
+    }
+
+    fn has_live_rtt(&self) -> bool {
+        self.transport.has_live_rtt()
+    }
+
+    fn wake_handle(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        self.transport.wake_handle()
     }
 }
 

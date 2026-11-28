@@ -150,8 +150,8 @@ pub struct ControllerPipeline {
 /// `LostInNetwork`，禁止为了减少丢帧而调大。
 const MAX_PARTIALS: usize = 2;
 
-/// 常规单帧解码 deadline 余量（微秒）。
-const DECODE_BUDGET_US: u32 = 3_000;
+/// 常规单帧解码 deadline 余量（微秒；6ms 兼顾 Retina/1080p 硬解瞬态波动与 120fps 节拍）。
+const DECODE_BUDGET_US: u32 = 6_000;
 /// 高分屏（>2.6M 像素）或 IDR 帧解码 deadline 余量（微秒）。
 const HIGH_RES_DECODE_BUDGET_US: u32 = 10_000;
 /// `async_decode` 有界帧队列容量（严格遵守 TASK.md 铁律 1：解码队列上限 ≤ 2；
