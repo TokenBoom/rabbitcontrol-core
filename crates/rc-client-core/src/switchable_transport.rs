@@ -2753,7 +2753,7 @@ mod tests {
             true,
             Duration::from_secs(2),
             Duration::from_millis(900),
-            Some(400_000),
+            Some(800_000),
             Some(0.02),
         )
         .unwrap();

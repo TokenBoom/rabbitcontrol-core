@@ -16167,7 +16167,10 @@ mod tests {
                     active_ctrl = Some(first);
                 }
             }
-            if active_ctrl.is_some() {
+            if active_ctrl
+                .as_ref()
+                .is_some_and(|c| c.controller_device_id == "111222333")
+            {
                 break;
             }
             thread::sleep(Duration::from_millis(10));

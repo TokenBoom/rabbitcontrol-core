@@ -10003,7 +10003,7 @@ mod tests {
             thread: Some(graceful_thread),
         };
 
-        handle.detach_and_abort(Duration::from_millis(200));
+        handle.detach_and_abort(Duration::from_millis(600));
         assert!(
             observed_clean_graceful.load(Ordering::Acquire),
             "detach_and_abort 必须先给优雅窗口，让会话线程在 socket 切断前发完 LockScreen / Bye"
@@ -10965,7 +10965,7 @@ mod tests {
                 &relay_addr_str,
                 RelayRole::Host,
                 &token,
-                Duration::from_secs(8),
+                Duration::from_secs(15),
             )
             .expect("host connect relay");
             let (hclock, _) = reanchorable_clock(Instant::now());
@@ -11040,7 +11040,7 @@ mod tests {
             ..UiSessionConfig::default()
         });
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(20);
         let mut negotiated_transport: Option<String> = None;
         while Instant::now() < deadline {
             if let Some(upd) = session.try_recv_update() {

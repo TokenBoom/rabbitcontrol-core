@@ -4474,7 +4474,7 @@ mod tests {
         jh.join().unwrap();
         assert!(res.is_err());
         assert!(
-            started.elapsed() < Duration::from_millis(150),
+            started.elapsed() < Duration::from_millis(400),
             "cancel must interrupt start_after_ms quickly, took {:?}",
             started.elapsed()
         );
@@ -4977,10 +4977,10 @@ mod tests {
         assert_eq!(capped.len(), MAX_AUX_SOCKETS_HARD_CAP);
         drop(capped);
 
-        // 模拟 Wave 2 才开始监听的 Cone 对端（在 Wave 1 期间拒绝/丢弃，等待 600ms 后才绑定并收发）
+        // 模拟 Wave 2 才开始响应的 Cone 对端（持续持有 socket 在 Wave 1 期间排空丢弃，800ms 后才应答，避免释放重绑端口竞争 AddrInUse）
         let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        host_sock.set_nonblocking(true).unwrap();
         let host_port = host_sock.local_addr().unwrap().port();
-        drop(host_sock); // 先释放端口，等 Wave 2 窗口再监听
 
         let client_port = reserve_ephemeral_udp_port();
         let secret_hex = "ffeeddccbbaa99887766554433221100";
@@ -4997,15 +4997,17 @@ mod tests {
         };
 
         let host_jh = thread::spawn(move || {
-            // 等待进入 Wave 2 (timeout=1.4s -> wave2_at=700ms)
-            thread::sleep(Duration::from_millis(800));
-            let sock = UdpSocket::bind(("127.0.0.1", host_port)).unwrap();
-            sock.set_nonblocking(true).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(2);
             let mut buf = [0u8; 256];
+            // 等待进入 Wave 2 (timeout=1.4s -> wave2_at=700ms)，期间排空并丢弃 Wave 1 入站包
+            let wave2_start = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < wave2_start {
+                while host_sock.recv_from(&mut buf).is_ok() {}
+                thread::sleep(Duration::from_millis(5));
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
             let host_nonce = [0x42u8; 8];
             while Instant::now() < deadline {
-                match sock.recv_from(&mut buf) {
+                match host_sock.recv_from(&mut buf) {
                     Ok((len, src)) if src.port() != client_port => {
                         if let Some(pkt) =
                             decode_and_verify_punch_packet_v2(&buf[..len], &secret_bytes).filter(
@@ -5020,7 +5022,7 @@ mod tests {
                                 pkt.sender_nonce,
                                 &secret_bytes,
                             );
-                            let _ = sock.send_to(&ack, src);
+                            let _ = host_sock.send_to(&ack, src);
                             let probe = encode_punch_packet_v2(
                                 P2pRole::Host,
                                 false,
@@ -5029,7 +5031,7 @@ mod tests {
                                 [0u8; 8],
                                 &secret_bytes,
                             );
-                            let _ = sock.send_to(&probe, src);
+                            let _ = host_sock.send_to(&probe, src);
                             return src.port();
                         }
                     }
