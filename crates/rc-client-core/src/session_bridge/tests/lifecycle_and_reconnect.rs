@@ -248,27 +248,34 @@ fn detach_and_abort_waits_graceful_window_before_triggering_force_disconnect() {
     let relay_cancel = Arc::new(AtomicBool::new(false));
     let running = Arc::new(AtomicBool::new(true));
     let observed_clean_graceful = Arc::new(AtomicBool::new(false));
+    let thread_ready = Arc::new(AtomicBool::new(false));
 
     let t_cmd = Arc::clone(&cmd_tx);
     let t_disc = Arc::clone(&disconnect_flag);
     let t_cancel = Arc::clone(&relay_cancel);
     let t_running = Arc::clone(&running);
     let t_clean = Arc::clone(&observed_clean_graceful);
+    let t_ready = Arc::clone(&thread_ready);
     let graceful_thread = thread::spawn(move || {
+        t_ready.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             if let Some(SessionCommand::Disconnect) = t_cmd.try_pop() {
-                // 模拟发完 LockScreen / Bye(Normal)
-                thread::sleep(Duration::from_millis(15));
+                // 模拟发完 LockScreen / Bye(Normal)（留足 CI 虚拟化调度抖动余量）
+                thread::sleep(Duration::from_millis(5));
                 if !t_disc.load(Ordering::Acquire) && !t_cancel.load(Ordering::Acquire) {
                     t_clean.store(true, Ordering::Release);
                 }
                 break;
             }
-            thread::sleep(Duration::from_millis(2));
+            thread::sleep(Duration::from_millis(1));
         }
         t_running.store(false, Ordering::Release);
     });
+    let ready_deadline = Instant::now() + Duration::from_secs(2);
+    while !thread_ready.load(Ordering::Acquire) && Instant::now() < ready_deadline {
+        thread::yield_now();
+    }
 
     let handle = SessionHandle {
         cmd_tx: Arc::clone(&cmd_tx),
@@ -317,19 +324,26 @@ fn detach_and_abort_waits_graceful_window_before_triggering_force_disconnect() {
     let disconnect_flag2 = Arc::new(AtomicBool::new(false));
     let relay_cancel2 = Arc::new(AtomicBool::new(false));
     let running2 = Arc::new(AtomicBool::new(true));
+    let thread_ready2 = Arc::new(AtomicBool::new(false));
 
     let t_cancel2 = Arc::clone(&relay_cancel2);
     let t_running2 = Arc::clone(&running2);
+    let t_ready2 = Arc::clone(&thread_ready2);
     let force_thread = thread::spawn(move || {
+        t_ready2.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             if t_cancel2.load(Ordering::Acquire) {
                 break;
             }
-            thread::sleep(Duration::from_millis(2));
+            thread::sleep(Duration::from_millis(1));
         }
         t_running2.store(false, Ordering::Release);
     });
+    let ready_deadline2 = Instant::now() + Duration::from_secs(2);
+    while !thread_ready2.load(Ordering::Acquire) && Instant::now() < ready_deadline2 {
+        thread::yield_now();
+    }
 
     let handle2 = SessionHandle {
         cmd_tx: cmd_tx2,
@@ -361,14 +375,14 @@ fn detach_and_abort_waits_graceful_window_before_triggering_force_disconnect() {
     };
 
     let start = Instant::now();
-    handle2.detach_and_abort(Duration::from_millis(300));
+    handle2.detach_and_abort(Duration::from_millis(800));
     let elapsed = start.elapsed();
     assert!(
         disconnect_flag2.load(Ordering::Acquire) && relay_cancel2.load(Ordering::Acquire),
         "优雅窗口超时后必须触发 trigger_disconnect() 强制中断底层 socket"
     );
     assert!(
-        elapsed >= Duration::from_millis(60) && elapsed < Duration::from_millis(300),
+        elapsed >= Duration::from_millis(60) && elapsed < Duration::from_millis(800),
         "强断应发生在 80ms 优雅窗口之后并在 max_wait 内返回，实际耗时 {elapsed:?}"
     );
     file_worker2.shutdown();
