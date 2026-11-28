@@ -170,6 +170,10 @@ impl Default for HighRefreshAdvisory {
     }
 }
 
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
@@ -294,6 +298,15 @@ pub enum DisplayControlMsg {
         /// 被控端是否支持接收控制端元数据 `ControllerMeta`（`0x16`；旧版缺省为 `false`）。
         #[serde(default)]
         supports_controller_meta: bool,
+        /// 当前生效显示器逻辑宽度（px/pt，如 `1512`）。
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        display_width: u32,
+        /// 当前生效显示器逻辑高度（px/pt，如 `982`）。
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        display_height: u32,
+        /// 当前生效显示器是否处于 HiDPI 模式（`backing > logical`）。
+        #[serde(default)]
+        display_hidpi: bool,
     },
     /// 控制端 → 被控端：握手入流后上报本端非对称解码能力、细化能力、选型偏好与扩展包头位支持标志。
     ClientMediaCaps {
@@ -1226,6 +1239,9 @@ mod tests {
             still_stream_epoch: 2,
             supports_pixel_scroll: true,
             supports_controller_meta: true,
+            display_width: 1512,
+            display_height: 982,
+            display_hidpi: true,
         };
         let encoded_caps = encode_display_ctrl(&caps).expect("encode capabilities");
         assert_eq!(decode_display_ctrl(&encoded_caps), Some(caps));
@@ -1266,6 +1282,9 @@ mod tests {
                 still_stream_epoch: 0,
                 supports_pixel_scroll: false,
                 supports_controller_meta: false,
+                display_width: 0,
+                display_height: 0,
+                display_hidpi: false,
             }
         );
 

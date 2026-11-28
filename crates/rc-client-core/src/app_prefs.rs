@@ -17,11 +17,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::display_ctrl::base64_encode;
 
-/// 默认码率预设名称。
-pub const DEFAULT_BITRATE_PRESET: &str = "14m";
+/// 默认码率预设名称（`"auto"` 表示按分辨率/帧率自适应码率）。
+pub const DEFAULT_BITRATE_PRESET: &str = "auto";
 
-/// 默认码率（bps：14 Mbps）。
-pub const DEFAULT_BITRATE_BPS: u32 = 14_000_000;
+/// 默认码率（bps：30 Mbps，支撑 Retina HiDPI 默认高清晰度流）。
+pub const DEFAULT_BITRATE_BPS: u32 = 30_000_000;
 
 /// 默认目标帧率（fps；与苹果端 VideoToolbox 低延迟码控甜点及常见 60Hz 显示器对齐）。
 pub const DEFAULT_FPS: u32 = 60;
@@ -165,10 +165,10 @@ pub struct AppPrefs {
     /// 自定义访问验证码（`None` = 临时验证码模式；`Some("")` = 无密码；`Some(pw)` = 自定义密码）。
     #[serde(default)]
     pub custom_host_password: Option<String>,
-    /// 当前选择的码率档位（`"auto"` / `"30m"` / `"14m"` / `"8m"`，默认 `"14m"`）。
+    /// 当前选择的码率档位（`"auto"` / `"150m"` / `"100m"` / `"60m"` / `"30m"` / `"14m"` / `"8m"`，默认 `"auto"`）。
     #[serde(default = "default_bitrate_preset")]
     pub bitrate_preset: String,
-    /// 当前目标码率（bps，默认 `14_000_000`）。
+    /// 当前目标码率（bps，默认 `30_000_000`）。
     #[serde(default = "default_bitrate_bps")]
     pub bitrate_bps: u32,
     /// 当前目标帧率（fps，默认 `60`）。
@@ -431,11 +431,11 @@ pub struct SecurityPrefsPatch {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StreamPrefsPatch {
-    /// 可选码率档位（`"auto"` / `"30m"` / `"14m"` / `"8m"`）。
+    /// 可选码率档位（`"auto"` / `"150m"` / `"100m"` / `"60m"` / `"30m"` / `"14m"` / `"8m"`）。
     pub bitrate_preset: Option<String>,
-    /// 可选目标码率（bps，范围 `1_000_000..=60_000_000`）。
+    /// 可选目标码率（bps，范围 `1_000_000..=150_000_000`）。
     pub bitrate_bps: Option<u32>,
-    /// 可选目标帧率（fps，范围 `15..=240`）。
+    /// 可选目标帧率（fps，范围 `15..=380`）。
     pub fps: Option<u32>,
     /// 可选目标分辨率宽度（需与 `resolution_height` 成对提供，且 `>= 320`）。
     pub resolution_width: Option<u32>,
@@ -1460,8 +1460,8 @@ mod tests {
 
         let prefs = AppPrefs::default();
         assert!(!prefs.allow_remote_assist);
-        assert_eq!(prefs.bitrate_preset, "14m");
-        assert_eq!(prefs.bitrate_bps, 14_000_000);
+        assert_eq!(prefs.bitrate_preset, "auto");
+        assert_eq!(prefs.bitrate_bps, 30_000_000);
         assert_eq!(prefs.fps, 60);
         assert_eq!(prefs.resolution_width, None);
         assert_eq!(prefs.resolution_height, None);
@@ -1470,8 +1470,8 @@ mod tests {
 
         let json_val = serde_json::to_value(&prefs).unwrap();
         assert_eq!(json_val["allowRemoteAssist"], false);
-        assert_eq!(json_val["bitratePreset"], "14m");
-        assert_eq!(json_val["bitrateBps"], 14_000_000);
+        assert_eq!(json_val["bitratePreset"], "auto");
+        assert_eq!(json_val["bitrateBps"], 30_000_000);
         assert_eq!(json_val["fps"], 60);
         assert!(json_val["resolutionWidth"].is_null());
         assert!(json_val["resolutionHeight"].is_null());

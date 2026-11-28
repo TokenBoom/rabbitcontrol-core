@@ -1802,6 +1802,68 @@ fn host_hardware_display_backing(prefer_hardware: bool) -> Option<Resolution> {
     crate::platform::main_display_backing_resolution()
 }
 
+/// HiDPI/Retina 物理像素采集默认最大宽度上限（覆盖 14" MBP `3024×1964`、16" MBP `3456×2234` 与 4K `3840×2160`）。
+const DEFAULT_HIDPI_STREAM_MAX_WIDTH: u32 = 3840;
+/// HiDPI/Retina 物理像素采集默认最大高度上限（覆盖 16:10 16" MBP `3456×2234` 1:1 直出）。
+const DEFAULT_HIDPI_STREAM_MAX_HEIGHT: u32 = 2400;
+
+/// 计算 HiDPI 显示器在不改动系统逻辑分辨率的前提下，满足编码像素率预算与上限封顶的流采集目标分辨率。
+///
+/// - 优先 1:1 物理 `backing` 像素直出（当宽高不超过 `3840×2400` 且像素率在当前编码器甜点预算内时零缩放）；
+/// - 超出封顶或高刷像素率预算时，在 `logical` 宽高比下向下偶数缩放；
+/// - 非 HiDPI 或退化输入保持 `logical.to_even()`。
+fn compute_hidpi_stream_target(
+    logical: Resolution,
+    backing: Option<Resolution>,
+    fps: u32,
+    codec: rc_encode::Codec,
+) -> Resolution {
+    let logical_even = logical.to_even();
+    let Some(backing_even) = backing.map(|b| b.to_even()) else {
+        return logical_even;
+    };
+    if logical_even.width < 2
+        || logical_even.height < 2
+        || backing_even.width <= logical_even.width
+        || backing_even.height <= logical_even.height
+    {
+        return logical_even;
+    }
+    let budget_rate = display_ctrl::StreamCodec::from(codec).high_refresh_max_pixel_rate();
+    let max_pixels = budget_rate / u64::from(fps.max(1));
+    let backing_pixels =
+        u64::from(backing_even.width).saturating_mul(u64::from(backing_even.height));
+    if backing_even.width <= DEFAULT_HIDPI_STREAM_MAX_WIDTH
+        && backing_even.height <= DEFAULT_HIDPI_STREAM_MAX_HEIGHT
+        && backing_pixels <= max_pixels
+    {
+        return backing_even;
+    }
+    let logical_pixels =
+        u64::from(logical_even.width).saturating_mul(u64::from(logical_even.height));
+    if max_pixels <= logical_pixels {
+        return logical_even;
+    }
+    let cap_w = backing_even
+        .width
+        .min(DEFAULT_HIDPI_STREAM_MAX_WIDTH)
+        .max(logical_even.width);
+    let cap_h = backing_even
+        .height
+        .min(DEFAULT_HIDPI_STREAM_MAX_HEIGHT)
+        .max(logical_even.height);
+    let scale = (max_pixels as f64 / logical_pixels as f64).sqrt();
+    let budget_w = ((logical_even.width as f64 * scale).floor() as u32).max(logical_even.width);
+    let budget_h = ((logical_even.height as f64 * scale).floor() as u32).max(logical_even.height);
+    let (w, h) = display_ctrl::fit_within_cap(
+        cap_w.min(budget_w),
+        cap_h.min(budget_h),
+        logical_even.width,
+        logical_even.height,
+    );
+    Resolution::new(w.max(logical_even.width), h.max(logical_even.height)).to_even()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn default_host_session_config(
     listen_addr: SocketAddr,
@@ -3785,7 +3847,29 @@ fn parse_audio_ctrl_muted(payload: &[u8]) -> Option<bool> {
     val.get("muted").and_then(serde_json::Value::as_bool)
 }
 
-/// 计算本会话被控端的原生逻辑分辨率与最高输出分辨率上界（封顶 3840×2160）。
+/// 将显示器的物理 `backing` 分辨率按 `logical` 宽高比夹紧至协议流上限（`5120×2880`），
+/// 并保证不低于逻辑分辨率（同样封顶 `5120×2880`）且偶数对齐。
+fn clamp_display_max_res(logical: Resolution, backing: Resolution) -> Resolution {
+    let logical_even = logical.to_even();
+    let backing_even = backing.to_even();
+    let cap_w = backing_even
+        .width
+        .max(logical_even.width)
+        .min(display_ctrl::MAX_STREAM_WIDTH);
+    let cap_h = backing_even
+        .height
+        .max(logical_even.height)
+        .min(display_ctrl::MAX_STREAM_HEIGHT);
+    let (mw, mh) =
+        display_ctrl::fit_within_cap(cap_w, cap_h, logical_even.width, logical_even.height);
+    Resolution::new(
+        mw.max(logical_even.width.min(display_ctrl::MAX_STREAM_WIDTH)),
+        mh.max(logical_even.height.min(display_ctrl::MAX_STREAM_HEIGHT)),
+    )
+    .to_even()
+}
+
+/// 计算本会话被控端的原生逻辑分辨率与最高输出分辨率上界（封顶 5120×2880）。
 fn compute_host_display_bounds(
     host: &HostSession,
     prefer_hardware: bool,
@@ -3797,13 +3881,7 @@ fn compute_host_display_bounds(
         let native = host_hardware_display_caps(true)
             .unwrap_or_else(|| Resolution::new(neg.width, neg.height).to_even());
         let backing = host_hardware_display_backing(true).unwrap_or(native);
-        let (mw, mh) = display_ctrl::fit_within_cap(
-            backing.width.min(display_ctrl::MAX_STREAM_WIDTH),
-            backing.height.min(display_ctrl::MAX_STREAM_HEIGHT),
-            native.width,
-            native.height,
-        );
-        let max_res = Resolution::new(mw.max(native.width), mh.max(native.height));
+        let max_res = clamp_display_max_res(native, backing);
         (native, max_res)
     } else {
         let native = Resolution::new(neg.width, neg.height).to_even();
@@ -3887,7 +3965,9 @@ fn host_supported_codecs(
 fn encode_host_display_caps(
     host: &HostSession,
     native_res: Resolution,
+    active_display_logical: Resolution,
     max_res: Resolution,
+    display_hidpi: bool,
     presets: Vec<DisplayPreset>,
     hevc_available: bool,
     negotiator: &HostCodecNegotiator,
@@ -3924,11 +4004,227 @@ fn encode_host_display_caps(
         still_stream_epoch,
         supports_pixel_scroll: true,
         supports_controller_meta: true,
+        display_width: active_display_logical.width,
+        display_height: active_display_logical.height,
+        display_hidpi,
     })
+}
+
+/// 根据当前激活显示器状态生成 `Capabilities` 所需的原生分辨率与预设列表。
+fn build_session_display_caps_params(
+    active_display_id: Option<u32>,
+    session_native_res: Resolution,
+    session_max_res: Resolution,
+    original_native_res: Option<Resolution>,
+    prefer_hardware: bool,
+    hardware_video_active: bool,
+) -> (Resolution, Vec<DisplayPreset>) {
+    if active_display_id.is_some() {
+        (
+            session_native_res,
+            display_ctrl::build_resolution_presets(
+                session_native_res.width,
+                session_native_res.height,
+                session_max_res.width,
+                session_max_res.height,
+            ),
+        )
+    } else {
+        (
+            original_native_res.unwrap_or(session_native_res),
+            build_hardware_display_presets(
+                prefer_hardware,
+                hardware_video_active,
+                original_native_res,
+            ),
+        )
+    }
+}
+
+/// 当热重建或恢复后发生编码器回退（如 HEVC → H.264）时：
+/// 1. 若原编码器为 HEVC，置位 `hevc_runtime_failed`；
+/// 2. 若处于 `auto_hidpi_active`，按实际生效编码器的像素率预算重算目标分辨率并重建流；
+/// 3. 递增编解码协商代次 `codec_generation`。
+fn handle_codec_fallback_hidpi(
+    host: &mut HostSession,
+    prev_codec: rc_encode::Codec,
+    auto_hidpi_active: bool,
+    session_native_res: Resolution,
+    session_max_res: Resolution,
+    hevc_runtime_failed: &mut bool,
+    codec_negotiator: &mut HostCodecNegotiator,
+) -> bool {
+    let actual_codec = host.active_codec();
+    if actual_codec == prev_codec {
+        return false;
+    }
+    if prev_codec == rc_encode::Codec::Hevc {
+        *hevc_runtime_failed = true;
+    }
+    if auto_hidpi_active {
+        if let Some(cur) = host.negotiated() {
+            let fb_res = compute_hidpi_stream_target(
+                session_native_res,
+                Some(session_max_res),
+                cur.fps,
+                actual_codec,
+            );
+            if (fb_res.width, fb_res.height) != (cur.width, cur.height) {
+                let _ = host.reconfigure_stream_with_codec(
+                    fb_res.width,
+                    fb_res.height,
+                    Some(cur.fps),
+                    Some(session_max_res),
+                    Some(actual_codec),
+                );
+            }
+        }
+    }
+    codec_negotiator.bump_generation();
+    true
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct TestModeSwitchEntry {
+    req: (u32, u32),
+    logical: Resolution,
+    backing: Resolution,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestHostPlatformMock {
+    enable_hardware_display_ops: bool,
+    displays: Arc<Mutex<Vec<crate::platform::PlatformDisplayInfo>>>,
+    next_virtual_id: Arc<std::sync::atomic::AtomicU32>,
+    mode_switches: Arc<Mutex<Vec<TestModeSwitchEntry>>>,
+    current_backing: Arc<Mutex<Option<Resolution>>>,
+    initial_backing: Option<Resolution>,
+    privacy_curtain_ok: bool,
+}
+
+#[cfg(test)]
+impl TestHostPlatformMock {
+    fn new(
+        main_logical: Resolution,
+        main_backing: Resolution,
+        extra_displays: Vec<crate::platform::PlatformDisplayInfo>,
+    ) -> Self {
+        let mut displays = vec![crate::platform::PlatformDisplayInfo {
+            id: 1,
+            name: "Main".to_string(),
+            width: main_logical.width,
+            height: main_logical.height,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            is_main: true,
+            is_virtual: false,
+        }];
+        displays.extend(extra_displays);
+        Self {
+            enable_hardware_display_ops: true,
+            displays: Arc::new(Mutex::new(displays)),
+            next_virtual_id: Arc::new(std::sync::atomic::AtomicU32::new(100)),
+            mode_switches: Arc::new(Mutex::new(Vec::new())),
+            current_backing: Arc::new(Mutex::new(Some(main_backing))),
+            initial_backing: Some(main_backing),
+            privacy_curtain_ok: true,
+        }
+    }
+
+    fn with_mode_switch(&self, req: (u32, u32), logical: Resolution, backing: Resolution) {
+        self.mode_switches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(TestModeSwitchEntry {
+                req,
+                logical,
+                backing,
+            });
+    }
+
+    fn switch_mode(&self, target_w: u32, target_h: u32) -> Result<Resolution, String> {
+        let switches = self.mode_switches.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = switches
+            .iter()
+            .find(|e| e.req.0 == target_w && e.req.1 == target_h)
+            .copied()
+        {
+            *self
+                .current_backing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(entry.backing);
+            Ok(entry.logical)
+        } else {
+            Err("mock switch_to unsupported".to_string())
+        }
+    }
+
+    fn restore_mode(&self) {
+        *self
+            .current_backing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = self.initial_backing;
+    }
+
+    fn backing_resolution(&self) -> Option<Resolution> {
+        *self
+            .current_backing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn list_displays(&self) -> Vec<crate::platform::PlatformDisplayInfo> {
+        self.displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn create_virtual_display(
+        &self,
+        width: u32,
+        height: u32,
+        _hidpi: bool,
+    ) -> Result<crate::platform::PlatformDisplayInfo, String> {
+        let id = self.next_virtual_id.fetch_add(1, Ordering::AcqRel);
+        let info = crate::platform::PlatformDisplayInfo {
+            id,
+            name: format!("Virtual {id}"),
+            width,
+            height,
+            origin_x: 2000.0,
+            origin_y: 0.0,
+            is_main: false,
+            is_virtual: true,
+        };
+        self.displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(info.clone());
+        Ok(info)
+    }
+
+    fn destroy_virtual_display(&self, display_id: u32) -> bool {
+        let mut guard = self.displays.lock().unwrap_or_else(|e| e.into_inner());
+        let before = guard.len();
+        guard.retain(|d| !(d.is_virtual && d.id == display_id));
+        guard.len() < before
+    }
+
+    fn destroy_all_virtual_displays(&self) {
+        self.displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|d| !d.is_virtual);
+    }
 }
 
 struct HostDisplayModeSession {
     guard: Option<Box<dyn crate::platform::DisplayModeSessionGuard>>,
+    #[cfg(test)]
+    test_platform: Option<TestHostPlatformMock>,
 }
 
 impl HostDisplayModeSession {
@@ -3938,7 +4234,22 @@ impl HostDisplayModeSession {
         } else {
             None
         };
-        Self { guard }
+        Self {
+            guard,
+            #[cfg(test)]
+            test_platform: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn capture_with_test_platform(
+        prefer_hardware: bool,
+        hardware_video_active: bool,
+        test_platform: Option<TestHostPlatformMock>,
+    ) -> Self {
+        let mut this = Self::capture(prefer_hardware, hardware_video_active);
+        this.test_platform = test_platform;
+        this
     }
 
     fn original_resolution(&self) -> Option<Resolution> {
@@ -3946,6 +4257,10 @@ impl HostDisplayModeSession {
     }
 
     fn switch_to(&mut self, target_w: u32, target_h: u32) -> Result<Resolution, String> {
+        #[cfg(test)]
+        if let Some(ref tp) = self.test_platform {
+            return tp.switch_mode(target_w, target_h);
+        }
         match self.guard.as_mut() {
             Some(g) => g.switch_to(target_w, target_h),
             None => Err("显示器模式守卫未激活".to_string()),
@@ -3953,6 +4268,10 @@ impl HostDisplayModeSession {
     }
 
     fn restore(&mut self) {
+        #[cfg(test)]
+        if let Some(ref tp) = self.test_platform {
+            tp.restore_mode();
+        }
         if let Some(g) = self.guard.as_mut() {
             g.restore();
         }
@@ -4032,6 +4351,8 @@ struct HostHardwareCleanupGuard {
     host_audio_modified: bool,
     restore_audio_on_exit: bool,
     virtual_display_count: usize,
+    #[cfg(test)]
+    test_platform: Option<TestHostPlatformMock>,
 }
 
 impl HostHardwareCleanupGuard {
@@ -4042,7 +4363,19 @@ impl HostHardwareCleanupGuard {
             host_audio_modified: false,
             restore_audio_on_exit: true,
             virtual_display_count: 0,
+            #[cfg(test)]
+            test_platform: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_platform(
+        prefer_hardware: bool,
+        test_platform: Option<TestHostPlatformMock>,
+    ) -> Self {
+        let mut this = Self::new(prefer_hardware || test_platform.is_some());
+        this.test_platform = test_platform;
+        this
     }
 
     fn cleanup_now(&mut self) {
@@ -4051,6 +4384,17 @@ impl HostHardwareCleanupGuard {
             self.host_audio_modified = false;
             self.restore_audio_on_exit = true;
             self.virtual_display_count = 0;
+            return;
+        }
+        #[cfg(test)]
+        if let Some(ref tp) = self.test_platform {
+            self.privacy_active = false;
+            self.host_audio_modified = false;
+            self.restore_audio_on_exit = true;
+            if self.virtual_display_count > 0 {
+                tp.destroy_all_virtual_displays();
+                self.virtual_display_count = 0;
+            }
             return;
         }
         if self.privacy_active {
@@ -4079,8 +4423,10 @@ impl Drop for HostHardwareCleanupGuard {
     }
 }
 
-fn encode_host_displays_state(active_display_id: Option<u32>) -> Option<Vec<u8>> {
-    let raw = crate::platform::list_displays();
+fn encode_host_displays_state_from_list(
+    active_display_id: Option<u32>,
+    raw: Vec<crate::platform::PlatformDisplayInfo>,
+) -> Option<Vec<u8>> {
     if raw.is_empty() {
         return None;
     }
@@ -4103,6 +4449,10 @@ fn encode_host_displays_state(active_display_id: Option<u32>) -> Option<Vec<u8>>
         displays,
         active_display_id: resolved_active,
     })
+}
+
+fn encode_host_displays_state(active_display_id: Option<u32>) -> Option<Vec<u8>> {
+    encode_host_displays_state_from_list(active_display_id, crate::platform::list_displays())
 }
 
 fn trigger_host_lock_screen(lock_screen_count: &AtomicU64, prefer_hardware: bool) {
@@ -4542,6 +4892,80 @@ fn drive_ui_host_session_with_switch_and_tracking(
         switch_rt,
         controller_tracking,
         busy_lan_endpoint,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestHostMediaOverride {
+    native_res: Resolution,
+    max_res: Resolution,
+    auto_hidpi: bool,
+    hevc_available: bool,
+    encode_caps: Vec<rc_pipeline::CodecCapability>,
+    platform: Option<TestHostPlatformMock>,
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn drive_ui_host_session_with_media_override(
+    host: &mut HostSession,
+    clock: &SessionClock,
+    clock_anchor: Option<&HostClockAnchor>,
+    updates: &BoundedHostUpdateQueue,
+    password_version: &AtomicU64,
+    observed_pw_ver: u64,
+    config_version: &AtomicU64,
+    observed_cfg_ver: u64,
+    disconnect_flag: &AtomicBool,
+    stop_flag: &AtomicBool,
+    close_reason: &AtomicU8,
+    transport_kind: HostTransportKind,
+    prefer_hardware: bool,
+    hardware_video_active: bool,
+    lock_screen_count: &AtomicU64,
+    auth_state: Option<&Mutex<AuthRuntimeState>>,
+    owner_terminals: &mut PersistentOwnerTerminals,
+    wake_guard: SharedWakeGuard,
+    file_transfer_dir: SharedFileTransferDir,
+    allow_assist_file_transfer: &AtomicBool,
+    incoming_relay: Option<&Arc<BoundedRelayIncomingQueue>>,
+    active_peer_id: Option<&str>,
+    session_started_at: Instant,
+    media_override: TestHostMediaOverride,
+) -> DriveSessionOutcome {
+    let audio_mgr = HostAudioManager::new(false);
+    drive_ui_host_session_core(
+        host,
+        clock,
+        clock_anchor,
+        updates,
+        password_version,
+        observed_pw_ver,
+        config_version,
+        observed_cfg_ver,
+        disconnect_flag,
+        stop_flag,
+        close_reason,
+        transport_kind,
+        prefer_hardware,
+        hardware_video_active,
+        lock_screen_count,
+        auth_state,
+        owner_terminals,
+        wake_guard,
+        file_transfer_dir,
+        allow_assist_file_transfer,
+        incoming_relay,
+        active_peer_id,
+        session_started_at,
+        audio_mgr,
+        None,
+        None,
+        None,
+        Some(media_override),
     )
 }
 
@@ -4602,6 +5026,7 @@ fn drive_ui_host_session_with_audio(
         switch_rt,
         None,
         None,
+        None,
     )
 }
 
@@ -4634,6 +5059,7 @@ fn drive_ui_host_session_core(
     switch_rt: Option<HostSwitchRuntime>,
     mut controller_tracking: Option<HostControllerTracking>,
     busy_lan_endpoint: Option<&QuicEndpoint>,
+    #[cfg(test)] media_override: Option<TestHostMediaOverride>,
 ) -> DriveSessionOutcome {
     // 启用 8s 应用层客户端失活看门狗（控制端在静屏与纯工具模式下每 1s 发送 ProbePing 心跳）。
     host.set_client_idle_timeout_us(HostSession::CLIENT_IDLE_TIMEOUT_US);
@@ -4643,8 +5069,23 @@ fn drive_ui_host_session_core(
     };
     let _activity =
         crate::platform::begin_latency_critical_activity("RabbitControl 被控会话", true);
+    #[cfg(test)]
+    let test_platform = media_override.as_ref().and_then(|ov| ov.platform.clone());
+    #[cfg(test)]
+    let hw_display_ops_active = (prefer_hardware && hardware_video_active)
+        || test_platform
+            .as_ref()
+            .is_some_and(|p| p.enable_hardware_display_ops);
+    #[cfg(not(test))]
+    let hw_display_ops_active = prefer_hardware && hardware_video_active;
+    #[cfg(test)]
+    let mut hw_cleanup =
+        HostHardwareCleanupGuard::with_test_platform(prefer_hardware, test_platform.clone());
+    #[cfg(not(test))]
     let mut hw_cleanup = HostHardwareCleanupGuard::new(prefer_hardware);
     let mut active_display_id: Option<u32> = None;
+    let mut virtual_display_hidpi: std::collections::HashMap<u32, bool> =
+        std::collections::HashMap::new();
     let mut shows_cursor = false;
     let mut active_peer_id: Option<String> = active_peer_id.map(str::to_string);
 
@@ -4676,8 +5117,41 @@ fn drive_ui_host_session_core(
     let mut pending_portmap_tx: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pending_display_tx = HostDisplayCtrlOutbox::new();
     let mut pending_update_tx = crate::updater::PendingUpdateTxQueue::new();
+    #[cfg(test)]
+    let (mut session_native_res, mut session_max_res) = match media_override {
+        Some(ref ov) => (
+            ov.native_res,
+            clamp_display_max_res(ov.native_res, ov.max_res),
+        ),
+        None => compute_host_display_bounds(host, prefer_hardware, hardware_video_active),
+    };
+    #[cfg(not(test))]
     let (mut session_native_res, mut session_max_res) =
         compute_host_display_bounds(host, prefer_hardware, hardware_video_active);
+    #[cfg(test)]
+    let mut session_display_hidpi = match media_override {
+        Some(ref ov) => {
+            ov.max_res.width > ov.native_res.width && ov.max_res.height > ov.native_res.height
+        }
+        None => {
+            prefer_hardware
+                && hardware_video_active
+                && session_max_res.width > session_native_res.width
+                && session_max_res.height > session_native_res.height
+        }
+    };
+    #[cfg(not(test))]
+    let mut session_display_hidpi = prefer_hardware
+        && hardware_video_active
+        && session_max_res.width > session_native_res.width
+        && session_max_res.height > session_native_res.height;
+    #[cfg(test)]
+    let mut display_mode_session = HostDisplayModeSession::capture_with_test_platform(
+        prefer_hardware,
+        hardware_video_active,
+        test_platform.clone(),
+    );
+    #[cfg(not(test))]
     let mut display_mode_session =
         HostDisplayModeSession::capture(prefer_hardware, hardware_video_active);
     let original_native_res = display_mode_session
@@ -4690,6 +5164,18 @@ fn drive_ui_host_session_core(
     };
 
     let hardware_media_active = prefer_hardware && hardware_video_active;
+    #[cfg(test)]
+    let mut auto_hidpi_active = media_override
+        .as_ref()
+        .map_or(prefer_hardware && hardware_video_active, |ov| ov.auto_hidpi);
+    #[cfg(not(test))]
+    let mut auto_hidpi_active = prefer_hardware && hardware_video_active;
+    #[cfg(test)]
+    let host_encode_caps = media_override
+        .as_ref()
+        .map(|ov| ov.encode_caps.clone())
+        .unwrap_or_else(|| codec_selector::cached_or_platform_encode_caps(hardware_media_active));
+    #[cfg(not(test))]
     let host_encode_caps = codec_selector::cached_or_platform_encode_caps(hardware_media_active);
     let mut codec_negotiator = HostCodecNegotiator::new(host_encode_caps.clone());
     let host_refinement_supported =
@@ -4709,14 +5195,39 @@ fn drive_ui_host_session_core(
     let mut still_window_dropped_dgrams: u64 = 0;
     let mut still_last_dropped_total: u64 = host.transport_tx_dropped_datagrams();
     let mut hevc_runtime_failed = false;
-    let host_hevc_available =
-        |failed: bool| hardware_media_active && !failed && rc_pipeline::platform_supports_hevc();
+    #[cfg(test)]
+    let base_hevc_supported = (hardware_media_active && rc_pipeline::platform_supports_hevc())
+        || media_override.as_ref().is_some_and(|ov| ov.hevc_available);
+    #[cfg(not(test))]
+    let base_hevc_supported = hardware_media_active && rc_pipeline::platform_supports_hevc();
+    let host_hevc_available = |failed: bool| !failed && base_hevc_supported;
     let transport_kind_cell = std::cell::Cell::new(transport_kind);
     let current_net_hint = |host: &HostSession| NetworkHint {
         is_relay: transport_kind_cell.get() == HostTransportKind::Relay,
         is_lan: transport_kind_cell.get() == HostTransportKind::Lan,
         estimated_bitrate_bps: host.current_bitrate_bps(),
         rtt_us: 0,
+    };
+    let encode_displays_state = |active_id: Option<u32>| -> Option<Vec<u8>> {
+        #[cfg(test)]
+        if let Some(ref tp) = test_platform {
+            return encode_host_displays_state_from_list(active_id, tp.list_displays());
+        }
+        encode_host_displays_state(active_id)
+    };
+    let list_session_displays = || -> Vec<crate::platform::PlatformDisplayInfo> {
+        #[cfg(test)]
+        if let Some(ref tp) = test_platform {
+            return tp.list_displays();
+        }
+        crate::platform::list_displays()
+    };
+    let current_main_backing = || -> Option<Resolution> {
+        #[cfg(test)]
+        if let Some(ref tp) = test_platform {
+            return tp.backing_resolution();
+        }
+        host_hardware_display_backing(true)
     };
 
     let mut last_reported_screen_state: Option<(bool, bool)> = None;
@@ -4767,7 +5278,9 @@ fn drive_ui_host_session_core(
         if let Some(payload) = encode_host_display_caps(
             host,
             original_native_res.unwrap_or(session_native_res),
+            session_native_res,
             session_max_res,
+            session_display_hidpi,
             presets,
             host_hevc_available(hevc_runtime_failed),
             &codec_negotiator,
@@ -4776,8 +5289,8 @@ fn drive_ui_host_session_core(
         ) {
             pending_display_tx.set_caps(payload);
         }
-        if prefer_hardware && hardware_video_active {
-            if let Some(disp_payload) = encode_host_displays_state(active_display_id) {
+        if hw_display_ops_active {
+            if let Some(disp_payload) = encode_displays_state(active_display_id) {
                 pending_display_tx.push_transient(disp_payload);
             }
         }
@@ -4968,44 +5481,66 @@ fn drive_ui_host_session_core(
                                 if failed_codec == rc_encode::Codec::Hevc {
                                     hevc_runtime_failed = true;
                                 }
+                                let fb_res = if auto_hidpi_active {
+                                    compute_hidpi_stream_target(
+                                        session_native_res,
+                                        Some(session_max_res),
+                                        cur.fps,
+                                        fb_plan.codec,
+                                    )
+                                } else {
+                                    Resolution::new(cur.width, cur.height)
+                                };
                                 let prev_codec = host.active_codec();
                                 let _ = host.reconfigure_stream_with_codec(
-                                    cur.width,
-                                    cur.height,
+                                    fb_res.width,
+                                    fb_res.height,
                                     Some(cur.fps),
                                     Some(session_max_res),
                                     Some(fb_plan.codec),
                                 );
+                                let actual_codec = host.active_codec();
+                                if actual_codec != fb_plan.codec && auto_hidpi_active {
+                                    let actual_res = compute_hidpi_stream_target(
+                                        session_native_res,
+                                        Some(session_max_res),
+                                        cur.fps,
+                                        actual_codec,
+                                    );
+                                    if let Some(n) = host.negotiated() {
+                                        if (actual_res.width, actual_res.height)
+                                            != (n.width, n.height)
+                                        {
+                                            let _ = host.reconfigure_stream_with_codec(
+                                                actual_res.width,
+                                                actual_res.height,
+                                                Some(cur.fps),
+                                                Some(session_max_res),
+                                                Some(actual_codec),
+                                            );
+                                        }
+                                    }
+                                }
                                 if host.active_codec() != prev_codec {
                                     codec_negotiator.bump_generation();
                                 }
                                 if let Some(n) = host.negotiated() {
                                     still_refine.on_stream_reset(n.width, n.height);
                                 }
-                                let (caps_native, presets) = if active_display_id.is_some() {
-                                    (
-                                        session_native_res,
-                                        display_ctrl::build_resolution_presets(
-                                            session_native_res.width,
-                                            session_native_res.height,
-                                            session_max_res.width,
-                                            session_max_res.height,
-                                        ),
-                                    )
-                                } else {
-                                    (
-                                        original_native_res.unwrap_or(session_native_res),
-                                        build_hardware_display_presets(
-                                            prefer_hardware,
-                                            hardware_video_active,
-                                            original_native_res,
-                                        ),
-                                    )
-                                };
+                                let (caps_native, presets) = build_session_display_caps_params(
+                                    active_display_id,
+                                    session_native_res,
+                                    session_max_res,
+                                    original_native_res,
+                                    prefer_hardware,
+                                    hardware_video_active,
+                                );
                                 if let Some(cp) = encode_host_display_caps(
                                     host,
                                     caps_native,
+                                    session_native_res,
                                     session_max_res,
+                                    session_display_hidpi,
                                     presets,
                                     host_hevc_available(hevc_runtime_failed),
                                     &codec_negotiator,
@@ -5234,32 +5769,42 @@ fn drive_ui_host_session_core(
                                                             switched_res.height,
                                                         );
                                                         session_native_res = switched_res;
-                                                        let cur_backing =
-                                                            host_hardware_display_backing(true)
-                                                                .unwrap_or(switched_res);
-                                                        session_max_res = Resolution {
-                                                            width: cur_backing
-                                                                .width
-                                                                .max(switched_res.width),
-                                                            height: cur_backing
-                                                                .height
-                                                                .max(switched_res.height),
-                                                        };
+                                                        let cur_backing = current_main_backing()
+                                                            .unwrap_or(switched_res);
+                                                        session_max_res = clamp_display_max_res(
+                                                            switched_res,
+                                                            cur_backing,
+                                                        );
+                                                        session_display_hidpi = session_max_res
+                                                            .width
+                                                            > switched_res.width
+                                                            && session_max_res.height
+                                                                > switched_res.height;
+                                                        auto_hidpi_active = true;
+                                                        let eff_fps = target_fps.unwrap_or(cur.fps);
+                                                        let stream_res =
+                                                            compute_hidpi_stream_target(
+                                                                switched_res,
+                                                                Some(session_max_res),
+                                                                eff_fps,
+                                                                attempted_codec,
+                                                            );
                                                         if let Err(err) = host
                                                             .reconfigure_stream_with_codec(
-                                                                switched_res.width,
-                                                                switched_res.height,
+                                                                stream_res.width,
+                                                                stream_res.height,
                                                                 target_fps,
-                                                                Some(switched_res),
+                                                                Some(session_max_res),
                                                                 requested_codec,
                                                             )
                                                         {
                                                             eprintln!(
                                                         "[rc-ui-host] 热切换流参数 ({}x{}@{fps}fps, {requested_codec:?}) 失败: {err}",
-                                                        switched_res.width, switched_res.height
+                                                        stream_res.width, stream_res.height
                                                     );
                                                         }
                                                     } else {
+                                                        auto_hidpi_active = false;
                                                         let (target_w, target_h) =
                                                             display_ctrl::fit_target_preserving_aspect(
                                                                 width,
@@ -5285,10 +5830,21 @@ fn drive_ui_host_session_core(
                                                         }
                                                     }
                                                 } else {
+                                                    let eff_fps = target_fps.unwrap_or(cur.fps);
+                                                    let target_res = if auto_hidpi_active {
+                                                        compute_hidpi_stream_target(
+                                                            session_native_res,
+                                                            Some(session_max_res),
+                                                            eff_fps,
+                                                            attempted_codec,
+                                                        )
+                                                    } else {
+                                                        Resolution::new(cur.width, cur.height)
+                                                    };
                                                     if let Err(err) = host
                                                         .reconfigure_stream_with_codec(
-                                                            cur.width,
-                                                            cur.height,
+                                                            target_res.width,
+                                                            target_res.height,
                                                             target_fps,
                                                             Some(session_max_res),
                                                             requested_codec,
@@ -5296,12 +5852,13 @@ fn drive_ui_host_session_core(
                                                     {
                                                         eprintln!(
                                                             "[rc-ui-host] 热切换流参数 ({}x{}@{fps}fps, {requested_codec:?}) 失败: {err}",
-                                                            cur.width, cur.height
+                                                            target_res.width, target_res.height
                                                         );
                                                     }
                                                 }
+                                                let actual_codec = host.active_codec();
                                                 if attempted_codec != rc_encode::Codec::H264
-                                                    && host.active_codec() != attempted_codec
+                                                    && actual_codec != attempted_codec
                                                 {
                                                     let fail_target = StreamTarget {
                                                         width: cur.width,
@@ -5311,12 +5868,37 @@ fn drive_ui_host_session_core(
                                                     let _ = codec_negotiator.on_encode_failure(
                                                         attempted_codec,
                                                         "reconfigure stream encoder init failed",
-                                                        host.active_codec(),
+                                                        actual_codec,
                                                         fail_target,
                                                         current_net_hint(host),
                                                     );
                                                     if attempted_codec == rc_encode::Codec::Hevc {
                                                         hevc_runtime_failed = true;
+                                                    }
+                                                }
+                                                if actual_codec != attempted_codec
+                                                    && auto_hidpi_active
+                                                {
+                                                    let eff_fps = target_fps.unwrap_or(cur.fps);
+                                                    let fb_res = compute_hidpi_stream_target(
+                                                        session_native_res,
+                                                        Some(session_max_res),
+                                                        eff_fps,
+                                                        actual_codec,
+                                                    );
+                                                    if let Some(n) = host.negotiated() {
+                                                        if (fb_res.width, fb_res.height)
+                                                            != (n.width, n.height)
+                                                        {
+                                                            let _ = host
+                                                                .reconfigure_stream_with_codec(
+                                                                    fb_res.width,
+                                                                    fb_res.height,
+                                                                    target_fps,
+                                                                    Some(session_max_res),
+                                                                    Some(actual_codec),
+                                                                );
+                                                        }
                                                     }
                                                 }
                                                 if host.active_codec() != prev_codec {
@@ -5326,31 +5908,20 @@ fn drive_ui_host_session_core(
                                                     still_refine.on_stream_reset(n.width, n.height);
                                                 }
                                                 let (caps_native, presets) =
-                                                    if active_display_id.is_some() {
-                                                        (
-                                                            session_native_res,
-                                                            display_ctrl::build_resolution_presets(
-                                                                session_native_res.width,
-                                                                session_native_res.height,
-                                                                session_max_res.width,
-                                                                session_max_res.height,
-                                                            ),
-                                                        )
-                                                    } else {
-                                                        (
-                                                            original_native_res
-                                                                .unwrap_or(session_native_res),
-                                                            build_hardware_display_presets(
-                                                                prefer_hardware,
-                                                                hardware_video_active,
-                                                                original_native_res,
-                                                            ),
-                                                        )
-                                                    };
+                                                    build_session_display_caps_params(
+                                                        active_display_id,
+                                                        session_native_res,
+                                                        session_max_res,
+                                                        original_native_res,
+                                                        prefer_hardware,
+                                                        hardware_video_active,
+                                                    );
                                                 if let Some(caps_payload) = encode_host_display_caps(
                                                     host,
                                                     caps_native,
+                                                    session_native_res,
                                                     session_max_res,
+                                                    session_display_hidpi,
                                                     presets,
                                                     host_hevc_available(hevc_runtime_failed),
                                                     &codec_negotiator,
@@ -5387,31 +5958,70 @@ fn drive_ui_host_session_core(
                                                     target,
                                                     current_net_hint(host),
                                                 );
-                                                if plan.codec != prev_codec {
+                                                let target_res = if auto_hidpi_active {
+                                                    compute_hidpi_stream_target(
+                                                        session_native_res,
+                                                        Some(session_max_res),
+                                                        cur.fps,
+                                                        plan.codec,
+                                                    )
+                                                } else {
+                                                    Resolution::new(cur.width, cur.height)
+                                                };
+                                                if plan.codec != prev_codec
+                                                    || (target_res.width, target_res.height)
+                                                        != prev_dims
+                                                {
                                                     if let Err(err) = host
                                                         .reconfigure_stream_with_codec(
-                                                            cur.width,
-                                                            cur.height,
+                                                            target_res.width,
+                                                            target_res.height,
                                                             Some(cur.fps),
                                                             Some(session_max_res),
                                                             Some(plan.codec),
                                                         )
                                                     {
                                                         eprintln!(
-                                                            "[rc-ui-host] ClientMediaCaps 自动选型切换 ({:?}) 失败: {err}",
-                                                            plan.codec
+                                                            "[rc-ui-host] ClientMediaCaps 自动选型切换 ({:?}, {}x{}) 失败: {err}",
+                                                            plan.codec,
+                                                            target_res.width,
+                                                            target_res.height
                                                         );
                                                     }
-                                                    if host.active_codec() != plan.codec {
+                                                    let actual_codec = host.active_codec();
+                                                    if actual_codec != plan.codec {
                                                         let _ = codec_negotiator.on_encode_failure(
                                                             plan.codec,
                                                             "selected codec encoder init failed",
-                                                            host.active_codec(),
+                                                            actual_codec,
                                                             target,
                                                             current_net_hint(host),
                                                         );
                                                         if plan.codec == rc_encode::Codec::Hevc {
                                                             hevc_runtime_failed = true;
+                                                        }
+                                                        if auto_hidpi_active {
+                                                            let fb_res =
+                                                                compute_hidpi_stream_target(
+                                                                    session_native_res,
+                                                                    Some(session_max_res),
+                                                                    cur.fps,
+                                                                    actual_codec,
+                                                                );
+                                                            if let Some(n) = host.negotiated() {
+                                                                if (fb_res.width, fb_res.height)
+                                                                    != (n.width, n.height)
+                                                                {
+                                                                    let _ = host
+                                                                        .reconfigure_stream_with_codec(
+                                                                            fb_res.width,
+                                                                            fb_res.height,
+                                                                            Some(cur.fps),
+                                                                            Some(session_max_res),
+                                                                            Some(actual_codec),
+                                                                        );
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                     if host.active_codec() != prev_codec {
@@ -5428,31 +6038,20 @@ fn drive_ui_host_session_core(
                                                 }
                                             }
                                             let (caps_native, presets) =
-                                                if active_display_id.is_some() {
-                                                    (
-                                                        session_native_res,
-                                                        display_ctrl::build_resolution_presets(
-                                                            session_native_res.width,
-                                                            session_native_res.height,
-                                                            session_max_res.width,
-                                                            session_max_res.height,
-                                                        ),
-                                                    )
-                                                } else {
-                                                    (
-                                                        original_native_res
-                                                            .unwrap_or(session_native_res),
-                                                        build_hardware_display_presets(
-                                                            prefer_hardware,
-                                                            hardware_video_active,
-                                                            original_native_res,
-                                                        ),
-                                                    )
-                                                };
+                                                build_session_display_caps_params(
+                                                    active_display_id,
+                                                    session_native_res,
+                                                    session_max_res,
+                                                    original_native_res,
+                                                    prefer_hardware,
+                                                    hardware_video_active,
+                                                );
                                             if let Some(caps_payload) = encode_host_display_caps(
                                                 host,
                                                 caps_native,
+                                                session_native_res,
                                                 session_max_res,
+                                                session_display_hidpi,
                                                 presets,
                                                 host_hevc_available(hevc_runtime_failed),
                                                 &codec_negotiator,
@@ -5493,23 +6092,33 @@ fn drive_ui_host_session_core(
                                                     if failed_codec == rc_encode::Codec::Hevc {
                                                         hevc_runtime_failed = true;
                                                     }
+                                                    let fb_res = if auto_hidpi_active {
+                                                        compute_hidpi_stream_target(
+                                                            session_native_res,
+                                                            Some(session_max_res),
+                                                            cur.fps,
+                                                            fallback_plan.codec,
+                                                        )
+                                                    } else {
+                                                        Resolution::new(cur.width, cur.height)
+                                                    };
                                                     let _ = host.reconfigure_stream_with_codec(
-                                                        cur.width,
-                                                        cur.height,
+                                                        fb_res.width,
+                                                        fb_res.height,
                                                         Some(cur.fps),
                                                         Some(session_max_res),
                                                         Some(fallback_plan.codec),
                                                     );
                                                     // 若降级目标（如 HEVC）在编码侧同样构造失败并被 HostSession 内部顺延 H.264，
-                                                    // 同步记录熔断与 hevc_runtime_failed。
+                                                    // 同步记录熔断与 hevc_runtime_failed，并对齐回退编码器分辨率预算。
+                                                    let actual_codec = host.active_codec();
                                                     if fallback_plan.codec != rc_encode::Codec::H264
-                                                        && host.active_codec()
-                                                            != fallback_plan.codec
+                                                        && actual_codec != fallback_plan.codec
                                                     {
                                                         let _ = codec_negotiator.on_encode_failure(
                                                             fallback_plan.codec,
                                                             "fallback codec encoder init failed",
-                                                            host.active_codec(),
+                                                            actual_codec,
                                                             target,
                                                             current_net_hint(host),
                                                         );
@@ -5518,32 +6127,44 @@ fn drive_ui_host_session_core(
                                                         {
                                                             hevc_runtime_failed = true;
                                                         }
+                                                        if auto_hidpi_active {
+                                                            let actual_res =
+                                                                compute_hidpi_stream_target(
+                                                                    session_native_res,
+                                                                    Some(session_max_res),
+                                                                    cur.fps,
+                                                                    actual_codec,
+                                                                );
+                                                            if let Some(n) = host.negotiated() {
+                                                                if (
+                                                                    actual_res.width,
+                                                                    actual_res.height,
+                                                                ) != (n.width, n.height)
+                                                                {
+                                                                    let _ = host
+                                                                        .reconfigure_stream_with_codec(
+                                                                            actual_res.width,
+                                                                            actual_res.height,
+                                                                            Some(cur.fps),
+                                                                            Some(session_max_res),
+                                                                            Some(actual_codec),
+                                                                        );
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                     if host.active_codec() != prev_codec {
                                                         codec_negotiator.bump_generation();
                                                     }
                                                     let (caps_native, presets) =
-                                                        if active_display_id.is_some() {
-                                                            (
-                                                                session_native_res,
-                                                                display_ctrl::build_resolution_presets(
-                                                                    session_native_res.width,
-                                                                    session_native_res.height,
-                                                                    session_max_res.width,
-                                                                    session_max_res.height,
-                                                                ),
-                                                            )
-                                                        } else {
-                                                            (
-                                                                original_native_res
-                                                                    .unwrap_or(session_native_res),
-                                                                build_hardware_display_presets(
-                                                                    prefer_hardware,
-                                                                    hardware_video_active,
-                                                                    original_native_res,
-                                                                ),
-                                                            )
-                                                        };
+                                                        build_session_display_caps_params(
+                                                            active_display_id,
+                                                            session_native_res,
+                                                            session_max_res,
+                                                            original_native_res,
+                                                            prefer_hardware,
+                                                            hardware_video_active,
+                                                        );
                                                     if let Some(n) = host.negotiated() {
                                                         still_refine
                                                             .on_stream_reset(n.width, n.height);
@@ -5552,7 +6173,9 @@ fn drive_ui_host_session_core(
                                                         encode_host_display_caps(
                                                             host,
                                                             caps_native,
+                                                            session_native_res,
                                                             session_max_res,
+                                                            session_display_hidpi,
                                                             presets,
                                                             host_hevc_available(
                                                                 hevc_runtime_failed,
@@ -5609,10 +6232,21 @@ fn drive_ui_host_session_core(
                                             {
                                                 codec_negotiator.set_manual_pref(c);
                                                 let prev_codec = host.active_codec();
+                                                let prev_dims = (cur.width, cur.height);
+                                                let target_res = if auto_hidpi_active {
+                                                    compute_hidpi_stream_target(
+                                                        session_native_res,
+                                                        Some(session_max_res),
+                                                        cur.fps,
+                                                        c,
+                                                    )
+                                                } else {
+                                                    Resolution::new(cur.width, cur.height)
+                                                };
                                                 if let Err(err) = host
                                                     .reconfigure_stream_with_codec(
-                                                        cur.width,
-                                                        cur.height,
+                                                        target_res.width,
+                                                        target_res.height,
                                                         Some(cur.fps),
                                                         Some(session_max_res),
                                                         Some(c),
@@ -5622,28 +6256,54 @@ fn drive_ui_host_session_core(
                                                         "[rc-ui-host] 热切换编解码器 ({c:?}) 失败（保持当前管线）: {err}"
                                                     );
                                                 }
-                                                if c != rc_encode::Codec::H264
-                                                    && host.active_codec() != c
+                                                let actual_codec = host.active_codec();
+                                                if c != rc_encode::Codec::H264 && actual_codec != c
                                                 {
                                                     let fail_target = StreamTarget {
-                                                        width: cur.width,
-                                                        height: cur.height,
+                                                        width: target_res.width,
+                                                        height: target_res.height,
                                                         fps: cur.fps,
                                                     };
                                                     let _ = codec_negotiator.on_encode_failure(
                                                         c,
                                                         "manual SetCodec encoder init failed",
-                                                        host.active_codec(),
+                                                        actual_codec,
                                                         fail_target,
                                                         current_net_hint(host),
                                                     );
                                                     if c == rc_encode::Codec::Hevc {
                                                         hevc_runtime_failed = true;
                                                     }
+                                                    if auto_hidpi_active {
+                                                        let fb_res = compute_hidpi_stream_target(
+                                                            session_native_res,
+                                                            Some(session_max_res),
+                                                            cur.fps,
+                                                            actual_codec,
+                                                        );
+                                                        if let Some(n) = host.negotiated() {
+                                                            if (fb_res.width, fb_res.height)
+                                                                != (n.width, n.height)
+                                                            {
+                                                                let _ = host
+                                                                    .reconfigure_stream_with_codec(
+                                                                        fb_res.width,
+                                                                        fb_res.height,
+                                                                        Some(cur.fps),
+                                                                        Some(session_max_res),
+                                                                        Some(actual_codec),
+                                                                    );
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                                 if host.active_codec() != prev_codec {
                                                     codec_negotiator.bump_generation();
-                                                    if let Some(n) = host.negotiated() {
+                                                }
+                                                if let Some(n) = host.negotiated() {
+                                                    if host.active_codec() != prev_codec
+                                                        || (n.width, n.height) != prev_dims
+                                                    {
                                                         still_refine
                                                             .on_stream_reset(n.width, n.height);
                                                     }
@@ -5651,31 +6311,20 @@ fn drive_ui_host_session_core(
                                             }
                                             // 无论切换成功、幂等或拒绝，均回推最新 Capabilities，让控制端获知权威生效 codec。
                                             let (caps_native, presets) =
-                                                if active_display_id.is_some() {
-                                                    (
-                                                        session_native_res,
-                                                        display_ctrl::build_resolution_presets(
-                                                            session_native_res.width,
-                                                            session_native_res.height,
-                                                            session_max_res.width,
-                                                            session_max_res.height,
-                                                        ),
-                                                    )
-                                                } else {
-                                                    (
-                                                        original_native_res
-                                                            .unwrap_or(session_native_res),
-                                                        build_hardware_display_presets(
-                                                            prefer_hardware,
-                                                            hardware_video_active,
-                                                            original_native_res,
-                                                        ),
-                                                    )
-                                                };
+                                                build_session_display_caps_params(
+                                                    active_display_id,
+                                                    session_native_res,
+                                                    session_max_res,
+                                                    original_native_res,
+                                                    prefer_hardware,
+                                                    hardware_video_active,
+                                                );
                                             if let Some(caps_payload) = encode_host_display_caps(
                                                 host,
                                                 caps_native,
+                                                session_native_res,
                                                 session_max_res,
+                                                session_display_hidpi,
                                                 presets,
                                                 host_hevc_available(hevc_runtime_failed),
                                                 &codec_negotiator,
@@ -5702,16 +6351,23 @@ fn drive_ui_host_session_core(
                                             };
                                             let mut hevc_fell_back = false;
                                             let (applied_mode, applied_preset, supported) =
-                                                if !(prefer_hardware && hardware_video_active) {
+                                                if !hw_display_ops_active {
                                                     ("off", norm_preset, false)
                                                 } else if norm_mode == "off" {
                                                     let was_active = hw_cleanup.privacy_active;
                                                     if was_active {
-                                                        crate::platform::clear_privacy_curtain();
+                                                        #[cfg(test)]
+                                                        let cleared_by_test =
+                                                            test_platform.is_some();
+                                                        #[cfg(not(test))]
+                                                        let cleared_by_test = false;
+                                                        if !cleared_by_test {
+                                                            crate::platform::clear_privacy_curtain(
+                                                            );
+                                                        }
                                                         hw_cleanup.privacy_active = false;
                                                         if let Some(cur) = host.negotiated() {
-                                                            let wanted_hevc = host.active_codec()
-                                                                == rc_encode::Codec::Hevc;
+                                                            let prev_codec = host.active_codec();
                                                             let _ = host.force_reconfigure_stream(
                                                                 cur.width,
                                                                 cur.height,
@@ -5719,11 +6375,15 @@ fn drive_ui_host_session_core(
                                                                 Some(session_max_res),
                                                                 None,
                                                             );
-                                                            if wanted_hevc
-                                                                && host.active_codec()
-                                                                    != rc_encode::Codec::Hevc
-                                                            {
-                                                                hevc_runtime_failed = true;
+                                                            if handle_codec_fallback_hidpi(
+                                                                host,
+                                                                prev_codec,
+                                                                auto_hidpi_active,
+                                                                session_native_res,
+                                                                session_max_res,
+                                                                &mut hevc_runtime_failed,
+                                                                &mut codec_negotiator,
+                                                            ) {
                                                                 hevc_fell_back = true;
                                                             }
                                                         }
@@ -5743,18 +6403,36 @@ fn drive_ui_host_session_core(
                                                     } else {
                                                         norm_preset
                                                     };
-                                                    match crate::platform::set_privacy_curtain(
-                                                        norm_mode,
-                                                        eff_preset,
-                                                        decoded_custom.as_deref(),
-                                                    ) {
+                                                    #[cfg(test)]
+                                                    let curtain_res =
+                                                        if let Some(ref tp) = test_platform {
+                                                            if tp.privacy_curtain_ok {
+                                                                Ok(())
+                                                            } else {
+                                                                Err("mock privacy curtain failed"
+                                                                    .to_string())
+                                                            }
+                                                        } else {
+                                                            crate::platform::set_privacy_curtain(
+                                                                norm_mode,
+                                                                eff_preset,
+                                                                decoded_custom.as_deref(),
+                                                            )
+                                                        };
+                                                    #[cfg(not(test))]
+                                                    let curtain_res =
+                                                        crate::platform::set_privacy_curtain(
+                                                            norm_mode,
+                                                            eff_preset,
+                                                            decoded_custom.as_deref(),
+                                                        );
+                                                    match curtain_res {
                                                         Ok(()) => {
                                                             hw_cleanup.privacy_active = true;
                                                             // 重建 SCK 流使 SCContentFilter 立即排除新创建的幕布窗口。
                                                             if let Some(cur) = host.negotiated() {
-                                                                let wanted_hevc = host
-                                                                    .active_codec()
-                                                                    == rc_encode::Codec::Hevc;
+                                                                let prev_codec =
+                                                                    host.active_codec();
                                                                 let _ = host
                                                                     .force_reconfigure_stream(
                                                                         cur.width,
@@ -5763,11 +6441,15 @@ fn drive_ui_host_session_core(
                                                                         Some(session_max_res),
                                                                         None,
                                                                     );
-                                                                if wanted_hevc
-                                                                    && host.active_codec()
-                                                                        != rc_encode::Codec::Hevc
-                                                                {
-                                                                    hevc_runtime_failed = true;
+                                                                if handle_codec_fallback_hidpi(
+                                                                    host,
+                                                                    prev_codec,
+                                                                    auto_hidpi_active,
+                                                                    session_native_res,
+                                                                    session_max_res,
+                                                                    &mut hevc_runtime_failed,
+                                                                    &mut codec_negotiator,
+                                                                ) {
                                                                     hevc_fell_back = true;
                                                                 }
                                                             }
@@ -5778,7 +6460,14 @@ fn drive_ui_host_session_core(
                                                                 "[rc-ui-host] 设置防窥隐私幕布失败: {err}"
                                                             );
                                                             if hw_cleanup.privacy_active {
-                                                                crate::platform::clear_privacy_curtain();
+                                                                #[cfg(test)]
+                                                                let cleared_by_test =
+                                                                    test_platform.is_some();
+                                                                #[cfg(not(test))]
+                                                                let cleared_by_test = false;
+                                                                if !cleared_by_test {
+                                                                    crate::platform::clear_privacy_curtain();
+                                                                }
                                                                 hw_cleanup.privacy_active = false;
                                                             }
                                                             ("off", eff_preset, false)
@@ -5796,34 +6485,23 @@ fn drive_ui_host_session_core(
                                             }
                                             if hevc_fell_back {
                                                 let (caps_native, presets) =
-                                                    if active_display_id.is_some() {
-                                                        (
-                                                            session_native_res,
-                                                            display_ctrl::build_resolution_presets(
-                                                                session_native_res.width,
-                                                                session_native_res.height,
-                                                                session_max_res.width,
-                                                                session_max_res.height,
-                                                            ),
-                                                        )
-                                                    } else {
-                                                        (
-                                                            original_native_res
-                                                                .unwrap_or(session_native_res),
-                                                            build_hardware_display_presets(
-                                                                prefer_hardware,
-                                                                hardware_video_active,
-                                                                original_native_res,
-                                                            ),
-                                                        )
-                                                    };
+                                                    build_session_display_caps_params(
+                                                        active_display_id,
+                                                        session_native_res,
+                                                        session_max_res,
+                                                        original_native_res,
+                                                        prefer_hardware,
+                                                        hardware_video_active,
+                                                    );
                                                 if let Some(n) = host.negotiated() {
                                                     still_refine.on_stream_reset(n.width, n.height);
                                                 }
                                                 if let Some(cp) = encode_host_display_caps(
                                                     host,
                                                     caps_native,
+                                                    session_native_res,
                                                     session_max_res,
+                                                    session_display_hidpi,
                                                     presets,
                                                     host_hevc_available(hevc_runtime_failed),
                                                     &codec_negotiator,
@@ -5881,8 +6559,7 @@ fn drive_ui_host_session_core(
                                                     shows_cursor,
                                                 );
                                                 if let Some(cur) = host.negotiated() {
-                                                    let wanted_hevc = host.active_codec()
-                                                        == rc_encode::Codec::Hevc;
+                                                    let prev_codec = host.active_codec();
                                                     if let Err(err) = host.force_reconfigure_stream(
                                                         cur.width,
                                                         cur.height,
@@ -5899,11 +6576,15 @@ fn drive_ui_host_session_core(
                                                             shows_cursor,
                                                         );
                                                     }
-                                                    if wanted_hevc
-                                                        && host.active_codec()
-                                                            != rc_encode::Codec::Hevc
-                                                    {
-                                                        hevc_runtime_failed = true;
+                                                    if handle_codec_fallback_hidpi(
+                                                        host,
+                                                        prev_codec,
+                                                        auto_hidpi_active,
+                                                        session_native_res,
+                                                        session_max_res,
+                                                        &mut hevc_runtime_failed,
+                                                        &mut codec_negotiator,
+                                                    ) {
                                                         hevc_fell_back = true;
                                                     }
                                                 }
@@ -5924,34 +6605,23 @@ fn drive_ui_host_session_core(
                                             }
                                             if hevc_fell_back {
                                                 let (caps_native, presets) =
-                                                    if active_display_id.is_some() {
-                                                        (
-                                                            session_native_res,
-                                                            display_ctrl::build_resolution_presets(
-                                                                session_native_res.width,
-                                                                session_native_res.height,
-                                                                session_max_res.width,
-                                                                session_max_res.height,
-                                                            ),
-                                                        )
-                                                    } else {
-                                                        (
-                                                            original_native_res
-                                                                .unwrap_or(session_native_res),
-                                                            build_hardware_display_presets(
-                                                                prefer_hardware,
-                                                                hardware_video_active,
-                                                                original_native_res,
-                                                            ),
-                                                        )
-                                                    };
+                                                    build_session_display_caps_params(
+                                                        active_display_id,
+                                                        session_native_res,
+                                                        session_max_res,
+                                                        original_native_res,
+                                                        prefer_hardware,
+                                                        hardware_video_active,
+                                                    );
                                                 if let Some(n) = host.negotiated() {
                                                     still_refine.on_stream_reset(n.width, n.height);
                                                 }
                                                 if let Some(cp) = encode_host_display_caps(
                                                     host,
                                                     caps_native,
+                                                    session_native_res,
                                                     session_max_res,
+                                                    session_display_hidpi,
                                                     presets,
                                                     host_hevc_available(hevc_runtime_failed),
                                                     &codec_negotiator,
@@ -5963,23 +6633,25 @@ fn drive_ui_host_session_core(
                                             }
                                         }
                                         Some(DisplayControlMsg::ListDisplays) => {
-                                            if prefer_hardware && hardware_video_active {
+                                            if hw_display_ops_active {
                                                 if let Some(p) =
-                                                    encode_host_displays_state(active_display_id)
+                                                    encode_displays_state(active_display_id)
                                                 {
                                                     pending_display_tx.push_transient(p);
                                                 }
                                             }
                                         }
                                         Some(DisplayControlMsg::SwitchDisplay { display_id }) => {
-                                            if prefer_hardware && hardware_video_active {
-                                                let displays = crate::platform::list_displays();
+                                            if hw_display_ops_active {
+                                                let displays = list_session_displays();
                                                 if let Some(target) =
                                                     displays.iter().find(|d| d.id == display_id)
                                                 {
                                                     let prev_active = active_display_id;
                                                     let prev_native = session_native_res;
                                                     let prev_max = session_max_res;
+                                                    let prev_auto_hidpi = auto_hidpi_active;
+                                                    let prev_display_hidpi = session_display_hidpi;
                                                     let next_active = if target.is_main {
                                                         None
                                                     } else {
@@ -5990,42 +6662,133 @@ fn drive_ui_host_session_core(
                                                         target.height,
                                                     )
                                                     .to_even();
-                                                    let next_max = if target.is_main {
-                                                        compute_host_display_bounds(
-                                                            host,
-                                                            prefer_hardware,
-                                                            hardware_video_active,
-                                                        )
-                                                        .1
+                                                    let (
+                                                        next_max,
+                                                        next_auto_hidpi,
+                                                        next_display_hidpi,
+                                                    ) = if target.is_main {
+                                                        #[cfg(test)]
+                                                        let (main_max, next_auto) =
+                                                            match media_override {
+                                                                Some(ref ov) => (
+                                                                    clamp_display_max_res(
+                                                                        disp_res, ov.max_res,
+                                                                    ),
+                                                                    ov.auto_hidpi,
+                                                                ),
+                                                                None => (
+                                                                    compute_host_display_bounds(
+                                                                        host,
+                                                                        prefer_hardware,
+                                                                        hardware_video_active,
+                                                                    )
+                                                                    .1,
+                                                                    prefer_hardware
+                                                                        && hardware_video_active,
+                                                                ),
+                                                            };
+                                                        #[cfg(not(test))]
+                                                        let (main_max, next_auto) = (
+                                                            compute_host_display_bounds(
+                                                                host,
+                                                                prefer_hardware,
+                                                                hardware_video_active,
+                                                            )
+                                                            .1,
+                                                            prefer_hardware
+                                                                && hardware_video_active,
+                                                        );
+                                                        let is_hi = next_auto
+                                                            && main_max.width > disp_res.width
+                                                            && main_max.height > disp_res.height;
+                                                        (main_max, next_auto, is_hi)
                                                     } else {
-                                                        Resolution::new(
-                                                            disp_res.width.saturating_mul(2).min(
-                                                                display_ctrl::MAX_STREAM_WIDTH,
+                                                        match virtual_display_hidpi
+                                                            .get(&target.id)
+                                                            .copied()
+                                                        {
+                                                            Some(false) => (
+                                                                Resolution::new(
+                                                                    disp_res.width.min(
+                                                                        display_ctrl::MAX_STREAM_WIDTH,
+                                                                    ),
+                                                                    disp_res.height.min(
+                                                                        display_ctrl::MAX_STREAM_HEIGHT,
+                                                                    ),
+                                                                ),
+                                                                false,
+                                                                false,
                                                             ),
-                                                            disp_res.height.saturating_mul(2).min(
-                                                                display_ctrl::MAX_STREAM_HEIGHT,
+                                                            Some(true) => {
+                                                                let max_2x = Resolution::new(
+                                                                    disp_res
+                                                                        .width
+                                                                        .saturating_mul(2)
+                                                                        .min(
+                                                                            display_ctrl::MAX_STREAM_WIDTH,
+                                                                        ),
+                                                                    disp_res
+                                                                        .height
+                                                                        .saturating_mul(2)
+                                                                        .min(
+                                                                            display_ctrl::MAX_STREAM_HEIGHT,
+                                                                        ),
+                                                                );
+                                                                let is_hi = max_2x.width
+                                                                    > disp_res.width
+                                                                    && max_2x.height
+                                                                        > disp_res.height;
+                                                                (max_2x, false, is_hi)
+                                                            }
+                                                            None => (
+                                                                Resolution::new(
+                                                                    disp_res
+                                                                        .width
+                                                                        .saturating_mul(2)
+                                                                        .min(
+                                                                            display_ctrl::MAX_STREAM_WIDTH,
+                                                                        ),
+                                                                    disp_res
+                                                                        .height
+                                                                        .saturating_mul(2)
+                                                                        .min(
+                                                                            display_ctrl::MAX_STREAM_HEIGHT,
+                                                                        ),
+                                                                ),
+                                                                false,
+                                                                false,
                                                             ),
-                                                        )
+                                                        }
                                                     };
                                                     host.set_capture_options(
                                                         next_active,
                                                         shows_cursor,
                                                     );
-                                                    let wanted_hevc = host.active_codec()
-                                                        == rc_encode::Codec::Hevc;
-                                                    let reconfig_ok =
-                                                        if let Some(cur) = host.negotiated() {
-                                                            host.force_reconfigure_stream(
-                                                                disp_res.width,
-                                                                disp_res.height,
-                                                                Some(cur.fps),
+                                                    let prev_codec = host.active_codec();
+                                                    let reconfig_ok = if let Some(cur) =
+                                                        host.negotiated()
+                                                    {
+                                                        let target_stream_res = if next_auto_hidpi {
+                                                            compute_hidpi_stream_target(
+                                                                disp_res,
                                                                 Some(next_max),
-                                                                None,
+                                                                cur.fps,
+                                                                prev_codec,
                                                             )
-                                                            .is_ok()
                                                         } else {
-                                                            true
+                                                            disp_res
                                                         };
+                                                        host.force_reconfigure_stream(
+                                                            target_stream_res.width,
+                                                            target_stream_res.height,
+                                                            Some(cur.fps),
+                                                            Some(next_max),
+                                                            None,
+                                                        )
+                                                        .is_ok()
+                                                    } else {
+                                                        true
+                                                    };
                                                     if reconfig_ok {
                                                         audio_mgr.reset_backoff_for_display_change(
                                                             Instant::now(),
@@ -6033,12 +6796,17 @@ fn drive_ui_host_session_core(
                                                         active_display_id = next_active;
                                                         session_native_res = disp_res;
                                                         session_max_res = next_max;
-                                                        if wanted_hevc
-                                                            && host.active_codec()
-                                                                != rc_encode::Codec::Hevc
-                                                        {
-                                                            hevc_runtime_failed = true;
-                                                        }
+                                                        auto_hidpi_active = next_auto_hidpi;
+                                                        session_display_hidpi = next_display_hidpi;
+                                                        let _ = handle_codec_fallback_hidpi(
+                                                            host,
+                                                            prev_codec,
+                                                            next_auto_hidpi,
+                                                            disp_res,
+                                                            next_max,
+                                                            &mut hevc_runtime_failed,
+                                                            &mut codec_negotiator,
+                                                        );
                                                         host.set_injector_screen_bounds(
                                                             target.origin_x,
                                                             target.origin_y,
@@ -6060,14 +6828,14 @@ fn drive_ui_host_session_core(
                                                             )
                                                         } else {
                                                             (
-                                                                    disp_res,
-                                                                    display_ctrl::build_resolution_presets(
-                                                                        disp_res.width,
-                                                                        disp_res.height,
-                                                                        session_max_res.width,
-                                                                        session_max_res.height,
-                                                                    ),
-                                                                )
+                                                                disp_res,
+                                                                display_ctrl::build_resolution_presets(
+                                                                    disp_res.width,
+                                                                    disp_res.height,
+                                                                    session_max_res.width,
+                                                                    session_max_res.height,
+                                                                ),
+                                                            )
                                                         };
                                                         if let Some(n) = host.negotiated() {
                                                             still_refine
@@ -6076,7 +6844,9 @@ fn drive_ui_host_session_core(
                                                         if let Some(cp) = encode_host_display_caps(
                                                             host,
                                                             caps_native,
+                                                            session_native_res,
                                                             session_max_res,
+                                                            session_display_hidpi,
                                                             presets,
                                                             host_hevc_available(
                                                                 hevc_runtime_failed,
@@ -6091,6 +6861,8 @@ fn drive_ui_host_session_core(
                                                         active_display_id = prev_active;
                                                         session_native_res = prev_native;
                                                         session_max_res = prev_max;
+                                                        auto_hidpi_active = prev_auto_hidpi;
+                                                        session_display_hidpi = prev_display_hidpi;
                                                         host.set_capture_options(
                                                             prev_active,
                                                             shows_cursor,
@@ -6098,7 +6870,7 @@ fn drive_ui_host_session_core(
                                                     }
                                                 }
                                                 if let Some(dp) =
-                                                    encode_host_displays_state(active_display_id)
+                                                    encode_displays_state(active_display_id)
                                                 {
                                                     pending_display_tx.push_transient(dp);
                                                 }
@@ -6109,7 +6881,7 @@ fn drive_ui_host_session_core(
                                             height,
                                             hidpi,
                                         }) => {
-                                            if !(prefer_hardware && hardware_video_active) {
+                                            if !hw_display_ops_active {
                                                 if let Some(ep) =
                                                     display_ctrl::encode_display_ctrl(
                                                         &DisplayControlMsg::VirtualDisplayError {
@@ -6145,49 +6917,81 @@ fn drive_ui_host_session_core(
                                                 } else {
                                                     1080
                                                 };
-                                                match crate::platform::create_virtual_display(
-                                                    req_w, req_h, hidpi,
-                                                ) {
+                                                #[cfg(test)]
+                                                let create_res = if let Some(ref tp) = test_platform
+                                                {
+                                                    tp.create_virtual_display(req_w, req_h, hidpi)
+                                                } else {
+                                                    crate::platform::create_virtual_display(
+                                                        req_w, req_h, hidpi,
+                                                    )
+                                                };
+                                                #[cfg(not(test))]
+                                                let create_res =
+                                                    crate::platform::create_virtual_display(
+                                                        req_w, req_h, hidpi,
+                                                    );
+                                                match create_res {
                                                     Ok(vinfo) => {
                                                         hw_cleanup.virtual_display_count =
                                                             hw_cleanup
                                                                 .virtual_display_count
                                                                 .saturating_add(1);
-                                                        // 等待 WindowServer 将新虚拟屏注册到 CG/SCK 列表。
-                                                        thread::sleep(Duration::from_millis(260));
-                                                        let fresh_list =
-                                                            crate::platform::list_displays();
+                                                        #[cfg(test)]
+                                                        let skip_wait = test_platform.is_some();
+                                                        #[cfg(not(test))]
+                                                        let skip_wait = false;
+                                                        if !skip_wait {
+                                                            // 等待 WindowServer 将新虚拟屏注册到 CG/SCK 列表。
+                                                            thread::sleep(Duration::from_millis(
+                                                                260,
+                                                            ));
+                                                        }
+                                                        let fresh_list = list_session_displays();
                                                         let resolved = fresh_list
                                                             .iter()
                                                             .find(|d| d.id == vinfo.id)
                                                             .cloned()
                                                             .unwrap_or(vinfo);
+                                                        virtual_display_hidpi
+                                                            .insert(resolved.id, hidpi);
                                                         let prev_active = active_display_id;
                                                         let prev_native = session_native_res;
                                                         let prev_max = session_max_res;
+                                                        let prev_display_hidpi =
+                                                            session_display_hidpi;
                                                         let vres = Resolution::new(
                                                             resolved.width,
                                                             resolved.height,
                                                         )
                                                         .to_even();
-                                                        let next_max = Resolution::new(
-                                                            vres.width
-                                                                .saturating_mul(2)
-                                                                .min(
+                                                        let next_max = if hidpi {
+                                                            Resolution::new(
+                                                                vres.width.saturating_mul(2).min(
                                                                     display_ctrl::MAX_STREAM_WIDTH,
                                                                 ),
-                                                            vres.height
-                                                                .saturating_mul(2)
-                                                                .min(
+                                                                vres.height.saturating_mul(2).min(
                                                                     display_ctrl::MAX_STREAM_HEIGHT,
                                                                 ),
-                                                        );
+                                                            )
+                                                        } else {
+                                                            Resolution::new(
+                                                                vres.width.min(
+                                                                    display_ctrl::MAX_STREAM_WIDTH,
+                                                                ),
+                                                                vres.height.min(
+                                                                    display_ctrl::MAX_STREAM_HEIGHT,
+                                                                ),
+                                                            )
+                                                        };
+                                                        let next_display_hidpi = hidpi
+                                                            && next_max.width > vres.width
+                                                            && next_max.height > vres.height;
                                                         host.set_capture_options(
                                                             Some(resolved.id),
                                                             shows_cursor,
                                                         );
-                                                        let wanted_hevc = host.active_codec()
-                                                            == rc_encode::Codec::Hevc;
+                                                        let prev_codec = host.active_codec();
                                                         let switch_res = if let Some(cur) =
                                                             host.negotiated()
                                                         {
@@ -6212,12 +7016,18 @@ fn drive_ui_host_session_core(
                                                                     Some(resolved.id);
                                                                 session_native_res = vres;
                                                                 session_max_res = next_max;
-                                                                if wanted_hevc
-                                                                    && host.active_codec()
-                                                                        != rc_encode::Codec::Hevc
-                                                                {
-                                                                    hevc_runtime_failed = true;
-                                                                }
+                                                                session_display_hidpi =
+                                                                    next_display_hidpi;
+                                                                auto_hidpi_active = false;
+                                                                let _ = handle_codec_fallback_hidpi(
+                                                                    host,
+                                                                    prev_codec,
+                                                                    false,
+                                                                    vres,
+                                                                    next_max,
+                                                                    &mut hevc_runtime_failed,
+                                                                    &mut codec_negotiator,
+                                                                );
                                                                 host.set_injector_screen_bounds(
                                                                     resolved.origin_x,
                                                                     resolved.origin_y,
@@ -6240,7 +7050,9 @@ fn drive_ui_host_session_core(
                                                                     encode_host_display_caps(
                                                                         host,
                                                                         vres,
+                                                                        session_native_res,
                                                                         session_max_res,
+                                                                        session_display_hidpi,
                                                                         presets,
                                                                         host_hevc_available(
                                                                             hevc_runtime_failed,
@@ -6261,6 +7073,8 @@ fn drive_ui_host_session_core(
                                                                 active_display_id = prev_active;
                                                                 session_native_res = prev_native;
                                                                 session_max_res = prev_max;
+                                                                session_display_hidpi =
+                                                                    prev_display_hidpi;
                                                                 host.set_capture_options(
                                                                     prev_active,
                                                                     shows_cursor,
@@ -6279,11 +7093,9 @@ fn drive_ui_host_session_core(
                                                                 }
                                                             }
                                                         }
-                                                        if let Some(dp) =
-                                                            encode_host_displays_state(
-                                                                active_display_id,
-                                                            )
-                                                        {
+                                                        if let Some(dp) = encode_displays_state(
+                                                            active_display_id,
+                                                        ) {
                                                             pending_display_tx.push_transient(dp);
                                                         }
                                                     }
@@ -6303,12 +7115,20 @@ fn drive_ui_host_session_core(
                                         }
                                         Some(DisplayControlMsg::RemoveVirtualDisplay {
                                             display_id,
-                                        }) if prefer_hardware && hardware_video_active => {
+                                        }) if hw_display_ops_active => {
                                             let was_active = active_display_id == Some(display_id);
+                                            #[cfg(test)]
+                                            let removed = if let Some(ref tp) = test_platform {
+                                                tp.destroy_virtual_display(display_id)
+                                            } else {
+                                                crate::platform::destroy_virtual_display(display_id)
+                                            };
+                                            #[cfg(not(test))]
                                             let removed = crate::platform::destroy_virtual_display(
                                                 display_id,
                                             );
                                             if removed {
+                                                virtual_display_hidpi.remove(&display_id);
                                                 audio_mgr.reset_backoff_for_display_change(
                                                     Instant::now(),
                                                 );
@@ -6319,17 +7139,47 @@ fn drive_ui_host_session_core(
                                             if removed && was_active {
                                                 active_display_id = None;
                                                 host.set_capture_options(None, shows_cursor);
-                                                let (main_native, main_max) =
+                                                #[cfg(test)]
+                                                let ((main_native, main_max), next_auto_hidpi) =
+                                                    match media_override {
+                                                        Some(ref ov) => (
+                                                            (
+                                                                ov.native_res,
+                                                                clamp_display_max_res(
+                                                                    ov.native_res,
+                                                                    ov.max_res,
+                                                                ),
+                                                            ),
+                                                            ov.auto_hidpi,
+                                                        ),
+                                                        None => (
+                                                            compute_host_display_bounds(
+                                                                host,
+                                                                prefer_hardware,
+                                                                hardware_video_active,
+                                                            ),
+                                                            prefer_hardware
+                                                                && hardware_video_active,
+                                                        ),
+                                                    };
+                                                #[cfg(not(test))]
+                                                let ((main_native, main_max), next_auto_hidpi) = (
                                                     compute_host_display_bounds(
                                                         host,
                                                         prefer_hardware,
                                                         hardware_video_active,
-                                                    );
+                                                    ),
+                                                    prefer_hardware && hardware_video_active,
+                                                );
                                                 let caps_native =
                                                     original_native_res.unwrap_or(main_native);
                                                 session_native_res = main_native;
                                                 session_max_res = main_max;
-                                                let main_origin = crate::platform::list_displays()
+                                                auto_hidpi_active = next_auto_hidpi;
+                                                session_display_hidpi = next_auto_hidpi
+                                                    && main_max.width > main_native.width
+                                                    && main_max.height > main_native.height;
+                                                let main_origin = list_session_displays()
                                                     .into_iter()
                                                     .find(|d| d.is_main)
                                                     .map(|d| (d.origin_x, d.origin_y))
@@ -6341,21 +7191,33 @@ fn drive_ui_host_session_core(
                                                     main_native.height,
                                                 );
                                                 if let Some(cur) = host.negotiated() {
-                                                    let wanted_hevc = host.active_codec()
-                                                        == rc_encode::Codec::Hevc;
+                                                    let prev_codec = host.active_codec();
+                                                    let target_stream_res = if next_auto_hidpi {
+                                                        compute_hidpi_stream_target(
+                                                            main_native,
+                                                            Some(session_max_res),
+                                                            cur.fps,
+                                                            prev_codec,
+                                                        )
+                                                    } else {
+                                                        main_native
+                                                    };
                                                     let _ = host.force_reconfigure_stream(
-                                                        main_native.width,
-                                                        main_native.height,
+                                                        target_stream_res.width,
+                                                        target_stream_res.height,
                                                         Some(cur.fps),
                                                         Some(session_max_res),
                                                         None,
                                                     );
-                                                    if wanted_hevc
-                                                        && host.active_codec()
-                                                            != rc_encode::Codec::Hevc
-                                                    {
-                                                        hevc_runtime_failed = true;
-                                                    }
+                                                    let _ = handle_codec_fallback_hidpi(
+                                                        host,
+                                                        prev_codec,
+                                                        next_auto_hidpi,
+                                                        main_native,
+                                                        session_max_res,
+                                                        &mut hevc_runtime_failed,
+                                                        &mut codec_negotiator,
+                                                    );
                                                 }
                                                 let presets = build_hardware_display_presets(
                                                     prefer_hardware,
@@ -6368,7 +7230,9 @@ fn drive_ui_host_session_core(
                                                 if let Some(cp) = encode_host_display_caps(
                                                     host,
                                                     caps_native,
+                                                    session_native_res,
                                                     session_max_res,
+                                                    session_display_hidpi,
                                                     presets,
                                                     host_hevc_available(hevc_runtime_failed),
                                                     &codec_negotiator,
@@ -6379,7 +7243,7 @@ fn drive_ui_host_session_core(
                                                 }
                                             }
                                             if let Some(dp) =
-                                                encode_host_displays_state(active_display_id)
+                                                encode_displays_state(active_display_id)
                                             {
                                                 pending_display_tx.push_transient(dp);
                                             }
@@ -6396,39 +7260,27 @@ fn drive_ui_host_session_core(
                                                     pending_display_tx.push_transient(mp);
                                                 }
                                             } else {
-                                                let wanted_hevc =
-                                                    host.active_codec() == rc_encode::Codec::Hevc;
+                                                let prev_codec = host.active_codec();
                                                 match host.resume_media() {
                                                     Ok(()) => {
-                                                        if wanted_hevc
-                                                            && host.active_codec()
-                                                                != rc_encode::Codec::Hevc
-                                                        {
-                                                            hevc_runtime_failed = true;
-                                                        }
+                                                        let _ = handle_codec_fallback_hidpi(
+                                                            host,
+                                                            prev_codec,
+                                                            auto_hidpi_active,
+                                                            session_native_res,
+                                                            session_max_res,
+                                                            &mut hevc_runtime_failed,
+                                                            &mut codec_negotiator,
+                                                        );
                                                         let (caps_native, presets) =
-                                                            if active_display_id.is_some() {
-                                                                (
-                                                                    session_native_res,
-                                                                    display_ctrl::build_resolution_presets(
-                                                                        session_native_res.width,
-                                                                        session_native_res.height,
-                                                                        session_max_res.width,
-                                                                        session_max_res.height,
-                                                                    ),
-                                                                )
-                                                            } else {
-                                                                (
-                                                                    original_native_res.unwrap_or(
-                                                                        session_native_res,
-                                                                    ),
-                                                                    build_hardware_display_presets(
-                                                                        prefer_hardware,
-                                                                        hardware_video_active,
-                                                                        original_native_res,
-                                                                    ),
-                                                                )
-                                                            };
+                                                            build_session_display_caps_params(
+                                                                active_display_id,
+                                                                session_native_res,
+                                                                session_max_res,
+                                                                original_native_res,
+                                                                prefer_hardware,
+                                                                hardware_video_active,
+                                                            );
                                                         if let Some(n) = host.negotiated() {
                                                             still_refine
                                                                 .on_stream_reset(n.width, n.height);
@@ -6436,7 +7288,9 @@ fn drive_ui_host_session_core(
                                                         if let Some(cp) = encode_host_display_caps(
                                                             host,
                                                             caps_native,
+                                                            session_native_res,
                                                             session_max_res,
+                                                            session_display_hidpi,
                                                             presets,
                                                             host_hevc_available(
                                                                 hevc_runtime_failed,
@@ -6447,13 +7301,10 @@ fn drive_ui_host_session_core(
                                                         ) {
                                                             pending_display_tx.set_caps(cp);
                                                         }
-                                                        if prefer_hardware && hardware_video_active
-                                                        {
-                                                            if let Some(dp) =
-                                                                encode_host_displays_state(
-                                                                    active_display_id,
-                                                                )
-                                                            {
+                                                        if hw_display_ops_active {
+                                                            if let Some(dp) = encode_displays_state(
+                                                                active_display_id,
+                                                            ) {
                                                                 pending_display_tx
                                                                     .push_transient(dp);
                                                             }
@@ -7049,31 +7900,21 @@ fn drive_ui_host_session_core(
                         host.reset_clipboard_epoch();
                         last_busy = true;
                         pending_display_tx.clear();
-                        let (caps_native, presets) = if active_display_id.is_some() {
-                            (
-                                session_native_res,
-                                display_ctrl::build_resolution_presets(
-                                    session_native_res.width,
-                                    session_native_res.height,
-                                    session_max_res.width,
-                                    session_max_res.height,
-                                ),
-                            )
-                        } else {
-                            (
-                                original_native_res.unwrap_or(session_native_res),
-                                build_hardware_display_presets(
-                                    prefer_hardware,
-                                    hardware_video_active,
-                                    original_native_res,
-                                ),
-                            )
-                        };
+                        let (caps_native, presets) = build_session_display_caps_params(
+                            active_display_id,
+                            session_native_res,
+                            session_max_res,
+                            original_native_res,
+                            prefer_hardware,
+                            hardware_video_active,
+                        );
                         still_refine.on_input_event();
                         if let Some(payload) = encode_host_display_caps(
                             host,
                             caps_native,
+                            session_native_res,
                             session_max_res,
+                            session_display_hidpi,
                             presets,
                             host_hevc_available(hevc_runtime_failed),
                             &codec_negotiator,
@@ -7082,8 +7923,8 @@ fn drive_ui_host_session_core(
                         ) {
                             pending_display_tx.set_caps(payload);
                         }
-                        if prefer_hardware && hardware_video_active {
-                            if let Some(dp) = encode_host_displays_state(active_display_id) {
+                        if hw_display_ops_active {
+                            if let Some(dp) = encode_displays_state(active_display_id) {
                                 pending_display_tx.push_transient(dp);
                             }
                         }
@@ -7153,11 +7994,12 @@ fn drive_ui_host_session_core(
                         let had_privacy_curtain = hw_cleanup.privacy_active;
                         hw_cleanup.cleanup_now();
                         active_display_id = None;
+                        virtual_display_hidpi.clear();
                         shows_cursor = false;
                         host.set_capture_options(None, false);
                         display_mode_session.restore();
-                        let main_origin = if prefer_hardware && hardware_video_active {
-                            crate::platform::list_displays()
+                        let main_origin = if hw_display_ops_active {
+                            list_session_displays()
                                 .into_iter()
                                 .find(|d| d.is_main)
                                 .map(|d| (d.origin_x, d.origin_y))
@@ -7204,11 +8046,40 @@ fn drive_ui_host_session_core(
                         pending_portmap_tx.clear();
                         pending_display_tx.clear();
                         pending_update_tx.clear();
-                        (session_native_res, session_max_res) = compute_host_display_bounds(
-                            host,
-                            prefer_hardware,
-                            hardware_video_active,
-                        );
+                        #[cfg(test)]
+                        match media_override {
+                            Some(ref ov) => {
+                                session_native_res = ov.native_res;
+                                session_max_res = clamp_display_max_res(ov.native_res, ov.max_res);
+                                auto_hidpi_active = ov.auto_hidpi;
+                                session_display_hidpi = session_max_res.width
+                                    > session_native_res.width
+                                    && session_max_res.height > session_native_res.height;
+                            }
+                            None => {
+                                (session_native_res, session_max_res) = compute_host_display_bounds(
+                                    host,
+                                    prefer_hardware,
+                                    hardware_video_active,
+                                );
+                                auto_hidpi_active = prefer_hardware && hardware_video_active;
+                                session_display_hidpi = auto_hidpi_active
+                                    && session_max_res.width > session_native_res.width
+                                    && session_max_res.height > session_native_res.height;
+                            }
+                        }
+                        #[cfg(not(test))]
+                        {
+                            (session_native_res, session_max_res) = compute_host_display_bounds(
+                                host,
+                                prefer_hardware,
+                                hardware_video_active,
+                            );
+                            auto_hidpi_active = prefer_hardware && hardware_video_active;
+                            session_display_hidpi = auto_hidpi_active
+                                && session_max_res.width > session_native_res.width
+                                && session_max_res.height > session_native_res.height;
+                        }
                         if had_privacy_curtain {
                             if let Some(cur) = host.negotiated() {
                                 let _ = host.force_reconfigure_stream(
@@ -7228,7 +8099,9 @@ fn drive_ui_host_session_core(
                         if let Some(payload) = encode_host_display_caps(
                             host,
                             original_native_res.unwrap_or(session_native_res),
+                            session_native_res,
                             session_max_res,
+                            session_display_hidpi,
                             presets,
                             host_hevc_available(hevc_runtime_failed),
                             &codec_negotiator,
@@ -7237,8 +8110,8 @@ fn drive_ui_host_session_core(
                         ) {
                             pending_display_tx.set_caps(payload);
                         }
-                        if prefer_hardware && hardware_video_active {
-                            if let Some(dp) = encode_host_displays_state(active_display_id) {
+                        if hw_display_ops_active {
+                            if let Some(dp) = encode_displays_state(active_display_id) {
                                 pending_display_tx.push_transient(dp);
                             }
                         }
@@ -10055,7 +10928,105 @@ mod tests {
     }
 
     #[test]
-    fn client_media_caps_and_fps_change_preserve_host_current_resolution() {
+    fn compute_hidpi_stream_target_covers_retina_4k_5k_and_non_hidpi() {
+        // 14" MBP (1512×982 logical / 3024×1964 backing)
+        let mbp14_log = Resolution::new(1512, 982);
+        let mbp14_back = Some(Resolution::new(3024, 1964));
+        // @60fps & @90fps HEVC -> 1:1 物理像素直出（零缩放）
+        assert_eq!(
+            compute_hidpi_stream_target(mbp14_log, mbp14_back, 60, rc_encode::Codec::Hevc),
+            Resolution::new(3024, 1964)
+        );
+        assert_eq!(
+            compute_hidpi_stream_target(mbp14_log, mbp14_back, 90, rc_encode::Codec::Hevc),
+            Resolution::new(3024, 1964)
+        );
+        // @120fps HEVC -> 收窄至 600M px/s 预算内（<= 5_000_000 px）且高于逻辑分辨率
+        let mbp14_hevc_120 =
+            compute_hidpi_stream_target(mbp14_log, mbp14_back, 120, rc_encode::Codec::Hevc);
+        assert!(mbp14_hevc_120.width > 1512 && mbp14_hevc_120.height > 982);
+        assert!(mbp14_hevc_120.width < 3024 && mbp14_hevc_120.height < 1964);
+        assert!(
+            u64::from(mbp14_hevc_120.width) * u64::from(mbp14_hevc_120.height) <= 600_000_000 / 120
+        );
+        // @60/90/120fps H.264 -> 按 280M px/s 预算适配
+        for fps in [60u32, 90, 120] {
+            let res =
+                compute_hidpi_stream_target(mbp14_log, mbp14_back, fps, rc_encode::Codec::H264);
+            assert_eq!(res.width % 2, 0);
+            assert_eq!(res.height % 2, 0);
+            assert!(res.width >= 1512 && res.height >= 982);
+            assert!(
+                u64::from(res.width) * u64::from(res.height) <= 280_000_000 / u64::from(fps),
+                "H.264@{fps}fps 应满足 280M px/s 预算: {res:?}"
+            );
+        }
+
+        // 16" MBP (1728×1117 logical / 3456×2234 backing) @60fps HEVC -> 1:1 物理像素直出
+        assert_eq!(
+            compute_hidpi_stream_target(
+                Resolution::new(1728, 1117),
+                Some(Resolution::new(3456, 2234)),
+                60,
+                rc_encode::Codec::Hevc,
+            ),
+            Resolution::new(3456, 2234)
+        );
+
+        // 4K HiDPI (1920×1080 logical / 3840×2160 backing) @60fps HEVC -> 1:1 物理像素直出
+        assert_eq!(
+            compute_hidpi_stream_target(
+                Resolution::new(1920, 1080),
+                Some(Resolution::new(3840, 2160)),
+                60,
+                rc_encode::Codec::Hevc,
+            ),
+            Resolution::new(3840, 2160)
+        );
+
+        // 5K Studio Display (2560×1440 logical / 5120×2880 backing) @60fps HEVC -> 封顶 3840×2400 -> 3840×2160
+        let display_5k = compute_hidpi_stream_target(
+            Resolution::new(2560, 1440),
+            Some(Resolution::new(5120, 2880)),
+            60,
+            rc_encode::Codec::Hevc,
+        );
+        assert!(display_5k.width <= DEFAULT_HIDPI_STREAM_MAX_WIDTH);
+        assert!(display_5k.height <= DEFAULT_HIDPI_STREAM_MAX_HEIGHT);
+        assert_eq!(display_5k, Resolution::new(3840, 2160));
+
+        // 非 HiDPI (1920×1080 / 1920×1080)、无 backing 与退化输入原样返回
+        assert_eq!(
+            compute_hidpi_stream_target(
+                Resolution::new(1920, 1080),
+                Some(Resolution::new(1920, 1080)),
+                60,
+                rc_encode::Codec::Hevc,
+            ),
+            Resolution::new(1920, 1080)
+        );
+        assert_eq!(
+            compute_hidpi_stream_target(
+                Resolution::new(1920, 1080),
+                None,
+                60,
+                rc_encode::Codec::Hevc,
+            ),
+            Resolution::new(1920, 1080)
+        );
+        assert_eq!(
+            compute_hidpi_stream_target(
+                Resolution::new(0, 0),
+                Some(Resolution::new(3024, 1964)),
+                60,
+                rc_encode::Codec::Hevc,
+            ),
+            Resolution::new(0, 0)
+        );
+    }
+
+    #[test]
+    fn client_media_caps_and_fps_change_adapt_hidpi_physical_resolution_within_codec_budget() {
         use rc_session::{ClientSession, ClientSessionConfig};
 
         struct EmptyInput;
@@ -10101,7 +11072,7 @@ mod tests {
             t_anchor.reset_pending();
             host.accept_and_handshake(Duration::from_secs(5))
                 .expect("accept_and_handshake");
-            drive_ui_host_session_inner(
+            drive_ui_host_session_with_media_override(
                 &mut host,
                 &clock,
                 Some(&t_anchor),
@@ -10116,7 +11087,6 @@ mod tests {
                 HostTransportKind::Lan,
                 false,
                 false,
-                false,
                 &AtomicU64::new(0),
                 None,
                 &mut PersistentOwnerTerminals::new(),
@@ -10126,6 +11096,14 @@ mod tests {
                 None,
                 None,
                 Instant::now(),
+                TestHostMediaOverride {
+                    native_res: Resolution::new(1512, 982),
+                    max_res: Resolution::new(3024, 1964),
+                    auto_hidpi: true,
+                    hevc_available: true,
+                    encode_caps: rc_pipeline::default_codec_capabilities(true),
+                    platform: None,
+                },
             )
         });
 
@@ -10135,7 +11113,7 @@ mod tests {
                 width: 0,
                 height: 0,
                 fps: 60,
-                bitrate_bps: 14_000_000,
+                bitrate_bps: 30_000_000,
             },
             7789,
             Box::new(EmptyInput),
@@ -10156,7 +11134,8 @@ mod tests {
         let negotiated = client.connect_and_handshake().expect("client handshake");
         assert_eq!((negotiated.width, negotiated.height), (1512, 982));
 
-        // 1) 上报控制端支持 HEVC 的 ClientMediaCaps 后，被控端不得把 1512×982 自动放大到 2K。
+        // 1) HiDPI 物理像素 3024×1964 + ClientMediaCaps(HEVC) -> 自动升级为 3024×1964（1:1 物理像素），
+        //    同时 display_width=1512, display_height=982, display_hidpi=true。
         let caps_msg = display_ctrl::encode_display_ctrl(&DisplayControlMsg::ClientMediaCaps {
             decode_caps: rc_pipeline::default_codec_capabilities(true),
             refinement_caps: None,
@@ -10168,33 +11147,44 @@ mod tests {
             .send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, caps_msg)
             .expect("send ClientMediaCaps");
 
-        let mut saw_initial_caps = false;
+        let mut saw_hidpi_hevc_60 = false;
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
+        while Instant::now() < deadline && !saw_hidpi_hevc_60 {
             let _ = client.tick(Duration::from_millis(10), Instant::now());
             for (ch, payload) in client.drain_tool_messages() {
                 if ch == TOOL_CHANNEL_DISPLAY_CTRL {
                     if let Some(DisplayControlMsg::Capabilities {
                         current_width,
                         current_height,
+                        current_codec,
                         native_width,
                         native_height,
+                        display_width,
+                        display_height,
+                        display_hidpi,
                         ..
                     }) = display_ctrl::decode_display_ctrl(&payload)
                     {
-                        assert_eq!((current_width, current_height), (1512, 982));
                         assert_eq!((native_width, native_height), (1512, 982));
-                        saw_initial_caps = true;
+                        assert_eq!(
+                            (display_width, display_height, display_hidpi),
+                            (1512, 982, true)
+                        );
+                        if current_codec.as_deref() == Some("hevc")
+                            && (current_width, current_height) == (3024, 1964)
+                        {
+                            saw_hidpi_hevc_60 = true;
+                        }
                     }
                 }
             }
-            if saw_initial_caps {
-                break;
-            }
         }
-        assert!(saw_initial_caps, "应收到保持 1512×982 的 Capabilities");
+        assert!(
+            saw_hidpi_hevc_60,
+            "HiDPI 3024×1964 + ClientMediaCaps(HEVC)@60fps 应自动升级为 3024×1964"
+        );
 
-        // 2) 仅切帧率（width=0, height=0, fps=120）同样保持被控端当前系统分辨率 1512×982。
+        // 2) 切到 120fps 时收窄至 HEVC 600M px/s 预算内 (<= 600_000_000 / 120) 而不改系统逻辑分辨率。
         let set_fps = display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetStream {
             width: 0,
             height: 0,
@@ -10206,9 +11196,15 @@ mod tests {
             .send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, set_fps)
             .expect("send SetStream");
 
-        let mut saw_120_caps = false;
+        let expected_hevc_120 = compute_hidpi_stream_target(
+            Resolution::new(1512, 982),
+            Some(Resolution::new(3024, 1964)),
+            120,
+            rc_encode::Codec::Hevc,
+        );
+        let mut saw_hevc_120 = false;
         let deadline2 = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline2 && !saw_120_caps {
+        while Instant::now() < deadline2 && !saw_hevc_120 {
             let _ = client.tick(Duration::from_millis(10), Instant::now());
             for (ch, payload) in client.drain_tool_messages() {
                 if ch == TOOL_CHANNEL_DISPLAY_CTRL {
@@ -10216,20 +11212,1349 @@ mod tests {
                         current_width,
                         current_height,
                         current_fps,
+                        current_codec,
+                        display_width,
+                        display_height,
+                        display_hidpi,
                         ..
                     }) = display_ctrl::decode_display_ctrl(&payload)
                     {
-                        assert_eq!((current_width, current_height), (1512, 982));
-                        if current_fps == 120 {
-                            saw_120_caps = true;
+                        assert_eq!(
+                            (display_width, display_height, display_hidpi),
+                            (1512, 982, true)
+                        );
+                        if current_fps == 120 && current_codec.as_deref() == Some("hevc") {
+                            assert_eq!(
+                                (current_width, current_height),
+                                (expected_hevc_120.width, expected_hevc_120.height)
+                            );
+                            assert!(
+                                u64::from(current_width) * u64::from(current_height)
+                                    <= 600_000_000 / 120
+                            );
+                            saw_hevc_120 = true;
                         }
                     }
                 }
             }
         }
-        assert!(saw_120_caps, "仅切帧率 120fps 后仍应保持 1512×982");
+        assert!(
+            saw_hevc_120,
+            "切到 120fps 后应收窄至 HEVC 600M px/s 预算内并保持逻辑分辨率 1512×982"
+        );
+
+        // 3) 切到 H.264@120fps 时按 280M px/s 预算适配。
+        let set_h264 = display_ctrl::encode_display_ctrl(&DisplayControlMsg::SetCodec {
+            codec: "h264".to_string(),
+        })
+        .expect("encode SetCodec(h264)");
+        client
+            .send_tool_message(TOOL_CHANNEL_DISPLAY_CTRL, set_h264)
+            .expect("send SetCodec(h264)");
+
+        let expected_h264_120 = compute_hidpi_stream_target(
+            Resolution::new(1512, 982),
+            Some(Resolution::new(3024, 1964)),
+            120,
+            rc_encode::Codec::H264,
+        );
+        let mut saw_h264_120 = false;
+        let deadline3 = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline3 && !saw_h264_120 {
+            let _ = client.tick(Duration::from_millis(10), Instant::now());
+            for (ch, payload) in client.drain_tool_messages() {
+                if ch == TOOL_CHANNEL_DISPLAY_CTRL {
+                    if let Some(DisplayControlMsg::Capabilities {
+                        current_width,
+                        current_height,
+                        current_fps,
+                        current_codec,
+                        display_width,
+                        display_height,
+                        display_hidpi,
+                        ..
+                    }) = display_ctrl::decode_display_ctrl(&payload)
+                    {
+                        assert_eq!(
+                            (display_width, display_height, display_hidpi),
+                            (1512, 982, true)
+                        );
+                        if current_fps == 120 && current_codec.as_deref() == Some("h264") {
+                            assert_eq!(
+                                (current_width, current_height),
+                                (expected_h264_120.width, expected_h264_120.height)
+                            );
+                            assert!(
+                                u64::from(current_width) * u64::from(current_height)
+                                    <= 280_000_000 / 120
+                            );
+                            saw_h264_120 = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_h264_120,
+            "H.264@120fps 应按 280M px/s 预算适配并保持逻辑分辨率 1512×982"
+        );
 
         let _ = client.close(ByeReason::Normal);
+        stop_flag.store(true, Ordering::Release);
+        let _ = host_thread.join();
+    }
+
+    fn build_hidpi_channel_host(
+        clock: SessionClock,
+        caps_w: u32,
+        caps_h: u32,
+        init_fps: u32,
+        caps_fps: u32,
+        fail_hevc: Arc<AtomicBool>,
+    ) -> (HostSession, mpsc::Sender<NetEvent>, mpsc::Receiver<Vec<u8>>) {
+        use rc_session::proto::{AuthMethod, ControlMessage, Hello, PROTOCOL_VERSION};
+
+        let requested = SessionParams {
+            width: caps_w,
+            height: caps_h,
+            fps: init_fps,
+            bitrate_bps: 30_000_000,
+        };
+        let hello_msg = ControlMessage::Hello(Hello {
+            version: PROTOCOL_VERSION,
+            session_id: 142,
+            requested,
+            auth_method: AuthMethod::None,
+            auth_payload: Vec::new(),
+        });
+        let mut hello_bytes = Vec::new();
+        hello_msg.encode(&mut hello_bytes);
+
+        let (in_tx, in_rx) = mpsc::channel::<NetEvent>();
+        let (out_reliable_tx, out_reliable_rx) = mpsc::channel::<Vec<u8>>();
+        let out_datagram_count = Arc::new(AtomicU64::new(0));
+        in_tx
+            .send(NetEvent::Reliable(hello_bytes))
+            .expect("queue hello");
+
+        let transport = ChannelTestTransport {
+            in_rx,
+            out_reliable_tx,
+            out_datagram_count,
+        };
+        let capture = rc_capture::FakeBackend::new(rc_capture::FakeBackendConfig {
+            display: rc_capture::DisplayInfo {
+                id: rc_types::DisplayId(0),
+                resolution: Resolution::new(caps_w, caps_h),
+                scale: 1.0,
+                hdr: false,
+            },
+            fps: init_fps,
+            content: rc_capture::FakeContent::Dynamic,
+            dirty_rect: None,
+        })
+        .expect("fake capture");
+        let encoder = rc_encode::FakeEncoder::new(rc_encode::EncoderConfig {
+            resolution: Resolution::new(caps_w, caps_h),
+            fps: init_fps,
+            bitrate_bps: 30_000_000,
+            ..rc_encode::EncoderConfig::default()
+        })
+        .expect("fake encoder");
+
+        let cfg = HostSessionConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            mtu: rc_session::DEFAULT_SESSION_MTU,
+            caps: SessionParams {
+                width: caps_w,
+                height: caps_h,
+                fps: caps_fps,
+                bitrate_bps: 150_000_000,
+            },
+            pipeline: PipelineConfig {
+                resolution: Resolution::new(caps_w, caps_h),
+                fps: init_fps,
+                bitrate_bps: 30_000_000,
+                prefer_hardware: false,
+                target_latency_us: 22_000,
+                trace_capacity: 64,
+                diff: DiffMode::TrustPlatform,
+                clock_origin_us: None,
+                max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+                ..PipelineConfig::default()
+            },
+            handshake_timeout: Duration::from_secs(5),
+            injector: Box::new(RecordingInjector::new()),
+            pace_capture: false,
+            auth: HostAuthConfig::default(),
+            approver: Box::new(AutoApprover),
+            tool_permissions: rc_session::ToolPermissions::all_allowed(),
+        };
+        let mut host = HostSession::with_parts(
+            cfg,
+            Box::new(transport),
+            Box::new(capture),
+            Box::new(encoder),
+            clock,
+        )
+        .expect("with_parts");
+        host.set_pipeline_factory_for(Box::new(move |pcfg| {
+            if fail_hevc.load(Ordering::Acquire) && pcfg.codec == rc_encode::Codec::Hevc {
+                return Err(rc_types::Error::Encoder(
+                    "simulated hevc runtime fallback".into(),
+                ));
+            }
+            let (p, _) = fake_stack_anchored(pcfg, None)?;
+            Ok(p)
+        }));
+        host.handshake().expect("handshake");
+        assert_eq!(host.state(), SessionState::Streaming);
+        (host, in_tx, out_reliable_rx)
+    }
+
+    fn spawn_hidpi_channel_driver(
+        mut host: HostSession,
+        clock: SessionClock,
+        media_override: TestHostMediaOverride,
+    ) -> (Arc<AtomicBool>, thread::JoinHandle<DriveSessionOutcome>) {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop_flag);
+        let handle = thread::spawn(move || {
+            let updates = BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP);
+            let pw_ver = AtomicU64::new(0);
+            let cfg_ver = AtomicU64::new(0);
+            let disc = AtomicBool::new(false);
+            let close_reason = AtomicU8::new(ByeReason::Normal as u8);
+            let lock_cnt = AtomicU64::new(0);
+            let mut owner_terms = PersistentOwnerTerminals::new();
+            let wake_guard: SharedWakeGuard = Arc::new(Mutex::new(None));
+            let ft_dir: SharedFileTransferDir = Arc::new(RwLock::new(None));
+            let allow_assist_ft = AtomicBool::new(true);
+            drive_ui_host_session_with_media_override(
+                &mut host,
+                &clock,
+                None,
+                &updates,
+                &pw_ver,
+                0,
+                &cfg_ver,
+                0,
+                &disc,
+                &t_stop,
+                &close_reason,
+                HostTransportKind::Lan,
+                false,
+                false,
+                &lock_cnt,
+                None,
+                &mut owner_terms,
+                wake_guard,
+                ft_dir,
+                &allow_assist_ft,
+                None,
+                None,
+                Instant::now(),
+                media_override,
+            )
+        });
+        (stop_flag, handle)
+    }
+
+    #[test]
+    fn hidpi_set_privacy_mode_mouse_mode_and_media_resume_rescale_on_hevc_fallback() {
+        let expected_h264_60 = compute_hidpi_stream_target(
+            Resolution::new(1512, 982),
+            Some(Resolution::new(3024, 1964)),
+            60,
+            rc_encode::Codec::H264,
+        );
+        assert!(expected_h264_60.width < 3024 && expected_h264_60.height < 1964);
+        assert!(
+            u64::from(expected_h264_60.width) * u64::from(expected_h264_60.height)
+                <= 280_000_000 / 60
+        );
+
+        let send_client_hevc_caps =
+            |in_tx: &mpsc::Sender<NetEvent>, out_rx: &mpsc::Receiver<Vec<u8>>| -> u64 {
+                let _init = recv_display_ctrl_until(out_rx, Duration::from_secs(2), |m| {
+                    matches!(m, DisplayControlMsg::Capabilities { .. })
+                });
+                send_display_ctrl_event(
+                    in_tx,
+                    &DisplayControlMsg::ClientMediaCaps {
+                        decode_caps: rc_pipeline::default_codec_capabilities(true),
+                        refinement_caps: None,
+                        pref: crate::codec_selector::CodecSelectionPref::OfficeClear,
+                        supports_ext_codec_flags: true,
+                    },
+                );
+                let msgs = recv_display_ctrl_until(out_rx, Duration::from_secs(2), |m| {
+                    matches!(
+                        m,
+                        DisplayControlMsg::Capabilities {
+                            current_width: 3024,
+                            current_height: 1964,
+                            current_codec: Some(c),
+                            ..
+                        } if c == "hevc"
+                    )
+                });
+                msgs.into_iter()
+                    .rev()
+                    .find_map(|m| match m {
+                        DisplayControlMsg::Capabilities {
+                            codec_generation, ..
+                        } => Some(codec_generation),
+                        _ => None,
+                    })
+                    .expect("expected HEVC 3024x1964 Capabilities")
+            };
+
+        // 1) SetPrivacyMode (on + off) HEVC -> H.264 运行时回退必须按 280M px/s 预算缩流
+        {
+            let clock: SessionClock = Arc::new(|| 10_000);
+            let fail_hevc = Arc::new(AtomicBool::new(false));
+            let (host, in_tx, out_rx) = build_hidpi_channel_host(
+                Arc::clone(&clock),
+                1512,
+                982,
+                60,
+                144,
+                Arc::clone(&fail_hevc),
+            );
+            let platform_mock = TestHostPlatformMock::new(
+                Resolution::new(1512, 982),
+                Resolution::new(3024, 1964),
+                Vec::new(),
+            );
+            let (stop_flag, driver) = spawn_hidpi_channel_driver(
+                host,
+                clock,
+                TestHostMediaOverride {
+                    native_res: Resolution::new(1512, 982),
+                    max_res: Resolution::new(3024, 1964),
+                    auto_hidpi: true,
+                    hevc_available: true,
+                    encode_caps: rc_pipeline::default_codec_capabilities(true),
+                    platform: Some(platform_mock),
+                },
+            );
+
+            let gen_hevc = send_client_hevc_caps(&in_tx, &out_rx);
+
+            // 开启防窥幕布时强制 HEVC 构码失败回退 H.264
+            fail_hevc.store(true, Ordering::Release);
+            send_display_ctrl_event(
+                &in_tx,
+                &DisplayControlMsg::SetPrivacyMode {
+                    mode: "privacy".to_string(),
+                    preset: "preset-1".to_string(),
+                    custom_image_base64: None,
+                },
+            );
+            let msgs_on = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+                matches!(m, DisplayControlMsg::PrivacyState { .. })
+            });
+            assert!(msgs_on.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::PrivacyState {
+                    mode,
+                    supported: true,
+                    ..
+                } if mode == "privacy"
+            )));
+            assert!(
+                msgs_on.iter().any(|m| matches!(
+                    m,
+                    DisplayControlMsg::Capabilities {
+                        current_width,
+                        current_height,
+                        current_codec: Some(c),
+                        supported_codecs,
+                        codec_generation,
+                        ..
+                    } if c == "h264"
+                        && (*current_width, *current_height) == (expected_h264_60.width, expected_h264_60.height)
+                        && !supported_codecs.iter().any(|s| s == "hevc")
+                        && *codec_generation > gen_hevc
+                )),
+                "SetPrivacyMode(on) HEVC fallback must rescale into H.264 280M px/s budget: {msgs_on:?}"
+            );
+
+            // 恢复 HEVC 3024x1964 后再测试 SetPrivacyMode(off) 时触发 HEVC 回退
+            fail_hevc.store(false, Ordering::Release);
+            send_display_ctrl_event(
+                &in_tx,
+                &DisplayControlMsg::SetCodec {
+                    codec: "hevc".to_string(),
+                },
+            );
+            let _ = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+                matches!(
+                    m,
+                    DisplayControlMsg::Capabilities {
+                        current_width: 3024,
+                        current_height: 1964,
+                        current_codec: Some(c),
+                        ..
+                    } if c == "hevc"
+                )
+            });
+
+            fail_hevc.store(true, Ordering::Release);
+            send_display_ctrl_event(
+                &in_tx,
+                &DisplayControlMsg::SetPrivacyMode {
+                    mode: "off".to_string(),
+                    preset: "preset-1".to_string(),
+                    custom_image_base64: None,
+                },
+            );
+            let msgs_off = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+                matches!(
+                    m,
+                    DisplayControlMsg::Capabilities {
+                        current_codec: Some(c),
+                        ..
+                    } if c == "h264"
+                )
+            });
+            assert!(
+                msgs_off.iter().any(|m| matches!(
+                    m,
+                    DisplayControlMsg::Capabilities {
+                        current_width,
+                        current_height,
+                        current_codec: Some(c),
+                        ..
+                    } if c == "h264"
+                        && (*current_width, *current_height) == (expected_h264_60.width, expected_h264_60.height)
+                )),
+                "SetPrivacyMode(off) HEVC fallback must rescale into H.264 280M px/s budget: {msgs_off:?}"
+            );
+
+            stop_flag.store(true, Ordering::Release);
+            let _ = driver.join();
+        }
+
+        // 2) SetMouseMode HEVC -> H.264 运行时回退必须按 280M px/s 预算缩流
+        {
+            let clock: SessionClock = Arc::new(|| 10_000);
+            let fail_hevc = Arc::new(AtomicBool::new(false));
+            let (host, in_tx, out_rx) = build_hidpi_channel_host(
+                Arc::clone(&clock),
+                1512,
+                982,
+                60,
+                144,
+                Arc::clone(&fail_hevc),
+            );
+            let (stop_flag, driver) = spawn_hidpi_channel_driver(
+                host,
+                clock,
+                TestHostMediaOverride {
+                    native_res: Resolution::new(1512, 982),
+                    max_res: Resolution::new(3024, 1964),
+                    auto_hidpi: true,
+                    hevc_available: true,
+                    encode_caps: rc_pipeline::default_codec_capabilities(true),
+                    platform: None,
+                },
+            );
+
+            let gen_hevc = send_client_hevc_caps(&in_tx, &out_rx);
+            fail_hevc.store(true, Ordering::Release);
+            send_display_ctrl_event(
+                &in_tx,
+                &DisplayControlMsg::SetMouseMode {
+                    mode: "remote".to_string(),
+                },
+            );
+            let msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+                matches!(m, DisplayControlMsg::MouseModeState { .. })
+            });
+            assert!(msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::MouseModeState { mode } if mode == "remote"
+            )));
+            assert!(
+                msgs.iter().any(|m| matches!(
+                    m,
+                    DisplayControlMsg::Capabilities {
+                        current_width,
+                        current_height,
+                        current_codec: Some(c),
+                        codec_generation,
+                        ..
+                    } if c == "h264"
+                        && (*current_width, *current_height) == (expected_h264_60.width, expected_h264_60.height)
+                        && *codec_generation > gen_hevc
+                )),
+                "SetMouseMode HEVC fallback must rescale into H.264 280M px/s budget: {msgs:?}"
+            );
+
+            stop_flag.store(true, Ordering::Release);
+            let _ = driver.join();
+        }
+
+        // 3) SetMediaPaused(false) 恢复流时 HEVC -> H.264 运行时回退必须按 280M px/s 预算缩流
+        {
+            let clock: SessionClock = Arc::new(|| 10_000);
+            let fail_hevc = Arc::new(AtomicBool::new(false));
+            let (host, in_tx, out_rx) = build_hidpi_channel_host(
+                Arc::clone(&clock),
+                1512,
+                982,
+                60,
+                144,
+                Arc::clone(&fail_hevc),
+            );
+            let (stop_flag, driver) = spawn_hidpi_channel_driver(
+                host,
+                clock,
+                TestHostMediaOverride {
+                    native_res: Resolution::new(1512, 982),
+                    max_res: Resolution::new(3024, 1964),
+                    auto_hidpi: true,
+                    hevc_available: true,
+                    encode_caps: rc_pipeline::default_codec_capabilities(true),
+                    platform: None,
+                },
+            );
+
+            let gen_hevc = send_client_hevc_caps(&in_tx, &out_rx);
+            send_display_ctrl_event(&in_tx, &DisplayControlMsg::SetMediaPaused { paused: true });
+            let paused_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+                matches!(m, DisplayControlMsg::MediaState { paused: true })
+            });
+            assert!(paused_msgs
+                .iter()
+                .any(|m| matches!(m, DisplayControlMsg::MediaState { paused: true })));
+
+            fail_hevc.store(true, Ordering::Release);
+            send_display_ctrl_event(&in_tx, &DisplayControlMsg::SetMediaPaused { paused: false });
+            let resumed_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+                matches!(m, DisplayControlMsg::MediaState { paused: false })
+            });
+            assert!(
+                resumed_msgs.iter().any(|m| matches!(
+                    m,
+                    DisplayControlMsg::Capabilities {
+                        current_width,
+                        current_height,
+                        current_codec: Some(c),
+                        supported_codecs,
+                        codec_generation,
+                        ..
+                    } if c == "h264"
+                        && (*current_width, *current_height) == (expected_h264_60.width, expected_h264_60.height)
+                        && !supported_codecs.iter().any(|s| s == "hevc")
+                        && *codec_generation > gen_hevc
+                )),
+                "SetMediaPaused(false) HEVC fallback must rescale into H.264 280M px/s budget: {resumed_msgs:?}"
+            );
+
+            stop_flag.store(true, Ordering::Release);
+            let _ = driver.join();
+        }
+    }
+
+    #[test]
+    fn hidpi_codec_decode_failed_rescales_hevc_to_h264_budget() {
+        let clock: SessionClock = Arc::new(|| 10_000);
+        let fail_hevc = Arc::new(AtomicBool::new(false));
+        let (host, in_tx, out_rx) =
+            build_hidpi_channel_host(Arc::clone(&clock), 1512, 982, 90, 144, fail_hevc);
+        let (stop_flag, driver) = spawn_hidpi_channel_driver(
+            host,
+            clock,
+            TestHostMediaOverride {
+                native_res: Resolution::new(1512, 982),
+                max_res: Resolution::new(3024, 1964),
+                auto_hidpi: true,
+                hevc_available: true,
+                encode_caps: rc_pipeline::default_codec_capabilities(true),
+                platform: None,
+            },
+        );
+
+        let _init = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(m, DisplayControlMsg::Capabilities { .. })
+        });
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::ClientMediaCaps {
+                decode_caps: rc_pipeline::default_codec_capabilities(true),
+                refinement_caps: None,
+                pref: crate::codec_selector::CodecSelectionPref::OfficeClear,
+                supports_ext_codec_flags: true,
+            },
+        );
+        let hevc_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_width: 3024,
+                    current_height: 1964,
+                    current_fps: 90,
+                    current_codec: Some(c),
+                    ..
+                } if c == "hevc"
+            )
+        });
+        let hevc_gen = hevc_msgs
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                DisplayControlMsg::Capabilities {
+                    codec_generation, ..
+                } => Some(*codec_generation),
+                _ => None,
+            })
+            .expect("expected HEVC 3024x1964@90fps Capabilities");
+
+        let expected_h264_90 = compute_hidpi_stream_target(
+            Resolution::new(1512, 982),
+            Some(Resolution::new(3024, 1964)),
+            90,
+            rc_encode::Codec::H264,
+        );
+        assert!(expected_h264_90.width < 3024 && expected_h264_90.height < 1964);
+        assert!(
+            u64::from(expected_h264_90.width) * u64::from(expected_h264_90.height)
+                <= 280_000_000 / 90
+        );
+
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::CodecDecodeFailed {
+                codec: "hevc".to_string(),
+                generation: hevc_gen,
+                reason: "decoder failed on 90fps hevc".to_string(),
+            },
+        );
+        let fb_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_codec: Some(c),
+                    ..
+                } if c == "h264"
+            )
+        });
+        assert!(
+            fb_msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_width,
+                    current_height,
+                    current_fps: 90,
+                    current_codec: Some(c),
+                    supported_codecs,
+                    codec_generation,
+                    ..
+                } if c == "h264"
+                    && (*current_width, *current_height) == (expected_h264_90.width, expected_h264_90.height)
+                    && !supported_codecs.iter().any(|s| s == "hevc")
+                    && *codec_generation == hevc_gen + 1
+            )),
+            "CodecDecodeFailed(hevc) must rescale HiDPI stream into H.264 280M px/s budget: {fb_msgs:?}"
+        );
+
+        stop_flag.store(true, Ordering::Release);
+        let _ = driver.join();
+    }
+
+    #[test]
+    fn hidpi_set_stream_nonzero_clamps_6k_and_toggles_auto_hidpi() {
+        let clock: SessionClock = Arc::new(|| 10_000);
+        let fail_hevc = Arc::new(AtomicBool::new(false));
+        let (host, in_tx, out_rx) =
+            build_hidpi_channel_host(Arc::clone(&clock), 3008, 1692, 60, 144, fail_hevc);
+        let platform_mock = TestHostPlatformMock::new(
+            Resolution::new(3008, 1692),
+            Resolution::new(6016, 3384),
+            Vec::new(),
+        );
+        // 仅 (2560, 1440) 支持真切系统逻辑分辨率，backing 为 6K (6016x3384)，用于验证 5120x2880 封顶与 auto_hidpi_active=true；
+        // 其他尺寸如 (3200, 1800) 将命中 switch_to 失败回退分支，验证 auto_hidpi_active=false 与第 4 参数 session_max_res。
+        platform_mock.with_mode_switch(
+            (2560, 1440),
+            Resolution::new(2560, 1440),
+            Resolution::new(6016, 3384),
+        );
+
+        let (stop_flag, driver) = spawn_hidpi_channel_driver(
+            host,
+            clock,
+            TestHostMediaOverride {
+                native_res: Resolution::new(3008, 1692),
+                max_res: Resolution::new(6016, 3384),
+                auto_hidpi: true,
+                hevc_available: true,
+                encode_caps: rc_pipeline::default_codec_capabilities(true),
+                platform: Some(platform_mock),
+            },
+        );
+
+        let init_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(m, DisplayControlMsg::Capabilities { .. })
+        });
+        assert!(init_msgs.iter().any(|m| matches!(
+            m,
+            DisplayControlMsg::Capabilities {
+                max_width: 5120,
+                max_height: 2880,
+                display_width: 3008,
+                display_height: 1692,
+                display_hidpi: true,
+                ..
+            }
+        )));
+
+        // 1) switch_to(2560, 1440) 成功：6K backing (6016x3384) 必须被 clamp_display_max_res 封顶到 5120x2880，
+        //    且 auto_hidpi_active=true 使后续 fps 切换仍按 HiDPI 预算重算（且不被 host.caps 3008x1692 截断）。
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::SetStream {
+                width: 2560,
+                height: 1440,
+                fps: 60,
+                codec: Some("hevc".to_string()),
+            },
+        );
+        let expected_60 = compute_hidpi_stream_target(
+            Resolution::new(2560, 1440),
+            Some(Resolution::new(5120, 2880)),
+            60,
+            rc_encode::Codec::Hevc,
+        );
+        assert_eq!(expected_60, Resolution::new(3840, 2160));
+        let switch_ok_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    display_width: 2560,
+                    display_height: 1440,
+                    ..
+                }
+            )
+        });
+        assert!(
+            switch_ok_msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_width,
+                    current_height,
+                    max_width: 5120,
+                    max_height: 2880,
+                    display_width: 2560,
+                    display_height: 1440,
+                    display_hidpi: true,
+                    current_codec: Some(c),
+                    ..
+                } if c == "hevc"
+                    && (*current_width, *current_height) == (expected_60.width, expected_60.height)
+            )),
+            "SetStream switch_to success must clamp 6K max_res to 5120x2880 and use HiDPI target: {switch_ok_msgs:?}"
+        );
+
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::SetStream {
+                width: 0,
+                height: 0,
+                fps: 120,
+                codec: None,
+            },
+        );
+        let expected_120 = compute_hidpi_stream_target(
+            Resolution::new(2560, 1440),
+            Some(Resolution::new(5120, 2880)),
+            120,
+            rc_encode::Codec::Hevc,
+        );
+        let fps120_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_fps: 120,
+                    ..
+                }
+            )
+        });
+        assert!(fps120_msgs.iter().any(|m| matches!(
+            m,
+            DisplayControlMsg::Capabilities {
+                current_width,
+                current_height,
+                current_fps: 120,
+                ..
+            } if (*current_width, *current_height) == (expected_120.width, expected_120.height)
+        )));
+
+        // 2) switch_to(3200, 1800) 失败回退：auto_hidpi_active 置 false，仍以 Some(session_max_res)=5120x2880 作为第 4 参数
+        //    从而允许 3200x1800（高于 host.caps 3008x1692），且后续 SetStream(0,0,120) 保持 3200x1800 不被覆盖。
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::SetStream {
+                width: 3200,
+                height: 1800,
+                fps: 60,
+                codec: Some("hevc".to_string()),
+            },
+        );
+        let fallback_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_width: 3200,
+                    current_height: 1800,
+                    current_fps: 60,
+                    ..
+                }
+            )
+        });
+        assert!(fallback_msgs.iter().any(|m| matches!(
+            m,
+            DisplayControlMsg::Capabilities {
+                current_width: 3200,
+                current_height: 1800,
+                max_width: 5120,
+                max_height: 2880,
+                ..
+            }
+        )));
+
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::SetStream {
+                width: 0,
+                height: 0,
+                fps: 120,
+                codec: None,
+            },
+        );
+        let manual_120_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_fps: 120,
+                    ..
+                }
+            )
+        });
+        assert!(
+            manual_120_msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_width: 3200,
+                    current_height: 1800,
+                    current_fps: 120,
+                    ..
+                }
+            )),
+            "switch_to fallback must keep auto_hidpi_active=false on subsequent fps changes: {manual_120_msgs:?}"
+        );
+
+        stop_flag.store(true, Ordering::Release);
+        let _ = driver.join();
+    }
+
+    #[test]
+    fn switch_display_and_virtual_display_preserve_accurate_display_hidpi_and_auto_hidpi() {
+        let clock: SessionClock = Arc::new(|| 10_000);
+        let fail_hevc = Arc::new(AtomicBool::new(false));
+        let (host, in_tx, out_rx) =
+            build_hidpi_channel_host(Arc::clone(&clock), 1512, 982, 60, 144, fail_hevc);
+        let platform_mock = TestHostPlatformMock::new(
+            Resolution::new(1512, 982),
+            Resolution::new(3024, 1964),
+            vec![crate::platform::PlatformDisplayInfo {
+                id: 2,
+                name: "External 1080p".to_string(),
+                width: 1920,
+                height: 1080,
+                origin_x: 1512.0,
+                origin_y: 0.0,
+                is_main: false,
+                is_virtual: false,
+            }],
+        );
+        let (stop_flag, driver) = spawn_hidpi_channel_driver(
+            host,
+            clock,
+            TestHostMediaOverride {
+                native_res: Resolution::new(1512, 982),
+                max_res: Resolution::new(3024, 1964),
+                auto_hidpi: true,
+                hevc_available: true,
+                encode_caps: rc_pipeline::default_codec_capabilities(true),
+                platform: Some(platform_mock),
+            },
+        );
+
+        let _init = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(m, DisplayControlMsg::Capabilities { .. })
+        });
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::ClientMediaCaps {
+                decode_caps: rc_pipeline::default_codec_capabilities(true),
+                refinement_caps: None,
+                pref: crate::codec_selector::CodecSelectionPref::OfficeClear,
+                supports_ext_codec_flags: true,
+            },
+        );
+        let _ = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_width: 3024,
+                    current_height: 1964,
+                    display_hidpi: true,
+                    ..
+                }
+            )
+        });
+
+        // 1) SwitchDisplay 到非 HiDPI 副屏 (1920x1080)：不得误报 display_hidpi=true，且 auto_hidpi_active=false。
+        send_display_ctrl_event(&in_tx, &DisplayControlMsg::SwitchDisplay { display_id: 2 });
+        let sec_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::DisplaysState {
+                    active_display_id: 2,
+                    ..
+                }
+            )
+        });
+        assert!(
+            sec_msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_width: 1920,
+                    current_height: 1080,
+                    display_width: 1920,
+                    display_height: 1080,
+                    display_hidpi: false,
+                    ..
+                }
+            )),
+            "secondary non-HiDPI display must report display_hidpi=false: {sec_msgs:?}"
+        );
+
+        // 2) CreateVirtualDisplay(hidpi=false)：不得合成 2x max_res，也不得误报 display_hidpi=true。
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::CreateVirtualDisplay {
+                width: 1920,
+                height: 1080,
+                hidpi: false,
+            },
+        );
+        let v_non_hidpi_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::DisplaysState {
+                    active_display_id,
+                    ..
+                } if *active_display_id != 1 && *active_display_id != 2
+            )
+        });
+        let v_non_hidpi_id = v_non_hidpi_msgs
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                DisplayControlMsg::DisplaysState {
+                    active_display_id, ..
+                } => Some(*active_display_id),
+                _ => None,
+            })
+            .expect("must receive virtual display id");
+        assert!(
+            v_non_hidpi_msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_width: 1920,
+                    current_height: 1080,
+                    max_width: 1920,
+                    max_height: 1080,
+                    display_width: 1920,
+                    display_height: 1080,
+                    display_hidpi: false,
+                    ..
+                }
+            )),
+            "CreateVirtualDisplay(hidpi=false) must report max=1920x1080 and display_hidpi=false: {v_non_hidpi_msgs:?}"
+        );
+
+        // 3) CreateVirtualDisplay(hidpi=true)：正确上报 2x max_res 与 display_hidpi=true。
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::CreateVirtualDisplay {
+                width: 1920,
+                height: 1080,
+                hidpi: true,
+            },
+        );
+        let v_hidpi_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::DisplaysState {
+                    active_display_id,
+                    ..
+                } if *active_display_id != v_non_hidpi_id && *active_display_id > 2
+            )
+        });
+        let v_hidpi_id = v_hidpi_msgs
+            .iter()
+            .find_map(|m| match m {
+                DisplayControlMsg::DisplaysState {
+                    active_display_id, ..
+                } => Some(*active_display_id),
+                _ => None,
+            })
+            .expect("must receive hidpi virtual display id");
+        assert!(
+            v_hidpi_msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    max_width: 3840,
+                    max_height: 2160,
+                    display_width: 1920,
+                    display_height: 1080,
+                    display_hidpi: true,
+                    ..
+                }
+            )),
+            "CreateVirtualDisplay(hidpi=true) must report display_hidpi=true: {v_hidpi_msgs:?}"
+        );
+
+        // 4) SwitchDisplay 切回非 HiDPI 虚拟屏再切回 HiDPI 虚拟屏，验证 virtual_display_hidpi 状态追踪准确。
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::SwitchDisplay {
+                display_id: v_non_hidpi_id,
+            },
+        );
+        let back_non_hi = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::DisplaysState {
+                    active_display_id,
+                    ..
+                } if *active_display_id == v_non_hidpi_id
+            )
+        });
+        assert!(
+            back_non_hi.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    max_width: 1920,
+                    max_height: 1080,
+                    display_hidpi: false,
+                    ..
+                }
+            )),
+            "SwitchDisplay back to non-HiDPI virtual display must report max=1920x1080, display_hidpi=false: {back_non_hi:?}"
+        );
+
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::SwitchDisplay {
+                display_id: v_hidpi_id,
+            },
+        );
+        let back_hi = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::DisplaysState {
+                    active_display_id,
+                    ..
+                } if *active_display_id == v_hidpi_id
+            )
+        });
+        assert!(back_hi.iter().any(|m| matches!(
+            m,
+            DisplayControlMsg::Capabilities {
+                max_width: 3840,
+                max_height: 2160,
+                display_hidpi: true,
+                ..
+            }
+        )));
+
+        // 5) RemoveVirtualDisplay 移除当前激活的虚拟屏：自动回退主屏并恢复 auto_hidpi_active=true 与 3024x1964 直出。
+        send_display_ctrl_event(
+            &in_tx,
+            &DisplayControlMsg::RemoveVirtualDisplay {
+                display_id: v_hidpi_id,
+            },
+        );
+        let removed_msgs = recv_display_ctrl_until(&out_rx, Duration::from_secs(2), |m| {
+            matches!(
+                m,
+                DisplayControlMsg::DisplaysState {
+                    active_display_id: 1,
+                    ..
+                }
+            )
+        });
+        assert!(
+            removed_msgs.iter().any(|m| matches!(
+                m,
+                DisplayControlMsg::Capabilities {
+                    current_width: 3024,
+                    current_height: 1964,
+                    display_width: 1512,
+                    display_height: 982,
+                    display_hidpi: true,
+                    ..
+                }
+            )),
+            "RemoveVirtualDisplay must restore main display HiDPI state: {removed_msgs:?}"
+        );
+
+        stop_flag.store(true, Ordering::Release);
+        let _ = driver.join();
+    }
+
+    #[test]
+    fn detach_outcome_replaced_resets_display_and_auto_hidpi_state() {
+        use rc_session::{ClientSession, ClientSessionConfig};
+
+        struct EmptyInput;
+        impl rc_input::InputCapture for EmptyInput {
+            fn next_events(
+                &mut self,
+                _timeout: Duration,
+            ) -> rc_types::Result<Vec<rc_input::InputEvent>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let updates = Arc::new(BoundedHostUpdateQueue::new(HOST_UPDATE_CHANNEL_CAP));
+        let owner_replay = Arc::new(Mutex::new(rc_session::OwnerReplayCache::new()));
+        let BuiltUiHost {
+            mut host,
+            clock,
+            clock_anchor,
+            ..
+        } = build_host_session(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            None,
+            rc_session::auth::DEFAULT_AUTH_TIMEOUT_US,
+            false,
+            false,
+            true,
+            true,
+            None,
+            owner_replay,
+            Box::new(AutoApprover),
+            Arc::clone(&updates),
+        )
+        .expect("build_host_session");
+        host.update_caps_resolution(1512, 982);
+        let addr = host.local_addr().expect("local_addr");
+
+        let platform_mock = TestHostPlatformMock::new(
+            Resolution::new(1512, 982),
+            Resolution::new(3024, 1964),
+            vec![crate::platform::PlatformDisplayInfo {
+                id: 2,
+                name: "External 1080p".to_string(),
+                width: 1920,
+                height: 1080,
+                origin_x: 1512.0,
+                origin_y: 0.0,
+                is_main: false,
+                is_virtual: false,
+            }],
+        );
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop_flag);
+        let t_updates = Arc::clone(&updates);
+        let t_anchor = clock_anchor.clone();
+        let host_thread = thread::spawn(move || {
+            t_anchor.reset_pending();
+            host.accept_and_handshake(Duration::from_secs(5))
+                .expect("accept_and_handshake");
+            drive_ui_host_session_with_media_override(
+                &mut host,
+                &clock,
+                Some(&t_anchor),
+                &t_updates,
+                &AtomicU64::new(0),
+                0,
+                &AtomicU64::new(0),
+                0,
+                &AtomicBool::new(false),
+                &t_stop,
+                &AtomicU8::new(ByeReason::Normal as u8),
+                HostTransportKind::Lan,
+                false,
+                false,
+                &AtomicU64::new(0),
+                None,
+                &mut PersistentOwnerTerminals::new(),
+                Arc::new(Mutex::new(None)),
+                Arc::new(RwLock::new(None)),
+                &AtomicBool::new(true),
+                None,
+                None,
+                Instant::now(),
+                TestHostMediaOverride {
+                    native_res: Resolution::new(1512, 982),
+                    max_res: Resolution::new(3024, 1964),
+                    auto_hidpi: true,
+                    hevc_available: true,
+                    encode_caps: rc_pipeline::default_codec_capabilities(true),
+                    platform: Some(platform_mock),
+                },
+            )
+        });
+
+        let make_client = |sid: u64| {
+            let mut ccfg = ClientSessionConfig::new(
+                addr,
+                SessionParams {
+                    width: 0,
+                    height: 0,
+                    fps: 60,
+                    bitrate_bps: 30_000_000,
+                },
+                sid,
+                Box::new(EmptyInput),
+            );
+            ccfg.handshake_timeout = Duration::from_secs(3);
+            ccfg.connect_timeout = Duration::from_secs(3);
+            ccfg.auth = rc_session::auth::ClientAuthConfig::default();
+            let cclock: SessionClock = Arc::new(|| 0);
+            ClientSession::new(
+                ccfg,
+                DEV_CERT_PEM,
+                DEV_KEY_PEM,
+                DEV_CERT_PEM,
+                "rabbitcontrol",
+                cclock,
+            )
+            .expect("client new")
+        };
+
+        // 1) client1 连接并切换至非 HiDPI 副屏 (display_id=2)，随后直接 drop 进入 Detached
+        let mut client1 = make_client(7791);
+        client1.connect_and_handshake().expect("client1 handshake");
+        client1
+            .send_tool_message(
+                TOOL_CHANNEL_DISPLAY_CTRL,
+                display_ctrl::encode_display_ctrl(&DisplayControlMsg::SwitchDisplay {
+                    display_id: 2,
+                })
+                .unwrap(),
+            )
+            .expect("send SwitchDisplay");
+
+        let mut saw_sec = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !saw_sec {
+            let _ = client1.tick(Duration::from_millis(10), Instant::now());
+            for (ch, payload) in client1.drain_tool_messages() {
+                if ch == TOOL_CHANNEL_DISPLAY_CTRL {
+                    if let Some(DisplayControlMsg::Capabilities {
+                        display_width: 1920,
+                        display_height: 1080,
+                        display_hidpi: false,
+                        ..
+                    }) = display_ctrl::decode_display_ctrl(&payload)
+                    {
+                        saw_sec = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_sec,
+            "client1 must switch to secondary display 1920x1080"
+        );
+        drop(client1);
+        thread::sleep(Duration::from_millis(80));
+
+        // 2) client2 以全新 session_id 连接命中 DetachOutcome::Replaced：
+        //    必须重置回主屏 (display_width=1512, display_height=982, display_hidpi=true, active_display_id=1)，
+        //    且恢复 auto_hidpi_active=true 使 ClientMediaCaps(HEVC) 自动升级为 3024x1964。
+        let mut client2 = make_client(7792);
+        client2
+            .connect_and_handshake()
+            .expect("client2 handshake (Replaced)");
+
+        let mut saw_reset_caps = false;
+        let mut saw_main_display_active = false;
+        let deadline2 = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline2 && !(saw_reset_caps && saw_main_display_active) {
+            let _ = client2.tick(Duration::from_millis(10), Instant::now());
+            for (ch, payload) in client2.drain_tool_messages() {
+                if ch == TOOL_CHANNEL_DISPLAY_CTRL {
+                    match display_ctrl::decode_display_ctrl(&payload) {
+                        Some(DisplayControlMsg::Capabilities {
+                            display_width: 1512,
+                            display_height: 982,
+                            display_hidpi: true,
+                            ..
+                        }) => saw_reset_caps = true,
+                        Some(DisplayControlMsg::DisplaysState {
+                            active_display_id: 1,
+                            ..
+                        }) => saw_main_display_active = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_reset_caps && saw_main_display_active,
+            "Replaced must reset to main HiDPI display (caps={saw_reset_caps}, displays={saw_main_display_active})"
+        );
+
+        client2
+            .send_tool_message(
+                TOOL_CHANNEL_DISPLAY_CTRL,
+                display_ctrl::encode_display_ctrl(&DisplayControlMsg::ClientMediaCaps {
+                    decode_caps: rc_pipeline::default_codec_capabilities(true),
+                    refinement_caps: None,
+                    pref: crate::codec_selector::CodecSelectionPref::OfficeClear,
+                    supports_ext_codec_flags: true,
+                })
+                .unwrap(),
+            )
+            .expect("client2 send ClientMediaCaps");
+        let mut saw_hidpi_reupgrade = false;
+        let deadline3 = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline3 && !saw_hidpi_reupgrade {
+            let _ = client2.tick(Duration::from_millis(10), Instant::now());
+            for (ch, payload) in client2.drain_tool_messages() {
+                if ch == TOOL_CHANNEL_DISPLAY_CTRL {
+                    if let Some(DisplayControlMsg::Capabilities {
+                        current_width: 3024,
+                        current_height: 1964,
+                        current_codec: Some(c),
+                        display_hidpi: true,
+                        ..
+                    }) = display_ctrl::decode_display_ctrl(&payload)
+                    {
+                        if c == "hevc" {
+                            saw_hidpi_reupgrade = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_hidpi_reupgrade,
+            "Replaced must restore auto_hidpi_active=true so ClientMediaCaps(HEVC) upgrades to 3024x1964"
+        );
+
+        let _ = client2.close(ByeReason::Normal);
         stop_flag.store(true, Ordering::Release);
         let _ = host_thread.join();
     }

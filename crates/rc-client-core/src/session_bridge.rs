@@ -415,6 +415,15 @@ pub enum SessionUpdate {
         /// 针对当前分辨率、帧率与编码器的高刷满帧甜点与 HEVC 建议。
         #[serde(default)]
         advisory: HighRefreshAdvisory,
+        /// 当前生效显示器逻辑宽度（px/pt，如 `1512`；旧被控端未上报时为 `0`）。
+        #[serde(default)]
+        display_width: u32,
+        /// 当前生效显示器逻辑高度（px/pt，如 `982`；旧被控端未上报时为 `0`）。
+        #[serde(default)]
+        display_height: u32,
+        /// 当前生效显示器是否处于 HiDPI 模式（`backing > logical`）。
+        #[serde(default)]
+        display_hidpi: bool,
     },
     /// 被控端推送的当前桌面壁纸缩略图（`data:image/jpeg;base64,...` / `data:image/png;base64,...`）。
     Wallpaper {
@@ -7680,6 +7689,9 @@ fn handle_display_ctrl_msg(
             still_stream_epoch: _,
             supports_pixel_scroll: _,
             supports_controller_meta: _,
+            display_width,
+            display_height,
+            display_hidpi,
         } => {
             if current_width > 0 && current_height > 0 {
                 *hud_width = current_width;
@@ -7712,6 +7724,12 @@ fn handle_display_ctrl_msg(
                 client_supports_hevc,
                 &resolved_presets,
             );
+            let (eff_display_width, eff_display_height, eff_display_hidpi) =
+                if display_width == 0 || display_height == 0 {
+                    (0, 0, false)
+                } else {
+                    (display_width, display_height, display_hidpi)
+                };
             Some(SessionUpdate::DisplayConfig {
                 width: current_width,
                 height: current_height,
@@ -7724,6 +7742,9 @@ fn handle_display_ctrl_msg(
                 supported_codecs,
                 client_supports_hevc,
                 advisory,
+                display_width: eff_display_width,
+                display_height: eff_display_height,
+                display_hidpi: eff_display_hidpi,
             })
         }
         DisplayControlMsg::Wallpaper { mime, data_base64 } => {
@@ -8589,6 +8610,9 @@ mod tests {
                 still_stream_epoch: 0,
                 supports_pixel_scroll: false,
                 supports_controller_meta: false,
+                display_width: 1280,
+                display_height: 800,
+                display_hidpi: true,
             },
             &mut hud_w,
             &mut hud_h,
@@ -8603,6 +8627,9 @@ mod tests {
                 supported_codecs,
                 client_supports_hevc,
                 advisory,
+                display_width,
+                display_height,
+                display_hidpi,
                 ..
             } => {
                 assert_eq!(presets, custom_presets);
@@ -8611,6 +8638,10 @@ mod tests {
                 assert!(client_supports_hevc);
                 assert_eq!(advisory.level, display_ctrl::HighRefreshLevel::SuggestHevc);
                 assert!(advisory.can_enable_hevc);
+                assert_eq!(
+                    (display_width, display_height, display_hidpi),
+                    (1280, 800, true)
+                );
             }
             other => panic!("expected DisplayConfig, got {other:?}"),
         }
@@ -8636,6 +8667,9 @@ mod tests {
                 still_stream_epoch: 0,
                 supports_pixel_scroll: false,
                 supports_controller_meta: false,
+                display_width: 0,
+                display_height: 0,
+                display_hidpi: true,
             },
             &mut hud_w,
             &mut hud_h,
@@ -8644,11 +8678,20 @@ mod tests {
         .expect("fallback capabilities update");
         match fallback_upd {
             SessionUpdate::DisplayConfig {
-                presets, advisory, ..
+                presets,
+                advisory,
+                display_width,
+                display_height,
+                display_hidpi,
+                ..
             } => {
                 assert!(!presets.is_empty());
                 assert!(presets.iter().any(|p| p.is_native && p.width == 1920));
                 assert_eq!(advisory.level, display_ctrl::HighRefreshLevel::Optimal);
+                assert_eq!(
+                    (display_width, display_height, display_hidpi),
+                    (0, 0, false)
+                );
             }
             other => panic!("expected DisplayConfig, got {other:?}"),
         }
